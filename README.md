@@ -27,7 +27,7 @@ server in production, without changing a line.
 
 | | |
 |---|---|
-| **Encrypted at rest** | Everything stored is encrypted (`NUAGE_ENCRYPTION_KEY`): the pages with XTS-AES-256, each log record with AES-256-GCM, and the backups, which are copies of them. Keys derived per application (HKDF, or Argon2id from a passphrase), as in [brocolis](https://github.com/maxlestage/brocolis). |
+| **Encrypted at rest** | Everything stored is encrypted (`NUAGE_ENCRYPTION_KEY`): the pages with XTS-AES-256, each log record with AES-256-GCM, and the backups, which are copies of them. Keys derived per application (HKDF, or Argon2id from a passphrase). |
 | **Several applications** | One server, one database per application: its own tokens, its own keys, its own backups. The token an application sends picks its database. The console and `/app` show them side by side. |
 | **Pages on disk** | Tables and indexes in one B-tree file with a bounded page cache (`NUAGE_CACHE_MB`): the data is not limited by memory. Primary-key and index lookups read only the rows they need. |
 | **Write-ahead log** | Each commit is appended to the log and synced to disk before it is applied. Checkpoints, crash recovery, CRC-32 on log records and checksums on pages. |
@@ -104,8 +104,7 @@ db.delete_branch("preview-42").await?;
 
 ## Encryption
 
-Nuage DB encrypts everything it stores, with the primitives of
-[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id):
+Nuage DB encrypts everything it stores (AES-256, HKDF-SHA256, Argon2id):
 
 | What | How |
 |---|---|
@@ -195,6 +194,37 @@ it. What a visitor feels is mostly the network: pick the host's region closest t
 dyno that never sleeps (Heroku **Basic**, not Eco, whose first request after a pause takes
 seconds).
 
+## Install on a server
+
+On any Linux server (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 or ARM64, from 512 MiB
+of memory), one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
+```
+
+It installs the `nuage` binary (a static build: no dependency), **creates swap** when the
+server has none (the size of the memory, 1 to 4 GiB; `vm.swappiness=10`, so the memory goes
+to the database), a `nuage` user, the data in `/var/lib/nuage`, the settings in
+`/etc/nuage/nuage.env` with a generated key, token and console password, and a systemd
+service started at boot. It prints the address, the token and the password once: **copy
+`/etc/nuage/nuage.env` somewhere safe**, nobody can read the data without its key.
+
+- **HTTPS**: point a domain name to the server, then
+  `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, with a free
+  certificate; Nuage DB then listens on `127.0.0.1` only). Without HTTPS the console works,
+  but warns that the password travels in clear.
+- **Upgrade**: run the command again; data, key and settings stay.
+- **Options**: `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0`: no swap), `NUAGE_VERSION=v0.3.0`,
+  `NUAGE_FROM_SOURCE=1` (build with cargo).
+- **Remove**: `... | sudo bash -s uninstall` (keeps the data), `... | sudo bash -s purge`.
+- **Memory**: each application's page cache is `NUAGE_CACHE_MB=auto`, an eighth of the
+  memory (8 to 512 MiB); the rest stays on disk. The console's *Server* page shows the memory
+  Nuage DB uses, the free memory and the swap.
+
+Binaries for Linux, macOS and Windows are on the
+[releases page](https://github.com/maxlestage/Nuage/releases).
+
 ## Quick start
 
 ```bash
@@ -214,11 +244,11 @@ Then open:
 
 Applications connect with `NuageDb::connect("http://localhost:8080", "dev-token")`.
 
-Docker:
+Docker (Compose, with the settings in `.env`, from [`nuage.env.example`](nuage.env.example)):
 
 ```bash
-docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+cp nuage.env.example .env   # then set NUAGE_ENCRYPTION_KEY, NUAGE_TOKEN, NUAGE_ADMIN_PASSWORD
+docker compose up -d
 ```
 
 ## Deploy on Heroku
@@ -257,13 +287,14 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | Variable | Meaning | Default |
 |---|---|---|
 | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
+| `NUAGE_BIND` | address to listen on (`127.0.0.1`: this machine only, behind a proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 | `NUAGE_NAME` | name of the first application (and of its database) | `nuage` |
 | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`, `nuage genkey`), base64 of 32 bytes, or a passphrase of 12 characters or more | **required**: the binary does not start without it |
 | `NUAGE_TOKEN` | a token of the first application (named `NUAGE_NAME`); the console makes the other applications and their tokens | none |
 | `NUAGE_ADMIN_PASSWORD` | password of the console (and of the dashboard) | none: the console is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
-| `NUAGE_CACHE_MB` | page cache of each application, in MiB | `64` |
+| `NUAGE_CACHE_MB` | page cache of each application, in MiB, or `auto` | `auto`: an eighth of the memory, 8 to 512 MiB |
 | `NUAGE_BACKUP_DIR` | back up to this folder | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint of S3-compatible storage | `https://s3.<region>.amazonaws.com` |
@@ -277,8 +308,8 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `SITE_URL` | public address of the website (canonical links, share card) | each request's host |
 
 A commented example: [`nuage.env.example`](nuage.env.example). Serve the server over HTTPS
-(most hosts do it for you): the token travels in a header, and the console's cookie is
-`Secure`.
+(most hosts do it for you; on your own server, the installer's `NUAGE_DOMAIN`): the token
+travels in a header, and the console's cookie is `Secure` over HTTPS.
 
 ## `/app` and `/admin`
 
@@ -289,8 +320,8 @@ A commented example: [`nuage.env.example`](nuage.env.example). Serve the server 
   link goes through `/admin?next=/en/app/` and comes back to the dashboard. With
   `NUAGE_PUBLIC_STATUS=true`, visitors see the public subset. It installs as an app (PWA) and
   shows the last known state offline.
-- **`/admin`**, the console (in English, French and Spanish: the browser's language, or the EN · FR · ES links of every page): the applications (cards; create one, its token is shown once), then for each one its overview, tables and their rows, its tokens (new, revoke), its settings (description, deletion confirmed by its name), a query console (a small subset
-  of SQL, with a confirmation before changes), branches, storage and buttons for a
+- **`/admin`**, the console (in English, French and Spanish: the browser's language, or the EN · FR · ES links of every page): the applications (cards; create one, its token is shown once), then for each one its overview, tables and their rows, its tokens (new, revoke), its settings (description, deletion confirmed by its name), a query console (all of SQL,
+  with a confirmation before changes), branches, storage and buttons for a
   checkpoint, a backup, an integrity check and a compaction. Rendered by the server, it works
   without JavaScript, on a phone too. `HttpOnly`, `Secure`, `SameSite=Strict` session cookie,
   CSRF tokens, limited login attempts.

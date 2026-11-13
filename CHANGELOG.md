@@ -2,12 +2,40 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.3.0 (2026-11-13)
+
+### Install on any server
+
+- `install.sh`: `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash`
+  installs Nuage DB on a Linux server (x86_64 or ARM64): the static binary (checked with its
+  sha256; else built from source), swap when the server has none (the size of the memory, 1
+  to 4 GiB, `vm.swappiness=10`), a `nuage` system user, `/var/lib/nuage`,
+  `/etc/nuage/nuage.env` with a generated key, token and password (kept on upgrades), a
+  hardened systemd service, the firewall (ufw, firewalld), and with `NUAGE_DOMAIN` HTTPS
+  through Caddy. `uninstall` and `purge` remove it.
+- Releases: each `v*` tag publishes the binary for Linux (static, musl, x86_64 and ARM64),
+  macOS (ARM64, x86_64) and Windows, with their sha256.
+- `docker-compose.yml`.
+- `NUAGE_BIND`: the address to listen on (`127.0.0.1` behind a proxy); `nuage --version`.
+- The console's cookies are `Secure` over HTTPS and on `localhost`; a server reached in plain
+  HTTP (just installed, by its IP) can log in, and its login page warns that the password
+  travels in clear.
+
+### Memory
+
+- `NUAGE_CACHE_MB=auto` (the default): each application's page cache is an eighth of the
+  memory, 8 to 512 MiB (it was 64 MiB), the container's limit included.
+- The console's *Server* page and `/api/status` (`memory`) show the memory Nuage DB uses, the
+  free memory, the swap and the cache of each application.
+
+### Documentation
+
+- Nuage DB is documented on its own: the references to another project are gone.
+
 
 ### Encryption at rest
 
-- Everything Nuage DB stores is encrypted, with the primitives of
-  [brocolis](https://github.com/maxlestage/brocolis): the page store with XTS-AES-256 (a
+- Everything Nuage DB stores is encrypted (AES-256, HKDF-SHA256, Argon2id): the page store with XTS-AES-256 (a
   storage backend of redb), each write-ahead log record with AES-256-GCM (a key per segment,
   from a random salt; the LSN as nonce), and the backups, copies of both.
 - `NUAGE_ENCRYPTION_KEY`: a 32-byte key (64 hex digits or base64; `nuage genkey`) or a

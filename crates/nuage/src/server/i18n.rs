@@ -121,6 +121,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "El formulario ha caducado. Inténtalo de nuevo.",
     ),
     ("Wrong password.", "Mot de passe incorrect.", "Contraseña incorrecta."),
+    (
+        "This connection is not encrypted (HTTP): the password travels in clear. Reach the console over HTTPS (a domain name with the installer's NUAGE_DOMAIN, or a proxy), or through an SSH tunnel to localhost.",
+        "Cette connexion n'est pas chiffrée (HTTP) : le mot de passe circule en clair. Ouvrez la console en HTTPS (un nom de domaine avec NUAGE_DOMAIN de l'installateur, ou un proxy), ou par un tunnel SSH vers localhost.",
+        "Esta conexión no está cifrada (HTTP): la contraseña viaja sin cifrar. Abre la consola por HTTPS (un nombre de dominio con NUAGE_DOMAIN del instalador, o un proxy), o por un túnel SSH a localhost.",
+    ),
     ("Console off", "Console coupée", "Consola desactivada"),
     ("The console is off", "La console est coupée", "La consola está desactivada"),
     (
@@ -428,6 +433,16 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "desactivado para algunos datos: define NUAGE_ENCRYPTION_KEY",
     ),
     ("Events", "Événements", "Eventos"),
+    ("Memory", "Mémoire", "Memoria"),
+    (
+        "{} used by Nuage, {} free of {}",
+        "{} utilisés par Nuage, {} libres sur {}",
+        "{} usados por Nuage, {} libres de {}",
+    ),
+    ("Swap", "Swap", "Swap"),
+    ("none", "aucun", "ninguno"),
+    ("{} free of {}", "{} libres sur {}", "{} libres de {}"),
+    ("Cache of each application", "Cache de chaque application", "Caché de cada aplicación"),
     ("Time", "Heure", "Hora"),
     ("Level", "Niveau", "Nivel"),
     ("Event", "Événement", "Evento"),

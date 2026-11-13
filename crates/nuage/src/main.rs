@@ -16,6 +16,10 @@ fn main() -> ExitCode {
         println!("{}", nuage::Encryption::generate_key());
         return ExitCode::SUCCESS;
     }
+    if matches!(std::env::args().nth(1).as_deref(), Some("version" | "--version" | "-V")) {
+        println!("nuage {}", nuage::VERSION);
+        return ExitCode::SUCCESS;
+    }
     let config = match nuage::config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -76,7 +80,7 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "site"))]
         let options = config.server;
         let server = Server::new(engine.clone(), options);
-        let running = match server.listen(("0.0.0.0", config.port)).await {
+        let running = match server.listen((config.bind.as_str(), config.port)).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("nuage: {e}");

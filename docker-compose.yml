@@ -1,0 +1,29 @@
+# Nuage DB with Docker Compose:
+#
+#   cp nuage.env.example .env   # then set NUAGE_ENCRYPTION_KEY, NUAGE_TOKEN, NUAGE_ADMIN_PASSWORD
+#   docker compose up -d
+#
+# The data stays in the `nuage-data` volume. Keep a copy of NUAGE_ENCRYPTION_KEY: without it
+# the data and its backups cannot be read.
+services:
+  nuage:
+    build: .
+    image: nuage
+    env_file: .env
+    environment:
+      NUAGE_DATA_DIR: /data
+      PORT: "8080"
+      NUAGE_BIND: 0.0.0.0
+    ports:
+      - "${NUAGE_PORT:-8080}:8080"
+    volumes:
+      - nuage-data:/data
+    restart: unless-stopped
+    # Time to write the last log segment and checkpoint on `docker compose down`.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "nuage", "--version"]
+      interval: 1m
+
+volumes:
+  nuage-data:
