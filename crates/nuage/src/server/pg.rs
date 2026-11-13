@@ -181,6 +181,7 @@ pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
 }
 
 fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Result<()> {
+    let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let mut conn = Conn::Plain(stream);
     // The startup packet, after an optional TLS (or GSS) request.
     let params = loop {
@@ -263,6 +264,19 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
             cstr(b, &v);
         });
     }
+    // Say where the client is: psql shows it, drivers pass it on (a notice).
+    let access = if read_only { "read only" } else { "read and write" };
+    let hello =
+        format!("Connected to Nuage DB {}: application `{}`, {access}, branch `{branch}`.", crate::VERSION, app.name);
+    out.msg(b'N', |b| {
+        for (f, v) in [(b'S', "NOTICE"), (b'V', "NOTICE"), (b'C', "00000"), (b'M', hello.as_str())] {
+            b.push(f);
+            cstr(b, v);
+        }
+        b.push(0);
+    });
+    let client = if app_name.is_empty() { "a PostgreSQL driver" } else { app_name.as_str() };
+    app.connected("PostgreSQL", client, &peer, read_only);
     let pid = rand_i32();
     out.msg(b'K', |b| {
         b.extend_from_slice(&pid.to_be_bytes());

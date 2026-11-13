@@ -54,6 +54,23 @@ pub(crate) struct App {
     pub metrics: Metrics,
     /// Last request (Unix ms, 0: none yet).
     pub last_request: AtomicI64,
+    /// Who connected last, and how: the console shows it.
+    pub last_connection: Mutex<Option<Connection>>,
+}
+
+/// A connection of an application's client, as the console shows it.
+#[derive(Clone, Debug)]
+pub(crate) struct Connection {
+    /// When (Unix ms).
+    pub at: i64,
+    /// `HTTP API`, `SQL over HTTP` or `PostgreSQL`.
+    pub via: &'static str,
+    /// The client's name: its User-Agent, a website's origin, or a
+    /// PostgreSQL driver's `application_name`.
+    pub client: String,
+    /// Its address.
+    pub peer: String,
+    pub read_only: bool,
 }
 
 /// What the console and the status show of an application.
@@ -104,6 +121,7 @@ impl App {
             origins: RwLock::new(Vec::new()),
             metrics: Metrics::new(),
             last_request: AtomicI64::new(0),
+            last_connection: Mutex::new(None),
         }
     }
 
@@ -135,6 +153,17 @@ impl App {
 
     pub(crate) fn touch(&self) {
         self.last_request.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// A client of this application connected (a request, or a PostgreSQL login).
+    pub(crate) fn connected(&self, via: &'static str, client: &str, peer: &str, read_only: bool) {
+        let client: String = client.chars().take(80).collect();
+        *self.last_connection.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Connection { at: now_millis(), via, client, peer: peer.chars().take(64).collect(), read_only });
+    }
+
+    pub(crate) fn last_connection(&self) -> Option<Connection> {
+        self.last_connection.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn record(&self) -> Json {

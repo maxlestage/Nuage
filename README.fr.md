@@ -172,6 +172,14 @@ serveur. Chaque serveur décrit son API à `/v1/openapi.json` (OpenAPI 3.1) pour
 client dans n'importe quel autre langage. Rust a aussi le client natif, `NuageDb`. Et
 chaque pilote PostgreSQL se connecte aussi : voir plus bas.
 
+**Ma connexion marche-t-elle ?** `GET /v1/ping` répond quelle application le jeton ouvre :
+`curl https://db.example.com/v1/ping -H "Authorization: Bearer <jeton>"` donne
+`Connected to Nuage DB 0.4.0: application blog, read and write, branch main, 3 table(s).`,
+et sans jeton, ou avec un jeton qui n'ouvre rien, il dit ce qui ne va pas. Depuis n'importe
+quelle machine : `nuage check <url> <jeton>`. Une connexion PostgreSQL reçoit la même phrase
+en avis (psql l'affiche), et la page de chaque application dans la console montre sa dernière
+connexion (quand, comment, quel client), ou qu'elle attend la première.
+
 ## Protocole PostgreSQL
 
 Nuage DB parle aussi le protocole de PostgreSQL (`NUAGE_PG_PORT=5432` ; l'installateur et

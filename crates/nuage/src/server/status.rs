@@ -118,6 +118,12 @@ fn app_json(app: &App, env_token: bool) -> Json {
         "websites": info.origins,
         "created_at": rfc3339_ms(app.created_at),
         "last_request_at": (last > 0).then(|| rfc3339_ms(last)).flatten(),
+        "last_connection": app.last_connection().map(|c| json!({
+            "at": rfc3339_ms(c.at),
+            "via": c.via,
+            "client": c.client,
+            "read_only": c.read_only,
+        })),
         "requests": requests_json(&app.metrics),
         "branches": branches,
     })

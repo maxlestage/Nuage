@@ -6,6 +6,7 @@
 //! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) of the application the token opens | `Authorization: Bearer <token of an application>` |
 //! | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects: for websites in any language | the same; a read-only token reads only |
 //! | port `NUAGE_PG_PORT` | the PostgreSQL protocol ([`Server::listen_pg`]): every language's PostgreSQL driver | a token of an application as the password |
+//! | `GET /v1/ping` | "does my connection work?": the application the token opens, its access, branch and tables | a token of an application |
 //! | `GET /v1/openapi.json` | the OpenAPI description of `/v1/sql`, for code generators of every language | public |
 //!
 //! Websites: a page calls `/v1` from the browser when its origin is one of
@@ -604,7 +605,7 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
         if method == Method::OPTIONS {
             return preflight(state, origin.as_deref());
         }
-        let (mut res, allowed) = match protocol(state, req, origin.as_deref()).await {
+        let (mut res, allowed) = match protocol(state, req, origin.as_deref(), peer).await {
             Ok(answer) => answer,
             Err(e) => (error_response(&e), None),
         };
@@ -726,6 +727,7 @@ async fn protocol(
     state: &Arc<State>,
     req: Request<Incoming>,
     origin: Option<&str>,
+    peer: SocketAddr,
 ) -> Result<(Response<HttpBody>, Option<String>)> {
     if state.options.token.is_none() && !state.apps.any_token() {
         return Ok((
@@ -734,7 +736,12 @@ async fn protocol(
         ));
     }
     let Some((app, read_only)) = state.app_of(req.headers()) else {
-        return Ok((unauthorized("missing or invalid bearer token"), None));
+        let message = if bearer(req.headers()).is_some() {
+            "this token opens no application: it was revoked, or mistyped. Copy a token from the console (the application's Tokens tab), or use NUAGE_TOKEN"
+        } else {
+            "no token: send the header `Authorization: Bearer <token>`, with a token of an application (the console's Tokens tab, or NUAGE_TOKEN)"
+        };
+        return Ok((unauthorized(message), None));
     };
     // A page of a website the application does not list: refused (the
     // browser would not let it read the answer anyway).
@@ -751,6 +758,19 @@ async fn protocol(
     }
     let started = Instant::now();
     app.touch();
+    let via = if req.uri().path().starts_with("/v1/sql") { "SQL over HTTP" } else { "HTTP API" };
+    let client = origin
+        .map(str::to_owned)
+        .or_else(|| req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_owned))
+        .unwrap_or_default();
+    let address = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_else(|| peer.ip().to_string());
+    app.connected(via, &client, &address, read_only);
     let result = app_protocol(state, &app, read_only, req).await;
     let failed = match &result {
         Ok(res) => res.status().is_server_error(),
@@ -786,6 +806,30 @@ async fn app_protocol(
     let engine = &app.engine;
 
     match (method, segments.as_slice()) {
+        // "Does my connection work?": which application the token opens.
+        (Method::GET, ["ping"]) => {
+            check_branch(engine, &branch)?;
+            let tables = Embedded::from_engine(engine.clone()).tables().map(|t| t.len()).unwrap_or(0);
+            let access = if read_only { "read-only" } else { "read-write" };
+            Ok(json_response(
+                200,
+                &json!({
+                    "ok": true,
+                    "message": format!(
+                        "Connected to Nuage DB {}: application `{}`, {}, branch `{branch}`, {tables} table(s).",
+                        crate::VERSION,
+                        app.name,
+                        if read_only { "read only" } else { "read and write" },
+                    ),
+                    "server": "Nuage DB",
+                    "version": crate::VERSION,
+                    "application": app.name,
+                    "access": access,
+                    "branch": branch,
+                    "tables": tables,
+                }),
+            ))
+        }
         (Method::GET, ["info"]) => Ok(json_response(
             200,
             &json!({

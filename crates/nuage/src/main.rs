@@ -16,6 +16,30 @@ fn main() -> ExitCode {
         println!("{}", nuage::Encryption::generate_key());
         return ExitCode::SUCCESS;
     }
+    // `nuage check [url] [token]`: does a connection work? (NUAGE_URL, NUAGE_TOKEN)
+    if std::env::args().nth(1).as_deref() == Some("check") {
+        let arg = |i: usize, var: &str| std::env::args().nth(i).or_else(|| std::env::var(var).ok()).unwrap_or_default();
+        let (url, token) = (arg(2, "NUAGE_URL"), arg(3, "NUAGE_TOKEN"));
+        if url.is_empty() || token.is_empty() {
+            eprintln!("usage: nuage check <url> <token>   (or NUAGE_URL and NUAGE_TOKEN)");
+            return ExitCode::FAILURE;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+        let answer = match runtime {
+            Ok(r) => r.block_on(nuage::keepawake::check(&url, &token)),
+            Err(e) => Err(e.to_string()),
+        };
+        return match answer {
+            Ok(line) => {
+                println!("✓ {line}");
+                ExitCode::SUCCESS
+            }
+            Err(line) => {
+                eprintln!("✗ {line}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("version" | "--version" | "-V")) {
         println!("nuage {}", nuage::VERSION);
         return ExitCode::SUCCESS;
