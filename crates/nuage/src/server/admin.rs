@@ -4,6 +4,9 @@
 //! of one application (tables, query, branches, storage, tokens, settings);
 //! `/admin/server` is the server and the events of every application.
 //!
+//! In English, French and Spanish: the `nuage_lang` cookie (set by the
+//! `?lang=` links of every page), else `Accept-Language`, else English.
+//!
 //! Security: one password (`NUAGE_ADMIN_PASSWORD`), compared in constant
 //! time; a random session cookie (`HttpOnly`, `Secure`, `SameSite=Strict`,
 //! 12 hours); a CSRF token in every form (and a double-submit cookie on the
@@ -23,12 +26,15 @@ use memoire_orm::ast::SelectAst;
 use memoire_orm::{Error, Order, Query, TableSchema, Value};
 
 use super::apps::App;
+use super::i18n::{Lang, t, tf};
 use super::{HttpBody, State, full, random_token, read_body, same_secret};
 use crate::embedded::Embedded;
 use crate::engine::MAIN;
 
 const SESSION_COOKIE: &str = "nuage_session";
 const LOGIN_COOKIE: &str = "nuage_login";
+/// The console's language (`fr`, `en`, `es`), chosen with `?lang=`.
+pub(crate) const LANG_COOKIE: &str = "nuage_lang";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILURES_PER_ADDRESS: usize = 5;
@@ -47,7 +53,7 @@ pub(crate) struct Sessions {
     failures: Mutex<Vec<(IpAddr, Instant)>>,
 }
 
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|c| {
         let (k, v) = c.trim().split_once('=')?;
         (k == name).then_some(v)
@@ -146,20 +152,45 @@ pre{background:var(--card);border:1px solid var(--line);border-radius:8px;paddin
 .reveal pre{user-select:all}
 "#;
 
-fn page(title: &str, csrf: Option<&str>, body: &str) -> String {
+fn lang_switch(l: Lang, here: &str) -> String {
+    let mut out = String::from(r#"<span class="langs">"#);
+    for other in Lang::ALL {
+        let sep = if other == Lang::En { "" } else { " · " };
+        if other == l {
+            let _ = write!(out, r#"{sep}<b aria-current="true">{}</b>"#, other.code().to_uppercase());
+        } else {
+            let _ = write!(
+                out,
+                r#"{sep}<a href="{}?lang={code}" hreflang="{code}" lang="{code}">{}</a>"#,
+                esc(here),
+                other.code().to_uppercase(),
+                code = other.code()
+            );
+        }
+    }
+    out.push_str("</span>");
+    out
+}
+
+fn page(l: Lang, here: &str, title: &str, csrf: Option<&str>, body: &str) -> String {
     let nav = match csrf {
         Some(csrf) => format!(
-            r#"<nav><a href="/admin">Applications</a><a href="/admin/server">Server</a></nav>
-<form method="post" action="/admin/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{}"><button class="plain">Log out</button></form>"#,
-            esc(csrf)
+            r#"<nav><a href="/admin">{apps}</a><a href="/admin/server">{server}</a></nav>{langs}
+<form method="post" action="/admin/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{c}"><button class="plain">{out}</button></form>"#,
+            apps = t(l, "Applications"),
+            server = t(l, "Server"),
+            langs = lang_switch(l, here),
+            c = esc(csrf),
+            out = t(l, "Log out")
         ),
-        None => String::new(),
+        None => format!(r#"<span style="margin-left:auto">{}</span>"#, lang_switch(l, here)),
     };
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex"><meta name="color-scheme" content="light dark"><title>{} · Nuage DB</title><style>{STYLE}</style></head>
 <body><header><strong>Nuage DB</strong>{nav}</header><main>{body}</main></body></html>"#,
-        esc(title)
+        esc(title),
+        lang = l.code()
     )
 }
 
@@ -169,6 +200,7 @@ fn html(status: u16, body: String) -> Response<HttpBody> {
     let h = res.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::VARY, HeaderValue::from_static("Accept-Language, Cookie"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert(
         "content-security-policy",
@@ -196,25 +228,35 @@ fn set_cookie(res: &mut Response<HttpBody>, name: &str, value: &str, max_age: u6
     }
 }
 
-fn bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+fn bytes(l: Lang, n: u64) -> String {
+    let units: [&str; 5] =
+        if l == Lang::En { ["B", "KiB", "MiB", "GiB", "TiB"] } else { ["o", "Kio", "Mio", "Gio", "Tio"] };
+    let units = if l == Lang::Es { ["B", "KiB", "MiB", "GiB", "TiB"] } else { units };
     let mut v = n as f64;
     let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
+    while v >= 1024.0 && u < units.len() - 1 {
         v /= 1024.0;
         u += 1;
     }
-    if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
+    let s = if u == 0 { format!("{n} {}", units[0]) } else { format!("{v:.1} {}", units[u]) };
+    if l == Lang::En { s } else { s.replace('.', ",") }
 }
 
-fn duration(d: Duration) -> String {
+fn duration(l: Lang, d: Duration) -> String {
     let s = d.as_secs();
+    let day = if l == Lang::En { "d" } else { "j" };
+    let day = if l == Lang::Es { "d" } else { day };
     match s {
         0..=59 => format!("{s} s"),
         60..=3599 => format!("{} min", s / 60),
         3600..=86_399 => format!("{} h {} min", s / 3600, s / 60 % 60),
-        _ => format!("{} d {} h", s / 86_400, s / 3600 % 24),
+        _ => format!("{} {day} {} h", s / 86_400, s / 3600 % 24),
     }
+}
+
+/// A number written with a decimal comma in French and Spanish.
+fn dec(l: Lang, s: String) -> String {
+    if l == Lang::En { s } else { s.replace('.', ",") }
 }
 
 fn card(label: &str, value: &str) -> String {
@@ -226,11 +268,11 @@ fn cell(v: &Value) -> String {
         Value::Null => r#"<span class="muted">NULL</span>"#.into(),
         Value::Text(s) => esc(s),
         Value::Bytes(b) => esc(&format!("{} bytes", b.len())),
-        other => esc(&other.to_string().trim_matches('\'').replace("''", "'")),
+        other => esc(&crate::sql::value::to_text(other).unwrap_or_default()),
     }
 }
 
-fn table_html(headers: &[String], rows: &[Vec<Value>]) -> String {
+fn table_html(l: Lang, headers: &[String], rows: &[Vec<Value>]) -> String {
     let mut out = String::from(r#"<div class="scroll"><table><thead><tr>"#);
     for h in headers {
         let _ = write!(out, "<th>{}</th>", esc(h));
@@ -244,7 +286,8 @@ fn table_html(headers: &[String], rows: &[Vec<Value>]) -> String {
         out.push_str("</tr>");
     }
     if rows.is_empty() {
-        let _ = write!(out, r#"<tr><td colspan="{}" class="muted">No rows.</td></tr>"#, headers.len().max(1));
+        let _ =
+            write!(out, r#"<tr><td colspan="{}" class="muted">{}</td></tr>"#, headers.len().max(1), t(l, "No rows."));
     }
     out.push_str("</tbody></table></div>");
     out
@@ -296,13 +339,20 @@ fn query_param(req: &Request<Incoming>, name: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// `/` when no site is served: a pointer to the console.
-pub(crate) fn home_page(state: &State) -> Response<HttpBody> {
+pub(crate) fn home_page(state: &State, headers: &HeaderMap) -> Response<HttpBody> {
+    let l = Lang::of(headers);
     let body = format!(
-        r#"<h1>Nuage DB is running</h1><p>{} application(s), version {}. Everything stored is encrypted when <code>NUAGE_ENCRYPTION_KEY</code> is set.</p><p><a href="/admin">Open the console</a> · <a href="/api/health">Health</a></p>"#,
-        state.apps.all().len(),
-        crate::VERSION
+        r#"<h1>{}</h1><p>{}</p><p><a href="/admin">{}</a> · <a href="/api/health">{}</a></p>"#,
+        t(l, "Nuage DB is running"),
+        tf(
+            l,
+            "{} application(s), version {}. Everything stored is encrypted.",
+            &[&state.apps.all().len(), &crate::VERSION]
+        ),
+        t(l, "Open the console"),
+        t(l, "Health")
     );
-    html(200, page("Home", None, &body))
+    html(200, page(l, "/", t(l, "Home"), None, &body))
 }
 
 /// Where to go after logging in: only a path of this site (`/fr/app/`), never
@@ -329,30 +379,47 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-fn login_page(message: Option<&str>, status: u16, next: Option<&str>) -> Response<HttpBody> {
+fn login_page(l: Lang, message: Option<&str>, status: u16, next: Option<&str>) -> Response<HttpBody> {
     let token = random_token();
     let msg = message.map_or(String::new(), |m| format!(r#"<p class="msg bad">{}</p>"#, esc(m)));
     let next = next
         .and_then(safe_next)
         .map_or(String::new(), |n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n)));
     let body = format!(
-        r#"<div class="login card"><h1>Console</h1>{msg}<form method="post" action="/admin/login">
-<input type="hidden" name="csrf" value="{token}">{next}<p><label>Password<br><input type="password" name="password" autocomplete="current-password" required autofocus></label></p>
-<button>Log in</button></form></div>"#
+        r#"<div class="login card"><h1>{console}</h1>{msg}<form method="post" action="/admin/login">
+<input type="hidden" name="csrf" value="{token}">{next}<p><label>{password}<br><input type="password" name="password" autocomplete="current-password" required autofocus></label></p>
+<button>{login}</button></form></div>"#,
+        console = t(l, "Console"),
+        password = t(l, "Password"),
+        login = t(l, "Log in")
     );
-    let mut res = html(status, page("Log in", None, &body));
+    let mut res = html(status, page(l, "/admin/login", t(l, "Log in"), None, &body));
     set_cookie(&mut res, LOGIN_COOKIE, &token, 3600);
     res
 }
 
 pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
+    // `?lang=fr`: the console in that language from now on (a cookie).
+    if let Some(choice) = query_param(&req, "lang").as_deref().and_then(Lang::from_code) {
+        let back = req.uri().path().to_owned();
+        let mut res = redirect(safe_next(&back).unwrap_or("/admin"));
+        set_cookie(&mut res, LANG_COOKIE, choice.code(), 365 * 24 * 3600);
+        return res;
+    }
+    let l = Lang::of(req.headers());
     let Some(password) = state.options.admin_password.clone() else {
         return html(
             503,
             page(
-                "Console off",
+                l,
+                "/admin",
+                t(l, "Console off"),
                 None,
-                "<h1>The console is off</h1><p>Set <code>NUAGE_ADMIN_PASSWORD</code> on the server to turn it on.</p>",
+                &format!(
+                    "<h1>{}</h1><p>{}</p>",
+                    t(l, "The console is off"),
+                    t(l, "Set <code>NUAGE_ADMIN_PASSWORD</code> on the server to turn it on.")
+                ),
             ),
         );
     };
@@ -362,25 +429,27 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
     let next_param = query_param(&req, "next");
     if path == "/admin/login" {
         if method != Method::POST {
-            return login_page(None, 200, next_param.as_deref());
+            return login_page(l, None, 200, next_param.as_deref());
         }
         let ip = client_ip(req.headers(), peer);
         let expected = cookie(req.headers(), LOGIN_COOKIE).map(str::to_owned);
-        let Ok(body) = read_body(state, req).await else { return login_page(Some("Invalid request."), 400, None) };
+        let Ok(body) = read_body(state, req).await else {
+            return login_page(l, Some(t(l, "Invalid request.")), 400, None);
+        };
         let form = parse_form(&body);
         let next = form.get("next").map(String::as_str);
         if !state.admin.may_try(ip) {
-            return login_page(Some("Too many failed attempts. Wait a few minutes."), 429, next);
+            return login_page(l, Some(t(l, "Too many failed attempts. Wait a few minutes.")), 429, next);
         }
         let csrf_ok =
             matches!((&expected, form.get("csrf")), (Some(a), Some(b)) if same_secret(a.as_bytes(), b.as_bytes()));
         if !csrf_ok {
-            return login_page(Some("The form expired. Try again."), 403, next);
+            return login_page(l, Some(t(l, "The form expired. Try again.")), 403, next);
         }
         let given = form.get("password").map(String::as_str).unwrap_or_default();
         if !same_secret(given.as_bytes(), password.as_bytes()) {
             state.admin.failed(ip);
-            return login_page(Some("Wrong password."), 401, next);
+            return login_page(l, Some(t(l, "Wrong password.")), 401, next);
         }
         let mut res = redirect(next.and_then(safe_next).unwrap_or("/admin"));
         set_cookie(&mut res, SESSION_COOKIE, &state.admin.create(), SESSION_TTL.as_secs());
@@ -390,7 +459,7 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
 
     let Some((session, csrf)) = state.admin.current(req.headers()) else {
         if method != Method::GET {
-            return login_page(Some("Log in first."), 401, None);
+            return login_page(l, Some(t(l, "Log in first.")), 401, None);
         }
         // `/admin?next=/fr/app/` (from the site's dashboard) keeps its target;
         // any other console page comes back to itself.
@@ -423,30 +492,61 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
     }
 
     let origin = origin_of(req.headers());
+    let cx = Cx { l, csrf: csrf.clone(), here: path.clone() };
     if method == Method::POST {
         let Ok(body) = read_body(state, req).await else {
-            return html(400, page("Error", Some(&csrf), "<p>Invalid request.</p>"));
+            return html(400, cx.page(t(l, "Error"), &format!("<p>{}</p>", t(l, "Invalid request."))));
         };
         let form = parse_form(&body);
         if !form.get("csrf").is_some_and(|c| same_secret(c.as_bytes(), csrf.as_bytes())) {
             return html(
                 403,
-                page(
-                    "Refused",
-                    Some(&csrf),
-                    r#"<h1>Refused</h1><p class="msg bad">Invalid form token (CSRF). Reload the page and try again.</p>"#,
+                cx.page(
+                    t(l, "Refused"),
+                    &format!(
+                        r#"<h1>{}</h1><p class="msg bad">{}</p>"#,
+                        t(l, "Refused"),
+                        t(l, "Invalid form token (CSRF). Reload the page and try again.")
+                    ),
                 ),
             );
         }
-        return post(state, &path, form, &session, &csrf, origin).await;
+        return post(state, &path, form, &session, cx, origin).await;
     }
 
     let state2 = state.clone();
-    let csrf2 = csrf.clone();
     let page_no = query_param(&req, "page").and_then(|p| p.parse().ok()).unwrap_or(0u64);
-    tokio::task::spawn_blocking(move || get(&state2, &path, &csrf2, page_no, &origin))
+    let cx2 = cx.clone();
+    tokio::task::spawn_blocking(move || get(&state2, &path, &cx2, page_no, &origin))
         .await
-        .unwrap_or_else(|e| html(500, page("Error", Some(&csrf), &format!("<p>{}</p>", esc(&e.to_string())))))
+        .unwrap_or_else(|e| html(500, cx.page(t(l, "Error"), &format!("<p>{}</p>", esc(&e.to_string())))))
+}
+
+/// What every page of a session needs: its language, the CSRF token, where it is.
+#[derive(Clone)]
+struct Cx {
+    l: Lang,
+    csrf: String,
+    here: String,
+}
+
+impl Cx {
+    fn page(&self, title: &str, body: &str) -> String {
+        page(self.l, &self.here, title, Some(&self.csrf), body)
+    }
+
+    fn t(&self, en: &'static str) -> &'static str {
+        t(self.l, en)
+    }
+
+    fn tf(&self, en: &'static str, args: &[&dyn std::fmt::Display]) -> String {
+        tf(self.l, en, args)
+    }
+
+    /// The hidden CSRF field of a form.
+    fn field(&self) -> String {
+        format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(&self.csrf))
+    }
 }
 
 /// `https://host` of the request, for the connection examples.
@@ -481,11 +581,11 @@ fn split_app(path: &str) -> Option<(String, &str)> {
     Some((url_decode(name), sub))
 }
 
-fn ago_ms(ms: i64) -> String {
+fn ago_ms(l: Lang, ms: i64) -> String {
     if ms <= 0 {
-        return "never".into();
+        return t(l, "never").into();
     }
-    format!("{} ago", duration(Duration::from_millis((crate::engine::store::now_millis() - ms).max(0) as u64)))
+    tf(l, "{} ago", &[&duration(l, Duration::from_millis((crate::engine::store::now_millis() - ms).max(0) as u64))])
 }
 
 fn date_ms(ms: i64) -> String {
@@ -493,30 +593,29 @@ fn date_ms(ms: i64) -> String {
         .map_or_else(|| "—".into(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
 }
 
-fn lock_badge(engine: &crate::engine::Engine) -> String {
+fn lock_badge(l: Lang, engine: &crate::engine::Engine) -> String {
     match engine.encryption() {
         Some(_) => {
-            r#"<span class="pill ok" title="XTS-AES-256 pages, AES-256-GCM log and backups">&#128274; encrypted</span>"#
-                .into()
+            format!(r#"<span class="pill ok" title="XTS-AES-256, AES-256-GCM">&#128274; {}</span>"#, t(l, "encrypted"))
         }
-        None => r#"<span class="pill bad">in clear</span>"#.into(),
+        None => format!(r#"<span class="pill bad">{}</span>"#, t(l, "in clear")),
     }
 }
 
 /// The application's header: its name, badges, the other applications and
 /// its tabs.
-fn app_header(state: &State, app: &App, tab: &str) -> String {
+fn app_header(state: &State, cx: &Cx, app: &App, tab: &str) -> String {
     let base = app_base(&app.name);
     let mut out = String::from(r#"<div class="apphead"><div class="row-title">"#);
     let _ = write!(out, "<h1>{}</h1>", esc(&app.name));
     if app.first {
-        out.push_str(r#"<span class="pill">first application</span>"#);
+        let _ = write!(out, r#"<span class="pill">{}</span>"#, cx.t("first application"));
     }
-    out.push_str(&lock_badge(&app.engine));
+    out.push_str(&lock_badge(cx.l, &app.engine));
     out.push_str("</div>");
     let others: Vec<Arc<App>> = state.apps.all().into_iter().filter(|a| a.name != app.name).collect();
     if !others.is_empty() {
-        out.push_str(r#"<p class="switch"><span class="muted">Other applications:</span> "#);
+        let _ = write!(out, r#"<p class="switch"><span class="muted">{}</span> "#, cx.t("Other applications:"));
         for o in &others {
             let _ = write!(out, r#"<a class="chip" href="{}{}">{}</a> "#, app_base(&o.name), esc(tab), esc(&o.name));
         }
@@ -533,44 +632,46 @@ fn app_header(state: &State, app: &App, tab: &str) -> String {
         ("/settings", "Settings"),
     ] {
         let current = if sub == tab { r#" aria-current="page""# } else { "" };
-        let _ = write!(out, r#"<a href="{base}{sub}"{current}>{label}</a>"#);
+        let _ = write!(out, r#"<a href="{base}{sub}"{current}>{}</a>"#, cx.t(label));
     }
     out.push_str("</nav></div>");
     out
 }
 
-fn app_page(state: &State, app: &App, tab: &str, title: &str, csrf: &str, body: &str) -> String {
-    page(&format!("{title} · {}", app.name), Some(csrf), &format!("{}{body}", app_header(state, app, tab)))
+fn app_page(state: &State, cx: &Cx, app: &App, tab: &str, title: &str, body: &str) -> String {
+    cx.page(&format!("{title} · {}", app.name), &format!("{}{body}", app_header(state, cx, app, tab)))
 }
 
 /// A token, shown once, and how to connect with it.
-fn token_reveal(origin: &str, app: &str, token: &str) -> String {
+fn token_reveal(cx: &Cx, origin: &str, app: &str, token: &str) -> String {
     format!(
-        r#"<div class="msg ok reveal"><p><b>New token of {app}: copy it now, it is not shown again</b> (the server keeps only its digest).</p>
-<pre><code>{token}</code></pre><p>Connect the application with it:</p>
+        r#"<div class="msg ok reveal"><p><b>{title}</b> {digest}</p>
+<pre><code>{token}</code></pre><p>{connect}</p>
 <pre><code>NUAGE_URL={origin}
 NUAGE_TOKEN={token}</code></pre>
 <pre><code>let db = NuageDb::connect("{origin}", "{token}").await?;</code></pre></div>"#,
-        app = esc(app),
+        title = esc(&cx.tf("New token of {}: copy it now, it is not shown again", &[&app])),
+        digest = cx.t("(the server keeps only its digest)."),
+        connect = cx.t("Connect the application with it:"),
         token = esc(token),
         origin = esc(origin)
     )
 }
 
-fn connect_help(origin: &str, app: &App) -> String {
+fn connect_help(cx: &Cx, origin: &str, app: &App) -> String {
     let sites = app.origins();
     let sites = if sites.is_empty() {
-        format!(r#"No website yet: add yours in <a href="{}/settings">Settings</a>."#, app_base(&app.name))
+        cx.tf(r#"No website yet: add yours in <a href="{}/settings">Settings</a>."#, &[&app_base(&app.name)])
     } else {
-        format!("Websites allowed: {}.", esc(&sites.join(", ")))
+        cx.tf("Websites allowed: {}.", &[&esc(&sites.join(", "))])
     };
     format!(
-        r#"<h2>Connect</h2><p class="muted">The token an application sends picks its database: it reads and writes only its own.</p>
+        r#"<h2>{connect}</h2><p class="muted">{picks}</p>
 <pre><code>NUAGE_URL={o}
-NUAGE_TOKEN=&lt;a token of this application&gt;</code></pre>
+NUAGE_TOKEN=&lt;{a_token}&gt;</code></pre>
 <pre><code>let db = nuage::Db::from_env().await?;                      // or
 let db = NuageDb::connect("{o}", token).await?;</code></pre>
-<h2>Connect a website</h2><p class="muted">Any language, or a page's JavaScript, sends SQL with <code>?</code> parameters to <code>POST /v1/sql</code> and gets rows as JSON. In a page, use a <b>read-only</b> token. {sites}</p>
+<h2>{site}</h2><p class="muted">{any} {sites}</p>
 <pre><code>const res = await fetch("{o}/v1/sql", {{
   method: "POST",
   headers: {{ "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" }},
@@ -579,21 +680,32 @@ let db = NuageDb::connect("{o}", token).await?;</code></pre>
 const {{ rows }} = await res.json();   // [{{ "id": 42, "title": "…" }}, …]</code></pre>
 <pre><code>curl {o}/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
   -d '{{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Bonjour"]}}'</code></pre>"#,
+        connect = cx.t("Connect"),
+        picks = cx.t("The token an application sends picks its database: it reads and writes only its own."),
+        a_token = cx.t("a token of this application"),
+        site = cx.t("Connect a website"),
+        any = cx.t(
+            "Any language, or a page's JavaScript, sends SQL with <code>?</code> parameters to <code>POST /v1/sql</code> and gets rows as JSON. In a page, use a <b>read-only</b> token."
+        ),
         o = esc(origin)
     )
 }
 
 /// The list of applications, as cards.
-fn apps_body(state: &State, csrf: &str, message: Option<String>) -> String {
-    let mut body = String::from("<h1>Applications</h1>");
+fn apps_body(state: &State, cx: &Cx, message: Option<String>) -> String {
+    let l = cx.l;
+    let mut body = format!("<h1>{}</h1>", cx.t("Applications"));
     if let Some(m) = message {
         body.push_str(&m);
     }
     let all = state.apps.all();
     let _ = write!(
         body,
-        r#"<p class="muted">{} application(s) on this server. Each one has its own database, tokens, encryption keys and backups.</p><div class="apps">"#,
-        all.len()
+        r#"<p class="muted">{}</p><div class="apps">"#,
+        cx.tf(
+            "{} application(s) on this server. Each one has its own database, tokens, encryption keys and backups.",
+            &[&all.len()]
+        )
     );
     let env = state.options.token.is_some();
     for app in &all {
@@ -605,55 +717,71 @@ fn apps_body(state: &State, csrf: &str, message: Option<String>) -> String {
         let backup = engine.backup_status();
         let info = app.info(env);
         let tokens = info.tokens.len() + usize::from(info.env_token);
+        let fact =
+            |label: &'static str, value: String| format!("<div><dt>{}</dt><dd>{}</dd></div>", cx.t(label), esc(&value));
         let _ = write!(
             body,
-            r#"<a class="card app{bad}" href="{href}"><div class="row-title"><b>{name}</b>{first}{lock}</div>{desc}<dl class="mini">
-<div><dt>Tables</dt><dd>{tables}</dd></div><div><dt>Rows</dt><dd>{rows}</dd></div><div><dt>Size</dt><dd>{size}</dd></div>
-<div><dt>Requests</dt><dd>{rate:.1}/s</dd></div><div><dt>p99</dt><dd>{p99:.1} ms</dd></div><div><dt>Errors</dt><dd>{errors:.1}/s</dd></div>
-<div><dt>Branches</dt><dd>{branches}</dd></div><div><dt>Tokens</dt><dd>{tokens}</dd></div><div><dt>Last request</dt><dd>{last}</dd></div>
-</dl>{backup_note}</a>"#,
+            r#"<a class="card app{bad}" href="{href}"><div class="row-title"><b>{name}</b>{first}{lock}</div>{desc}<dl class="mini">{facts}</dl>{backup_note}</a>"#,
             bad = if backup.last_ok { "" } else { " is-bad" },
             href = app_base(&app.name),
             name = esc(&app.name),
-            first = if app.first { r#"<span class="pill">first</span>"# } else { "" },
-            lock = lock_badge(engine),
+            first = if app.first { format!(r#"<span class="pill">{}</span>"#, cx.t("first")) } else { String::new() },
+            lock = lock_badge(l, engine),
             desc = if info.description.is_empty() {
                 String::new()
             } else {
                 format!(r#"<small>{}</small>"#, esc(&info.description))
             },
-            tables = tables.len(),
-            rows = tables.iter().map(|t| t.rows).sum::<i64>(),
-            size = bytes(stats.file_bytes),
-            branches = engine.branches().len(),
-            last = ago_ms(app.last_request.load(std::sync::atomic::Ordering::Relaxed)),
+            facts = [
+                fact("Tables", tables.len().to_string()),
+                fact("Rows", tables.iter().map(|t| t.rows).sum::<i64>().to_string()),
+                fact("Size", bytes(l, stats.file_bytes)),
+                fact("Requests", dec(l, format!("{rate:.1}/s"))),
+                fact("p99", dec(l, format!("{p99:.1} ms"))),
+                fact("Errors", dec(l, format!("{errors:.1}/s"))),
+                fact("Branches", engine.branches().len().to_string()),
+                fact("Tokens", tokens.to_string()),
+                fact("Last request", ago_ms(l, app.last_request.load(std::sync::atomic::Ordering::Relaxed))),
+            ]
+            .concat(),
             backup_note = if backup.last_ok {
                 String::new()
             } else {
-                format!(r#"<small class="bad">Backup failing: {}</small>"#, esc(&backup.last_error.unwrap_or_default()))
+                format!(
+                    r#"<small class="bad">{}</small>"#,
+                    esc(&cx.tf("Backup failing: {}", &[&backup.last_error.unwrap_or_default()]))
+                )
             },
         );
     }
     for (name, error) in state.apps.failed() {
         let _ = write!(
             body,
-            r#"<a class="card app is-bad" href="{}/settings"><div class="row-title"><b>{}</b><span class="pill bad">cannot be opened</span></div><small>{}</small></a>"#,
+            r#"<a class="card app is-bad" href="{}/settings"><div class="row-title"><b>{}</b><span class="pill bad">{}</span></div><small>{}</small></a>"#,
             app_base(&name),
             esc(&name),
+            cx.t("cannot be opened"),
             esc(&error)
         );
     }
     let _ = write!(
         body,
-        r#"</div><h2>New application</h2><form method="post" action="/admin/apps" class="row"><input type="hidden" name="csrf" value="{}">
-<label>Name<input name="name" pattern="[a-z0-9_\-]{{1,63}}" required placeholder="shop"></label><label>Description<input name="description" placeholder="optional"></label><button>Create</button></form>
-<p class="muted">Its database is created at once, encrypted with keys of its own, with a first token.</p>"#,
-        esc(csrf)
+        r#"</div><h2>{new}</h2><form method="post" action="/admin/apps" class="row">{f}
+<label>{name}<input name="name" pattern="[a-z0-9_\-]{{1,63}}" required placeholder="shop"></label><label>{desc}<input name="description" placeholder="{optional}"></label><button>{create}</button></form>
+<p class="muted">{note}</p>"#,
+        new = cx.t("New application"),
+        f = cx.field(),
+        name = cx.t("Name"),
+        desc = cx.t("Description"),
+        optional = cx.t("optional"),
+        create = cx.t("Create"),
+        note = cx.t("Its database is created at once, encrypted with keys of its own, with a first token.")
     );
     body
 }
 
-fn app_overview(state: &State, app: &App, csrf: &str, origin: &str) -> String {
+fn app_overview(state: &State, cx: &Cx, app: &App, origin: &str) -> String {
+    let l = cx.l;
     let engine = &app.engine;
     let stats = engine.stats();
     let tables = Embedded::from_engine(engine.clone()).tables().unwrap_or_default();
@@ -666,51 +794,54 @@ fn app_overview(state: &State, app: &App, csrf: &str, origin: &str) -> String {
         let _ = write!(body, r#"<p class="muted">{}</p>"#, esc(&info.description));
     }
     body.push_str(r#"<div class="grid">"#);
-    for (l, v) in [
-        ("Size on disk", bytes(stats.file_bytes)),
+    for (label, v) in [
+        ("Size on disk", bytes(l, stats.file_bytes)),
         ("Tables", tables.len().to_string()),
         ("Rows", tables.iter().map(|t| t.rows).sum::<i64>().to_string()),
         ("Branches", engine.branches().len().to_string()),
-        ("Requests", format!("{rate:.1}/s, {} in all", app.metrics.total())),
-        ("Latency", format!("p50 {p50:.2} ms, p99 {p99:.2} ms")),
-        ("Errors", format!("{errors:.1}/s")),
-        ("Last request", ago_ms(app.last_request.load(std::sync::atomic::Ordering::Relaxed))),
+        ("Requests", cx.tf("{}/s, {} in all", &[&dec(l, format!("{rate:.1}")), &app.metrics.total()])),
+        ("Latency", dec(l, format!("p50 {p50:.2} ms, p99 {p99:.2} ms"))),
+        ("Errors", dec(l, format!("{errors:.1}/s"))),
+        ("Last request", ago_ms(l, app.last_request.load(std::sync::atomic::Ordering::Relaxed))),
         ("Tokens", (info.tokens.len() + usize::from(info.env_token)).to_string()),
         (
             "Encryption",
-            engine.encryption().map_or("off: stored in clear".into(), |k| format!("on ({k}), keys of its own")),
+            match engine.encryption() {
+                Some(k) => cx.tf("on ({}), keys of its own", &[&cx.t(k)]),
+                None => cx.t("off: stored in clear").into(),
+            },
         ),
         (
             "Last checkpoint",
             stats
                 .last_checkpoint
                 .and_then(|t| t.elapsed().ok())
-                .map_or("none yet".into(), |d| format!("{} ago", duration(d))),
+                .map_or_else(|| cx.t("none yet").into(), |d| cx.tf("{} ago", &[&duration(l, d)])),
         ),
         (
             "Backup",
             match (&backup.target, backup.last_ok) {
-                (None, _) => "off".into(),
-                (Some(t), true) => format!("to {t}"),
-                (Some(_), false) => "failing".into(),
+                (None, _) => cx.t("off").into(),
+                (Some(t), true) => cx.tf("to {}", &[t]),
+                (Some(_), false) => cx.t("failing").into(),
             },
         ),
-        ("Created", if app.first { "with the server".into() } else { date_ms(app.created_at) }),
+        ("Created", if app.first { cx.t("with the server").into() } else { date_ms(app.created_at) }),
     ] {
-        body.push_str(&card(l, &v));
+        body.push_str(&card(cx.t(label), &v));
     }
     body.push_str("</div>");
-    body.push_str(&connect_help(origin, app));
+    body.push_str(&connect_help(cx, origin, app));
     let _ = write!(
         body,
-        r#"<p class="muted">Data is stored in <code>{}</code>.</p>"#,
-        esc(&engine.dir().display().to_string())
+        r#"<p class="muted">{}</p>"#,
+        cx.tf("Data is stored in <code>{}</code>.", &[&esc(&engine.dir().display().to_string())])
     );
-    let _ = csrf;
     body
 }
 
-fn tables_body(app: &App) -> Result<String, Error> {
+fn tables_body(cx: &Cx, app: &App) -> Result<String, Error> {
+    let l = cx.l;
     let db = Embedded::from_engine(app.engine.clone());
     let tables = db.tables()?;
     let base = app_base(&app.name);
@@ -720,21 +851,27 @@ fn tables_body(app: &App) -> Result<String, Error> {
             vec![
                 Value::Text(t.name.clone()),
                 Value::I64(t.rows),
-                Value::Text(bytes(t.bytes as u64)),
+                Value::Text(bytes(l, t.bytes as u64)),
                 Value::Text(t.columns.join(", ")),
             ]
         })
         .collect();
-    let mut body = table_html(&["Table".into(), "Rows".into(), "Size".into(), "Columns".into()], &rows);
+    let headers: Vec<String> = ["Table", "Rows", "Size", "Columns"].iter().map(|h| cx.t(h).to_owned()).collect();
+    let mut body = table_html(l, &headers, &rows);
     body.push_str("<p>");
     for t in &tables {
-        let _ = write!(body, r#"<a href="{base}/tables/{0}">Browse {0}</a> · "#, esc(&t.name));
+        let _ = write!(
+            body,
+            r#"<a href="{base}/tables/{0}">{1}</a> · "#,
+            esc(&t.name),
+            esc(&cx.tf("Browse {}", &[&t.name]))
+        );
     }
     body.push_str("</p>");
     Ok(body)
 }
 
-fn rows_body(state: &State, app: &App, name: &str, page_no: u64) -> Result<String, Error> {
+fn rows_body(state: &State, cx: &Cx, app: &App, name: &str, page_no: u64) -> Result<String, Error> {
     let db = Embedded::from_engine(app.engine.clone());
     let schema = schema_of(state, &db, name)?;
     let pk = &schema.columns[schema.primary_key];
@@ -754,20 +891,21 @@ fn rows_body(state: &State, app: &App, name: &str, page_no: u64) -> Result<Strin
     let rows = db.fetch_rows(Query::Select(&select))?;
     let headers: Vec<String> = schema.columns.iter().map(|c| c.name.to_owned()).collect();
     let mut body = format!("<h2>{}</h2>", esc(name));
-    body.push_str(&table_html(&headers, &rows));
+    body.push_str(&table_html(cx.l, &headers, &rows));
     body.push_str("<p>");
     if page_no > 0 {
-        let _ = write!(body, r#"<a href="?page={}">← Previous</a> "#, page_no - 1);
+        let _ = write!(body, r#"<a href="?page={}">← {}</a> "#, page_no - 1, cx.t("Previous"));
     }
-    let _ = write!(body, "Page {} ", page_no + 1);
+    let _ = write!(body, "{} ", cx.tf("Page {}", &[&(page_no + 1)]));
     if rows.len() as u64 == PAGE_ROWS {
-        let _ = write!(body, r#"<a href="?page={}">Next →</a>"#, page_no + 1);
+        let _ = write!(body, r#"<a href="?page={}">{} →</a>"#, page_no + 1, cx.t("Next"));
     }
     body.push_str("</p>");
     Ok(body)
 }
 
-fn server_body(state: &State) -> String {
+fn server_body(state: &State, cx: &Cx) -> String {
+    let l = cx.l;
     let engine = &state.engine;
     let open = state.metrics.open_connections.load(std::sync::atomic::Ordering::Relaxed);
     let active = state.metrics.active_requests.load(std::sync::atomic::Ordering::Relaxed);
@@ -775,33 +913,37 @@ fn server_body(state: &State) -> String {
     let (p50, p99) = state.metrics.percentiles();
     let all = state.apps.all();
     let disk: u64 = all.iter().map(|a| a.engine.stats().file_bytes).sum();
-    let mut body = String::from(r#"<h1>Server</h1><div class="grid">"#);
-    for (l, v) in [
+    let mut body = format!(r#"<h1>{}</h1><div class="grid">"#, cx.t("Server"));
+    for (label, v) in [
         ("Version", format!("Nuage DB {}", crate::VERSION)),
-        ("Uptime", duration(engine.uptime())),
+        ("Uptime", duration(l, engine.uptime())),
         ("Applications", all.len().to_string()),
-        ("Size on disk", bytes(disk)),
-        ("Connections", format!("{} active, {} idle", active, open.saturating_sub(active))),
+        ("Size on disk", bytes(l, disk)),
+        ("Connections", cx.tf("{} active, {} idle", &[&active, &open.saturating_sub(active)])),
         ("Transactions open", state.open_transactions().to_string()),
-        ("Requests", format!("{rate:.1}/s, {} in all", state.metrics.total())),
-        ("Latency", format!("p50 {p50:.2} ms, p99 {p99:.2} ms")),
+        ("Requests", cx.tf("{}/s, {} in all", &[&dec(l, format!("{rate:.1}")), &state.metrics.total()])),
+        ("Latency", dec(l, format!("p50 {p50:.2} ms, p99 {p99:.2} ms"))),
         (
             "Encryption",
             if all.iter().all(|a| a.engine.encryption().is_some()) {
-                format!("{} ({})", crate::crypto::SCHEME, engine.encryption().unwrap_or("key"))
+                format!("{} ({})", crate::crypto::SCHEME, cx.t(engine.encryption().unwrap_or("key")))
             } else {
-                "off for some data: set NUAGE_ENCRYPTION_KEY".into()
+                cx.t("off for some data: set NUAGE_ENCRYPTION_KEY").into()
             },
         ),
-        ("Backup target", engine.backup_status().target.unwrap_or_else(|| "off".into())),
-        ("Free disk", engine.stats().disk_free_bytes.map_or("unknown".into(), bytes)),
+        ("Backup target", engine.backup_status().target.unwrap_or_else(|| cx.t("off").into())),
+        ("Free disk", engine.stats().disk_free_bytes.map_or_else(|| cx.t("unknown").into(), |b| bytes(l, b))),
     ] {
-        body.push_str(&card(l, &v));
+        body.push_str(&card(cx.t(label), &v));
     }
     let _ = write!(
         body,
-        r#"</div><p class="muted">Data is stored in <code>{}</code> (the others in <code>apps/</code>).</p><h2>Events</h2>"#,
-        esc(&engine.dir().display().to_string())
+        r#"</div><p class="muted">{}</p><h2>{}</h2>"#,
+        cx.tf(
+            "Data is stored in <code>{}</code> (the others in <code>apps/</code>).",
+            &[&esc(&engine.dir().display().to_string())]
+        ),
+        cx.t("Events")
     );
     let mut events: Vec<(i64, String, &'static str, String)> = all
         .iter()
@@ -815,76 +957,94 @@ fn server_body(state: &State) -> String {
             vec![Value::Text(date_ms(at)), Value::Text(app), Value::Text(level.into()), Value::Text(message)]
         })
         .collect();
-    body.push_str(&table_html(&["Time".into(), "Application".into(), "Level".into(), "Event".into()], &rows));
+    let headers: Vec<String> = ["Time", "Application", "Level", "Event"].iter().map(|h| cx.t(h).to_owned()).collect();
+    body.push_str(&table_html(l, &headers, &rows));
     body
 }
 
-fn get(state: &State, path: &str, csrf: &str, page_no: u64, origin: &str) -> Response<HttpBody> {
+fn not_found(cx: &Cx, what: &'static str) -> Response<HttpBody> {
+    html(404, cx.page(cx.t("Not found"), &format!("<h1>{}</h1>", cx.t(what))))
+}
+
+fn get(state: &State, path: &str, cx: &Cx, page_no: u64, origin: &str) -> Response<HttpBody> {
     match path {
-        "/admin" | "/admin/apps" => return html(200, page("Applications", Some(csrf), &apps_body(state, csrf, None))),
-        "/admin/server" => return html(200, page("Server", Some(csrf), &server_body(state))),
+        "/admin" | "/admin/apps" => return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, None))),
+        "/admin/server" => return html(200, cx.page(cx.t("Server"), &server_body(state, cx))),
         _ => {}
     }
-    let Some((name, sub)) = split_app(path) else {
-        return html(404, page("Not found", Some(csrf), "<h1>Not found</h1>"));
-    };
+    let Some((name, sub)) = split_app(path) else { return not_found(cx, "Not found") };
     let Some(app) = state.apps.get(&name) else {
         if sub == "/settings" && state.apps.failed().iter().any(|(n, _)| *n == name) {
-            return html(200, page("Settings", Some(csrf), &failed_settings(&name, csrf)));
+            return html(200, cx.page(cx.t("Settings"), &failed_settings(cx, &name)));
         }
-        return html(404, page("Not found", Some(csrf), "<h1>No such application</h1>"));
+        return not_found(cx, "No such application");
     };
     let (tab, title, body): (&str, &str, Result<String, Error>) = match sub {
-        "" => ("", "Overview", Ok(app_overview(state, &app, csrf, origin))),
-        "/tables" => ("/tables", "Tables", tables_body(&app)),
-        t if t.starts_with("/tables/") => ("/tables", "Rows", rows_body(state, &app, &t["/tables/".len()..], page_no)),
-        "/query" => ("/query", "Query", Ok(query_form(&app, csrf, "", None))),
-        "/branches" => ("/branches", "Branches", Ok(branches_body(&app, csrf, None))),
-        "/storage" => ("/storage", "Storage", Ok(storage_body(&app, csrf, None))),
-        "/tokens" => ("/tokens", "Tokens", Ok(tokens_body(state, &app, csrf, None))),
-        "/settings" => ("/settings", "Settings", Ok(settings_body(&app, csrf, None))),
-        _ => return html(404, page("Not found", Some(csrf), "<h1>Not found</h1>")),
+        "" => ("", "Overview", Ok(app_overview(state, cx, &app, origin))),
+        "/tables" => ("/tables", "Tables", tables_body(cx, &app)),
+        t if t.starts_with("/tables/") => {
+            ("/tables", "Rows", rows_body(state, cx, &app, &t["/tables/".len()..], page_no))
+        }
+        "/query" => ("/query", "Query", Ok(query_form(cx, &app, "", None))),
+        "/branches" => ("/branches", "Branches", Ok(branches_body(cx, &app, None))),
+        "/storage" => ("/storage", "Storage", Ok(storage_body(cx, &app, None))),
+        "/tokens" => ("/tokens", "Tokens", Ok(tokens_body(state, cx, &app, None))),
+        "/settings" => ("/settings", "Settings", Ok(settings_body(cx, &app, None))),
+        _ => return not_found(cx, "Not found"),
     };
     match body {
-        Ok(b) => html(200, app_page(state, &app, tab, title, csrf, &b)),
-        Err(e) => html(400, app_page(state, &app, tab, "Error", csrf, &note(false, &e.to_string()))),
+        Ok(b) => html(200, app_page(state, cx, &app, tab, cx.t(title), &b)),
+        Err(e) => html(400, app_page(state, cx, &app, tab, cx.t("Error"), &note(false, &e.to_string()))),
     }
 }
 
-fn query_form(app: &App, csrf: &str, sql: &str, extra: Option<&str>) -> String {
+fn query_form(cx: &Cx, app: &App, sql: &str, extra: Option<&str>) -> String {
     format!(
-        r#"<form method="post" action="{}/query"><input type="hidden" name="csrf" value="{}">
+        r#"<form method="post" action="{}/query">{}
 <textarea name="sql" spellcheck="false" placeholder="SELECT * FROM users WHERE age >= 18 ORDER BY name LIMIT 20">{}</textarea>
-<p class="row"><button>Run</button></p></form>
-<p class="muted">SQL: SELECT with joins, subqueries, GROUP BY, UNION, functions; INSERT (ON CONFLICT, RETURNING), UPDATE, DELETE; CREATE TABLE, CREATE INDEX, ALTER TABLE ADD COLUMN, DROP. Several statements separated by <code>;</code> run in one transaction. Changes ask for a confirmation first. Websites send the same SQL to <code>POST /v1/sql</code>.</p>{}"#,
+<p class="row"><button>{}</button></p></form>
+<p class="muted">{}</p>{}"#,
         app_base(&app.name),
-        esc(csrf),
+        cx.field(),
         esc(sql),
+        cx.t("Run"),
+        cx.t(
+            "SQL: SELECT with joins, subqueries, GROUP BY, UNION, functions; INSERT (ON CONFLICT, RETURNING), UPDATE, DELETE; CREATE TABLE, CREATE INDEX, ALTER TABLE ADD COLUMN, DROP. Several statements separated by <code>;</code> run in one transaction. Changes ask for a confirmation first. Websites send the same SQL to <code>POST /v1/sql</code>."
+        ),
         extra.unwrap_or_default()
     )
 }
 
-fn branches_body(app: &App, csrf: &str, message: Option<String>) -> String {
+fn branches_body(cx: &Cx, app: &App, message: Option<String>) -> String {
     let engine = &app.engine;
     let base = app_base(&app.name);
     let mut body = message.unwrap_or_default();
-    body.push_str(r#"<p class="muted">A branch is an instant copy of the database: it shares the data and stores only its own changes.</p>"#);
+    let _ = write!(
+        body,
+        r#"<p class="muted">{}</p>"#,
+        cx.t("A branch is an instant copy of the database: it shares the data and stores only its own changes.")
+    );
     let branches = engine.branches();
-    let mut out = String::from(
-        r#"<div class="scroll"><table><thead><tr><th>Branch</th><th>From</th><th>Own data</th><th></th></tr></thead><tbody>"#,
+    let mut out = format!(
+        r#"<div class="scroll"><table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+        cx.t("Branch"),
+        cx.t("From"),
+        cx.t("Own data")
     );
     for b in &branches {
         let _ = write!(
             out,
-            r#"<tr><td>{n}</td><td>{p}</td><td>{s}</td><td><form method="post" action="{base}/branches/{n}/reset" style="display:inline"><input type="hidden" name="csrf" value="{c}"><button class="plain">Reset</button></form> · <form method="post" action="{base}/branches/{n}/delete" style="display:inline"><input type="hidden" name="csrf" value="{c}"><button class="plain">Delete</button></form></td></tr>"#,
+            r#"<tr><td>{n}</td><td>{p}</td><td>{s}</td><td><form method="post" action="{base}/branches/{n}/reset" style="display:inline">{f}<button class="plain">{reset}</button></form> · <form method="post" action="{base}/branches/{n}/delete" style="display:inline">{f}<button class="plain">{delete}</button></form></td></tr>"#,
             n = esc(&b.name),
             p = esc(b.parent.as_deref().unwrap_or(&app.name)),
-            s = bytes(b.own_bytes),
-            c = esc(csrf)
+            s = bytes(cx.l, b.own_bytes),
+            f = cx.field(),
+            reset = cx.t("Reset"),
+            delete = cx.t("Delete")
         );
     }
     if branches.is_empty() {
-        out.push_str(r#"<tr><td colspan="4" class="muted">No branch yet.</td></tr>"#);
+        let _ = write!(out, r#"<tr><td colspan="4" class="muted">{}</td></tr>"#, cx.t("No branch yet."));
     }
     out.push_str("</tbody></table></div>");
     body.push_str(&out);
@@ -894,29 +1054,34 @@ fn branches_body(app: &App, csrf: &str, message: Option<String>) -> String {
     }
     let _ = write!(
         body,
-        r#"<h2>New branch</h2><form method="post" action="{base}/branches" class="row"><input type="hidden" name="csrf" value="{}">
-<label>Name<input name="name" pattern="[a-z0-9_\-]{{1,63}}" required placeholder="preview-42"></label><label>From<select name="from">{options}</select></label><button>Create</button></form>"#,
-        esc(csrf)
+        r#"<h2>{new}</h2><form method="post" action="{base}/branches" class="row">{f}
+<label>{name}<input name="name" pattern="[a-z0-9_\-]{{1,63}}" required placeholder="preview-42"></label><label>{from}<select name="from">{options}</select></label><button>{create}</button></form>"#,
+        new = cx.t("New branch"),
+        f = cx.field(),
+        name = cx.t("Name"),
+        from = cx.t("From"),
+        create = cx.t("Create")
     );
     body
 }
 
-fn storage_body(app: &App, csrf: &str, message: Option<String>) -> String {
+fn storage_body(cx: &Cx, app: &App, message: Option<String>) -> String {
+    let l = cx.l;
     let engine = &app.engine;
     let s = engine.stats();
     let b = engine.backup_status();
     let mut body = message.unwrap_or_default();
     body.push_str(r#"<div class="grid">"#);
-    for (l, v) in [
-        ("File", bytes(s.file_bytes)),
-        ("Data", bytes(s.stored_bytes)),
-        ("Free space in the file", bytes(s.fragmented_bytes)),
-        ("Pages", format!("{} of {}", s.pages, bytes(s.page_size))),
-        ("Write-ahead log", bytes(s.wal_bytes)),
-        ("Free disk", s.disk_free_bytes.map_or("unknown".into(), bytes)),
-        ("Cache", format!("{} / {}", bytes(s.cache_bytes), bytes(s.cache_capacity_bytes))),
-        ("Cache hits", format!("{:.1} %", s.cache_hit_rate * 100.0)),
-        ("Encryption", engine.encryption().map_or("off".into(), |_| crate::crypto::SCHEME.into())),
+    for (label, v) in [
+        ("File", bytes(l, s.file_bytes)),
+        ("Data", bytes(l, s.stored_bytes)),
+        ("Free space in the file", bytes(l, s.fragmented_bytes)),
+        ("Pages", cx.tf("{} of {}", &[&s.pages, &bytes(l, s.page_size)])),
+        ("Write-ahead log", bytes(l, s.wal_bytes)),
+        ("Free disk", s.disk_free_bytes.map_or_else(|| cx.t("unknown").into(), |b| bytes(l, b))),
+        ("Cache", format!("{} / {}", bytes(l, s.cache_bytes), bytes(l, s.cache_capacity_bytes))),
+        ("Cache hits", dec(l, format!("{:.1} %", s.cache_hit_rate * 100.0))),
+        ("Encryption", engine.encryption().map_or_else(|| cx.t("off").into(), |_| crate::crypto::SCHEME.into())),
         ("Last commit", s.lsn.to_string()),
         (
             "Last checkpoint",
@@ -925,25 +1090,26 @@ fn storage_body(app: &App, csrf: &str, message: Option<String>) -> String {
                 s.checkpoint_lsn,
                 s.last_checkpoint
                     .and_then(|t| t.elapsed().ok())
-                    .map_or("not yet".into(), |d| format!("{} ago", duration(d)))
+                    .map_or_else(|| cx.t("not yet").into(), |d| cx.tf("{} ago", &[&duration(l, d)]))
             ),
         ),
-        ("Backup target", b.target.clone().unwrap_or_else(|| "off".into())),
+        ("Backup target", b.target.clone().unwrap_or_else(|| cx.t("off").into())),
         (
             "Last backup",
             match (b.last_at, b.last_ok) {
-                (_, false) => format!("failed: {}", b.last_error.clone().unwrap_or_default()),
-                (Some(at), true) => ago_ms(at),
-                (None, true) => "none yet".into(),
+                (_, false) => cx.tf("failed: {}", &[&b.last_error.clone().unwrap_or_default()]),
+                (Some(at), true) => ago_ms(l, at),
+                (None, true) => cx.t("none yet").into(),
             },
         ),
     ] {
-        body.push_str(&card(l, &v));
+        body.push_str(&card(cx.t(label), &v));
     }
     let _ = write!(
         body,
-        r#"</div><p class="muted">Data is stored in <code>{}</code>.</p><h2>Maintenance</h2><div class="row">"#,
-        esc(&engine.dir().display().to_string())
+        r#"</div><p class="muted">{}</p><h2>{}</h2><div class="row">"#,
+        cx.tf("Data is stored in <code>{}</code>.", &[&esc(&engine.dir().display().to_string())]),
+        cx.t("Maintenance")
     );
     for (action, label) in [
         ("checkpoint", "Checkpoint now"),
@@ -953,93 +1119,135 @@ fn storage_body(app: &App, csrf: &str, message: Option<String>) -> String {
     ] {
         let _ = write!(
             body,
-            r#"<form method="post" action="{}/storage/{action}"><input type="hidden" name="csrf" value="{}"><button>{label}</button></form>"#,
+            r#"<form method="post" action="{}/storage/{action}">{}<button>{}</button></form>"#,
             app_base(&app.name),
-            esc(csrf)
+            cx.field(),
+            cx.t(label)
         );
     }
     body.push_str("</div>");
     body
 }
 
-fn tokens_body(state: &State, app: &App, csrf: &str, message: Option<String>) -> String {
+fn tokens_body(state: &State, cx: &Cx, app: &App, message: Option<String>) -> String {
     let base = app_base(&app.name);
     let info = app.info(state.options.token.is_some());
     let mut body = message.unwrap_or_default();
-    body.push_str(r#"<p class="muted">A token opens this application's database, and only it. The server keeps a SHA-256 digest of each token, never the token: a lost token cannot be shown again, make a new one.</p>"#);
-    let mut out = String::from(
-        r#"<div class="scroll"><table><thead><tr><th>Token</th><th>Rights</th><th>Created</th><th></th></tr></thead><tbody>"#,
+    let _ = write!(
+        body,
+        r#"<p class="muted">{}</p>"#,
+        cx.t("A token opens this application's database, and only it. The server keeps a SHA-256 digest of each token, never the token: a lost token cannot be shown again, make a new one.")
+    );
+    let mut out = format!(
+        r#"<div class="scroll"><table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+        cx.t("Token"),
+        cx.t("Rights"),
+        cx.t("Created")
     );
     if info.env_token {
-        out.push_str(r#"<tr><td><code>NUAGE_TOKEN</code></td><td>read and write</td><td class="muted">set on the server</td><td class="muted">change it in the environment</td></tr>"#);
-    }
-    for t in &info.tokens {
         let _ = write!(
             out,
-            r#"<tr><td><code>nuage_{id}…</code></td><td>{rights}</td><td>{at}</td><td><form method="post" action="{base}/tokens/{id}/revoke" style="display:inline"><input type="hidden" name="csrf" value="{c}"><button class="plain">Revoke</button></form></td></tr>"#,
-            id = esc(&t.id),
-            rights = if t.read_only { r#"<span class="pill">read only</span>"# } else { "read and write" },
-            at = date_ms(t.created_at),
-            c = esc(csrf)
+            r#"<tr><td><code>NUAGE_TOKEN</code></td><td>{}</td><td class="muted">{}</td><td class="muted">{}</td></tr>"#,
+            cx.t("read and write"),
+            cx.t("set on the server"),
+            cx.t("change it in the environment")
+        );
+    }
+    for tok in &info.tokens {
+        let _ = write!(
+            out,
+            r#"<tr><td><code>nuage_{id}…</code></td><td>{rights}</td><td>{at}</td><td><form method="post" action="{base}/tokens/{id}/revoke" style="display:inline">{f}<button class="plain">{revoke}</button></form></td></tr>"#,
+            id = esc(&tok.id),
+            rights = if tok.read_only {
+                format!(r#"<span class="pill">{}</span>"#, cx.t("read only"))
+            } else {
+                cx.t("read and write").into()
+            },
+            at = date_ms(tok.created_at),
+            f = cx.field(),
+            revoke = cx.t("Revoke")
         );
     }
     if info.tokens.is_empty() && !info.env_token {
-        out.push_str(r#"<tr><td colspan="4" class="muted">No token: no application can connect.</td></tr>"#);
+        let _ = write!(
+            out,
+            r#"<tr><td colspan="4" class="muted">{}</td></tr>"#,
+            cx.t("No token: no application can connect.")
+        );
     }
     out.push_str("</tbody></table></div>");
     body.push_str(&out);
     let _ = write!(
         body,
-        r#"<div class="row" style="margin-top:.75rem"><form method="post" action="{base}/tokens"><input type="hidden" name="csrf" value="{c}"><input type="hidden" name="scope" value="write"><button>New token (read and write)</button></form>
-<form method="post" action="{base}/tokens"><input type="hidden" name="csrf" value="{c}"><input type="hidden" name="scope" value="read"><button>New read-only token</button></form></div>
-<p class="muted">A token in a web page is public: anyone can read it in the page's code. Give pages a <b>read-only</b> token, and keep read-and-write tokens on servers.</p>"#,
-        c = esc(csrf)
+        r#"<div class="row" style="margin-top:.75rem"><form method="post" action="{base}/tokens">{f}<input type="hidden" name="scope" value="write"><button>{rw}</button></form>
+<form method="post" action="{base}/tokens">{f}<input type="hidden" name="scope" value="read"><button>{ro}</button></form></div>
+<p class="muted">{public}</p>"#,
+        f = cx.field(),
+        rw = cx.t("New token (read and write)"),
+        ro = cx.t("New read-only token"),
+        public = cx.t("A token in a web page is public: anyone can read it in the page's code. Give pages a <b>read-only</b> token, and keep read-and-write tokens on servers.")
     );
     body
 }
 
-fn settings_body(app: &App, csrf: &str, message: Option<String>) -> String {
+fn settings_body(cx: &Cx, app: &App, message: Option<String>) -> String {
     let base = app_base(&app.name);
     let mut body = message.unwrap_or_default();
     let description = app.description.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = write!(
         body,
-        r#"<h2>Description</h2><form method="post" action="{base}/description" class="row"><input type="hidden" name="csrf" value="{c}">
-<label>Description<input name="description" value="{d}" placeholder="what this application is"></label><button>Save</button></form>"#,
-        c = esc(csrf),
-        d = esc(&description)
+        r#"<h2>{title}</h2><form method="post" action="{base}/description" class="row">{f}
+<label>{title}<input name="description" value="{d}" placeholder="{what}"></label><button>{save}</button></form>"#,
+        title = cx.t("Description"),
+        f = cx.field(),
+        d = esc(&description),
+        what = cx.t("what this application is"),
+        save = cx.t("Save")
     );
     let _ = write!(
         body,
-        r#"<h2>Websites</h2><p class="muted">The pages of these websites may call this application from the browser (CORS): one origin per line, scheme and host (<code>https://site.fr</code>, <code>http://localhost:3000</code>), or <code>*</code> for any. Servers, and apps outside a browser, need none.</p>
-<form method="post" action="{base}/origins"><input type="hidden" name="csrf" value="{c}"><textarea name="origins" spellcheck="false" placeholder="https://site.fr" style="min-height:5rem">{o}</textarea><p class="row"><button>Save the websites</button></p></form>"#,
-        c = esc(csrf),
-        o = esc(&app.origins().join("\n"))
+        r#"<h2>{title}</h2><p class="muted">{help}</p>
+<form method="post" action="{base}/origins">{f}<textarea name="origins" spellcheck="false" placeholder="https://site.fr" style="min-height:5rem">{o}</textarea><p class="row"><button>{save}</button></p></form>"#,
+        title = cx.t("Websites"),
+        help = cx.t("The pages of these websites may call this application from the browser (CORS): one origin per line, scheme and host (<code>https://site.fr</code>, <code>http://localhost:3000</code>), or <code>*</code> for any. Servers, and apps outside a browser, need none."),
+        f = cx.field(),
+        o = esc(&app.origins().join("\n")),
+        save = cx.t("Save the websites")
     );
     if app.first {
-        body.push_str(r#"<h2>Delete</h2><p class="muted">The first application is the server's own database: it cannot be deleted.</p>"#);
+        let _ = write!(
+            body,
+            r#"<h2>{}</h2><p class="muted">{}</p>"#,
+            cx.t("Delete"),
+            cx.t("The first application is the server's own database: it cannot be deleted.")
+        );
     } else {
-        body.push_str(&delete_form(&app.name, csrf));
+        body.push_str(&delete_form(cx, &app.name));
     }
     body
 }
 
-fn delete_form(name: &str, csrf: &str) -> String {
+fn delete_form(cx: &Cx, name: &str) -> String {
+    let n = esc(name);
     format!(
-        r#"<h2>Delete</h2><p>Deleting <b>{n}</b> removes its tokens, its data and its backups. It cannot be undone.</p>
-<form method="post" action="{base}/delete" class="row"><input type="hidden" name="csrf" value="{c}">
-<label>Type <code>{n}</code> to confirm<input name="confirm" required autocomplete="off"></label><button class="danger">Delete {n}</button></form>"#,
-        n = esc(name),
+        r#"<h2>{title}</h2><p>{warn}</p>
+<form method="post" action="{base}/delete" class="row">{f}
+<label>{typ}<input name="confirm" required autocomplete="off"></label><button class="danger">{del}</button></form>"#,
+        title = cx.t("Delete"),
+        warn = cx.tf("Deleting <b>{}</b> removes its tokens, its data and its backups. It cannot be undone.", &[&n]),
         base = app_base(name),
-        c = esc(csrf)
+        f = cx.field(),
+        typ = cx.tf("Type <code>{}</code> to confirm", &[&n]),
+        del = cx.tf("Delete {}", &[&n])
     )
 }
 
-fn failed_settings(name: &str, csrf: &str) -> String {
+fn failed_settings(cx: &Cx, name: &str) -> String {
     format!(
-        r#"<h1>{}</h1><p class="msg bad">This application could not be opened at startup (see the server's events).</p>{}"#,
+        r#"<h1>{}</h1><p class="msg bad">{}</p>{}"#,
         esc(name),
-        delete_form(name, csrf)
+        cx.t("This application could not be opened at startup (see the server's events)."),
+        delete_form(cx, name)
     )
 }
 
@@ -1052,7 +1260,7 @@ async fn post(
     path: &str,
     form: HashMap<String, String>,
     session: &str,
-    csrf: &str,
+    cx: Cx,
     origin: String,
 ) -> Response<HttpBody> {
     if path == "/admin/logout" {
@@ -1063,141 +1271,141 @@ async fn post(
     }
     let state2 = state.clone();
     let path2 = path.to_owned();
-    let csrf2 = csrf.to_owned();
-    tokio::task::spawn_blocking(move || post_now(&state2, &path2, &form, &csrf2, &origin))
+    let cx2 = cx.clone();
+    tokio::task::spawn_blocking(move || post_now(&state2, &path2, &form, &cx2, &origin))
         .await
-        .unwrap_or_else(|e| html(500, page("Error", Some(csrf), &format!("<p>{}</p>", esc(&e.to_string())))))
+        .unwrap_or_else(|e| html(500, cx.page(cx.t("Error"), &format!("<p>{}</p>", esc(&e.to_string())))))
 }
 
-fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &str, origin: &str) -> Response<HttpBody> {
+fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, origin: &str) -> Response<HttpBody> {
     let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default().to_owned();
     if path == "/admin/apps" {
         let msg = match state.apps.create(field("name").trim(), &field("description")) {
             Ok((app, token)) => format!(
                 "{}{}",
-                note(true, &format!("Application {} created, with its own encrypted database.", app.name)),
-                token_reveal(origin, &app.name, &token)
+                note(true, &cx.tf("Application {} created, with its own encrypted database.", &[&app.name])),
+                token_reveal(cx, origin, &app.name, &token)
             ),
             Err(e) => note(false, &e.to_string()),
         };
-        return html(200, page("Applications", Some(csrf), &apps_body(state, csrf, Some(msg))));
+        return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
     }
-    let Some((name, sub)) = split_app(path) else {
-        return html(404, page("Not found", Some(csrf), "<h1>Not found</h1>"));
-    };
+    let Some((name, sub)) = split_app(path) else { return not_found(cx, "Not found") };
     if sub == "/delete" {
         if field("confirm").trim() != name {
-            let msg = note(false, &format!("Type {name} to confirm: nothing was deleted."));
+            let msg = note(false, &cx.tf("Type {} to confirm: nothing was deleted.", &[&name]));
             return match state.apps.get(&name) {
                 Some(app) => html(
                     400,
-                    app_page(state, &app, "/settings", "Settings", csrf, &settings_body(&app, csrf, Some(msg))),
+                    app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))),
                 ),
-                None => html(400, page("Settings", Some(csrf), &format!("{msg}{}", failed_settings(&name, csrf)))),
+                None => html(400, cx.page(cx.t("Settings"), &format!("{msg}{}", failed_settings(cx, &name)))),
             };
         }
         let msg = match state.apps.delete(&name) {
-            Ok(true) => note(true, &format!("Application {name} deleted, with its data and backups.")),
-            Ok(false) => note(false, &format!("There is no application {name}.")),
+            Ok(true) => note(true, &cx.tf("Application {} deleted, with its data and backups.", &[&name])),
+            Ok(false) => note(false, &cx.tf("There is no application {}.", &[&name])),
             Err(e) => note(false, &e.to_string()),
         };
-        return html(200, page("Applications", Some(csrf), &apps_body(state, csrf, Some(msg))));
+        return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
     }
-    let Some(app) = state.apps.get(&name) else {
-        return html(404, page("Not found", Some(csrf), "<h1>No such application</h1>"));
-    };
+    let Some(app) = state.apps.get(&name) else { return not_found(cx, "No such application") };
     let engine = &app.engine;
     let (sql, confirmed, branch, from) = (field("sql"), field("confirm") == "yes", field("name"), field("from"));
     match sub {
         "/query" => {
-            let result = run_console_sql(&app, state, &sql, confirmed, csrf);
+            let result = run_console_sql(state, cx, &app, &sql, confirmed);
             let (status, extra) = match result {
                 Ok(extra) => (200, extra),
                 Err(e) => (400, note(false, &e.to_string())),
             };
-            html(status, app_page(state, &app, "/query", "Query", csrf, &query_form(&app, csrf, &sql, Some(&extra))))
+            html(status, app_page(state, cx, &app, "/query", cx.t("Query"), &query_form(cx, &app, &sql, Some(&extra))))
         }
         "/branches" => {
             let from = (!from.is_empty()).then_some(from.as_str());
             let msg = match engine.create_branch(&branch, from) {
-                Ok(b) => note(true, &format!("Branch {} created.", b.name)),
+                Ok(b) => note(true, &cx.tf("Branch {} created.", &[&b.name])),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, &app, "/branches", "Branches", csrf, &branches_body(&app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/branches", cx.t("Branches"), &branches_body(cx, &app, Some(msg))))
         }
         p if p.starts_with("/branches/") => {
             let rest = &p["/branches/".len()..];
             let msg = match rest.rsplit_once('/') {
                 Some((n, "delete")) => match engine.delete_branch(n) {
-                    Ok(true) => note(true, &format!("Branch {n} deleted.")),
-                    Ok(false) => note(false, &format!("There is no branch {n}.")),
+                    Ok(true) => note(true, &cx.tf("Branch {} deleted.", &[&n])),
+                    Ok(false) => note(false, &cx.tf("There is no branch {}.", &[&n])),
                     Err(e) => note(false, &e.to_string()),
                 },
                 Some((n, "reset")) => match engine.reset_branch(n) {
-                    Ok(true) => note(true, &format!("Branch {n} reset to its parent.")),
-                    Ok(false) => note(false, &format!("There is no branch {n}.")),
+                    Ok(true) => note(true, &cx.tf("Branch {} reset to its parent.", &[&n])),
+                    Ok(false) => note(false, &cx.tf("There is no branch {}.", &[&n])),
                     Err(e) => note(false, &e.to_string()),
                 },
-                _ => note(false, "Unknown action."),
+                _ => note(false, cx.t("Unknown action.")),
             };
-            html(200, app_page(state, &app, "/branches", "Branches", csrf, &branches_body(&app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/branches", cx.t("Branches"), &branches_body(cx, &app, Some(msg))))
         }
         p if p.starts_with("/storage/") => {
             let msg = match &p["/storage/".len()..] {
-                "checkpoint" => engine.checkpoint().map(|l| note(true, &format!("Checkpoint at {l}."))),
-                "backup" => engine.backup_now(true).map(|()| note(true, "Backup done.")),
+                "checkpoint" => engine.checkpoint().map(|lsn| note(true, &cx.tf("Checkpoint at {}.", &[&lsn]))),
+                "backup" => engine.backup_now(true).map(|()| note(true, cx.t("Backup done."))),
                 "integrity" => engine.check_integrity().map(|ok| {
                     note(
                         ok,
-                        if ok { "Every page checksum is right." } else { "Damaged pages were found and repaired." },
+                        if ok {
+                            cx.t("Every page checksum is right.")
+                        } else {
+                            cx.t("Damaged pages were found and repaired.")
+                        },
                     )
                 }),
-                "compact" => engine
-                    .compact()
-                    .map(|done| note(done, if done { "Compaction done." } else { "Busy: compaction will run later." })),
-                _ => Ok(note(false, "Unknown action.")),
+                "compact" => engine.compact().map(|done| {
+                    note(done, if done { cx.t("Compaction done.") } else { cx.t("Busy: compaction will run later.") })
+                }),
+                _ => Ok(note(false, cx.t("Unknown action."))),
             }
             .unwrap_or_else(|e| note(false, &e.to_string()));
-            html(200, app_page(state, &app, "/storage", "Storage", csrf, &storage_body(&app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/storage", cx.t("Storage"), &storage_body(cx, &app, Some(msg))))
         }
         "/tokens" => {
             let msg = match state.apps.new_token(&app, field("scope") == "read") {
-                Ok(token) => token_reveal(origin, &app.name, &token),
+                Ok(token) => token_reveal(cx, origin, &app.name, &token),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, &app, "/tokens", "Tokens", csrf, &tokens_body(state, &app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/tokens", cx.t("Tokens"), &tokens_body(state, cx, &app, Some(msg))))
         }
         p if p.starts_with("/tokens/") && p.ends_with("/revoke") => {
             let id = &p["/tokens/".len()..p.len() - "/revoke".len()];
             let msg = match state.apps.revoke_token(&app, id) {
-                Ok(true) => note(true, &format!("Token nuage_{id}… revoked: it opens nothing any more.")),
-                Ok(false) => note(false, "There is no such token."),
+                Ok(true) => note(true, &cx.tf("Token nuage_{}… revoked: it opens nothing any more.", &[&id])),
+                Ok(false) => note(false, cx.t("There is no such token.")),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, &app, "/tokens", "Tokens", csrf, &tokens_body(state, &app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/tokens", cx.t("Tokens"), &tokens_body(state, cx, &app, Some(msg))))
         }
         "/origins" => {
             let msg = match state.apps.set_origins(&app, &field("origins")) {
-                Ok(o) if o.is_empty() => note(true, "No website: pages cannot call this application."),
-                Ok(o) => note(true, &format!("Pages of {} may call this application.", o.join(", "))),
+                Ok(o) if o.is_empty() => note(true, cx.t("No website: pages cannot call this application.")),
+                Ok(o) => note(true, &cx.tf("Pages of {} may call this application.", &[&o.join(", ")])),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, &app, "/settings", "Settings", csrf, &settings_body(&app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))))
         }
         "/description" => {
             let msg = match state.apps.set_description(&app, &field("description")) {
-                Ok(()) => note(true, "Description saved."),
+                Ok(()) => note(true, cx.t("Description saved.")),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, &app, "/settings", "Settings", csrf, &settings_body(&app, csrf, Some(msg))))
+            html(200, app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))))
         }
-        _ => html(404, page("Not found", Some(csrf), "<h1>Not found</h1>")),
+        _ => not_found(cx, "Not found"),
     }
 }
 
 /// Runs the console's SQL: reads at once; changes are first run without
 /// being kept (a dry run, to say what they would change), then on confirmation.
-fn run_console_sql(app: &App, state: &State, sql: &str, confirmed: bool, csrf: &str) -> memoire_orm::Result<String> {
+fn run_console_sql(state: &State, cx: &Cx, app: &App, sql: &str, confirmed: bool) -> memoire_orm::Result<String> {
     let script = crate::sql::Script::parse(sql)?;
     let writes = script.writes();
     let batch = [(script, Vec::new())];
@@ -1205,11 +1413,12 @@ fn run_console_sql(app: &App, state: &State, sql: &str, confirmed: bool, csrf: &
         let dry = crate::sql::run(&app.engine, MAIN, &state.schemas, &batch, false)?;
         let n: u64 = dry.iter().flatten().map(|r| r.rows_affected).sum();
         return Ok(format!(
-            r#"<div class="msg"><p><b>This changes data of {app}: {n} row(s) would be affected.</b></p>
-<form method="post" action="{base}/query"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="sql" value="{}"><input type="hidden" name="confirm" value="yes"><button class="danger">Confirm and run</button></form></div>"#,
-            esc(csrf),
+            r#"<div class="msg"><p><b>{}</b></p>
+<form method="post" action="{base}/query">{}<input type="hidden" name="sql" value="{}"><input type="hidden" name="confirm" value="yes"><button class="danger">{}</button></form></div>"#,
+            esc(&cx.tf("This changes data of {}: {} row(s) would be affected.", &[&app.name, &n])),
+            cx.field(),
             esc(sql),
-            app = esc(&app.name),
+            cx.t("Confirm and run"),
             base = app_base(&app.name),
         ));
     }
@@ -1217,9 +1426,14 @@ fn run_console_sql(app: &App, state: &State, sql: &str, confirmed: bool, csrf: &
     let mut out = String::new();
     for r in results.iter().flatten() {
         if r.returns_rows {
-            let _ = write!(out, "<p class=\"muted\">{} row(s).</p>{}", r.rows.len(), table_html(&r.columns, &r.rows));
+            let _ = write!(
+                out,
+                "<p class=\"muted\">{}</p>{}",
+                cx.tf("{} row(s).", &[&r.rows.len()]),
+                table_html(cx.l, &r.columns, &r.rows)
+            );
         } else {
-            out.push_str(&note(true, &format!("Done: {} row(s) affected.", r.rows_affected)));
+            out.push_str(&note(true, &cx.tf("Done: {} row(s) affected.", &[&r.rows_affected])));
         }
     }
     Ok(out)
