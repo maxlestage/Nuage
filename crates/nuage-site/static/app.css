@@ -1535,6 +1535,188 @@ h3 {
   }
 }
 
+/* Applications: one card each, chips to narrow the cards and the log. */
+.apps-section[hidden] {
+  display: none;
+}
+
+.apps-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+}
+
+.apps-count {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chips:empty {
+  display: none;
+}
+
+.chip {
+  font: 500 0.85rem/1 var(--font-mono);
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chip.is-active {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.app-cards {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.app-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 16px;
+}
+
+.app-card.is-error {
+  border-color: color-mix(in srgb, var(--err) 55%, transparent);
+}
+
+.app-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.app-name {
+  font-size: 1.05rem;
+  margin-right: auto;
+  overflow-wrap: anywhere;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 600 0.72rem/1 var(--font-sans);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 5px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pill .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.pill.is-ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+
+.pill.is-bad {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+
+.app-desc {
+  margin: -4px 0 0;
+  font-size: 0.88rem;
+}
+
+.app-rate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: end;
+  gap: 12px;
+}
+
+.app-rate p {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.app-rate .muted {
+  font-size: 0.8rem;
+}
+
+.spark.spark-sm {
+  height: 40px;
+}
+
+.app-facts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 16px;
+  font-size: 0.88rem;
+}
+
+.app-facts > div,
+.app-facts > div:last-child {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
+.app-facts dt {
+  font-size: 0.82rem;
+}
+
+.app-card .branches {
+  margin: 0;
+}
+
+.log-app {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--accent);
+}
+
+.enc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.enc-pill.is-off {
+  color: var(--err);
+}
+
 /* 9. Footer ============================================================== */
 .footer {
   margin-top: 40px;
@@ -1864,7 +2046,8 @@ h3 {
   .grid-2,
   .feature-grid,
   .services,
-  .panels {
+  .panels,
+  .app-cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1970,6 +2153,10 @@ h3 {
 
   .panels {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .app-cards {
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   }
 
   .panel-wide {

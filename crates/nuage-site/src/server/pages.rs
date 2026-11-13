@@ -39,7 +39,9 @@ let db = NuageDb::connect(url, token)?;
 let users = User::query().all(&db).await?;"#;
 
     pub const SERVER: &str = r#"# Database, /admin, /app and the status API, on one port.
-NUAGE_TOKEN=change-me PORT=8080 nuage"#;
+# Everything it stores is encrypted with NUAGE_ENCRYPTION_KEY: keep it safe.
+NUAGE_ENCRYPTION_KEY=$(nuage genkey) NUAGE_TOKEN=change-me PORT=8080 nuage
+# More applications, each with its own encrypted database and tokens: /admin."#;
 
     pub const STATUS: &str = r#"curl -H "Authorization: Bearer $NUAGE_TOKEN" https://nuage.example.com/api/status
 curl -N -H "Authorization: Bearer $NUAGE_TOKEN" https://nuage.example.com/api/status/stream
@@ -51,7 +53,7 @@ NUAGE_PUBLIC_STATUS=true"#;
     pub const HEROKU: &str = r#"# Procfile
 web: nuage
 
-heroku config:set NUAGE_TOKEN=change-me"#;
+heroku config:set NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=change-me"#;
 }
 
 /// Several nodes side by side.

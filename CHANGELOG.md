@@ -2,6 +2,49 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Encryption at rest
+
+- Everything Nuage DB stores is encrypted, with the primitives of
+  [brocolis](https://github.com/maxlestage/brocolis): the page store with XTS-AES-256 (a
+  storage backend of redb), each write-ahead log record with AES-256-GCM (a key per segment,
+  from a random salt; the LSN as nonce), and the backups, copies of both.
+- `NUAGE_ENCRYPTION_KEY`: a 32-byte key (64 hex digits or base64; `nuage genkey`) or a
+  passphrase (Argon2id, 64 MiB, 3 passes). Each data directory has a header
+  (`encryption.json`: salt, check value, never the key), copied to the backup; a wrong key is
+  refused at startup.
+- **The `nuage` binary requires `NUAGE_ENCRYPTION_KEY`.** A database or a backup stored in
+  clear is encrypted when it is opened with a key, and the backup in clear is replaced.
+- `EngineOptions::encryption` and `nuage::Encryption` for the embedded mode;
+  `Db::from_env()` reads `NUAGE_ENCRYPTION_KEY`.
+
+### Several applications
+
+- One server, several applications, each with a database of its own (directory, keys,
+  backups under `apps/<name>/`) and tokens of its own (only their SHA-256 digests are kept).
+  The token sent on `/v1` picks the database; transactions belong to their application.
+- The first application is the server's own database (`NUAGE_NAME`, `NUAGE_TOKEN`): existing
+  deployments keep their data. The list of applications lives in its metadata (logged,
+  encrypted, backed up, restored first).
+- `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app`, `apps`,
+  `app_engine`; `nuage::PrefixedStore`.
+- `/api/status`: every application for a console session, its own for an application's token,
+  each with its requests, latency, tables, rows, size, branches and encryption; `encryption`
+  and `applications` at the top; `log` events name their application.
+
+### Interface
+
+- The console: an **Applications** page (one card each, a form to create one; its token is
+  shown once with how to connect), and for each application tabs for its overview, tables,
+  query console, branches, storage, tokens (new, revoke) and settings (description, deletion
+  confirmed by its name); a **Server** page with the events of every application. The old
+  addresses (`/admin/tables`...) lead to the first application.
+- The dashboard `/app`: one card per application (requests per second with its own
+  sparkline, p99, errors, tables, rows, size, last request, branches, encryption), chips to
+  narrow the cards and the event log to one application, an "Encrypted" badge.
+- The website: "Encrypted at rest" and "Several applications" among the features.
+
 ## 0.2.1 (2026-11-13)
 
 First release of Nuage DB in its own repository (it was developed in
