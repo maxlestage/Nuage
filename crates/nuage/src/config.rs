@@ -17,6 +17,9 @@
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+//! | `NUAGE_KEEP_AWAKE_URL` | the server requests this address (its own `/api/health`) so a host that puts idle servers to sleep (Heroku Eco) keeps it awake | off |
+//! | `NUAGE_KEEP_AWAKE_MINUTES` | minutes between two requests | `20` |
+//! | `NUAGE_KEEP_AWAKE_HOURS` | only in these hours, UTC (`6-22`) | always |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +43,8 @@ pub struct Config {
     pub engine: EngineOptions,
     /// Server settings.
     pub server: ServerOptions,
+    /// Requests to its own address, so the host does not put it to sleep.
+    pub keep_awake: Option<crate::keepawake::KeepAwake>,
 }
 
 /// Reads the configuration through `var` (`std::env::var` in the binary).
@@ -95,7 +100,16 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         public_status: get("NUAGE_PUBLIC_STATUS").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
         ..ServerOptions::default()
     };
+    let keep_awake = match get("NUAGE_KEEP_AWAKE_URL") {
+        Some(url) => Some(crate::keepawake::KeepAwake::from_vars(
+            &url,
+            get("NUAGE_KEEP_AWAKE_MINUTES").as_deref(),
+            get("NUAGE_KEEP_AWAKE_HOURS").as_deref(),
+        )?),
+        None => None,
+    };
     Ok(Config {
+        keep_awake,
         port,
         data_dir: get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from),
         engine,
@@ -127,7 +141,14 @@ mod tests {
         assert_eq!(c.data_dir, PathBuf::from("nuage-data"));
         assert_eq!(c.engine.backup.unwrap().store.describe(), "/tmp/b");
         assert!(from_vars(|k| (k == "PORT").then(|| "x".to_owned())).is_err());
-        assert!(c.engine.encryption.is_none());
+        assert!(c.engine.encryption.is_none() && c.keep_awake.is_none());
+        let awake = from_vars(|k| match k {
+            "NUAGE_KEEP_AWAKE_URL" => Some("https://n.herokuapp.com/api/health".into()),
+            "NUAGE_KEEP_AWAKE_HOURS" => Some("6-22".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(awake.keep_awake.unwrap().hours, Some((6, 22)));
         let key = from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "0f".repeat(32))).unwrap();
         assert_eq!(key.engine.encryption.unwrap().kind(), "key");
         assert!(from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "short".to_owned())).is_err());

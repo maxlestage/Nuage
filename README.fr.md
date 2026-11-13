@@ -258,6 +258,9 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_BACKUP_S3_PREFIX` | préfixe des objets de sauvegarde | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes entre deux instantanés | `60` |
+| `NUAGE_KEEP_AWAKE_URL` | le serveur appelle cette adresse (son propre `https://…/api/health`) pour qu'un hébergeur qui endort les serveurs inactifs (Heroku Eco) le garde éveillé ; seulement s'il est éveillé : endormi, le visiteur suivant le réveille | coupé |
+| `NUAGE_KEEP_AWAKE_MINUTES` | minutes entre deux appels (moins que les 30 d'Eco) | `20` |
+| `NUAGE_KEEP_AWAKE_HOURS` | seulement à ces heures, en UTC (`6-22`) ; en dehors, il peut s'endormir | toujours |
 | `SITE_URL` | adresse publique du site (liens canoniques, carte de partage) | l'hôte de chaque requête |
 
 Un exemple commenté : [`nuage.env.example`](nuage.env.example). Servez le serveur en HTTPS
