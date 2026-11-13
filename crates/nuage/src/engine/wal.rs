@@ -4,17 +4,26 @@
 //! torn by a crash is detected and dropped with everything after it.
 //!
 //! Segments are files named after their first log sequence number
-//! (`wal/00000000000000000042.log`). A checkpoint makes the page store durable
+//! (`wal/00000000000000000042.log`). Encrypted, a segment starts with a
+//! header (`NUAGEWAL`, a version byte and a random salt) and each record is
+//! sealed with AES-256-GCM under the segment's key (see [`crate::crypto`]). A checkpoint makes the page store durable
 //! and starts a new segment; segments older than the checkpoint are removed
 //! once the backup, if any, has shipped them.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::storage_err;
 use memoire_orm::Result;
 use memoire_orm::evaluator::crc32;
+
+use crate::crypto::{SEGMENT_SALT, SegmentKey, WalKey, random};
+
+const MAGIC: &[u8; 9] = b"NUAGEWAL\x01";
+/// Bytes of the header of an encrypted segment.
+pub(crate) const HEADER_LEN: usize = MAGIC.len() + SEGMENT_SALT;
 
 /// One change to the page store.
 #[derive(Clone, Debug, PartialEq)]
@@ -91,8 +100,23 @@ fn io(e: std::io::Error) -> memoire_orm::Error {
     storage_err(format!("write-ahead log: {e}"))
 }
 
+/// `length ‖ CRC-32 ‖ payload`: a CRC over what is on disk tells a torn
+/// record from a whole one.
+fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32(payload).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
 impl Record {
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
+        frame(&self.payload())
+    }
+
+    fn payload(&self) -> Vec<u8> {
         let mut e = Enc(Vec::new());
         e.i64(self.lsn as i64);
         e.u32(self.ops.len() as u32);
@@ -121,12 +145,7 @@ impl Record {
                 }
             }
         }
-        let payload = e.0;
-        let mut out = Vec::with_capacity(payload.len() + 8);
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&crc32(&payload).to_le_bytes());
-        out.extend_from_slice(&payload);
-        out
+        e.0
     }
 
     fn decode(payload: &[u8]) -> Result<Record> {
@@ -147,11 +166,29 @@ impl Record {
     }
 }
 
+/// The key of an encrypted segment, from its header.
+fn segment_key(bytes: &[u8], key: &WalKey) -> Option<SegmentKey> {
+    let header = bytes.get(..HEADER_LEN)?;
+    if &header[..MAGIC.len()] != MAGIC {
+        return None;
+    }
+    Some(key.segment(header[MAGIC.len()..].try_into().ok()?))
+}
+
 /// Reads the records of a segment. A torn or damaged tail ends the segment:
 /// returns the records before it and the length of the valid part.
-pub(crate) fn read_segment(bytes: &[u8]) -> (Vec<Record>, usize) {
+/// Encrypted (`key`), a record that does not open under the segment's key
+/// ends it too.
+pub(crate) fn read_segment(bytes: &[u8], key: Option<&WalKey>) -> (Vec<Record>, usize) {
     let mut records = Vec::new();
-    let mut at = 0;
+    let seg = match key {
+        Some(k) => match segment_key(bytes, k) {
+            Some(seg) => Some(seg),
+            None => return (records, 0),
+        },
+        None => None,
+    };
+    let mut at = if seg.is_some() { HEADER_LEN } else { 0 };
     while at + 8 <= bytes.len() {
         let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or_default()) as usize;
         let crc = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap_or_default());
@@ -159,6 +196,17 @@ pub(crate) fn read_segment(bytes: &[u8]) -> (Vec<Record>, usize) {
         if crc32(payload) != crc {
             break;
         }
+        let opened;
+        let payload = match &seg {
+            Some(seg) => match seg.open(payload) {
+                Some(p) => {
+                    opened = p;
+                    opened.as_slice()
+                }
+                None => break,
+            },
+            None => payload,
+        };
         match Record::decode(payload) {
             Ok(r) => records.push(r),
             Err(_) => break,
@@ -198,24 +246,46 @@ pub(crate) struct Writer {
     dir: PathBuf,
     file: File,
     pub first_lsn: u64,
+    /// Bytes of records in the segment (its header not counted).
     pub bytes: u64,
     /// `fsync` after each record (off only in tests of the crash recovery).
     sync: bool,
+    key: Option<Arc<WalKey>>,
+    seg: Option<SegmentKey>,
 }
 
 impl Writer {
-    /// Opens (or creates) the segment starting at `first_lsn`.
-    pub(crate) fn open(dir: &Path, first_lsn: u64, sync: bool) -> Result<Writer> {
+    /// Opens (or creates) the segment starting at `first_lsn`. Encrypted, the
+    /// segment is (re)started with a fresh salt: a segment the writer opens
+    /// holds no valid record (they would be past the last LSN), and a new
+    /// salt means a new key, so no nonce of a torn record is ever reused.
+    pub(crate) fn open(dir: &Path, first_lsn: u64, sync: bool, key: Option<Arc<WalKey>>) -> Result<Writer> {
         fs::create_dir_all(dir).map_err(io)?;
         let path = dir.join(segment_name(first_lsn));
-        let file = OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
-        let bytes = file.metadata().map_err(io)?.len();
+        let (file, bytes, seg) = match &key {
+            None => {
+                let file = OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
+                let bytes = file.metadata().map_err(io)?.len();
+                (file, bytes, None)
+            }
+            Some(k) => {
+                let salt = random::<SEGMENT_SALT>();
+                let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&path).map_err(io)?;
+                file.write_all(MAGIC).and_then(|()| file.write_all(&salt)).map_err(io)?;
+                file.sync_all().map_err(io)?;
+                (file, 0, Some(k.segment(&salt)))
+            }
+        };
         sync_dir(dir);
-        Ok(Writer { dir: dir.to_owned(), file, first_lsn, bytes, sync })
+        Ok(Writer { dir: dir.to_owned(), file, first_lsn, bytes, sync, key, seg })
     }
 
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
-        let bytes = record.encode();
+        let payload = record.payload();
+        let bytes = match &self.seg {
+            Some(seg) => frame(&seg.seal(record.lsn, &payload)),
+            None => frame(&payload),
+        };
         self.file.write_all(&bytes).map_err(io)?;
         if self.sync {
             self.file.sync_data().map_err(io)?;
@@ -227,19 +297,31 @@ impl Writer {
     /// Closes this segment and starts the next one at `next_lsn`.
     pub(crate) fn rotate(&mut self, next_lsn: u64) -> Result<()> {
         self.file.sync_all().map_err(io)?;
-        *self = Writer::open(&self.dir, next_lsn, self.sync)?;
+        *self = Writer::open(&self.dir, next_lsn, self.sync, self.key.clone())?;
         Ok(())
     }
 }
 
 /// Reads every segment of `dir`, cutting a torn tail off the last one so new
-/// records follow valid ones.
-pub(crate) fn recover(dir: &Path) -> Result<Vec<Record>> {
+/// records follow valid ones. Encrypted (`key`), a segment without a valid
+/// header is an error, not a tail to cut: it was written in clear, or by
+/// another key.
+pub(crate) fn recover(dir: &Path, key: Option<&WalKey>) -> Result<Vec<Record>> {
     let mut all = Vec::new();
     for (_, path) in segments(dir)? {
         let mut bytes = Vec::new();
         File::open(&path).and_then(|mut f| f.read_to_end(&mut bytes)).map_err(io)?;
-        let (records, valid) = read_segment(&bytes);
+        // A header torn by a crash (a prefix of it) is a tail to cut; anything
+        // else that does not open is not this key's segment.
+        let n = bytes.len().min(MAGIC.len());
+        let torn_header = bytes.len() < HEADER_LEN && bytes[..n] == MAGIC[..n];
+        if let Some(k) = key
+            && !torn_header
+            && segment_key(&bytes, k).is_none()
+        {
+            return Err(storage_err(format!("{} is not an encrypted log segment", path.display())));
+        }
+        let (records, valid) = read_segment(&bytes, key);
         if valid < bytes.len() {
             let f = OpenOptions::new().write(true).open(&path).map_err(io)?;
             f.set_len(valid as u64).map_err(io)?;
@@ -277,12 +359,40 @@ mod tests {
         let mut bytes = a.encode();
         bytes.extend(b.encode());
         let full = bytes.len();
-        assert_eq!(read_segment(&bytes), (vec![a.clone(), b.clone()], full));
+        assert_eq!(read_segment(&bytes, None), (vec![a.clone(), b.clone()], full));
         bytes.truncate(full - 3);
-        assert_eq!(read_segment(&bytes).0, vec![a.clone()]);
+        assert_eq!(read_segment(&bytes, None).0, vec![a.clone()]);
         let mut flipped = a.encode();
         let last = flipped.len() - 1;
         flipped[last] ^= 1;
-        assert!(read_segment(&flipped).0.is_empty());
+        assert!(read_segment(&flipped, None).0.is_empty());
+    }
+
+    #[test]
+    fn encrypted_segments() {
+        let dir = std::env::temp_dir().join(format!("nuage-wal-enc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let enc = crate::crypto::Encryption::from_key([5; 32]);
+        let (_, keys) = crate::crypto::Header::create(&enc).unwrap();
+        let mut w = Writer::open(&dir, 1, false, Some(keys.wal.clone())).unwrap();
+        let a = Record {
+            lsn: 1,
+            ops: vec![Op::Put { table: "b:main".into(), key: b"secret-key".to_vec(), value: b"secret-value".to_vec() }],
+        };
+        let b = Record { lsn: 2, ops: vec![Op::Del { table: "b:main".into(), key: b"secret-key".to_vec() }] };
+        w.append(&a).unwrap();
+        w.append(&b).unwrap();
+        drop(w);
+        let raw = fs::read(dir.join(segment_name(1))).unwrap();
+        assert!(raw.starts_with(MAGIC));
+        assert!(!raw.windows(6).any(|x| x == b"secret"), "nothing in clear");
+        assert_eq!(read_segment(&raw, Some(&keys.wal)).0, vec![a.clone(), b.clone()]);
+        assert_eq!(recover(&dir, Some(&keys.wal)).unwrap(), vec![a, b]);
+        // Another key reads nothing; a key on a clear segment is an error.
+        let (_, other) = crate::crypto::Header::create(&enc).unwrap();
+        assert!(read_segment(&raw, Some(&other.wal)).0.is_empty());
+        fs::write(dir.join(segment_name(1)), Record { lsn: 1, ops: vec![] }.encode()).unwrap();
+        assert!(recover(&dir, Some(&keys.wal)).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -28,9 +28,11 @@ use memoire_orm::nuage::Branch;
 use memoire_orm::{Error, Result};
 use redb::ReadableDatabase;
 
+use crate::crypto::{Encryption, Header, Keys};
+
 pub use backup::{BackupStore, DirectoryStore};
-pub(crate) use store::MAIN;
 use store::Store;
+pub(crate) use store::{FILE, MAIN};
 
 /// An error of the storage layer (disk, damaged data).
 #[derive(Debug)]
@@ -98,6 +100,12 @@ pub struct EngineOptions {
     pub sync: bool,
     /// Name of the database, shown by the server. Default: `nuage`.
     pub name: String,
+    /// Encryption at rest (see [`crate::crypto`]): with it, the page store,
+    /// the log and the backups are encrypted, and a database stored in clear
+    /// is encrypted when it is opened. `None`: stored in clear (only for an
+    /// embedded database on a disk you trust; the server's binary requires
+    /// `NUAGE_ENCRYPTION_KEY`). Default: `None`.
+    pub encryption: Option<Encryption>,
 }
 
 impl Default for EngineOptions {
@@ -110,6 +118,7 @@ impl Default for EngineOptions {
             backup: None,
             sync: true,
             name: "nuage".into(),
+            encryption: None,
         }
     }
 }
@@ -187,6 +196,8 @@ pub struct Engine {
     started_at: SystemTime,
     stop: AtomicBool,
     events_seq: AtomicU64,
+    /// `key` or `passphrase` when the data is encrypted.
+    encryption: Option<&'static str>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -208,7 +219,9 @@ impl Engine {
         {
             restored = backup::restore(&dir, b.store.as_ref())?;
         }
-        let store = Store::open(&dir, options.cache_bytes, options.sync)?;
+        let (keys, migrated) = unlock(&dir, &options)?;
+        let encryption = options.encryption.as_ref().filter(|_| keys.is_some()).map(Encryption::kind);
+        let store = Store::open(&dir, options.cache_bytes, options.sync, keys.as_ref())?;
         let backup_status = BackupStatus {
             target: options.backup.as_ref().map(|b| b.store.describe()),
             last_ok: true,
@@ -226,9 +239,20 @@ impl Engine {
             started_at: SystemTime::now(),
             stop: AtomicBool::new(false),
             events_seq: AtomicU64::new(0),
+            encryption,
         });
         if restored {
             engine.event("info", "data restored from the backup");
+        }
+        if migrated {
+            engine.event("warn", "the data was stored in clear: it is now encrypted");
+            if let Some(b) = &engine.options.backup {
+                // The backup in clear is replaced by an encrypted one.
+                match engine.backup_now(true).and_then(|()| backup::purge_older(b.store.as_ref())) {
+                    Ok(()) => engine.event("info", "the backup in clear was replaced by an encrypted one"),
+                    Err(e) => engine.event("error", format!("could not replace the backup in clear: {e}")),
+                }
+            }
         }
         engine.event("info", format!("data is stored in {}", dir.display()));
         let weak = Arc::downgrade(&engine);
@@ -237,6 +261,12 @@ impl Engine {
             .spawn(move || upkeep(weak))
             .map_err(|e| storage_err(format!("cannot start the upkeep thread: {e}")))?;
         Ok(engine)
+    }
+
+    /// How the data is encrypted: `Some("key")` or `Some("passphrase")`, or
+    /// `None` when it is stored in clear.
+    pub fn encryption(&self) -> Option<&'static str> {
+        self.encryption
     }
 
     /// The data directory.
@@ -371,7 +401,7 @@ impl Engine {
 
     /// Disk and cache figures.
     pub fn stats(&self) -> StorageStats {
-        let file_bytes = std::fs::metadata(self.store.dir.join("nuage.redb")).map_or(0, |m| m.len());
+        let file_bytes = std::fs::metadata(self.store.dir.join(FILE)).map_or(0, |m| m.len());
         let wal_bytes = wal::segments(&self.store.dir.join("wal"))
             .unwrap_or_default()
             .iter()
@@ -523,6 +553,79 @@ fn upkeep(engine: Weak<Engine>) {
             }
         }
     }
+}
+
+/// Where an encrypted copy of a page store in clear is written before it
+/// takes its place.
+const ENCRYPTING: &str = "nuage.redb.encrypting";
+
+/// The keys of `dir` for `options.encryption`: opens its header, creates one
+/// for a new directory, or encrypts a directory stored in clear. Returns
+/// them, and whether data in clear was just encrypted.
+fn unlock(dir: &Path, options: &EngineOptions) -> Result<(Option<Keys>, bool)> {
+    let header = Header::read(dir)?;
+    let tmp = dir.join(ENCRYPTING);
+    match (&options.encryption, header) {
+        (None, None) => Ok((None, false)),
+        (None, Some(_)) => Err(Error::Validation(format!(
+            "the data in {} is encrypted: set NUAGE_ENCRYPTION_KEY (EngineOptions::encryption) to open it",
+            dir.display()
+        ))),
+        (Some(encryption), Some(header)) => {
+            let keys = header.unlock(encryption)?;
+            // The encrypted copy was made, not yet put in place.
+            let resumed = tmp.exists();
+            if resumed {
+                finish_encrypting(dir)?;
+            }
+            Ok((Some(keys), resumed))
+        }
+        (Some(encryption), None) => {
+            // A copy left by an encryption that did not finish: start again.
+            let _ = std::fs::remove_file(&tmp);
+            if dir.join(FILE).exists() {
+                return encrypt_in_place(dir, encryption, options).map(|k| (Some(k), true));
+            }
+            std::fs::create_dir_all(dir).map_err(|e| storage_err(format!("cannot create {}: {e}", dir.display())))?;
+            let (header, keys) = Header::create(encryption)?;
+            header.write(dir)?;
+            Ok((Some(keys), false))
+        }
+    }
+}
+
+/// Encrypts a directory stored in clear: replays its log, copies every
+/// table into an encrypted file, writes the header (from then on the
+/// directory is encrypted), then puts the copy in place of the file in clear
+/// and removes the log in clear. A crash at any point resumes or restarts it.
+fn encrypt_in_place(dir: &Path, encryption: &Encryption, options: &EngineOptions) -> Result<Keys> {
+    // Everything in the log in clear goes into the page store.
+    drop(Store::open(dir, options.cache_bytes, true, None)?);
+    let (header, keys) = Header::create(encryption)?;
+    let tmp = dir.join(ENCRYPTING);
+    {
+        let clear = store::open_redb(&dir.join(FILE), options.cache_bytes, None)?;
+        let encrypted = store::open_redb(&tmp, options.cache_bytes, Some(&keys))?;
+        store::copy_tables(&clear, &encrypted)?;
+    }
+    std::fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| storage_err(format!("cannot sync {}: {e}", tmp.display())))?;
+    header.write(dir)?;
+    finish_encrypting(dir)?;
+    Ok(keys)
+}
+
+fn finish_encrypting(dir: &Path) -> Result<()> {
+    let io = |e: std::io::Error| storage_err(format!("encrypting {}: {e}", dir.display()));
+    std::fs::rename(dir.join(ENCRYPTING), dir.join(FILE)).map_err(io)?;
+    // The checkpoint covers the whole log: the segments in clear go.
+    for (_, path) in wal::segments(&dir.join("wal"))? {
+        std::fs::remove_file(&path).map_err(io)?;
+    }
+    wal::sync_dir(dir);
+    wal::sync_dir(&dir.join("wal"));
+    Ok(())
 }
 
 /// Branch names: 1 to 63 lowercase letters, digits, `-` and `_`.
