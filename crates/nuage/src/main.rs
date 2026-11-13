@@ -88,6 +88,37 @@ fn main() -> ExitCode {
             }
         };
         log(&format!("listening on {}", running.local_addr()));
+        // The PostgreSQL protocol: every language's PostgreSQL driver.
+        let pg = match config.pg_port {
+            Some(port) => {
+                let tls = match &config.tls {
+                    Some((cert, key)) => match nuage::tls_config(cert, key) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!("nuage: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => None,
+                };
+                let encrypted = tls.is_some();
+                match server.listen_pg((config.bind.as_str(), port), nuage::PgOptions { tls }).await {
+                    Ok(r) => {
+                        let how = if encrypted { "with TLS" } else { "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)" };
+                        log(&format!(
+                            "PostgreSQL protocol on {} {how}: any PostgreSQL driver connects, its password a token",
+                            r.local_addr()
+                        ));
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("nuage: PostgreSQL protocol: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            None => None,
+        };
         let keep_awake = config.keep_awake.map(|k| {
             let hours = k.hours.map_or("always".to_owned(), |(a, b)| format!("from {a}:00 to {b}:00 UTC"));
             log(&format!("keep-awake: {} every {} min, {hours}", k.url, k.every.as_secs() / 60));
@@ -99,6 +130,9 @@ fn main() -> ExitCode {
         }
         log("stopping: last checkpoint and backup");
         running.shutdown().await;
+        if let Some(pg) = pg {
+            pg.shutdown().await;
+        }
         let _ = tokio::task::spawn_blocking(move || {
             let _ = engine.checkpoint();
             if engine.options().backup.is_some() {

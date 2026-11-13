@@ -1,0 +1,8 @@
+nuage: Nuage DB 0.3.0 — database `nuage`
+nuage: data is stored in /home/user/Nuage/dn on this server's disk
+nuage: everything is encrypted (XTS-AES-256 (pages), AES-256-GCM (log)), with the key of NUAGE_ENCRYPTION_KEY
+nuage: no backup is configured: if this disk is ephemeral (Heroku dynos), set NUAGE_BACKUP_S3_* or NUAGE_BACKUP_DIR, or the data is lost at the next restart
+nuage: NUAGE_ADMIN_PASSWORD is not set: the console (/admin) is off
+nuage: listening on 0.0.0.0:18782
+nuage: PostgreSQL protocol on 0.0.0.0:15434 in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS): any PostgreSQL driver connects, its password a token
+nuage: stopping: last checkpoint and backup

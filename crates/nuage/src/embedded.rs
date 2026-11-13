@@ -16,6 +16,14 @@ use crate::engine::store::{Overlay, Snapshot, Store};
 use crate::engine::wal::Op;
 use crate::engine::{Engine, EngineOptions, MAIN};
 
+/// A transaction's writes at a `SAVEPOINT`.
+pub(crate) struct Savepoint {
+    overlay: Overlay,
+    extra: Vec<Op>,
+    touched: BTreeMap<String, u64>,
+    written: BTreeSet<String>,
+}
+
 /// What a statement or a transaction read and wrote.
 pub(crate) struct Work {
     snap: Snapshot,
@@ -315,6 +323,29 @@ impl EmbeddedTransaction {
     /// A change to an existing table (index, column), in the transaction.
     pub(crate) fn alter(&self, change: &exec::Alter) -> Result<()> {
         self.with(|ctx| exec::alter(ctx, change))
+    }
+
+    /// What the transaction wrote so far, to come back to (`SAVEPOINT`).
+    pub(crate) fn savepoint(&self) -> Result<Savepoint> {
+        let guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let w = guard.as_ref().ok_or(Error::TransactionFinished)?;
+        Ok(Savepoint {
+            overlay: w.overlay.clone(),
+            extra: w.extra.clone(),
+            touched: w.touched.clone(),
+            written: w.written.clone(),
+        })
+    }
+
+    /// Forgets what the transaction wrote since `sp` (`ROLLBACK TO SAVEPOINT`).
+    pub(crate) fn rollback_to(&self, sp: &Savepoint) -> Result<()> {
+        let mut guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let w = guard.as_mut().ok_or(Error::TransactionFinished)?;
+        w.overlay = sp.overlay.clone();
+        w.extra = sp.extra.clone();
+        w.touched = sp.touched.clone();
+        w.written = sp.written.clone();
+        Ok(())
     }
 
     /// Commits (the synchronous form of [`Transaction::commit`]).

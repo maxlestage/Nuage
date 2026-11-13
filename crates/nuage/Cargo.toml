@@ -57,6 +57,7 @@ webpki-roots = "1"
 memoire-orm = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 
 [[bin]]
 name = "nuage"

@@ -72,7 +72,9 @@ pub use engine::{
     BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, PrefixedStore, StorageStats,
 };
 pub use memoire_orm::nuage::Branch;
-pub use server::{AppInfo, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo};
+pub use server::{
+    AppInfo, PgOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo, tls_config,
+};
 #[cfg(feature = "site")]
 pub use site::site;
 pub use sql::SqlResult;
