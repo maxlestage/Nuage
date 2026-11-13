@@ -150,6 +150,7 @@ pre{background:var(--card);border:1px solid var(--line);border-radius:8px;paddin
 .apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,19rem),1fr));gap:.75rem}a.card.app{display:block;color:var(--fg);text-decoration:none}a.card.app:hover{border-color:var(--accent)}.card.app.is-bad{border-color:var(--bad)}
 .mini{display:grid;grid-template-columns:repeat(3,1fr);gap:.35rem .75rem;margin:.6rem 0 0}.mini dt{color:var(--muted);font-size:.78rem}.mini dd{margin:0;font-variant-numeric:tabular-nums}
 .reveal pre{user-select:all}
+details.lang{border-bottom:1px solid var(--line)}details.lang summary{cursor:pointer;padding:.45rem 0;font-weight:600}
 "#;
 
 fn lang_switch(l: Lang, here: &str) -> String {
@@ -700,14 +701,11 @@ NUAGE_TOKEN=&lt;{a_token}&gt;</code></pre>
 <pre><code>let db = nuage::Db::from_env().await?;                      // or
 let db = NuageDb::connect("{o}", token).await?;</code></pre>
 <h2>{site}</h2><p class="muted">{any} {sites}</p>
-<pre><code>const res = await fetch("{o}/v1/sql", {{
-  method: "POST",
-  headers: {{ "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" }},
-  body: JSON.stringify({{ sql: "SELECT * FROM articles WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }}),
-}});
-const {{ rows }} = await res.json();   // [{{ "id": 42, "title": "…" }}, …]</code></pre>
-<pre><code>curl {o}/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
-  -d '{{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Bonjour"]}}'</code></pre>"#,
+{languages}<p class="muted">{more}</p>"#,
+        languages = language_snippets(origin),
+        more = cx.t(
+            r#"Complete examples (also TypeScript and Perl), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#
+        ),
         connect = cx.t("Connect"),
         picks = cx.t("The token an application sends picks its database: it reads and writes only its own."),
         a_token = cx.t("a token of this application"),
@@ -717,6 +715,100 @@ const {{ rows }} = await res.json();   // [{{ "id": 42, "title": "…" }}, …]<
         ),
         o = esc(origin)
     )
+}
+
+/// The same request in each language, `{o}` being the server's address.
+const SNIPPETS: [(&str, &str); 8] = [
+    (
+        "JavaScript",
+        r#"const res = await fetch("{o}/v1/sql", {
+  method: "POST",
+  headers: { "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" },
+  body: JSON.stringify({ sql: "SELECT * FROM articles WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }),
+});
+const { rows } = await res.json();   // [{ "id": 42, "title": "…" }, …]"#,
+    ),
+    (
+        "Python",
+        r#"import json, os, urllib.request
+
+def sql(query, params=()):
+    req = urllib.request.Request("{o}/v1/sql",
+        data=json.dumps({"sql": query, "params": list(params)}).encode(),
+        headers={"Authorization": "Bearer " + os.environ["NUAGE_TOKEN"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as res:
+        return json.load(res)
+
+rows = sql("SELECT * FROM articles WHERE category = ?", [3])["rows"]"#,
+    ),
+    (
+        "PHP",
+        r#"function sql(string $query, array $params = []): array {
+    $ctx = stream_context_create(['http' => ['method' => 'POST', 'ignore_errors' => true,
+        'header' => "Authorization: Bearer " . getenv('NUAGE_TOKEN') . "\r\nContent-Type: application/json\r\n",
+        'content' => json_encode(['sql' => $query, 'params' => $params])]]);
+    return json_decode(file_get_contents('{o}/v1/sql', false, $ctx), true);
+}
+
+$rows = sql('SELECT * FROM articles WHERE category = ?', [3])['rows'];"#,
+    ),
+    (
+        "Go",
+        r#"body, _ := json.Marshal(map[string]any{"sql": "SELECT * FROM articles WHERE category = ?", "params": []any{3}})
+req, _ := http.NewRequest("POST", "{o}/v1/sql", bytes.NewReader(body))
+req.Header.Set("Authorization", "Bearer "+os.Getenv("NUAGE_TOKEN"))
+req.Header.Set("Content-Type", "application/json")
+res, err := http.DefaultClient.Do(req)
+// json.NewDecoder(res.Body).Decode(&result): {"columns": [...], "rows": [{...}]}"#,
+    ),
+    (
+        "Ruby",
+        r#"require "json"
+require "net/http"
+
+res = Net::HTTP.post(URI("{o}/v1/sql"),
+  { sql: "SELECT * FROM articles WHERE category = ?", params: [3] }.to_json,
+  "Authorization" => "Bearer #{ENV['NUAGE_TOKEN']}", "Content-Type" => "application/json")
+rows = JSON.parse(res.body)["rows"]"#,
+    ),
+    (
+        "Java",
+        r#"var request = HttpRequest.newBuilder(URI.create("{o}/v1/sql"))
+    .header("Authorization", "Bearer " + System.getenv("NUAGE_TOKEN"))
+    .header("Content-Type", "application/json")
+    .POST(HttpRequest.BodyPublishers.ofString(
+        "{\"sql\": \"SELECT * FROM articles WHERE category = ?\", \"params\": [3]}"))
+    .build();
+String json = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString()).body();"#,
+    ),
+    (
+        "C#",
+        r#"var http = new HttpClient();
+http.DefaultRequestHeaders.Authorization =
+    new AuthenticationHeaderValue("Bearer", Environment.GetEnvironmentVariable("NUAGE_TOKEN"));
+var res = await http.PostAsJsonAsync("{o}/v1/sql",
+    new { sql = "SELECT * FROM articles WHERE category = ?", @params = new object[] { 3 } });
+var rows = (await res.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("rows");"#,
+    ),
+    (
+        "curl",
+        r#"curl {o}/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
+  -d '{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Bonjour"]}'"#,
+    ),
+];
+
+/// One folding block per language (no JavaScript needed), the first open.
+fn language_snippets(origin: &str) -> String {
+    let mut out = String::new();
+    for (i, (name, code)) in SNIPPETS.iter().enumerate() {
+        let open = if i == 0 { " open" } else { "" };
+        let _ = write!(
+            out,
+            r#"<details class="lang"{open}><summary>{name}</summary><pre><code>{}</code></pre></details>"#,
+            esc(&code.replace("{o}", origin))
+        );
+    }
+    out
 }
 
 /// The list of applications, as cards.

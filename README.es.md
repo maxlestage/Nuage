@@ -160,6 +160,15 @@ hash. No están: joins `RIGHT`/`FULL`, `WITH`, funciones de ventana, vistas, dis
 primaria de varias columnas, cambiar una clave primaria. Una tabla creada sin clave primaria
 recibe una columna `rowid`.
 
+## Cualquier lenguaje
+
+Nuage DB habla SQL por HTTP (`POST /v1/sql`, JSON de ida y de vuelta): todos los lenguajes
+lo usan, sin instalar nada. [`clients/`](clients) tiene un ejemplo completo, probado contra un
+servidor real en CI, para curl, JavaScript, TypeScript, Python, PHP, Go, Ruby, Java, C# y
+Perl; la consola muestra la misma petición en cada lenguaje con la dirección del servidor.
+Cada servidor describe su API en `/v1/openapi.json` (OpenAPI 3.1) para generar un cliente en
+cualquier otro lenguaje. Rust tiene además el cliente nativo, `NuageDb`.
+
 ## Sitios web
 
 Cualquier sitio puede usar la base de una aplicación, desde su servidor o desde sus páginas:

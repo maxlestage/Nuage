@@ -170,6 +170,12 @@ async fn status_api() {
     assert_eq!((health.status, health.body.as_str()), (200, r#"{"status":"ok"}"#));
     assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 401);
     assert_eq!(http(addr, "GET", "/api/status/stream", &[], "").await.status, 401);
+    // The description of the API, public, for code generators of every language.
+    let openapi = http(addr, "GET", "/v1/openapi.json", &[], "").await;
+    assert_eq!(openapi.status, 200);
+    let spec: serde_json::Value = serde_json::from_str(&openapi.body).unwrap();
+    assert!(spec["openapi"].as_str().unwrap().starts_with("3.") && spec["paths"]["/v1/sql"]["post"].is_object());
+    assert_eq!(spec["info"]["version"], nuage::VERSION, "openapi.json follows the version");
 
     let full = http(addr, "GET", "/api/status", &[("authorization", "Bearer t0ken")], "").await;
     assert_eq!(full.status, 200);
@@ -332,6 +338,9 @@ async fn console() {
     assert!(overview.body.contains("Applications") && overview.body.contains(r#"href="/admin/apps/nuage""#));
     let app = c.request("GET", "/admin/apps/nuage", &[]).await;
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
+    for language in ["JavaScript", "Python", "PHP", "Go", "Ruby", "Java", "C#", "curl"] {
+        assert!(app.body.contains(&format!("<summary>{language}</summary>")), "{language}");
+    }
     assert_eq!(c.request("GET", "/api/status", &[]).await.status, 200, "the session opens the status API");
     let csrf_token = csrf(&overview.body);
     // The pages of before the applications lead to the first one's.

@@ -158,6 +158,15 @@ SQL layer on the rows the indexes found, with hash joins. Not there: `RIGHT`/`FU
 `WITH`, window functions, views, triggers, a primary key of several columns, changing a primary
 key. A table created without a primary key gets a `rowid` column.
 
+## Any language
+
+Nuage DB speaks SQL over HTTP (`POST /v1/sql`, JSON in, JSON out): every language uses it,
+with nothing to install. [`clients/`](clients) has a complete example, tested against a real
+server in CI, for curl, JavaScript, TypeScript, Python, PHP, Go, Ruby, Java, C# and Perl;
+the console shows the same request in each language with the server's address. Every server
+describes its API at `/v1/openapi.json` (OpenAPI 3.1) to generate a client for any other
+language. Rust also has the native client, `NuageDb`.
+
 ## Websites
 
 Any website can use an application's database, from its server or from its pages:

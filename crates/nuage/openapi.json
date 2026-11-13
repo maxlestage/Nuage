@@ -1,0 +1,157 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Nuage DB",
+    "version": "0.3.0",
+    "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients",
+    "license": { "name": "MIT OR Apache-2.0" }
+  },
+  "servers": [{ "url": "/" }],
+  "security": [{ "token": [] }],
+  "paths": {
+    "/v1/sql": {
+      "post": {
+        "operationId": "sql",
+        "summary": "Run SQL",
+        "description": "One statement answers its result; several answer `{\"results\": [...]}`, one result per statement. A read-only token may only read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "oneOf": [{ "$ref": "#/components/schemas/Script" }, { "$ref": "#/components/schemas/Batch" }] },
+              "examples": {
+                "select": { "value": { "sql": "SELECT id, title FROM posts WHERE category = ? ORDER BY id DESC LIMIT 20", "params": [3] } },
+                "insert": { "value": { "sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Hello"] } },
+                "batch": {
+                  "value": {
+                    "statements": [
+                      { "sql": "UPDATE accounts SET balance = balance - ? WHERE id = ?", "params": [10, 1] },
+                      { "sql": "UPDATE accounts SET balance = balance + ? WHERE id = ?", "params": [10, 2] }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The result of the statement, or of each statement.",
+            "content": {
+              "application/json": {
+                "schema": { "oneOf": [{ "$ref": "#/components/schemas/Result" }, { "$ref": "#/components/schemas/Results" }] },
+                "examples": {
+                  "rows": { "value": { "columns": ["id", "title"], "rows": [{ "id": 42, "title": "Hello" }] } },
+                  "write": { "value": { "rows_affected": 1, "last_insert_id": 7 } }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Is the server up?",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Up.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "const": "ok" } } } } }
+          }
+        }
+      }
+    },
+    "/api/status": {
+      "get": {
+        "operationId": "status",
+        "summary": "Live status: requests, latency, storage, memory, backups",
+        "description": "With the token of an application: its own figures. Without credentials, a public subset when the server allows it (`NUAGE_PUBLIC_STATUS`).",
+        "responses": {
+          "200": { "description": "The status.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "token": { "type": "http", "scheme": "bearer", "description": "A token of an application (the console's Tokens tab, or NUAGE_TOKEN)." }
+    },
+    "schemas": {
+      "Value": {
+        "description": "A value: text, number, boolean, null, or JSON.",
+        "type": ["string", "number", "integer", "boolean", "null", "array", "object"]
+      },
+      "Script": {
+        "type": "object",
+        "required": ["sql"],
+        "properties": {
+          "sql": { "type": "string", "description": "One statement, or several separated by `;`." },
+          "params": { "type": "array", "items": { "$ref": "#/components/schemas/Value" }, "description": "Values of the `?` (in order) or `$n` parameters." },
+          "arrays": { "type": "boolean", "default": false, "description": "Rows as arrays, in the order of `columns`, instead of objects." }
+        }
+      },
+      "Batch": {
+        "type": "object",
+        "required": ["statements"],
+        "properties": {
+          "statements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["sql"],
+              "properties": { "sql": { "type": "string" }, "params": { "type": "array", "items": { "$ref": "#/components/schemas/Value" } } }
+            }
+          },
+          "arrays": { "type": "boolean", "default": false }
+        }
+      },
+      "Result": {
+        "type": "object",
+        "properties": {
+          "columns": { "type": "array", "items": { "type": "string" }, "description": "Statements that return rows." },
+          "rows": {
+            "type": "array",
+            "items": { "oneOf": [{ "type": "object", "additionalProperties": { "$ref": "#/components/schemas/Value" } }, { "type": "array", "items": { "$ref": "#/components/schemas/Value" } }] }
+          },
+          "rows_affected": { "type": "integer", "description": "Statements that change rows." },
+          "last_insert_id": { "$ref": "#/components/schemas/Value" }
+        }
+      },
+      "Results": {
+        "type": "object",
+        "required": ["results"],
+        "properties": { "results": { "type": "array", "items": { "$ref": "#/components/schemas/Result" } } }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["kind", "message"],
+            "properties": {
+              "kind": { "type": "string", "description": "`validation` (bad SQL or values), `unique_violation`, `constraint`, `no_such_table`, `table_exists`, `conversion`, `unsupported`, `unauthorized`, `forbidden` (a read-only token writing), `not_found`, `conflict` (another commit came first: retry), `transaction_finished`, `database`." },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "The statement failed; nothing was changed.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}
