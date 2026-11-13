@@ -27,6 +27,8 @@ server in production, without changing a line.
 
 | | |
 |---|---|
+| **Encrypted at rest** | Everything stored is encrypted (`NUAGE_ENCRYPTION_KEY`): the pages with XTS-AES-256, each log record with AES-256-GCM, and the backups, which are copies of them. Keys derived per application (HKDF, or Argon2id from a passphrase), as in [brocolis](https://github.com/maxlestage/brocolis). |
+| **Several applications** | One server, one database per application: its own tokens, its own keys, its own backups. The token an application sends picks its database. The console and `/app` show them side by side. |
 | **Pages on disk** | Tables and indexes in one B-tree file with a bounded page cache (`NUAGE_CACHE_MB`): the data is not limited by memory. Primary-key and index lookups read only the rows they need. |
 | **Write-ahead log** | Each commit is appended to the log and synced to disk before it is applied. Checkpoints, crash recovery, CRC-32 on log records and checksums on pages. |
 | **Memoire semantics** | Statements run on Memoire's own evaluator over the rows read from disk: Nuage DB behaves exactly like Memoire's in-memory engine, on data of any size. |
@@ -100,10 +102,51 @@ db.reset_branch("preview-42").await?;                // forget its changes
 db.delete_branch("preview-42").await?;
 ```
 
+## Encryption
+
+Nuage DB encrypts everything it stores, with the primitives of
+[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id):
+
+| What | How |
+|---|---|
+| pages (`nuage.redb`: tables, indexes, branches, the list of applications) | XTS-AES-256 (IEEE 1619), the mode of disk encryption: pages keep their place and size |
+| write-ahead log (`wal/*.log`) | AES-256-GCM per record, under a key of its own for each segment (random salt), the LSN as nonce |
+| backups (folder or S3) | copies of the files above, encrypted the same way, with the directory's header |
+
+`NUAGE_ENCRYPTION_KEY` is a key (`openssl rand -hex 32`) or a passphrase. Each data directory
+has a header, `encryption.json`, with a random salt and a check value (never the key): its
+root key is HKDF(key, salt), or Argon2id(passphrase, salt) (64 MiB, 3 passes), and the keys
+of the pages, of the log and the check value derive from it. Each application has its own
+directory, hence its own salt and keys. A wrong key is refused at startup, before anything is
+read. A database or a backup stored in clear by an earlier version is encrypted when it is
+opened with a key, and the backup in clear is replaced. **Keep the key**: without it, neither
+the data nor the backups can be read. The embedded mode encrypts too, with
+`EngineOptions { encryption: Some(Encryption::parse(key)?), .. }` or `NUAGE_ENCRYPTION_KEY`
+with `nuage::Db::from_env()`.
+
+## Several applications
+
+One server holds several applications, each with a database of its own:
+
+- the **first application** is the server's own database (`NUAGE_NAME`, data at the root of
+  `NUAGE_DATA_DIR`, token `NUAGE_TOKEN`): an existing deployment keeps its data as is;
+- the **others** are made in the console (`/admin`, **New application**): a database in
+  `apps/<name>/`, encrypted under keys of its own, backed up under `apps/<name>/`, and a first
+  token, shown once (the server keeps only its SHA-256 digest);
+- the **token** an application sends picks its database: `NuageDb::connect(url, token)` does
+  not change, and an application never sees another's data, nor its transactions;
+- their list lives in the first application's metadata: logged, encrypted, backed up and
+  restored with it, then each application restores its own backup.
+
+`Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` and `apps` do the
+same from Rust.
+
 ## Quick start
 
 ```bash
 git clone https://github.com/maxlestage/Nuage && cd Nuage
+# The key everything is encrypted with: keep it, the data cannot be read without it.
+export NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32)
 NUAGE_TOKEN=dev-token NUAGE_ADMIN_PASSWORD=dev-password cargo run -p nuage --release
 # nuage: data is stored in /home/me/Nuage/nuage-data on this server's disk
 # nuage: listening on 0.0.0.0:8080
@@ -121,7 +164,7 @@ Docker:
 
 ```bash
 docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
 ```
 
 ## Deploy on Heroku
@@ -145,7 +188,7 @@ By hand:
 
 ```bash
 heroku create my-nuage --buildpack emk/rust
-heroku config:set NUAGE_TOKEN=$(openssl rand -hex 32) \
+heroku config:set NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=$(openssl rand -hex 32) \
   NUAGE_ADMIN_PASSWORD='a long passphrase' \
   NUAGE_BACKUP_S3_BUCKET=my-bucket NUAGE_BACKUP_S3_REGION=eu-west-3 \
   NUAGE_BACKUP_S3_ACCESS_KEY_ID=... NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=...
@@ -161,11 +204,12 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 |---|---|---|
 | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
 | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
-| `NUAGE_NAME` | name of the database | `nuage` |
-| `NUAGE_TOKEN` | token of the database API and of the status API | none: the API is off |
+| `NUAGE_NAME` | name of the first application (and of its database) | `nuage` |
+| `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`, `nuage genkey`), base64 of 32 bytes, or a passphrase of 12 characters or more | **required**: the binary does not start without it |
+| `NUAGE_TOKEN` | a token of the first application (named `NUAGE_NAME`); the console makes the other applications and their tokens | none |
 | `NUAGE_ADMIN_PASSWORD` | password of the console (and of the dashboard) | none: the console is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
-| `NUAGE_CACHE_MB` | page cache, in MiB | `64` |
+| `NUAGE_CACHE_MB` | page cache of each application, in MiB | `64` |
 | `NUAGE_BACKUP_DIR` | back up to this folder | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint of S3-compatible storage | `https://s3.<region>.amazonaws.com` |
@@ -182,13 +226,13 @@ A commented example: [`nuage.env.example`](nuage.env.example). Serve the server 
 ## `/app` and `/admin`
 
 - **`/app`**, the live dashboard: requests per second, p50/p99 latency, connections,
-  services, storage, cache, write-ahead log, backups, databases and branches, and a live event
+  services, storage, cache, write-ahead log, backups, one card per application (its requests, latency, data, branches, encryption; chips narrow the cards and the log to one), and a live event
   log. It is a Rust/WebAssembly island that reads `/api/status`, then follows
   `/api/status/stream` (Server-Sent Events, every second). It is private: the **Sign in**
   link goes through `/admin?next=/en/app/` and comes back to the dashboard. With
   `NUAGE_PUBLIC_STATUS=true`, visitors see the public subset. It installs as an app (PWA) and
   shows the last known state offline.
-- **`/admin`**, the console: overview, tables and their rows, a query console (a small subset
+- **`/admin`**, the console: the applications (cards; create one, its token is shown once), then for each one its overview, tables and their rows, its tokens (new, revoke), its settings (description, deletion confirmed by its name), a query console (a small subset
   of SQL, with a confirmation before changes), branches, storage and buttons for a
   checkpoint, a backup, an integrity check and a compaction. Rendered by the server, it works
   without JavaScript, on a phone too. `HttpOnly`, `Secure`, `SameSite=Strict` session cookie,
@@ -196,9 +240,9 @@ A commented example: [`nuage.env.example`](nuage.env.example). Serve the server 
 
 | Path | What | Access |
 |---|---|---|
-| `/v1/*` | the database protocol | `Authorization: Bearer $NUAGE_TOKEN` |
+| `/v1/*` | the database protocol, on the database of the application the token opens | `Authorization: Bearer <token of an application>` |
 | `/api/health` | `{"status":"ok"}` | public |
-| `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | token or console session |
+| `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
 | `/admin` | the console | `NUAGE_ADMIN_PASSWORD` |
 | everything else | the website, `/app` included | public |
 

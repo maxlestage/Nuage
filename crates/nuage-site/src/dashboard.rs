@@ -3,6 +3,10 @@
 //! last known state saved on the device (marked stale), reads `GET /api/status`, then
 //! follows `GET /api/status/stream` (Server-Sent Events). The connection logic lives in
 //! `client::live` and only runs in the browser.
+//!
+//! A server holds several applications, each with a database of its own: the dashboard
+//! shows one card per application (its requests, latency, data, branches, encryption), and
+//! the chips above them narrow the cards and the event log to one application.
 
 use active::html::svg;
 use active::prelude::*;
@@ -10,6 +14,7 @@ use active::prelude::*;
 use crate::i18n::{Texts, fill, t};
 use crate::icons::{Icon, icon};
 use crate::routes::{Lang, Page, href};
+use crate::status::Database;
 use crate::status::{self, LogLine, Service, Status};
 
 /// The state of the connection to the server.
@@ -42,7 +47,20 @@ pub struct Live {
     /// The clock, ticking every second (ms since the epoch).
     pub now: State<f64>,
     pub history: State<Vec<f64>>,
+    /// Requests per second of each application (the last minute), in the server's order.
+    pub app_history: State<Vec<(String, Vec<f64>)>>,
+    /// The application the cards and the log are narrowed to (`None`: all of them).
+    pub filter: State<Option<String>>,
     pub log: State<Vec<LogLine>>,
+}
+
+/// Keeps the last [`HISTORY`] values.
+fn push_capped(h: &mut Vec<f64>, value: f64) {
+    h.push(value);
+    if h.len() > HISTORY {
+        let extra = h.len() - HISTORY;
+        h.drain(..extra);
+    }
 }
 
 impl Live {
@@ -54,6 +72,8 @@ impl Live {
             updated: use_state(None),
             now: use_state(0.0),
             history: use_state(Vec::new()),
+            app_history: use_state(Vec::new()),
+            filter: use_state(None),
             log: use_state(Vec::new()),
         }
     }
@@ -62,13 +82,25 @@ impl Live {
     pub fn apply(self, status: Status, now_ms: f64) {
         if let Some(requests) = &status.requests {
             let per_s = requests.per_s;
-            self.history.update(|h| {
-                h.push(per_s);
-                if h.len() > HISTORY {
-                    let extra = h.len() - HISTORY;
-                    h.drain(..extra);
-                }
+            self.history.update(|h| push_capped(h, per_s));
+        }
+        if let Some(dbs) = &status.databases {
+            self.app_history.update(|history| {
+                let next = dbs
+                    .iter()
+                    .map(|db| {
+                        let mut values =
+                            history.iter().find(|(n, _)| *n == db.name).map(|(_, v)| v.clone()).unwrap_or_default();
+                        push_capped(&mut values, db.requests.as_ref().map_or(0.0, |r| r.per_s));
+                        (db.name.clone(), values)
+                    })
+                    .collect();
+                *history = next;
             });
+            // An application that is gone cannot stay selected.
+            if self.filter.with(|f| f.as_ref().is_some_and(|f| !dbs.iter().any(|d| d.name == *f))) {
+                self.filter.set(None);
+            }
         }
         self.data.set(Some(status));
         self.updated.set(Some(now_ms));
@@ -194,7 +226,7 @@ pub fn dashboard(props: &str) -> Node {
     let lang = lang_of(props);
     let tx = t(lang);
     let live = Live::new();
-    let Live { data, conn, now, history, log, updated, .. } = live;
+    let Live { data, conn, now, history, app_history, filter, log, updated, .. } = live;
 
     // A value of the status, or a dash.
     let val =
@@ -255,6 +287,23 @@ pub fn dashboard(props: &str) -> Node {
                 .bool_attr("hidden", move || data.with(|d| d.as_ref().is_none_or(|d| d.version.is_none())))
                 .child(span().class("muted").text(format!("{} ", tx.version)))
                 .child(strong().text_dyn(val(|d| d.version.clone()))),
+        )
+        .child(
+            span()
+                .class("enc-pill")
+                .class_if("is-off", move || {
+                    data.with(|d| d.as_ref().and_then(|d| d.encryption.as_ref()).is_some_and(|e| !e.enabled))
+                })
+                .bool_attr("hidden", move || data.with(|d| d.as_ref().is_none_or(|d| d.encryption.is_none())))
+                .attr_dyn("title", move || {
+                    data.with(|d| d.as_ref().and_then(|d| d.encryption.as_ref()).and_then(|e| e.scheme.clone()))
+                        .unwrap_or_default()
+                })
+                .child(icon(Icon::Lock))
+                .child(span().text_dyn(move || {
+                    let on = data.with(|d| d.as_ref().and_then(|d| d.encryption.as_ref()).is_some_and(|e| e.enabled));
+                    (if on { tx.enc_on } else { tx.enc_off }).to_string()
+                })),
         );
 
     let login = div()
@@ -481,47 +530,61 @@ pub fn dashboard(props: &str) -> Node {
                 ),
         );
 
-    let databases = div()
-        .class("panel card panel-wide")
-        .child(h2().class("dash-h2").child(icon(Icon::Database)).text(tx.db_title))
-        .child(ul().class("dbs").children_dyn(move || {
+    let chip = move |label: String, value: Option<String>, current: &Option<String>| -> Node {
+        let active = *current == value;
+        button()
+            .attr("type", "button")
+            .class(if active { "chip is-active" } else { "chip" })
+            .attr("aria-pressed", if active { "true" } else { "false" })
+            .text(label)
+            .on_click(move |_| filter.set(value.clone()))
+            .into()
+    };
+
+    let applications = section()
+        .class("dash-section apps-section")
+        .attr("aria-labelledby", "apps-title")
+        .bool_attr("hidden", move || !private())
+        .child(
+            div()
+                .class("apps-head")
+                .child(h2().id("apps-title").class("dash-h2").child(icon(Icon::Layers)).text(tx.apps_title))
+                .child(p().class("muted apps-count").text_dyn(move || {
+                    data.with(|d| {
+                        d.as_ref()
+                            .and_then(|d| d.applications.or_else(|| d.databases.as_ref().map(|v| v.len() as u64)))
+                            .map_or(String::new(), |n| fill(tx.apps_count, n))
+                    })
+                })),
+        )
+        .child(div().class("chips").attr("role", "group").attr("aria-label", tx.apps_filter).children_dyn(move || {
+            let names: Vec<String> = data.with(|d| {
+                d.as_ref()
+                    .and_then(|d| d.databases.as_ref())
+                    .map_or_else(Vec::new, |v| v.iter().map(|d| d.name.clone()).collect())
+            });
+            if names.len() < 2 {
+                return Vec::new();
+            }
+            let current = filter.get();
+            let mut out = vec![chip(tx.apps_all.to_string(), None, &current)];
+            out.extend(names.into_iter().map(|n| chip(n.clone(), Some(n), &current)));
+            out
+        }))
+        .child(ul().class("app-cards").children_dyn(move || {
             let dbs = data.with(|d| d.as_ref().and_then(|d| d.databases.clone()).unwrap_or_default());
             if dbs.is_empty() {
                 return vec![li().class("muted").text(DASH).into()];
             }
+            let current = filter.get();
+            let n = now.get();
+            let history = app_history.get();
             dbs.into_iter()
+                .filter(|db| current.as_ref().is_none_or(|f| *f == db.name))
                 .map(|db| {
-                    let branches: Vec<Node> = if db.branches.is_empty() {
-                        vec![li().class("muted").text(tx.db_no_branch).into()]
-                    } else {
-                        db.branches
-                            .iter()
-                            .map(|b| {
-                                li().class("branch")
-                                    .child(icon(Icon::Branch))
-                                    .child(span().class("mono").text(b.name.clone()))
-                                    .child(span().class("muted").text(format!(
-                                        " · {} {}",
-                                        status::bytes(b.own_bytes),
-                                        tx.db_branch_own
-                                    )))
-                                    .into()
-                            })
-                            .collect()
-                    };
-                    li().class("db")
-                        .child(div().class("db-head").child(strong().class("mono").text(db.name.clone())).child(
-                            span().class("muted").text(format!(
-                                "{} {} · {} {} · {}",
-                                db.tables,
-                                tx.db_tables,
-                                status::group(db.rows),
-                                tx.db_rows,
-                                status::bytes(db.bytes)
-                            )),
-                        ))
-                        .child(ul().class("branches").children(branches))
-                        .into()
+                    let values =
+                        history.iter().find(|(name, _)| *name == db.name).map(|(_, v)| v.clone()).unwrap_or_default();
+                    app_card(tx, &db, &values, n)
                 })
                 .collect()
         }));
@@ -536,6 +599,11 @@ pub fn dashboard(props: &str) -> Node {
                 if lines.is_empty() {
                     return vec![li().class("log-empty muted").text(tx.log_empty).into()];
                 }
+                let current = filter.get();
+                let lines: Vec<LogLine> = lines.into_iter().filter(|l| current.is_none() || l.app == current).collect();
+                if lines.is_empty() {
+                    return vec![li().class("log-empty muted").text(tx.log_empty).into()];
+                }
                 lines
                     .into_iter()
                     .map(|line| {
@@ -547,7 +615,15 @@ pub fn dashboard(props: &str) -> Node {
                         li().class(format!("log-line is-{level}"))
                             .child(el("time").attr("datetime", line.at.clone()).text(status::clock(&line.at)))
                             .child(span().class("log-level").text(level))
-                            .child(span().class("log-msg").text(line.message))
+                            .child(
+                                span()
+                                    .class("log-msg")
+                                    .children(match &line.app {
+                                        Some(app) => vec![span().class("log-app mono").text(app.clone()).into()],
+                                        None => Vec::<Node>::new(),
+                                    })
+                                    .child(span().text(line.message)),
+                            )
                             .into()
                     })
                     .collect()
@@ -574,6 +650,7 @@ pub fn dashboard(props: &str) -> Node {
                 .bool_attr("hidden", move || conn.get() == Conn::Unauthorized)
                 .child(public_note)
                 .child(kpis)
+                .child(applications)
                 .child(services)
                 .child(
                     div()
@@ -581,12 +658,89 @@ pub fn dashboard(props: &str) -> Node {
                         .bool_attr("hidden", move || !private())
                         .child(storage)
                         .child(wal)
-                        .child(backup)
-                        .child(databases),
+                        .child(backup),
                 )
                 .child(events),
         )
         .into()
+}
+
+/// The card of one application.
+fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64) -> Node {
+    let degraded = db.status.as_deref() == Some("degraded");
+    let mut head = div().class("app-card-head").child(strong().class("mono app-name").text(db.name.clone()));
+    if db.first {
+        head = head.child(span().class("pill").text(tx.app_first));
+    }
+    head = match db.encrypted {
+        Some(true) => {
+            head.child(span().class("pill is-ok").child(icon(Icon::Lock)).child(span().text(tx.app_encrypted)))
+        }
+        Some(false) => head.child(span().class("pill is-bad").text(tx.app_clear)),
+        None => head,
+    };
+    if degraded {
+        head = head.child(span().class("pill is-bad").text(tx.app_degraded));
+    }
+    let requests = db.requests.clone().unwrap_or_default();
+    let fact = |label: &str, value: String| div().child(dt().text(label.to_string())).child(dd().text(value));
+    let mut card = li()
+        .class(if degraded { "app-card card is-error" } else { "app-card card" })
+        .attr("data-app", db.name.clone())
+        .child(head);
+    if let Some(d) = db.description.as_ref().filter(|d| !d.is_empty()) {
+        card = card.child(p().class("app-desc muted").text(d.clone()));
+    }
+    card = card
+        .child(
+            div()
+                .class("app-rate")
+                .child(
+                    p().child(span().class("kpi-value sm").text(status::rate(requests.per_s)))
+                        .child(span().class("muted").text(format!(" {}", tx.kpi_requests))),
+                )
+                .child(
+                    svg()
+                        .class("spark spark-sm")
+                        .attr("viewBox", "0 0 120 36")
+                        .attr("preserveAspectRatio", "none")
+                        .attr("role", "img")
+                        .attr("aria-label", tx.app_chart)
+                        .child(
+                            polyline().class("spark-line").attr("fill", "none").attr("points", spark_points(history)),
+                        ),
+                ),
+        )
+        .child(
+            dl().class("facts app-facts")
+                .child(fact("p99", status::millis(requests.p99_ms)))
+                .child(fact(tx.kpi_errors, format!("{:.2}", requests.errors_per_s)))
+                .child(fact(tx.db_tables, db.tables.to_string()))
+                .child(fact(tx.db_rows, status::group(db.rows)))
+                .child(fact(tx.app_size, status::bytes(db.file_bytes.max(db.bytes))))
+                .child(fact(tx.app_last_request, ago_of(tx, now, db.last_request_at.as_deref()))),
+        );
+    if !db.branches.is_empty() {
+        card = card.child(
+            ul().class("branches").children(
+                db.branches
+                    .iter()
+                    .map(|b| {
+                        li().class("branch")
+                            .child(icon(Icon::Branch))
+                            .child(span().class("mono").text(b.name.clone()))
+                            .child(span().class("muted").text(format!(
+                                " · {} {}",
+                                status::bytes(b.own_bytes),
+                                tx.db_branch_own
+                            )))
+                            .into()
+                    })
+                    .collect::<Vec<Node>>(),
+            ),
+        );
+    }
+    card.into()
 }
 
 #[cfg(test)]
@@ -621,6 +775,37 @@ mod tests {
         assert!(!live.is_stale());
         live.now.set(90_000.0);
         assert!(live.is_stale());
+    }
+
+    #[test]
+    fn one_card_per_application_and_a_filter() {
+        let live = Live::new();
+        let db = |name: &str, per_s: f64| Database {
+            name: name.into(),
+            encrypted: Some(true),
+            requests: Some(crate::status::Requests { per_s, ..Default::default() }),
+            ..Default::default()
+        };
+        for i in 0..3 {
+            let status = Status {
+                status: "ok".into(),
+                databases: Some(vec![db("nuage", 1.0), db("shop", f64::from(i))]),
+                ..Default::default()
+            };
+            live.apply(status, f64::from(i) * 1000.0);
+        }
+        let history = live.app_history.get();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1], ("shop".to_string(), vec![0.0, 1.0, 2.0]));
+        live.filter.set(Some("shop".into()));
+        // The selected application disappears: back to all of them.
+        live.apply(
+            Status { status: "ok".into(), databases: Some(vec![db("nuage", 1.0)]), ..Default::default() },
+            4000.0,
+        );
+        assert_eq!(live.filter.get(), None);
+        let html = app_card(t(Lang::Fr), &db("shop", 2.5), &[1.0, 2.5], 0.0).render();
+        assert!(html.contains("shop") && html.contains("chiffrée") && html.contains("2.5"), "{html}");
     }
 
     #[test]

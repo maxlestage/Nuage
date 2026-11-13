@@ -31,9 +31,27 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<Backup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<Encryption>,
+    /// Applications on the server (each has a database of its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applications: Option<u64>,
+    /// The applications in view: all of them for a console session, its own for an
+    /// application's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databases: Option<Vec<Database>>,
     #[serde(default)]
     pub services: Vec<Service>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Encryption {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// `key` or `passphrase`.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -96,9 +114,31 @@ pub struct Backup {
     pub last_error: Option<String>,
 }
 
+/// An application and its database.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Database {
     pub name: String,
+    /// The server's own database (the first application).
+    #[serde(default)]
+    pub first: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `ok` or `degraded` (its backups fail).
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub encrypted: Option<bool>,
+    #[serde(default)]
+    pub file_bytes: u64,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub last_request_at: Option<String>,
+    /// Its own requests (the `requests` of the status are the whole server's).
+    #[serde(default)]
+    pub requests: Option<Requests>,
     #[serde(default)]
     pub tables: u64,
     #[serde(default)]
@@ -139,6 +179,9 @@ pub struct LogLine {
     pub level: String,
     #[serde(default)]
     pub message: String,
+    /// The application the event is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
 }
 
 impl Status {
@@ -311,10 +354,15 @@ mod tests {
       "wal": { "bytes": 1048576, "last_checkpoint_at": "2026-11-13T11:59:00Z" },
       "backup": { "enabled": true, "target": "s3://bucket/prefix", "last_at": "2026-11-13T11:55:00Z",
                   "last_ok": true, "last_error": null },
+      "encryption": { "enabled": true, "scheme": "XTS-AES-256 (pages), AES-256-GCM (log)", "secret": "key" },
+      "applications": 2,
       "databases": [
-        { "name": "nuage", "tables": 12, "rows": 34567, "bytes": 41943040,
+        { "name": "nuage", "first": true, "encrypted": true, "tables": 12, "rows": 34567, "bytes": 41943040,
+          "requests": { "per_s": 10.0, "total": 100000, "errors_per_s": 0.0, "p50_ms": 0.7, "p99_ms": 3.9 },
           "branches": [ { "name": "preview-42", "parent": "nuage", "created_at": "2026-11-13T09:00:00Z",
-                          "own_bytes": 65536 } ] }
+                          "own_bytes": 65536 } ] },
+        { "name": "shop", "description": "La boutique", "encrypted": true, "tables": 3, "rows": 120,
+          "bytes": 65536, "tokens": 2, "last_request_at": "2026-11-13T11:59:58Z", "branches": [] }
       ],
       "services": [
         { "name": "engine", "status": "ok", "detail": "12 800 pages, cache 97 %" },
@@ -330,6 +378,9 @@ mod tests {
         let status: Status = serde_json::from_str(SAMPLE).unwrap();
         assert_eq!(status.requests.as_ref().unwrap().p99_ms, 4.2);
         assert_eq!(status.databases.as_ref().unwrap()[0].branches[0].own_bytes, 65536);
+        assert_eq!(status.databases.as_ref().unwrap()[1].description.as_deref(), Some("La boutique"));
+        assert!(status.encryption.as_ref().unwrap().enabled);
+        assert_eq!(status.applications, Some(2));
         assert_eq!(status.services.len(), 5);
         assert!(!status.is_public());
         let public = status.public();

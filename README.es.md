@@ -28,6 +28,8 @@ Nuage DB en producción, sin cambiar una línea.
 
 | | |
 |---|---|
+| **Cifrado en reposo** | Todo lo almacenado se cifra (`NUAGE_ENCRYPTION_KEY`): las páginas con XTS-AES-256, cada registro del log con AES-256-GCM, y las copias de seguridad, que son copias de ellos. Claves derivadas por aplicación (HKDF, o Argon2id desde una frase de contraseña), como en [brocolis](https://github.com/maxlestage/brocolis). |
+| **Varias aplicaciones** | Un servidor, una base por aplicación: sus tokens, sus claves, sus copias. El token que envía una aplicación elige su base. La consola y `/app` las muestran una junto a otra. |
 | **Páginas en disco** | Tablas e índices en un solo archivo B-tree con una caché de páginas acotada (`NUAGE_CACHE_MB`): los datos no están limitados por la memoria. Las búsquedas por clave primaria e índice solo leen las filas necesarias. |
 | **Registro de escritura** | Cada commit se añade al registro y se sincroniza en disco antes de aplicarse. Checkpoints, recuperación tras un fallo, CRC-32 en los registros y sumas de comprobación en las páginas. |
 | **Semántica de Memoire** | Las consultas pasan por el evaluador de Memoire, sobre las filas leídas del disco: Nuage DB se comporta exactamente como el motor en memoria de Memoire, con datos de cualquier tamaño. |
@@ -101,10 +103,51 @@ db.reset_branch("preview-42").await?;                // olvida sus cambios
 db.delete_branch("preview-42").await?;
 ```
 
+## Cifrado
+
+Nuage DB cifra todo lo que guarda, con las primitivas de
+[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id):
+
+| Qué | Cómo |
+|---|---|
+| páginas (`nuage.redb`: tablas, índices, ramas, lista de aplicaciones) | XTS-AES-256 (IEEE 1619), el modo del cifrado de disco: las páginas conservan su lugar y tamaño |
+| registro de escritura (`wal/*.log`) | AES-256-GCM por registro, con una clave propia de cada segmento (sal aleatoria), el LSN como nonce |
+| copias de seguridad (carpeta o S3) | copias de los archivos anteriores, cifradas igual, con la cabecera del directorio |
+
+`NUAGE_ENCRYPTION_KEY` es una clave (`openssl rand -hex 32`) o una frase de contraseña. Cada
+directorio de datos tiene una cabecera, `encryption.json`, con una sal aleatoria y un valor de
+control (nunca la clave): su clave raíz es HKDF(clave, sal), o Argon2id(frase, sal) (64 MiB,
+3 pasadas), y de ella derivan las claves de las páginas, del registro y el valor de control.
+Cada aplicación tiene su directorio, luego su sal y sus claves. Una clave incorrecta se
+rechaza al arrancar, antes de leer nada. Una base o una copia guardada en claro por una
+versión anterior se cifra al abrirla con una clave, y la copia en claro se sustituye.
+**Guarda la clave**: sin ella, ni los datos ni las copias se pueden leer. El modo integrado
+también cifra, con `EngineOptions { encryption: Some(Encryption::parse(clave)?), .. }` o
+`NUAGE_ENCRYPTION_KEY` con `nuage::Db::from_env()`.
+
+## Varias aplicaciones
+
+Un servidor aloja varias aplicaciones, cada una con su base:
+
+- la **primera aplicación** es la base del servidor (`NUAGE_NAME`, datos en la raíz de
+  `NUAGE_DATA_DIR`, token `NUAGE_TOKEN`): un despliegue existente conserva sus datos;
+- las **demás** se crean en la consola (`/admin`, **New application**): una base en
+  `apps/<nombre>/`, cifrada con sus propias claves, copiada bajo `apps/<nombre>/`, y un primer
+  token, mostrado una sola vez (el servidor solo guarda su huella SHA-256);
+- el **token** que envía una aplicación elige su base: `NuageDb::connect(url, token)` no
+  cambia, y una aplicación nunca ve los datos de otra, ni sus transacciones;
+- su lista está en los metadatos de la primera aplicación: registrada, cifrada, copiada y
+  restaurada con ella; después cada aplicación restaura su propia copia.
+
+`Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` y `apps` hacen lo
+mismo desde Rust.
+
 ## Inicio rápido
 
 ```bash
 git clone https://github.com/maxlestage/Nuage && cd Nuage
+# La clave que lo cifra todo: guárdala, sin ella los datos son ilegibles.
+export NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32)
 NUAGE_TOKEN=dev-token NUAGE_ADMIN_PASSWORD=dev-password cargo run -p nuage --release
 # nuage: data is stored in /home/yo/Nuage/nuage-data on this server's disk
 # nuage: listening on 0.0.0.0:8080
@@ -122,7 +165,7 @@ Docker:
 
 ```bash
 docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
 ```
 
 ## Desplegar en Heroku
@@ -146,7 +189,7 @@ A mano:
 
 ```bash
 heroku create mi-nuage --buildpack emk/rust
-heroku config:set NUAGE_TOKEN=$(openssl rand -hex 32) \
+heroku config:set NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=$(openssl rand -hex 32) \
   NUAGE_ADMIN_PASSWORD='una frase de contraseña larga' \
   NUAGE_BACKUP_S3_BUCKET=mi-bucket NUAGE_BACKUP_S3_REGION=eu-west-3 \
   NUAGE_BACKUP_S3_ACCESS_KEY_ID=... NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=...
@@ -162,11 +205,12 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 |---|---|---|
 | `PORT` | puerto de escucha (lo fija Heroku y la mayoría de alojamientos) | `8080` |
 | `NUAGE_DATA_DIR` | directorio de datos | `nuage-data` |
-| `NUAGE_NAME` | nombre de la base | `nuage` |
-| `NUAGE_TOKEN` | token de la API de la base y de la API de estado | ninguno: la API está desactivada |
+| `NUAGE_NAME` | nombre de la primera aplicación (y de su base) | `nuage` |
+| `NUAGE_ENCRYPTION_KEY` | la clave que lo cifra todo: 64 dígitos hexadecimales (`openssl rand -hex 32`, `nuage genkey`), el base64 de 32 bytes, o una frase de al menos 12 caracteres | **obligatoria**: el binario no arranca sin ella |
+| `NUAGE_TOKEN` | un token de la primera aplicación (llamada `NUAGE_NAME`); la consola crea las demás aplicaciones y sus tokens | ninguno |
 | `NUAGE_ADMIN_PASSWORD` | contraseña de la consola (y del panel) | ninguna: la consola está desactivada |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` y `/app` muestran una parte pública sin iniciar sesión | `false` |
-| `NUAGE_CACHE_MB` | caché de páginas, en MiB | `64` |
+| `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB | `64` |
 | `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta | |
 | `NUAGE_BACKUP_S3_BUCKET` | copias de seguridad en este bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint del almacenamiento compatible con S3 | `https://s3.<region>.amazonaws.com` |
@@ -183,13 +227,13 @@ la consola es `Secure`.
 ## `/app` y `/admin`
 
 - **`/app`**, el panel en directo: peticiones por segundo, latencia p50/p99, conexiones,
-  servicios, almacenamiento, caché, registro de escritura, copias de seguridad, bases y ramas,
+  servicios, almacenamiento, caché, registro de escritura, copias de seguridad, una tarjeta por aplicación (sus peticiones, latencia, datos, ramas y cifrado; unas pastillas limitan las tarjetas y el registro a una de ellas),
   y un registro de eventos en directo. Es una isla Rust/WebAssembly que lee `/api/status` y
   luego sigue `/api/status/stream` (Server-Sent Events, cada segundo). Es privado: el enlace
   **Iniciar sesión** pasa por `/admin?next=/es/app/` y vuelve al panel. Con
   `NUAGE_PUBLIC_STATUS=true`, los visitantes ven la parte pública. Se instala como una
   aplicación (PWA) y muestra el último estado conocido sin conexión.
-- **`/admin`**, la consola: vista general, tablas y sus filas, consola de consultas (un
+- **`/admin`**, la consola: las aplicaciones (tarjetas; crear una, su token se muestra una vez), y para cada una su vista general, sus tablas y sus filas, sus tokens (nuevo, revocar), sus ajustes (descripción, borrado confirmado con su nombre), consola de consultas (un
   pequeño subconjunto de SQL, con confirmación antes de los cambios), ramas, almacenamiento y
   botones para un checkpoint, una copia de seguridad, una comprobación de integridad y una
   compactación. Renderizada por el servidor, funciona sin JavaScript, también en el móvil.
@@ -198,9 +242,9 @@ la consola es `Secure`.
 
 | Ruta | Contenido | Acceso |
 |---|---|---|
-| `/v1/*` | el protocolo de la base | `Authorization: Bearer $NUAGE_TOKEN` |
+| `/v1/*` | el protocolo de la base, sobre la base de la aplicación que abre el token | `Authorization: Bearer <token de una aplicación>` |
 | `/api/health` | `{"status":"ok"}` | público |
-| `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token o sesión de la consola |
+| `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token de una aplicación (esa aplicación) o sesión de la consola (todas) |
 | `/admin` | la consola | `NUAGE_ADMIN_PASSWORD` |
 | todo lo demás | el sitio web, `/app` incluido | público |
 

@@ -28,6 +28,8 @@ ligne.
 
 | | |
 |---|---|
+| **Chiffré au repos** | Tout ce qui est stocké est chiffré (`NUAGE_ENCRYPTION_KEY`) : les pages en XTS-AES-256, chaque enregistrement du journal en AES-256-GCM, et les sauvegardes, qui en sont des copies. Clés dérivées par application (HKDF, ou Argon2id depuis une phrase de passe), comme dans [brocolis](https://github.com/maxlestage/brocolis). |
+| **Plusieurs applications** | Un serveur, une base par application : ses jetons, ses clés, ses sauvegardes. Le jeton qu'envoie une application choisit sa base. La console et `/app` les montrent côte à côte. |
 | **Pages sur disque** | Tables et index dans un seul fichier B-tree, avec un cache de pages borné (`NUAGE_CACHE_MB`) : les données ne sont pas limitées par la mémoire. Les recherches par clé primaire et par index ne lisent que les lignes utiles. |
 | **Journal d'écriture** | Chaque commit est ajouté au journal et synchronisé sur disque avant d'être appliqué. Checkpoints, reprise après crash, CRC-32 sur les enregistrements du journal et sommes de contrôle sur les pages. |
 | **Sémantique de Memoire** | Les requêtes passent par l'évaluateur de Memoire, sur les lignes lues sur disque : Nuage DB se comporte exactement comme le moteur en mémoire de Memoire, quelle que soit la taille des données. |
@@ -101,10 +103,53 @@ db.reset_branch("preview-42").await?;                // oublie ses changements
 db.delete_branch("preview-42").await?;
 ```
 
+## Chiffrement
+
+Nuage DB chiffre tout ce qu'il stocke, avec les primitives de
+[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id) :
+
+| Quoi | Comment |
+|---|---|
+| pages (`nuage.redb` : tables, index, branches, liste des applications) | XTS-AES-256 (IEEE 1619), le mode du chiffrement de disque : les pages gardent leur place et leur taille |
+| journal d'écriture (`wal/*.log`) | AES-256-GCM par enregistrement, sous une clé propre à chaque segment (sel aléatoire), le LSN comme nonce |
+| sauvegardes (dossier ou S3) | copies des fichiers ci-dessus, chiffrées de même, avec l'en-tête du répertoire |
+
+`NUAGE_ENCRYPTION_KEY` est une clé (`openssl rand -hex 32`) ou une phrase de passe. Chaque
+répertoire de données a un en-tête, `encryption.json`, avec un sel aléatoire et une valeur de
+contrôle (jamais la clé) : sa clé racine est HKDF(clé, sel), ou Argon2id(phrase, sel)
+(64 Mio, 3 passes), et les clés des pages, du journal et la valeur de contrôle en dérivent.
+Chaque application a son répertoire, donc son sel et ses clés. Une mauvaise clé est refusée
+au démarrage, avant toute lecture. Une base ou une sauvegarde stockée en clair par une
+version précédente est chiffrée à l'ouverture avec une clé, et la sauvegarde en clair est
+remplacée. **Gardez la clé** : sans elle, ni les données ni les sauvegardes ne sont lisibles.
+Le mode intégré chiffre aussi, avec
+`EngineOptions { encryption: Some(Encryption::parse(clé)?), .. }` ou `NUAGE_ENCRYPTION_KEY`
+avec `nuage::Db::from_env()`.
+
+## Plusieurs applications
+
+Un serveur accueille plusieurs applications, chacune avec sa base :
+
+- la **première application** est la base du serveur (`NUAGE_NAME`, données à la racine de
+  `NUAGE_DATA_DIR`, jeton `NUAGE_TOKEN`) : un déploiement existant garde ses données telles
+  quelles ;
+- les **autres** se créent dans la console (`/admin`, **New application**) : une base dans
+  `apps/<nom>/`, chiffrée sous ses propres clés, sauvegardée sous `apps/<nom>/`, et un premier
+  jeton, affiché une seule fois (le serveur n'en garde que l'empreinte SHA-256) ;
+- le **jeton** qu'envoie une application choisit sa base : `NuageDb::connect(url, jeton)` ne
+  change pas, et une application ne voit jamais les données d'une autre, ni ses transactions ;
+- leur liste est dans les métadonnées de la première application : journalisée, chiffrée,
+  sauvegardée et restaurée avec elle, puis chaque application restaure sa propre sauvegarde.
+
+`Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` et `apps` font de
+même depuis Rust.
+
 ## Démarrage rapide
 
 ```bash
 git clone https://github.com/maxlestage/Nuage && cd Nuage
+# La clé qui chiffre tout : gardez-la, sans elle les données sont illisibles.
+export NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32)
 NUAGE_TOKEN=dev-token NUAGE_ADMIN_PASSWORD=dev-password cargo run -p nuage --release
 # nuage: data is stored in /home/moi/Nuage/nuage-data on this server's disk
 # nuage: listening on 0.0.0.0:8080
@@ -122,7 +167,7 @@ Docker :
 
 ```bash
 docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
 ```
 
 ## Déployer sur Heroku
@@ -146,7 +191,7 @@ La racine de ce dépôt se déploie telle quelle : `Procfile`, `RustConfig` et
 
 ```bash
 heroku create mon-nuage --buildpack emk/rust
-heroku config:set NUAGE_TOKEN=$(openssl rand -hex 32) \
+heroku config:set NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=$(openssl rand -hex 32) \
   NUAGE_ADMIN_PASSWORD='une longue phrase de passe' \
   NUAGE_BACKUP_S3_BUCKET=mon-bucket NUAGE_BACKUP_S3_REGION=eu-west-3 \
   NUAGE_BACKUP_S3_ACCESS_KEY_ID=... NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=...
@@ -162,11 +207,12 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 |---|---|---|
 | `PORT` | port d'écoute (fixé par Heroku et la plupart des hébergeurs) | `8080` |
 | `NUAGE_DATA_DIR` | répertoire de données | `nuage-data` |
-| `NUAGE_NAME` | nom de la base | `nuage` |
-| `NUAGE_TOKEN` | jeton de l'API de la base et de l'API de statut | aucun : l'API est coupée |
+| `NUAGE_NAME` | nom de la première application (et de sa base) | `nuage` |
+| `NUAGE_ENCRYPTION_KEY` | la clé qui chiffre tout : 64 chiffres hexadécimaux (`openssl rand -hex 32`, `nuage genkey`), le base64 de 32 octets, ou une phrase de passe d'au moins 12 caractères | **obligatoire** : le binaire ne démarre pas sans |
+| `NUAGE_TOKEN` | un jeton de la première application (nommée `NUAGE_NAME`) ; la console crée les autres applications et leurs jetons | aucun |
 | `NUAGE_ADMIN_PASSWORD` | mot de passe de la console (et du tableau de bord) | aucun : la console est coupée |
 | `NUAGE_PUBLIC_STATUS` | `true` : `/api/status` et `/app` montrent une partie publique sans connexion | `false` |
-| `NUAGE_CACHE_MB` | cache de pages, en Mio | `64` |
+| `NUAGE_CACHE_MB` | cache de pages de chaque application, en Mio | `64` |
 | `NUAGE_BACKUP_DIR` | sauvegarde vers ce dossier | |
 | `NUAGE_BACKUP_S3_BUCKET` | sauvegarde vers ce bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | point d'accès du stockage compatible S3 | `https://s3.<region>.amazonaws.com` |
@@ -183,13 +229,13 @@ de la console est `Secure`.
 ## `/app` et `/admin`
 
 - **`/app`**, le tableau de bord en direct : requêtes par seconde, latence p50/p99,
-  connexions, services, stockage, cache, journal d'écriture, sauvegardes, bases et branches,
+  connexions, services, stockage, cache, journal d'écriture, sauvegardes, une carte par application (ses requêtes, sa latence, ses données, ses branches, son chiffrement ; des pastilles restreignent les cartes et le journal à l'une d'elles),
   et un journal d'événements en direct. C'est un îlot Rust/WebAssembly qui lit `/api/status`,
   puis suit `/api/status/stream` (Server-Sent Events, chaque seconde). Il est privé : le lien
   **Se connecter** passe par `/admin?next=/fr/app/` et revient au tableau de bord. Avec
   `NUAGE_PUBLIC_STATUS=true`, les visiteurs voient la partie publique. Il s'installe comme une
   application (PWA) et montre le dernier état connu hors ligne.
-- **`/admin`**, la console : vue d'ensemble, tables et leurs lignes, console de requêtes (un
+- **`/admin`**, la console : les applications (des cartes ; en créer une, son jeton s'affiche une fois), puis pour chacune sa vue d'ensemble, ses tables et leurs lignes, ses jetons (nouveau, révocation), ses réglages (description, suppression confirmée par son nom), une console de requêtes (un
   petit sous-ensemble de SQL, avec confirmation avant les modifications), branches, stockage
   et boutons pour un checkpoint, une sauvegarde, une vérification d'intégrité et un
   compactage. Rendue par le serveur, elle fonctionne sans JavaScript, sur téléphone aussi.
@@ -198,9 +244,9 @@ de la console est `Secure`.
 
 | Chemin | Contenu | Accès |
 |---|---|---|
-| `/v1/*` | le protocole de la base | `Authorization: Bearer $NUAGE_TOKEN` |
+| `/v1/*` | le protocole de la base, sur la base de l'application qu'ouvre le jeton | `Authorization: Bearer <jeton d'une application>` |
 | `/api/health` | `{"status":"ok"}` | public |
-| `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton ou session de la console |
+| `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |
 | `/admin` | la console | `NUAGE_ADMIN_PASSWORD` |
 | tout le reste | le site, `/app` compris | public |
 

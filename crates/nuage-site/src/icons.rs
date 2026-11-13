@@ -95,8 +95,18 @@ impl Icon {
 }
 
 /// The icons of the 8 feature cards, in the order of `Texts::features`.
-pub const FEATURE_ICONS: [Icon; 8] =
-    [Icon::HardDrive, Icon::Refresh, Icon::Save, Icon::Branch, Icon::Globe, Icon::Layers, Icon::Gear, Icon::Activity];
+pub const FEATURE_ICONS: [Icon; 10] = [
+    Icon::Lock,
+    Icon::Server,
+    Icon::HardDrive,
+    Icon::Refresh,
+    Icon::Save,
+    Icon::Branch,
+    Icon::Globe,
+    Icon::Layers,
+    Icon::Gear,
+    Icon::Activity,
+];
 
 /// `<svg class="icon" …>` with the icon's shapes.
 pub fn icon(icon: Icon) -> Element {

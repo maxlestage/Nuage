@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nuage_site::status::{
-    Backup, Branch, Connections, Database, LogLine, Requests, Service, Status, Storage, Wal, format_time,
+    Backup, Branch, Connections, Database, Encryption, LogLine, Requests, Service, Status, Storage, Wal, format_time,
 };
 use vitesse::prelude::*;
 use vitesse::sse::{self, Event};
@@ -97,7 +97,9 @@ impl Sim {
     }
 
     fn log(level: &str, message: String) -> LogLine {
-        LogLine { at: format_time(now_ms()), level: level.into(), message }
+        let apps = ["nuage", "shop", "analytics"];
+        let app = apps[message.len() % apps.len()];
+        LogLine { at: format_time(now_ms()), level: level.into(), message, app: Some(app.into()) }
     }
 
     /// One second passes: returns the events it produced.
@@ -215,20 +217,62 @@ impl Sim {
                 last_ok: Some(self.backup_ok),
                 last_error: (!self.backup_ok).then(|| "s3://nuage-backups/prod answered 503".into()),
             }),
+            encryption: Some(Encryption {
+                enabled: true,
+                scheme: Some("XTS-AES-256 (pages), AES-256-GCM (log)".into()),
+                secret: Some("key".into()),
+            }),
+            applications: Some(3),
             databases: Some(vec![
                 Database {
                     name: "nuage".into(),
+                    first: true,
+                    encrypted: Some(true),
                     tables: 12,
                     rows: 34_567 + self.tick * 3,
-                    bytes: self.bytes * 4 / 5,
+                    bytes: self.bytes * 3 / 5,
+                    file_bytes: self.bytes * 3 / 5,
+                    tokens: 1,
+                    last_request_at: Some(format_time(now - 400.0)),
+                    requests: Some(Requests {
+                        per_s: (self.per_s * 6.0).round() / 10.0,
+                        p99_ms: ((p50 * 4.0) * 10.0).round() / 10.0,
+                        ..Requests::default()
+                    }),
                     branches: self.branches.clone(),
+                    ..Database::default()
+                },
+                Database {
+                    name: "shop".into(),
+                    description: Some("La boutique en ligne".into()),
+                    encrypted: Some(true),
+                    status: Some(backup_status.into()),
+                    tables: 7,
+                    rows: 5_210 + self.tick,
+                    bytes: self.bytes / 5,
+                    file_bytes: self.bytes / 5,
+                    tokens: 2,
+                    last_request_at: Some(format_time(now - 1500.0)),
+                    requests: Some(Requests {
+                        per_s: (self.per_s * 4.0 * (1.0 + (self.tick as f64 / 5.0).cos() * 0.3)).round() / 10.0,
+                        errors_per_s: (errors * 100.0).round() / 100.0,
+                        p99_ms: ((p50 * 5.0 + self.rng.next() * 2.0) * 10.0).round() / 10.0,
+                        ..Requests::default()
+                    }),
+                    ..Database::default()
                 },
                 Database {
                     name: "analytics".into(),
+                    description: Some("Batch reports".into()),
+                    encrypted: Some(true),
                     tables: 4,
                     rows: 980_112,
                     bytes: self.bytes / 5,
-                    branches: Vec::new(),
+                    file_bytes: self.bytes / 5,
+                    tokens: 1,
+                    last_request_at: Some(format_time(now - 95_000.0)),
+                    requests: Some(Requests::default()),
+                    ..Database::default()
                 },
             ]),
             services: vec![

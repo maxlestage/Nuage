@@ -1,6 +1,6 @@
 {
   "name": "Nuage DB",
-  "description": "Nuage DB, Memoire's own database in Rust: tables on disk behind a write-ahead log, instant branches, backups restored at boot, an HTTP API, a management console at /admin and a live dashboard at /app.",
+  "description": "Nuage DB, Memoire's own database in Rust: everything encrypted at rest, several applications with a database each, tables on disk behind a write-ahead log, instant branches, backups restored at boot, a console at /admin and a live dashboard at /app.",
   "repository": "https://github.com/maxlestage/Nuage",
   "website": "https://github.com/maxlestage/Nuage",
   "logo": "https://raw.githubusercontent.com/maxlestage/Nuage/master/crates/nuage-site/static/favicon.svg",
@@ -9,7 +9,8 @@
   "buildpacks": [{ "url": "emk/rust" }],
   "formation": { "web": { "quantity": 1, "size": "basic" } },
   "env": {
-    "NUAGE_TOKEN": { "description": "Token of the database API (clients send it as a bearer token).", "generator": "secret" },
+    "NUAGE_ENCRYPTION_KEY": { "description": "The key everything is encrypted with (pages, log, backups). Keep a copy: without it the data and its backups cannot be read.", "generator": "secret" },
+    "NUAGE_TOKEN": { "description": "Token of the first application (clients send it as a bearer token). The console at /admin makes more applications, each with its own database and tokens.", "generator": "secret" },
     "NUAGE_ADMIN_PASSWORD": { "description": "Password of the console at /admin (it also opens the live dashboard at /app)." },
     "NUAGE_NAME": { "description": "Name of the database.", "value": "nuage", "required": false },
     "NUAGE_PUBLIC_STATUS": { "description": "true: /api/status and /app show a public subset (status, uptime, services) without signing in.", "value": "false", "required": false },

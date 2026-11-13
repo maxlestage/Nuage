@@ -4,7 +4,7 @@
 # dashboard at /app), for any container host:
 #
 #   docker build -t nuage .
-#   docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+#   docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
 #
 # The browser bundle of the dashboard is committed (crates/nuage-site/pkg) and embedded in
 # the binary: no WebAssembly build here.
