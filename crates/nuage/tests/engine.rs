@@ -148,13 +148,16 @@ fn crash_rounds(test: &str, key: Option<String>) {
         rt.block_on(async {
             let db = Embedded::open_with(&dir, options()).unwrap();
             let count = Item::count(&db).await.unwrap() as usize;
-            // Every acknowledged commit is there; at most the one in flight more.
-            assert!(count > acknowledged, "round {round}: {count} rows, {acknowledged} acknowledged");
-            assert!(count <= acknowledged + 7, "round {round}: {count} rows, {acknowledged} acknowledged");
+            // `acknowledged` is the last row of the last group printed: every row up to it is
+            // there (`+ 1`), then the commits in flight, whole or not at all: nothing more
+            // (`+ 1`), the single row (`+ 2`), or the single row and the batch of five (`+ 7`).
+            // Anything else is an acknowledged commit lost or a batch torn.
+            assert!(
+                matches!(count.checked_sub(acknowledged), Some(1 | 2 | 7)),
+                "round {round}: {count} rows, {acknowledged} acknowledged: a commit was lost or torn"
+            );
             let rows = Item::query().order_by(Item::ID.asc()).all(&db).await.unwrap();
             assert_eq!(rows.len(), count, "the row counter matches the rows");
-            // No half-applied batch: rows come in whole groups of six.
-            assert_eq!(count % 6, 0, "round {round}: a commit was torn ({count} rows)");
             assert!(db.engine().check_integrity().unwrap());
         });
     }
