@@ -338,7 +338,21 @@ async fn console() {
     assert!(overview.body.contains("Applications") && overview.body.contains(r#"href="/admin/apps/nuage""#));
     let app = c.request("GET", "/admin/apps/nuage", &[]).await;
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
-    for language in ["JavaScript", "Python", "PHP", "Go", "Ruby", "Java", "C#", "curl"] {
+    for language in [
+        "JavaScript",
+        "Python",
+        "PHP",
+        "Go",
+        "Ruby",
+        "Java",
+        "C#",
+        "Rust",
+        "Swift",
+        "Dart / Flutter",
+        "Kotlin",
+        "Elixir",
+        "curl",
+    ] {
         assert!(app.body.contains(&format!("<summary>{language}</summary>")), "{language}");
     }
     assert_eq!(c.request("GET", "/api/status", &[]).await.status, 200, "the session opens the status API");

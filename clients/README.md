@@ -16,7 +16,12 @@ program, with a small `sql(query, params)` function to copy into your code:
 | Java 11+ | [`Nuage.java`](Nuage.java) | `java Nuage.java` |
 | C# (.NET) | [`csharp.cs`](csharp.cs) | `dotnet run csharp.cs` |
 | Perl | [`perl.pl`](perl.pl) | `perl perl.pl` |
-| Rust | the `NuageDb` client of [Memoire](https://github.com/maxlestage/Memoire) (models and queries), or any HTTP client | |
+| Rust | [`rust/`](rust/src/main.rs) (SQL; for models and queries, the `NuageDb` client of [Memoire](https://github.com/maxlestage/Memoire)) | `cargo run` in `rust/` |
+| C, C++ (libcurl) | [`c.c`](c.c) | `cc c.c -lcurl && ./a.out` |
+| Kotlin (JVM, Android) | [`kotlin.kt`](kotlin.kt) | `kotlinc kotlin.kt -include-runtime -d nuage.jar && java -jar nuage.jar` |
+| Swift (iOS, macOS, Linux) | [`swift.swift`](swift.swift) | `swift swift.swift` |
+| Dart, Flutter | [`dart.dart`](dart.dart) | `dart run dart.dart` |
+| Elixir | [`elixir.exs`](elixir.exs) | `elixir elixir.exs` |
 
 Set `NUAGE_URL` (default `http://localhost:8080`) and `NUAGE_TOKEN` (a token of an
 application: the console's **Tokens** tab). [`test.sh`](test.sh) runs them all against a fresh
@@ -45,4 +50,4 @@ Content-Type: application/json
 
 The OpenAPI description, served by every server at
 [`/v1/openapi.json`](../crates/nuage/openapi.json), generates a client for the languages not
-listed here (`openapi-generator`, Kiota, Swagger Codegen...), and opens in Postman or Insomnia.
+listed here (Lua, R, Scala, Haskell, OCaml...: `openapi-generator`, Kiota, Swagger Codegen...), and opens in Postman or Insomnia.

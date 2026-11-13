@@ -704,7 +704,7 @@ let db = NuageDb::connect("{o}", token).await?;</code></pre>
 {languages}<p class="muted">{more}</p>"#,
         languages = language_snippets(origin),
         more = cx.t(
-            r#"Complete examples (also TypeScript and Perl), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#
+            r#"Complete examples (also TypeScript, Perl and C), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#
         ),
         connect = cx.t("Connect"),
         picks = cx.t("The token an application sends picks its database: it reads and writes only its own."),
@@ -718,7 +718,7 @@ let db = NuageDb::connect("{o}", token).await?;</code></pre>
 }
 
 /// The same request in each language, `{o}` being the server's address.
-const SNIPPETS: [(&str, &str); 8] = [
+const SNIPPETS: [(&str, &str); 13] = [
     (
         "JavaScript",
         r#"const res = await fetch("{o}/v1/sql", {
@@ -786,9 +786,55 @@ String json = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers
         r#"var http = new HttpClient();
 http.DefaultRequestHeaders.Authorization =
     new AuthenticationHeaderValue("Bearer", Environment.GetEnvironmentVariable("NUAGE_TOKEN"));
-var res = await http.PostAsJsonAsync("{o}/v1/sql",
-    new { sql = "SELECT * FROM articles WHERE category = ?", @params = new object[] { 3 } });
-var rows = (await res.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("rows");"#,
+var request = new JsonObject { ["sql"] = "SELECT * FROM articles WHERE category = ?", ["params"] = new JsonArray(3) };
+var res = await http.PostAsync("{o}/v1/sql", new StringContent(request.ToJsonString(), Encoding.UTF8, "application/json"));
+var rows = JsonNode.Parse(await res.Content.ReadAsStringAsync())!["rows"];"#,
+    ),
+    (
+        "Rust",
+        r#"// ureq + serde_json; for models and queries, memoire-orm's NuageDb
+let mut res = ureq::post("{o}/v1/sql")
+    .header("Authorization", format!("Bearer {}", std::env::var("NUAGE_TOKEN")?))
+    .send_json(serde_json::json!({ "sql": "SELECT * FROM articles WHERE category = ?", "params": [3] }))?;
+let rows = res.body_mut().read_json::<serde_json::Value>()?["rows"].take();"#,
+    ),
+    (
+        "Swift",
+        r#"var request = URLRequest(url: URL(string: "{o}/v1/sql")!)
+request.httpMethod = "POST"
+request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+request.httpBody = try JSONSerialization.data(withJSONObject:
+    ["sql": "SELECT * FROM articles WHERE category = ?", "params": [3]])
+let (data, _) = try await URLSession.shared.data(for: request)
+let rows = (try JSONSerialization.jsonObject(with: data) as? [String: Any])?["rows"]"#,
+    ),
+    (
+        "Dart / Flutter",
+        r#"final request = await HttpClient().postUrl(Uri.parse('{o}/v1/sql'));
+request.headers.set('Authorization', 'Bearer $token');
+request.headers.contentType = ContentType.json;
+request.write(jsonEncode({'sql': 'SELECT * FROM articles WHERE category = ?', 'params': [3]}));
+final response = await request.close();
+final rows = jsonDecode(await response.transform(utf8.decoder).join())['rows'];"#,
+    ),
+    (
+        "Kotlin",
+        r#"val request = HttpRequest.newBuilder(URI.create("{o}/v1/sql"))
+    .header("Authorization", "Bearer " + System.getenv("NUAGE_TOKEN"))
+    .header("Content-Type", "application/json")
+    .POST(HttpRequest.BodyPublishers.ofString(
+        """{"sql": "SELECT * FROM articles WHERE category = ?", "params": [3]}"""))
+    .build()
+val json = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString()).body()"#,
+    ),
+    (
+        "Elixir",
+        r#"headers = [{~c"authorization", ~c"Bearer " ++ String.to_charlist(System.fetch_env!("NUAGE_TOKEN"))}]
+body = JSON.encode!(%{sql: "SELECT * FROM articles WHERE category = ?", params: [3]})
+{:ok, {_, _, answer}} =
+  :httpc.request(:post, {~c"{o}/v1/sql", headers, ~c"application/json", body}, [], body_format: :binary)
+rows = JSON.decode!(answer)["rows"]"#,
     ),
     (
         "curl",
