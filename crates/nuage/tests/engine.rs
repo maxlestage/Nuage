@@ -67,15 +67,14 @@ async fn data_survives_a_restart() {
 fn crash_child(dir: &str) -> ! {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        let db = Embedded::open_with(
-            dir,
+        let db = open_when_free(
+            dir.as_ref(),
             EngineOptions {
                 checkpoint_every: Duration::from_millis(50),
                 encryption: crash_key(),
                 ..EngineOptions::default()
             },
-        )
-        .unwrap();
+        );
         db.create_table_if_not_exists::<Item>().await.unwrap();
         // Rows of earlier rounds are kept: carry on after them.
         let mut n = Item::count(&db).await.unwrap() as i64;
@@ -89,6 +88,20 @@ fn crash_child(dir: &str) -> ! {
             n += 6;
         }
     })
+}
+
+/// Opens `dir`, waiting while another handle lets go of it: a dropped
+/// database is closed by its upkeep thread when that thread is in the middle
+/// of a checkpoint, a moment later.
+fn open_when_free(dir: &std::path::Path, options: EngineOptions) -> Embedded {
+    for _ in 0..200 {
+        match Embedded::open_with(dir, options.clone()) {
+            Ok(db) => return db,
+            Err(e) if e.to_string().contains("already open") => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("{} stays open", dir.display())
 }
 
 /// The key of the child, from `NUAGE_CRASH_KEY` (set: an encrypted database).
@@ -146,7 +159,7 @@ fn crash_rounds(test: &str, key: Option<String>) {
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let db = Embedded::open_with(&dir, options()).unwrap();
+            let db = open_when_free(&dir, options());
             let count = Item::count(&db).await.unwrap() as usize;
             // `acknowledged` is the last row of the last group printed: every row up to it is
             // there (`+ 1`), then the commits in flight, whole or not at all: nothing more
