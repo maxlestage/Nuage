@@ -18,6 +18,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
@@ -135,6 +136,62 @@ impl BackupStore for DirectoryStore {
             Err(e) => Err(io(e)),
         }
     }
+}
+
+/// The objects of a store under a prefix (`apps/<name>/`): the backups of
+/// one application next to the others'.
+pub struct PrefixedStore {
+    inner: Arc<dyn BackupStore>,
+    prefix: String,
+}
+
+impl PrefixedStore {
+    /// `inner`'s objects whose names start with `prefix` (which ends with `/`).
+    pub fn new(inner: Arc<dyn BackupStore>, prefix: impl Into<String>) -> Self {
+        PrefixedStore { inner, prefix: prefix.into() }
+    }
+}
+
+impl BackupStore for PrefixedStore {
+    fn describe(&self) -> String {
+        format!("{}/{}", self.inner.describe().trim_end_matches('/'), self.prefix.trim_end_matches('/'))
+    }
+
+    fn put(&self, name: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(&format!("{}{name}", self.prefix), data)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(&format!("{}{name}", self.prefix), path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(&format!("{}{name}", self.prefix))
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list(&format!("{}{prefix}", self.prefix))?
+            .into_iter()
+            .filter_map(|n| n.strip_prefix(&self.prefix).map(str::to_owned))
+            .collect())
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(&format!("{}{name}", self.prefix))
+    }
+}
+
+/// Removes every object of a backup (a deleted application's).
+pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
+    for prefix in ["snapshots/", "wal/"] {
+        for name in backup.list(prefix)? {
+            backup.delete(&name)?;
+        }
+    }
+    backup.delete(crate::crypto::HEADER_FILE)?;
+    backup.delete(MANIFEST)
 }
 
 const MANIFEST: &str = "manifest.json";

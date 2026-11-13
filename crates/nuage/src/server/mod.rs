@@ -3,13 +3,14 @@
 //!
 //! | Path | What | Access |
 //! |---|---|---|
-//! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) | `Authorization: Bearer $NUAGE_TOKEN` |
+//! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) of the application the token opens | `Authorization: Bearer <token of an application>` |
 //! | `/api/health` | `{"status":"ok"}` | public |
 //! | `/api/status`, `/api/status/stream` | live status, as JSON and as Server-Sent Events | token or console session; a public subset with `public_status` |
 //! | `/admin` | the management console | `NUAGE_ADMIN_PASSWORD` |
 //! | anything else (`GET`) | the site handler, if any, else a small home page | public |
 
 mod admin;
+pub(crate) mod apps;
 pub(crate) mod query;
 mod status;
 
@@ -36,6 +37,7 @@ use serde_json::{Value as Json, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
 
+pub use self::apps::{AppInfo, TokenInfo};
 use crate::embedded::{self, Embedded, EmbeddedTransaction};
 use crate::engine::{Engine, MAIN};
 
@@ -85,8 +87,9 @@ where
 /// Settings of a [`Server`].
 #[derive(Clone)]
 pub struct ServerOptions {
-    /// Token of the database protocol and of the status API
-    /// (`NUAGE_TOKEN`). Without it, `/v1` refuses every request.
+    /// A token of the first application, the server's own engine
+    /// (`NUAGE_TOKEN`). The console makes the tokens of the other
+    /// applications (and more for the first one).
     pub token: Option<String>,
     /// Password of the console (`NUAGE_ADMIN_PASSWORD`). Without it, the
     /// console is off.
@@ -142,7 +145,7 @@ pub(crate) struct Metrics {
 const LATENCY_SAMPLES: usize = 2048;
 
 impl Metrics {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Metrics {
             total: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -208,12 +211,15 @@ impl Metrics {
 
 struct OpenTx {
     tx: EmbeddedTransaction,
+    app: String,
     branch: String,
     last_used: Mutex<Instant>,
 }
 
 pub(crate) struct State {
+    /// The first application's engine (the server's own).
     pub(crate) engine: Arc<Engine>,
+    pub(crate) apps: apps::Apps,
     pub(crate) options: ServerOptions,
     pub(crate) metrics: Metrics,
     pub(crate) schemas: SchemaCache,
@@ -275,10 +281,12 @@ impl RunningServer {
 }
 
 impl Server {
-    /// A server for `engine`.
+    /// A server for `engine`, its first application, and every other
+    /// application `engine` lists (opened from `<engine dir>/apps/<name>`).
     pub fn new(engine: Arc<Engine>, options: ServerOptions) -> Server {
         Server {
             state: Arc::new(State {
+                apps: apps::Apps::open(engine.clone()),
                 engine,
                 options,
                 metrics: Metrics::new(),
@@ -289,15 +297,51 @@ impl Server {
         }
     }
 
-    /// The engine it serves.
+    /// The engine of the first application (the server's own).
     pub fn engine(&self) -> &Arc<Engine> {
         &self.state.engine
+    }
+
+    /// The applications, the first one first.
+    pub fn apps(&self) -> Vec<AppInfo> {
+        let env = self.state.options.token.is_some();
+        self.state.apps.all().iter().map(|a| a.info(env)).collect()
+    }
+
+    /// The engine of the application `name`.
+    pub fn app_engine(&self, name: &str) -> Option<Arc<Engine>> {
+        self.state.apps.get(name).map(|a| a.engine.clone())
+    }
+
+    /// Creates an application (a database of its own) and its first token.
+    /// The token is returned once: the server keeps only its digest.
+    pub fn create_app(&self, name: &str, description: &str) -> Result<(AppInfo, String)> {
+        let (app, token) = self.state.apps.create(name, description)?;
+        Ok((app.info(false), token))
+    }
+
+    /// A new token for the application `name`, returned once.
+    pub fn new_app_token(&self, name: &str) -> Result<String> {
+        let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
+        self.state.apps.new_token(&app)
+    }
+
+    /// Revokes the token `id` of the application `name`.
+    pub fn revoke_app_token(&self, name: &str, id: &str) -> Result<bool> {
+        let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
+        self.state.apps.revoke_token(&app, id)
+    }
+
+    /// Deletes the application `name`, its data and its backups (not the
+    /// first one).
+    pub fn delete_app(&self, name: &str) -> Result<bool> {
+        self.state.apps.delete(name)
     }
 
     /// The live status, as `/api/status` answers it to an authenticated
     /// client.
     pub fn status(&self) -> Json {
-        status::status(&self.state, true)
+        status::status(&self.state, &status::View::All)
     }
 
     /// Binds `addr` and serves in the background on the current Tokio
@@ -347,8 +391,8 @@ impl State {
         self.transactions.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    pub(crate) fn db(&self, branch: &str) -> Result<Embedded> {
-        Embedded::from_engine(self.engine.clone()).on_branch(branch)
+    pub(crate) fn db(&self, engine: &Arc<Engine>, branch: &str) -> Result<Embedded> {
+        Embedded::from_engine(engine.clone()).on_branch(branch)
     }
 }
 
@@ -396,12 +440,9 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl State {
-    /// The request carries the token.
-    pub(crate) fn has_token(&self, headers: &HeaderMap) -> bool {
-        match (&self.options.token, bearer(headers)) {
-            (Some(t), Some(given)) => same_secret(t.as_bytes(), given.as_bytes()),
-            _ => false,
-        }
+    /// The application whose token the request carries.
+    pub(crate) fn app_of(&self, headers: &HeaderMap) -> Option<Arc<apps::App>> {
+        self.apps.authenticate(bearer(headers)?, self.options.token.as_deref())
     }
 }
 
@@ -506,26 +547,47 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     json_response(404, &json!({ "error": { "kind": "not_found", "message": format!("no such page: {path}") } }))
 }
 
-/// `/v1/*`: the database protocol.
+/// `/v1/*`: the database protocol, on the database of the application the
+/// token opens.
 async fn protocol(state: &Arc<State>, req: Request<Incoming>) -> Result<Response<HttpBody>> {
-    if state.options.token.is_none() {
-        return Ok(unauthorized("the database API is off: set NUAGE_TOKEN on the server"));
+    if state.options.token.is_none() && !state.apps.any_token() {
+        return Ok(unauthorized(
+            "the database API is off: create an application in the console (/admin), or set NUAGE_TOKEN",
+        ));
     }
-    if !state.has_token(req.headers()) {
+    let Some(app) = state.app_of(req.headers()) else {
         return Ok(unauthorized("missing or invalid bearer token"));
-    }
+    };
+    let started = Instant::now();
+    app.touch();
+    let result = app_protocol(state, &app, req).await;
+    let failed = match &result {
+        Ok(res) => res.status().is_server_error(),
+        Err(e) => wire::error_to_json(e).0 >= 500,
+    };
+    app.metrics.record(started.elapsed(), failed);
+    result
+}
+
+async fn app_protocol(state: &Arc<State>, app: &Arc<apps::App>, req: Request<Incoming>) -> Result<Response<HttpBody>> {
     let method = req.method().clone();
     let path = req.uri().path().trim_end_matches('/').to_owned();
     let segments: Vec<&str> = path.trim_start_matches("/v1/").split('/').collect();
     let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let branch = header(BRANCH_HEADER).unwrap_or_else(|| MAIN.to_owned());
     let tx_id = header(TRANSACTION_HEADER);
-    let engine = &state.engine;
+    let engine = &app.engine;
 
     match (method, segments.as_slice()) {
         (Method::GET, ["info"]) => Ok(json_response(
             200,
-            &json!({ "name": "Nuage DB", "version": crate::VERSION, "database": engine.options().name }),
+            &json!({
+                "name": "Nuage DB",
+                "version": crate::VERSION,
+                "database": engine.options().name,
+                "application": app.name,
+                "encrypted": engine.encryption().is_some(),
+            }),
         )),
         (Method::POST, [op @ ("fetch" | "execute")]) => {
             let fetch = *op == "fetch";
@@ -533,7 +595,7 @@ async fn protocol(state: &Arc<State>, req: Request<Incoming>) -> Result<Response
             let query = wire::query_from_json(body.get("query").unwrap_or(&Json::Null), &state.schemas)?;
             let engine = engine.clone();
             let tx = match &tx_id {
-                Some(id) => Some(state.transaction(id, &branch)?),
+                Some(id) => Some(state.transaction(id, &app.name, &branch)?),
                 None => None,
             };
             // The engine blocks on disk: off the async workers.
@@ -575,7 +637,7 @@ async fn protocol(state: &Arc<State>, req: Request<Incoming>) -> Result<Response
                 };
                 statements.push((fetch, wire::query_from_json(q, &state.schemas)?));
             }
-            let db = state.db(&branch)?;
+            let db = state.db(engine, &branch)?;
             let results = tokio::task::spawn_blocking(move || {
                 let list: Vec<(bool, memoire_orm::Query<'_>)> =
                     statements.iter().map(|(f, q)| (*f, q.as_query())).collect();
@@ -593,19 +655,21 @@ async fn protocol(state: &Arc<State>, req: Request<Incoming>) -> Result<Response
             Ok(json_response(200, &json!({ "results": results })))
         }
         (Method::POST, ["transactions"]) => {
-            let tx = state.db(&branch)?.begin_now()?;
+            let tx = state.db(engine, &branch)?.begin_now()?;
             let id = random_token();
-            let open = OpenTx { tx, branch, last_used: Mutex::new(Instant::now()) };
+            let open = OpenTx { tx, app: app.name.clone(), branch, last_used: Mutex::new(Instant::now()) };
             state.transactions.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), Arc::new(open));
             Ok(json_response(200, &json!({ "id": id })))
         }
         (Method::POST, ["transactions", id, action @ ("commit" | "rollback")]) => {
-            let open = state
-                .transactions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(*id)
-                .ok_or(Error::TransactionFinished)?;
+            let open = {
+                let mut txs = state.transactions.lock().unwrap_or_else(|e| e.into_inner());
+                // Another application's transaction does not exist for this one.
+                if txs.get(*id).is_none_or(|t| t.app != app.name) {
+                    return Err(Error::TransactionFinished);
+                }
+                txs.remove(*id).ok_or(Error::TransactionFinished)?
+            };
             let commit = *action == "commit";
             tokio::task::spawn_blocking(move || if commit { open.tx.commit_now() } else { open.tx.rollback_now() })
                 .await
@@ -645,12 +709,13 @@ fn check_branch(engine: &Engine, branch: &str) -> Result<()> {
 }
 
 impl State {
-    fn transaction(&self, id: &str, branch: &str) -> Result<Arc<OpenTx>> {
+    fn transaction(&self, id: &str, app: &str, branch: &str) -> Result<Arc<OpenTx>> {
         let tx = self
             .transactions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|t| t.app == app)
             .cloned()
             .ok_or(Error::TransactionFinished)?;
         if tx.branch != branch {
