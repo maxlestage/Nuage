@@ -167,7 +167,7 @@ sans clé primaire reçoit une colonne `rowid`.
 Nuage DB parle SQL en HTTP (`POST /v1/sql`, du JSON à l'aller et au retour) : tous les
 langages s'en servent, sans rien installer. [`clients/`](clients) contient un exemple complet,
 testé sur un vrai serveur en CI, pour curl, JavaScript, TypeScript, Python, PHP, Go, Ruby,
-Java, C# et Perl ; la console montre la même requête dans chaque langage avec l'adresse du
+Java, Kotlin, C#, Swift, Dart (Flutter), Elixir, Rust, C et Perl ; la console montre la même requête dans chaque langage avec l'adresse du
 serveur. Chaque serveur décrit son API à `/v1/openapi.json` (OpenAPI 3.1) pour générer un
 client dans n'importe quel autre langage. Rust a aussi le client natif, `NuageDb`.
 

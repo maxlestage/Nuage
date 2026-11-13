@@ -1,0 +1,15 @@
+# Nuage DB from Rust over HTTP, with SQL (ureq and serde_json). For models and the query
+# builder, use the native client instead: memoire-orm's NuageDb.
+#   NUAGE_URL=https://db.example.com NUAGE_TOKEN=... cargo run
+[package]
+name = "nuage-sql-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ureq = { version = "3", features = ["json"] }
+serde_json = "1"
+
+# Not a member of the repository's workspace.
+[workspace]

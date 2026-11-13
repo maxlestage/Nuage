@@ -122,9 +122,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Wrong password.", "Mot de passe incorrect.", "Contraseña incorrecta."),
     (
-        r#"Complete examples (also TypeScript and Perl), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
-        r#"Des exemples complets (aussi TypeScript et Perl), testés sur un vrai serveur : <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Pour générer un client dans un autre langage : <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
-        r#"Ejemplos completos (también TypeScript y Perl), probados contra un servidor real: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Para generar un cliente en otro lenguaje: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+        r#"Complete examples (also TypeScript, Perl and C), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+        r#"Des exemples complets (aussi TypeScript, Perl et C), testés sur un vrai serveur : <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Pour générer un client dans un autre langage : <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+        r#"Ejemplos completos (también TypeScript, Perl y C), probados contra un servidor real: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Para generar un cliente en otro lenguaje: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
     ),
     (
         "This connection is not encrypted (HTTP): the password travels in clear. Reach the console over HTTPS (a domain name with the installer's NUAGE_DOMAIN, or a proxy), or through an SSH tunnel to localhost.",

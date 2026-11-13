@@ -1,3 +1,4 @@
 /target
 /nuage-data
 .env
+/clients/rust/target
