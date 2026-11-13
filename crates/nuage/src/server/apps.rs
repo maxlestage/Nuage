@@ -35,6 +35,8 @@ pub struct TokenInfo {
     pub id: String,
     /// When it was made (Unix ms).
     pub created_at: i64,
+    /// Reads only: for the JavaScript of a website, which anyone can read.
+    pub read_only: bool,
     digest: [u8; 32],
 }
 
@@ -47,6 +49,8 @@ pub(crate) struct App {
     pub first: bool,
     pub created_at: i64,
     tokens: Mutex<Vec<TokenInfo>>,
+    /// Websites whose pages may call it from the browser (CORS): `https://site.fr`, or `*`.
+    origins: RwLock<Vec<String>>,
     pub metrics: Metrics,
     /// Last request (Unix ms, 0: none yet).
     pub last_request: AtomicI64,
@@ -67,6 +71,8 @@ pub struct AppInfo {
     pub tokens: Vec<TokenInfo>,
     /// `NUAGE_TOKEN` opens it too (the first application only).
     pub env_token: bool,
+    /// Websites whose pages may call it from the browser.
+    pub origins: Vec<String>,
 }
 
 fn digest(token: &str) -> [u8; 32] {
@@ -95,6 +101,7 @@ impl App {
             first,
             created_at,
             tokens: Mutex::new(Vec::new()),
+            origins: RwLock::new(Vec::new()),
             metrics: Metrics::new(),
             last_request: AtomicI64::new(0),
         }
@@ -104,15 +111,26 @@ impl App {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// `token` is one of this application's (the environment's token aside).
-    fn has_token(&self, token: &str) -> bool {
-        let d = digest(token);
+    /// `Some(read_only)` when the token with digest `d` is one of this
+    /// application's (the environment's token aside).
+    fn token(&self, d: &[u8; 32]) -> Option<bool> {
         // Every digest is compared: the time taken tells nothing.
         self.tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .fold(false, |found, t| found | same_secret(&t.digest, &d))
+            .fold(None, |found, t| if same_secret(&t.digest, d) { Some(t.read_only) } else { found })
+    }
+
+    /// The websites allowed to call it from the browser.
+    pub(crate) fn origins(&self) -> Vec<String> {
+        self.origins.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A page of `origin` may call it.
+    pub(crate) fn allows_origin(&self, origin: &str) -> bool {
+        let origin = normalize_origin(origin);
+        self.origins.read().unwrap_or_else(|e| e.into_inner()).iter().any(|o| o == "*" || *o == origin)
     }
 
     pub(crate) fn touch(&self) {
@@ -123,12 +141,15 @@ impl App {
         let tokens: Vec<Json> = self
             .tokens()
             .iter()
-            .map(|t| json!({ "id": t.id, "createdAt": t.created_at, "sha256": hex(&t.digest) }))
+            .map(
+                |t| json!({ "id": t.id, "createdAt": t.created_at, "sha256": hex(&t.digest), "readOnly": t.read_only }),
+            )
             .collect();
         json!({
             "createdAt": self.created_at,
             "description": *self.description.lock().unwrap_or_else(|e| e.into_inner()),
             "tokens": tokens,
+            "origins": self.origins(),
         })
     }
 }
@@ -175,6 +196,7 @@ impl Apps {
             if name == apps.first.name {
                 *apps.first.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
                 *apps.first.description.lock().unwrap_or_else(|e| e.into_inner()) = description_of(&record);
+                *apps.first.origins.write().unwrap_or_else(|e| e.into_inner()) = origins_of(&record);
                 continue;
             }
             match apps.open_engine(&name) {
@@ -182,6 +204,7 @@ impl Apps {
                     let created = record.get("createdAt").and_then(Json::as_i64).unwrap_or(0);
                     let app = App::new(name.clone(), e, false, created, description_of(&record));
                     *app.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
+                    *app.origins.write().unwrap_or_else(|e| e.into_inner()) = origins_of(&record);
                     apps.others.write().unwrap_or_else(|e| e.into_inner()).insert(name, Arc::new(app));
                 }
                 Err(e) => {
@@ -215,19 +238,54 @@ impl Apps {
         self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The application `token` opens: `env_token` (`NUAGE_TOKEN`) opens the
-    /// first one. Every application is tried, whatever matches.
-    pub(crate) fn authenticate(&self, token: &str, env_token: Option<&str>) -> Option<Arc<App>> {
+    /// The application `token` opens, and whether it only reads:
+    /// `env_token` (`NUAGE_TOKEN`) opens the first one, for everything. Every
+    /// application is tried, whatever matches.
+    pub(crate) fn authenticate(&self, token: &str, env_token: Option<&str>) -> Option<(Arc<App>, bool)> {
         let mut found = None;
         if env_token.is_some_and(|t| same_secret(t.as_bytes(), token.as_bytes())) {
-            found = Some(self.first.clone());
+            found = Some((self.first.clone(), false));
         }
+        let d = digest(token);
         for app in self.all() {
-            if app.has_token(token) && found.is_none() {
-                found = Some(app);
+            if let Some(read_only) = app.token(&d)
+                && found.is_none()
+            {
+                found = Some((app, read_only));
             }
         }
         found
+    }
+
+    /// Some application lets pages of `origin` call it (the answer to a
+    /// browser's preflight, which carries no token).
+    pub(crate) fn any_allows(&self, origin: &str) -> bool {
+        self.all().iter().any(|a| a.allows_origin(origin))
+    }
+
+    /// Sets the websites whose pages may call `app`, one per line or comma:
+    /// `https://site.fr`, `http://localhost:3000`, or `*` for any.
+    pub(crate) fn set_origins(&self, app: &App, list: &str) -> Result<Vec<String>> {
+        let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut origins = Vec::new();
+        for o in list.split(|c: char| c == ',' || c.is_whitespace()).filter(|o| !o.is_empty()) {
+            let o = normalize_origin(o);
+            let valid = o == "*"
+                || ((o.starts_with("https://") || o.starts_with("http://"))
+                    && o.split("://").nth(1).is_some_and(|h| !h.is_empty() && !h.contains('/')));
+            if !valid {
+                return Err(Error::Validation(format!(
+                    "`{o}` is not an origin: write `https://site.fr` (scheme and host, no path), or `*`"
+                )));
+            }
+            if !origins.contains(&o) {
+                origins.push(o);
+            }
+        }
+        *app.origins.write().unwrap_or_else(|e| e.into_inner()) = origins.clone();
+        self.save(app)?;
+        self.first.engine.event("info", format!("websites of application `{}`: {}", app.name, origins.join(", ")));
+        Ok(origins)
     }
 
     /// Any application has a token (else the database API is off).
@@ -274,19 +332,21 @@ impl Apps {
         }
         let engine = self.open_engine(name)?;
         let app = Arc::new(App::new(name.to_owned(), engine, false, now_millis(), description.trim().to_owned()));
-        let token = add_token(&app);
+        let token = add_token(&app, false);
         self.save(&app)?;
         self.others.write().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned(), app.clone());
         self.first.engine.event("info", format!("application `{name}` created"));
         Ok((app, token))
     }
 
-    /// A new token for `app`, shown once.
-    pub(crate) fn new_token(&self, app: &App) -> Result<String> {
+    /// A new token for `app` (`read_only`: it reads, never writes), shown
+    /// once.
+    pub(crate) fn new_token(&self, app: &App, read_only: bool) -> Result<String> {
         let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
-        let token = add_token(app);
+        let token = add_token(app, read_only);
         self.save(app)?;
-        self.first.engine.event("info", format!("new token for application `{}`", app.name));
+        let kind = if read_only { "read-only token" } else { "token" };
+        self.first.engine.event("info", format!("new {kind} for application `{}`", app.name));
         Ok(token)
     }
 
@@ -348,11 +408,17 @@ fn dir_of(first: &Engine, name: &str) -> PathBuf {
     first.dir().join("apps").join(name)
 }
 
-fn add_token(app: &App) -> String {
+/// `https://Site.fr/` → `https://site.fr`: what browsers send in `Origin`.
+fn normalize_origin(o: &str) -> String {
+    o.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn add_token(app: &App, read_only: bool) -> String {
     let token = format!("{TOKEN_PREFIX}{}", random_token());
     let info = TokenInfo {
         id: token[TOKEN_PREFIX.len()..TOKEN_PREFIX.len() + TOKEN_ID_LEN].to_owned(),
         created_at: now_millis(),
+        read_only,
         digest: digest(&token),
     };
     app.tokens.lock().unwrap_or_else(|e| e.into_inner()).push(info);
@@ -369,11 +435,20 @@ fn parse_tokens(record: &Json) -> Vec<TokenInfo> {
                     Some(TokenInfo {
                         id: t.get("id")?.as_str()?.to_owned(),
                         created_at: t.get("createdAt").and_then(Json::as_i64).unwrap_or(0),
+                        read_only: t.get("readOnly").and_then(Json::as_bool).unwrap_or(false),
                         digest: unhex(t.get("sha256")?.as_str()?)?,
                     })
                 })
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+fn origins_of(record: &Json) -> Vec<String> {
+    record
+        .get("origins")
+        .and_then(Json::as_array)
+        .map(|l| l.iter().filter_map(Json::as_str).map(normalize_origin).collect())
         .unwrap_or_default()
 }
 
@@ -390,6 +465,7 @@ impl App {
             created_at: self.created_at,
             tokens: self.tokens(),
             env_token: self.first && env_token,
+            origins: self.origins(),
         }
     }
 }

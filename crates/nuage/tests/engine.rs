@@ -333,3 +333,52 @@ async fn backup_and_restore_into_an_empty_directory() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// `WHERE indexed = ? ORDER BY id [DESC] LIMIT n [OFFSET m]` stops reading
+/// early: it still gives exactly what reading everything gives.
+#[tokio::test]
+async fn early_stop_through_an_index_gives_the_same_rows() {
+    let dir = temp_dir("early");
+    let db = Embedded::open(&dir).unwrap();
+    db.create_table::<Item>().await.unwrap();
+    for n in 0..600 {
+        item(n).insert(&db).await.unwrap();
+    }
+    // Some rows of the group deleted and changed, so the index has gaps.
+    Item::delete_many().filter(Item::ID.between(100, 140)).execute(&db).await.unwrap();
+    Item::update_many()
+        .set(Item::SCORE, 99.0)
+        .filter(Item::GROUP_NO.eq(7))
+        .filter(Item::ID.gt(300))
+        .execute(&db)
+        .await
+        .unwrap();
+    for (desc, limit, offset, extra) in [
+        (true, 5, 0, false),
+        (false, 5, 0, false),
+        (true, 3, 2, false),
+        (true, 4, 0, true),
+        (false, 2, 1, true),
+        (true, 50, 0, false),
+    ] {
+        let base = || {
+            let mut q = Item::query().filter(Item::GROUP_NO.eq(7));
+            if extra {
+                q = q.filter(Item::SCORE.lt(50.0));
+            }
+            q
+        };
+        let ordered =
+            |q: memoire_orm::Select<Item>| if desc { q.order_by(Item::ID.desc()) } else { q.order_by(Item::ID.asc()) };
+        let fast = ordered(base()).limit(limit).offset(offset).all(&db).await.unwrap();
+        let mut all = ordered(base()).all(&db).await.unwrap();
+        all = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        assert_eq!(fast, all, "desc={desc} limit={limit} offset={offset} extra={extra}");
+    }
+    // No order: any `n` matching rows.
+    let some = Item::query().filter(Item::GROUP_NO.eq(3)).limit(4).all(&db).await.unwrap();
+    assert_eq!(some.len(), 4);
+    assert!(some.iter().all(|i| i.group_no == 3));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

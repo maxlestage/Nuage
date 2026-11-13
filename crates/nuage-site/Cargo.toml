@@ -8,7 +8,6 @@ description = "The website of Nuage DB (pages, live status dashboard at /app, PW
 authors.workspace = true
 # The same license as the repository's LICENSE (the site serves its copy, static/LICENSE.txt).
 license-file.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 # The library holds what both sides share: texts, routes, the status types and the islands

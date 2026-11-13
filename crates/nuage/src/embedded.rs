@@ -186,6 +186,14 @@ impl Embedded {
         Ok(out)
     }
 
+    /// The schema of one table (as `memoire_orm::nuage::wire` writes it),
+    /// `None` when there is no such table: one read, whatever the number of
+    /// tables.
+    pub fn table_schema(&self, name: &str) -> Result<Option<Json>> {
+        let mut work = Work::new(&self.engine.store, &self.branch)?;
+        Ok(work.ctx(&self.engine.store, &self.branch).meta(name)?.map(|m| m.schema))
+    }
+
     /// Statements run in one transaction: all of them apply, or none. Each
     /// is `(returns_rows, statement)`; the result is the rows, or the write's
     /// outcome.

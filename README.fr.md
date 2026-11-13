@@ -144,6 +144,44 @@ Un serveur accueille plusieurs applications, chacune avec sa base :
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` et `apps` font de
 même depuis Rust.
 
+## Sites web
+
+Tout site peut utiliser la base d'une application, depuis son serveur ou depuis ses pages :
+
+- **`POST /v1/sql`**, depuis n'importe quel langage : `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `CREATE TABLE`, `DROP TABLE`, avec des paramètres `?` (des valeurs, jamais du SQL : pas
+  d'injection). Les lignes reviennent en objets JSON, un insert renvoie son `last_insert_id`.
+- **Depuis le navigateur** : ajoutez le site dans la console (**Settings → Websites** :
+  `https://site.fr`, `http://localhost:3000`, ou `*`) et ses pages peuvent appeler `/v1`
+  (CORS). La requête préalable du navigateur est mise en cache un jour : un aller-retour, une
+  seule fois.
+- **Jetons en lecture seule** (**Tokens → New read-only token**) : un jeton dans une page est
+  public, les pages reçoivent donc un jeton qui lit sans jamais écrire ; gardez les jetons
+  lecture-écriture sur des serveurs.
+
+```js
+const res = await fetch("https://mon-nuage.herokuapp.com/v1/sql", {
+  method: "POST",
+  headers: { "Authorization": "Bearer " + JETON_LECTURE, "Content-Type": "application/json" },
+  body: JSON.stringify({ sql: "SELECT id, title FROM posts WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }),
+});
+const { rows } = await res.json(); // [{ "id": 42, "title": "…" }, …]
+```
+
+```bash
+curl https://mon-nuage.herokuapp.com/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
+  -d '{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Bonjour"]}'
+```
+
+Vitesse, mesurée sur la machine du serveur (`cargo run --release -p nuage --example bench`,
+données chiffrées, 20 000 lignes, 4 cœurs) : une ligne par clé ou par colonne unique en
+**0,2 ms**, une page de 20 lignes par un index en **0,5 ms**, une mise à jour durable (fsync)
+en **0,5 ms**, **plus de 13 000 lectures/s**. Les réponses JSON de 1 Kio ou plus sont
+compressées en gzip pour les clients qui l'acceptent. Ce que ressent un visiteur, c'est
+surtout le réseau : choisissez la région de l'hébergeur la plus proche de lui, et un dyno qui
+ne se met jamais en veille (Heroku **Basic**, pas Eco, dont la première requête après une
+pause prend plusieurs secondes).
+
 ## Démarrage rapide
 
 ```bash
@@ -245,6 +283,7 @@ de la console est `Secure`.
 | Chemin | Contenu | Accès |
 |---|---|---|
 | `/v1/*` | le protocole de la base, sur la base de l'application qu'ouvre le jeton | `Authorization: Bearer <jeton d'une application>` |
+| `POST /v1/sql` | SQL avec paramètres `?`, lignes en objets JSON (sites, tout langage) | un jeton de l'application ; un jeton en lecture seule ne fait que lire |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |
 | `/admin` | la console | `NUAGE_ADMIN_PASSWORD` |

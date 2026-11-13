@@ -787,3 +787,226 @@ async fn applications() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+async fn raw(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, HeaderMap, Vec<u8>) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let mut req = Request::builder().method(method).uri(path).header("host", addr.to_string());
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = sender.send_request(req.body(Full::new(Bytes::from(body.to_owned()))).unwrap()).await.unwrap();
+    let (status, headers) = (res.status().as_u16(), res.headers().clone());
+    (status, headers, res.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+/// Websites: SQL with parameters from any language, read-only tokens for
+/// pages, CORS for the websites of an application, compressed answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn websites() {
+    let server = Server::new(engine("websites"), options());
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let (_, write) = server.create_app("blog", "").unwrap();
+    let read = server.new_app_read_token("blog").unwrap();
+    let auth = |t: &str| format!("Bearer {t}");
+    let (w, r) = (auth(&write), auth(&read));
+    let sql = |sql: &str, params: serde_json::Value| serde_json::json!({ "sql": sql, "params": params }).to_string();
+    let json = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap();
+
+    // Tables, rows and reads in SQL, values passed as parameters.
+    let create = "CREATE TABLE posts (id BIGINT PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, category INT INDEX, title TEXT, published BOOLEAN, at TIMESTAMPTZ)";
+    let res = http(addr, "POST", "/v1/sql", &[("authorization", &w)], &sql(create, serde_json::json!([]))).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    for n in 0..200 {
+        let res = http(
+            addr,
+            "POST",
+            "/v1/sql",
+            &[("authorization", &w)],
+            &sql(
+                "INSERT INTO posts (slug, category, title, published, at) VALUES (?, ?, ?, ?, ?)",
+                serde_json::json!([
+                    format!("post-{n}"),
+                    n % 4,
+                    format!("Post {n} — l'été"),
+                    n % 2 == 0,
+                    "2026-11-13T10:00:00Z"
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(json(&res.body)["last_insert_id"], n + 1);
+    }
+    let page = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r)],
+        &sql(
+            "SELECT id, title, published FROM posts WHERE category = ? ORDER BY id DESC LIMIT ?",
+            serde_json::json!([1, 3]),
+        ),
+    )
+    .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let page = json(&page.body);
+    assert_eq!(page["columns"], serde_json::json!(["id", "title", "published"]));
+    assert_eq!(page["rows"][0], serde_json::json!({ "id": 198, "title": "Post 197 — l'été", "published": false }));
+    assert_eq!(page["rows"].as_array().unwrap().len(), 3);
+    // A parameter is never SQL.
+    let none = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r)],
+        &sql("SELECT * FROM posts WHERE slug = ?", serde_json::json!(["x' OR '1'='1"])),
+    )
+    .await;
+    assert_eq!(json(&none.body)["rows"], serde_json::json!([]));
+    let bad =
+        http(addr, "POST", "/v1/sql", &[("authorization", &r)], &sql("SELECT * FROM nowhere", serde_json::json!([])))
+            .await;
+    assert_eq!(bad.status, 404, "{}", bad.body);
+
+    // A read-only token reads, and nothing else.
+    for (path, body) in [
+        ("/v1/sql", sql("DELETE FROM posts", serde_json::json!([]))),
+        ("/v1/sql", sql("DROP TABLE posts", serde_json::json!([]))),
+        ("/v1/execute", "{}".to_owned()),
+        ("/v1/transactions", String::new()),
+        ("/v1/branches", r#"{"name":"x"}"#.to_owned()),
+    ] {
+        let res = http(addr, "POST", path, &[("authorization", &r)], &body).await;
+        assert_eq!(res.status, 403, "{path}: {}", res.body);
+        assert!(res.body.contains("only reads"), "{}", res.body);
+    }
+    let reader = NuageDb::connect(&running.url(), &read).await.unwrap();
+    assert!(reader.branches().await.is_ok(), "reads work with the client too");
+    let count = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &w)],
+        &sql("SELECT COUNT(*) FROM posts", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(json(&count.body)["rows"][0]["count"], 200);
+
+    // CORS: only the application's websites, and the preflight is cached.
+    let site = "https://blog.example";
+    let pre = [
+        ("origin", site),
+        ("access-control-request-method", "POST"),
+        ("access-control-request-headers", "authorization,content-type"),
+    ];
+    assert_eq!(http(addr, "OPTIONS", "/v1/sql", &pre, "").await.status, 403, "no website yet");
+    let from_site = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r), ("origin", site)],
+        &sql("SELECT id FROM posts LIMIT 1", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(from_site.status, 403);
+    assert_eq!(
+        server.set_app_origins("blog", &["https://Blog.example/", "http://localhost:3000"]).unwrap(),
+        [site, "http://localhost:3000"]
+    );
+    assert!(server.set_app_origins("blog", &["blog.example/path"]).is_err());
+    let res = http(addr, "OPTIONS", "/v1/sql", &pre, "").await;
+    assert_eq!(res.status, 204);
+    assert_eq!(res.headers["access-control-allow-origin"], site);
+    assert_eq!(res.headers["access-control-max-age"], "86400");
+    assert!(res.headers["access-control-allow-headers"].to_str().unwrap().contains("authorization"));
+    let from_site = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r), ("origin", site)],
+        &sql("SELECT id FROM posts LIMIT 1", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!((from_site.status, from_site.headers["access-control-allow-origin"].to_str().unwrap()), (200, site));
+    // Errors are readable by the page too; other websites get nothing.
+    let denied = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r), ("origin", site)],
+        &sql("DELETE FROM posts", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!((denied.status, denied.headers.get("access-control-allow-origin").is_some()), (403, true));
+    let evil = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r), ("origin", "https://evil.example")],
+        &sql("SELECT id FROM posts", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!((evil.status, evil.headers.get("access-control-allow-origin").is_none()), (403, true));
+    // Another application's token from the blog's website: refused.
+    let other = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", "Bearer t0ken"), ("origin", site)],
+        &sql("SELECT 1 FROM posts", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(other.status, 403);
+
+    // Compressed for clients that accept it, plain for the others.
+    let all = sql("SELECT * FROM posts", serde_json::json!([]));
+    let (status, headers, body) =
+        raw(addr, "POST", "/v1/sql", &[("authorization", &r), ("accept-encoding", "gzip, br")], &all).await;
+    assert_eq!((status, headers["content-encoding"].to_str().unwrap()), (200, "gzip"));
+    let mut plain = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut plain).unwrap();
+    assert_eq!(json(&plain)["rows"].as_array().unwrap().len(), 200);
+    let (_, headers, body2) = raw(addr, "POST", "/v1/sql", &[("authorization", &r)], &all).await;
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(String::from_utf8(body2).unwrap(), plain);
+    assert!(body.len() * 4 < plain.len(), "{} → {}", plain.len(), body.len());
+
+    // The console shows the rights and the websites.
+    let mut c = Console { addr, cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let tokens = c.request("GET", "/admin/apps/blog/tokens", &[]).await;
+    assert!(tokens.body.contains("read only") && tokens.body.contains("New read-only token"));
+    let token = csrf(&tokens.body);
+    let res = c
+        .request(
+            "POST",
+            "/admin/apps/blog/origins",
+            &[("csrf", &token), ("origins", "https://a.example\nhttps://b.example")],
+        )
+        .await;
+    assert!(res.body.contains("https://a.example, https://b.example"), "{}", res.body);
+    let overview = c.request("GET", "/admin/apps/blog", &[]).await;
+    assert!(overview.body.contains("/v1/sql") && overview.body.contains("https://a.example"));
+    let made = c.request("POST", "/admin/apps/blog/tokens", &[("csrf", &token), ("scope", "read")]).await;
+    let new_read = token_in(&made.body);
+    let res = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &auth(&new_read))],
+        &sql("DELETE FROM posts", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(res.status, 403);
+    running.shutdown().await;
+}

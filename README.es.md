@@ -142,6 +142,42 @@ Un servidor aloja varias aplicaciones, cada una con su base:
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` y `apps` hacen lo
 mismo desde Rust.
 
+## Sitios web
+
+Cualquier sitio puede usar la base de una aplicación, desde su servidor o desde sus páginas:
+
+- **`POST /v1/sql`**, desde cualquier lenguaje: `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `CREATE TABLE`, `DROP TABLE`, con parámetros `?` (valores, nunca SQL: sin inyección). Las
+  filas vuelven como objetos JSON; un insert devuelve su `last_insert_id`.
+- **Desde el navegador**: añade el sitio en la consola (**Settings → Websites**:
+  `https://sitio.es`, `http://localhost:3000`, o `*`) y sus páginas pueden llamar a `/v1`
+  (CORS). La petición previa del navegador se guarda en caché un día: un viaje, una sola vez.
+- **Tokens de solo lectura** (**Tokens → New read-only token**): un token en una página es
+  público, así que las páginas reciben uno que lee y nunca escribe; los tokens de lectura y
+  escritura se quedan en servidores.
+
+```js
+const res = await fetch("https://mi-nuage.herokuapp.com/v1/sql", {
+  method: "POST",
+  headers: { "Authorization": "Bearer " + TOKEN_LECTURA, "Content-Type": "application/json" },
+  body: JSON.stringify({ sql: "SELECT id, title FROM posts WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }),
+});
+const { rows } = await res.json(); // [{ "id": 42, "title": "…" }, …]
+```
+
+```bash
+curl https://mi-nuage.herokuapp.com/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
+  -d '{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Hola"]}'
+```
+
+Velocidad, medida en la máquina del servidor (`cargo run --release -p nuage --example bench`,
+datos cifrados, 20 000 filas, 4 núcleos): una fila por clave o por columna única en
+**0,2 ms**, una página de 20 filas por un índice en **0,5 ms**, una actualización duradera
+(fsync) en **0,5 ms**, **más de 13 000 lecturas/s**. Las respuestas JSON de 1 KiB o más se
+comprimen con gzip para los clientes que lo aceptan. Lo que nota un visitante es sobre todo
+la red: elige la región del proveedor más cercana a él, y un dyno que nunca se duerme
+(Heroku **Basic**, no Eco, cuya primera petición tras una pausa tarda varios segundos).
+
 ## Inicio rápido
 
 ```bash
@@ -243,6 +279,7 @@ la consola es `Secure`.
 | Ruta | Contenido | Acceso |
 |---|---|---|
 | `/v1/*` | el protocolo de la base, sobre la base de la aplicación que abre el token | `Authorization: Bearer <token de una aplicación>` |
+| `POST /v1/sql` | SQL con parámetros `?`, filas como objetos JSON (sitios, cualquier lenguaje) | un token de la aplicación; un token de solo lectura solo lee |
 | `/api/health` | `{"status":"ok"}` | público |
 | `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token de una aplicación (esa aplicación) o sesión de la consola (todas) |
 | `/admin` | la consola | `NUAGE_ADMIN_PASSWORD` |

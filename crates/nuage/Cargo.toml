@@ -5,7 +5,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
-homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 documentation = "https://docs.rs/nuage"
@@ -37,6 +36,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 libc = "0.2"
 getrandom = "0.4"
 ring = "0.17"
+# gzip of the JSON answers (websites, browsers).
+flate2 = "1"
 # Encryption at rest (see src/crypto.rs): XTS-AES-256 for the page store (`aes`), Argon2id
 # when the key is a passphrase, base64 keys; AES-256-GCM and HKDF come from `ring`.
 aes = "0.9"

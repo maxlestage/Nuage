@@ -7,7 +7,6 @@ version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
-homepage = "https://github.com/maxlestage/Nuage"
 repository = "https://github.com/maxlestage/Nuage"
 authors = ["Maxime Nathan Lestage"]
 

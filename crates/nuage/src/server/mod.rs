@@ -4,6 +4,11 @@
 //! | Path | What | Access |
 //! |---|---|---|
 //! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) of the application the token opens | `Authorization: Bearer <token of an application>` |
+//! | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects: for websites in any language | the same; a read-only token reads only |
+//!
+//! Websites: a page calls `/v1` from the browser when its origin is one of
+//! its application's websites (CORS, preflight cached for a day); JSON
+//! answers are gzip-compressed for clients that accept it.
 //! | `/api/health` | `{"status":"ok"}` | public |
 //! | `/api/status`, `/api/status/stream` | live status, as JSON and as Server-Sent Events | token or console session; a public subset with `public_status` |
 //! | `/admin` | the management console | `NUAGE_ADMIN_PASSWORD` |
@@ -323,7 +328,21 @@ impl Server {
     /// A new token for the application `name`, returned once.
     pub fn new_app_token(&self, name: &str) -> Result<String> {
         let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
-        self.state.apps.new_token(&app)
+        self.state.apps.new_token(&app, false)
+    }
+
+    /// A new read-only token for the application `name` (for the JavaScript
+    /// of a website: it reads, never writes), returned once.
+    pub fn new_app_read_token(&self, name: &str) -> Result<String> {
+        let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
+        self.state.apps.new_token(&app, true)
+    }
+
+    /// The websites whose pages may call the application `name` from the
+    /// browser (CORS): `https://site.fr`, `http://localhost:3000`, or `*`.
+    pub fn set_app_origins(&self, name: &str, origins: &[&str]) -> Result<Vec<String>> {
+        let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
+        self.state.apps.set_origins(&app, &origins.join("\n"))
     }
 
     /// Revokes the token `id` of the application `name`.
@@ -440,8 +459,9 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl State {
-    /// The application whose token the request carries.
-    pub(crate) fn app_of(&self, headers: &HeaderMap) -> Option<Arc<apps::App>> {
+    /// The application whose token the request carries, and whether the
+    /// token only reads.
+    pub(crate) fn app_of(&self, headers: &HeaderMap) -> Option<(Arc<apps::App>, bool)> {
         self.apps.authenticate(bearer(headers)?, self.options.token.as_deref())
     }
 }
@@ -485,7 +505,11 @@ async fn handle(state: Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     let started = Instant::now();
     state.metrics.active_requests.fetch_add(1, Ordering::Relaxed);
     let path = req.uri().path().to_owned();
+    let gzip = accepts_gzip(req.headers());
     let mut res = route(&state, req, peer).await;
+    if gzip {
+        res = compress(res).await;
+    }
     state.metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
     // The status stream would count as one never-ending request.
     if path != "/api/status/stream" {
@@ -510,10 +534,18 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
         return admin::route(state, req, peer).await;
     }
     if path.starts_with("/v1/") {
-        return match protocol(state, req).await {
-            Ok(res) => res,
-            Err(e) => error_response(&e),
+        let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        if method == Method::OPTIONS {
+            return preflight(state, origin.as_deref());
+        }
+        let (mut res, allowed) = match protocol(state, req, origin.as_deref()).await {
+            Ok(answer) => answer,
+            Err(e) => (error_response(&e), None),
         };
+        if let Some(origin) = allowed.as_deref().or(origin.as_deref().filter(|o| state.apps.any_allows(o))) {
+            cors_headers(&mut res, origin);
+        }
+        return res;
     }
     if method == Method::GET || method == Method::HEAD {
         if let Some(site) = &state.options.site {
@@ -547,32 +579,141 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     json_response(404, &json!({ "error": { "kind": "not_found", "message": format!("no such page: {path}") } }))
 }
 
+// ---------------------------------------------------------------------------
+// Websites: CORS and compression
+// ---------------------------------------------------------------------------
+
+/// Headers a page may send to `/v1` (those of `memoire_orm::NuageDb`).
+const CORS_HEADERS: &str = "authorization, content-type, accept, nuage-branch, nuage-transaction";
+
+/// The answer to a browser's preflight (`OPTIONS`, no token): yes for an
+/// origin some application lets in, cached by the browser for a day, so a
+/// page pays it once, not before every request.
+fn preflight(state: &State, origin: Option<&str>) -> Response<HttpBody> {
+    let mut res = Response::new(full(""));
+    *res.status_mut() = StatusCode::NO_CONTENT;
+    if let Some(origin) = origin.filter(|o| state.apps.any_allows(o)) {
+        cors_headers(&mut res, origin);
+        let h = res.headers_mut();
+        h.insert("access-control-allow-methods", HeaderValue::from_static("GET, POST, DELETE"));
+        h.insert("access-control-allow-headers", HeaderValue::from_static(CORS_HEADERS));
+        h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+    } else {
+        *res.status_mut() = StatusCode::FORBIDDEN;
+    }
+    res
+}
+
+fn cors_headers(res: &mut Response<HttpBody>, origin: &str) {
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        let h = res.headers_mut();
+        h.insert("access-control-allow-origin", v);
+        h.append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers.get_all(header::ACCEPT_ENCODING).iter().filter_map(|v| v.to_str().ok()).any(|v| {
+        v.split(',').any(|e| {
+            let mut parts = e.split(';');
+            parts.next().is_some_and(|n| n.trim().eq_ignore_ascii_case("gzip"))
+                && !parts.any(|q| q.trim().replace(' ', "") == "q=0")
+        })
+    })
+}
+
+/// JSON answers of 1 KiB or more, gzip-compressed (fast level: rows compress
+/// tenfold, for a fraction of a millisecond). Streams and pages are left as
+/// they are (the site compresses its own files).
+async fn compress(res: Response<HttpBody>) -> Response<HttpBody> {
+    use std::io::Write as _;
+    let json = res.headers().get(header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if !json || res.headers().contains_key(header::CONTENT_ENCODING) {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let Ok(collected) = body.collect().await;
+    let bytes = collected.to_bytes();
+    parts.headers.append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    if bytes.len() < 1024 {
+        return Response::from_parts(parts, full(bytes));
+    }
+    let mut gz = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::fast());
+    match gz.write_all(&bytes).and_then(|()| gz.finish()) {
+        Ok(packed) => {
+            parts.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, full(packed))
+        }
+        Err(_) => Response::from_parts(parts, full(bytes)),
+    }
+}
+
+fn forbidden(message: &str) -> Response<HttpBody> {
+    json_response(403, &json!({ "error": { "kind": "forbidden", "message": message } }))
+}
+
 /// `/v1/*`: the database protocol, on the database of the application the
-/// token opens.
-async fn protocol(state: &Arc<State>, req: Request<Incoming>) -> Result<Response<HttpBody>> {
+/// token opens. Returns the answer, and the origin to let read it (a page of
+/// one of the application's websites).
+async fn protocol(
+    state: &Arc<State>,
+    req: Request<Incoming>,
+    origin: Option<&str>,
+) -> Result<(Response<HttpBody>, Option<String>)> {
     if state.options.token.is_none() && !state.apps.any_token() {
-        return Ok(unauthorized(
-            "the database API is off: create an application in the console (/admin), or set NUAGE_TOKEN",
+        return Ok((
+            unauthorized("the database API is off: create an application in the console (/admin), or set NUAGE_TOKEN"),
+            None,
         ));
     }
-    let Some(app) = state.app_of(req.headers()) else {
-        return Ok(unauthorized("missing or invalid bearer token"));
+    let Some((app, read_only)) = state.app_of(req.headers()) else {
+        return Ok((unauthorized("missing or invalid bearer token"), None));
     };
+    // A page of a website the application does not list: refused (the
+    // browser would not let it read the answer anyway).
+    if let Some(o) = origin
+        && !app.allows_origin(o)
+    {
+        return Ok((
+            forbidden(&format!(
+                "{o} is not one of the websites of application `{}`: add it in the console (Settings)",
+                app.name
+            )),
+            None,
+        ));
+    }
     let started = Instant::now();
     app.touch();
-    let result = app_protocol(state, &app, req).await;
+    let result = app_protocol(state, &app, read_only, req).await;
     let failed = match &result {
         Ok(res) => res.status().is_server_error(),
         Err(e) => wire::error_to_json(e).0 >= 500,
     };
     app.metrics.record(started.elapsed(), failed);
-    result
+    let res = result.unwrap_or_else(|e| error_response(&e));
+    Ok((res, origin.map(str::to_owned)))
 }
 
-async fn app_protocol(state: &Arc<State>, app: &Arc<apps::App>, req: Request<Incoming>) -> Result<Response<HttpBody>> {
+const READ_ONLY: &str = "this token only reads: use a read-write token (from your server, never in a page)";
+
+async fn app_protocol(
+    state: &Arc<State>,
+    app: &Arc<apps::App>,
+    read_only: bool,
+    req: Request<Incoming>,
+) -> Result<Response<HttpBody>> {
     let method = req.method().clone();
     let path = req.uri().path().trim_end_matches('/').to_owned();
     let segments: Vec<&str> = path.trim_start_matches("/v1/").split('/').collect();
+    let writes = match (&method, segments.as_slice()) {
+        (&Method::POST, ["execute" | "transactions" | "branches", ..]) | (&Method::DELETE, _) => true,
+        // A transaction's statements, even its reads: a read-only token opens none.
+        _ => req.headers().contains_key(TRANSACTION_HEADER),
+    };
+    if read_only && writes {
+        return Ok(forbidden(READ_ONLY));
+    }
     let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let branch = header(BRANCH_HEADER).unwrap_or_else(|| MAIN.to_owned());
     let tx_id = header(TRANSACTION_HEADER);
@@ -635,6 +776,9 @@ async fn app_protocol(state: &Arc<State>, app: &Arc<apps::App>, req: Request<Inc
                         ));
                     }
                 };
+                if read_only && !fetch {
+                    return Ok(forbidden(READ_ONLY));
+                }
                 statements.push((fetch, wire::query_from_json(q, &state.schemas)?));
             }
             let db = state.db(engine, &branch)?;
@@ -699,6 +843,37 @@ async fn app_protocol(state: &Arc<State>, app: &Arc<apps::App>, req: Request<Inc
             } else {
                 Err(Error::NotFound)
             }
+        }
+        (Method::POST, ["sql"]) => {
+            let body = read_json(state, req).await?;
+            let sql =
+                body.get("sql").and_then(Json::as_str).ok_or_else(|| Error::Conversion("missing `sql`".into()))?;
+            let params = body.get("params").and_then(Json::as_array).cloned().unwrap_or_default();
+            let db = state.db(engine, &branch)?;
+            let stmt = query::parse_with(sql, &params, &|n: &str| admin::schema_of(state, &db, n))?;
+            if read_only && stmt.writes() {
+                return Ok(forbidden(READ_ONLY));
+            }
+            let (state, engine) = (state.clone(), engine.clone());
+            let outcome = tokio::task::spawn_blocking(move || query::run(&state.schemas, &engine, &branch, &stmt))
+                .await
+                .map_err(|e| Error::Pool(e.to_string()))??;
+            Ok(json_response(
+                200,
+                &match outcome {
+                    query::Outcome::Rows(columns, rows) => {
+                        let rows: Vec<Json> = rows
+                            .iter()
+                            .map(|r| Json::Object(columns.iter().cloned().zip(r.iter().map(query::to_json)).collect()))
+                            .collect();
+                        json!({ "columns": columns, "rows": rows })
+                    }
+                    query::Outcome::Done(r) => json!({
+                        "rows_affected": r.rows_affected,
+                        "last_insert_id": r.last_insert_id.as_ref().map(query::to_json),
+                    }),
+                },
+            ))
         }
         _ => Err(Error::NotFound),
     }

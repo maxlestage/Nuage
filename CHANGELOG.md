@@ -33,6 +33,19 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   each with its requests, latency, tables, rows, size, branches and encryption; `encryption`
   and `applications` at the top; `log` events name their application.
 
+### Websites and speed
+
+- `POST /v1/sql`: SQL from any language or a page (`SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `CREATE TABLE`, `DROP TABLE`), `?` parameters, rows as JSON objects, `last_insert_id`.
+- The websites of an application (console: **Settings → Websites**, `Server::set_app_origins`):
+  their pages call `/v1` from the browser (CORS); the preflight is cached for a day.
+- Read-only tokens for pages (`Server::new_app_read_token`): writes, transactions and branch
+  changes are refused with `403`.
+- JSON answers of 1 KiB or more are gzip-compressed when the client accepts it.
+- `WHERE indexed = ? ORDER BY id [DESC] LIMIT n` (and `LIMIT n` alone) read only the rows they
+  need: a page of 20 rows through an index goes from 1.3 ms to 0.5 ms.
+- `examples/bench.rs`: latency and throughput of a server, from a client on the same machine.
+
 ### Interface
 
 - The console: an **Applications** page (one card each, a form to create one; its token is
