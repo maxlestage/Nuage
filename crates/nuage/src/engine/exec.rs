@@ -25,11 +25,21 @@ use super::wal::Op;
 /// Rows read per step of a table scan.
 pub(crate) const CHUNK: usize = 2048;
 
-/// A stored index: its columns (by name) and whether it is unique.
+/// A stored index: its columns (by name) and whether it is unique. Indexes
+/// are numbered by their place in the list (their keys carry it): a dropped
+/// index stays as a tombstone with no column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IndexMeta {
     pub columns: Vec<String>,
     pub unique: bool,
+    /// The name `CREATE INDEX` gave it.
+    pub name: Option<String>,
+}
+
+impl IndexMeta {
+    pub(crate) fn live(&self) -> bool {
+        !self.columns.is_empty()
+    }
 }
 
 /// A table as the catalog records it.
@@ -53,11 +63,16 @@ impl TableMeta {
         for unique in [true, false] {
             for (i, c) in schema.columns.iter().enumerate() {
                 if i != schema.primary_key && c.unique == unique && (unique || c.indexed) {
-                    indexes.push(IndexMeta { columns: vec![name(i)], unique });
+                    indexes.push(IndexMeta { columns: vec![name(i)], unique, name: None });
                 }
             }
             for ix in schema.indexes.iter().filter(|ix| ix.unique == unique) {
-                indexes.push(IndexMeta { columns: ix.columns.iter().map(|&i| name(i)).collect(), unique });
+                let index_name = (!ix.name.is_empty()).then(|| ix.name.to_owned());
+                indexes.push(IndexMeta {
+                    columns: ix.columns.iter().map(|&i| name(i)).collect(),
+                    unique,
+                    name: index_name,
+                });
             }
         }
         TableMeta {
@@ -74,7 +89,7 @@ impl TableMeta {
             "generation": self.generation,
             "columns": self.columns,
             "pk": self.pk,
-            "indexes": self.indexes.iter().map(|i| json!({ "columns": i.columns, "unique": i.unique })).collect::<Vec<_>>(),
+            "indexes": self.indexes.iter().map(|i| json!({ "columns": i.columns, "unique": i.unique, "name": i.name })).collect::<Vec<_>>(),
             "schema": self.schema,
         })
         .to_string()
@@ -104,6 +119,7 @@ impl TableMeta {
                     Ok(IndexMeta {
                         columns: strings(i.get("columns"))?,
                         unique: i.get("unique").and_then(Json::as_bool).unwrap_or(false),
+                        name: i.get("name").and_then(Json::as_str).map(str::to_owned),
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -424,7 +440,7 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
         .indexes
         .iter()
         .enumerate()
-        .filter(|(_, ix)| ix.columns.iter().all(|c| pins.contains_key(c.as_str())))
+        .filter(|(_, ix)| ix.live() && ix.columns.iter().all(|c| pins.contains_key(c.as_str())))
         .max_by_key(|(_, ix)| ix.columns.len());
     match best {
         Some((i, ix)) => {
@@ -647,6 +663,9 @@ pub(crate) fn fetch_rows(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Vec<Vec
 fn index_entries(meta: &TableMeta, stored: &[Value], pk: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for (i, ix) in meta.indexes.iter().enumerate() {
+        if !ix.live() {
+            continue;
+        }
         let Some(pos) = meta.index_positions(ix) else { continue };
         let values: Vec<&Value> = pos.iter().map(|&p| stored.get(p).unwrap_or(&Value::Null)).collect();
         if values.iter().any(|v| v.is_null()) {
@@ -778,7 +797,7 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
             });
         }
         let stored = to_stored(&meta, &map, row, None);
-        for (i, ix) in meta.indexes.iter().enumerate().filter(|(_, ix)| ix.unique) {
+        for (i, ix) in meta.indexes.iter().enumerate().filter(|(_, ix)| ix.unique && ix.live()) {
             let Some(pos) = meta.index_positions(ix) else { continue };
             let values: Vec<&Value> = pos.iter().map(|&p| &stored[p]).collect();
             if values.iter().any(|v| v.is_null()) {
@@ -852,4 +871,149 @@ fn to_stored(meta: &TableMeta, map: &[Option<usize>], row: &[Value], old: Option
         }
     }
     stored
+}
+
+// ---------------------------------------------------------------------------
+// Schema changes of SQL: indexes and columns on existing tables
+// ---------------------------------------------------------------------------
+
+/// A change to an existing table.
+#[derive(Clone, Debug)]
+pub(crate) enum Alter {
+    /// `CREATE [UNIQUE] INDEX name ON table (columns)`: built from the rows
+    /// already there.
+    AddIndex { table: String, name: String, columns: Vec<String>, unique: bool, if_not_exists: bool },
+    /// `DROP INDEX name`.
+    DropIndex { name: String, if_exists: bool },
+    /// `ALTER TABLE table ADD COLUMN`: `column` as the wire protocol writes a
+    /// column, `fill` the value of the rows already there.
+    AddColumn { table: String, column: Json, fill: Value },
+}
+
+fn index_name_taken(ctx: &mut Ctx<'_>, name: &str) -> Result<Option<(String, usize)>> {
+    for table in ctx.table_names()? {
+        if let Some(meta) = ctx.meta(&table)?
+            && let Some(i) = meta.indexes.iter().position(|ix| ix.live() && ix.name.as_deref() == Some(name))
+        {
+            return Ok(Some((table, i)));
+        }
+    }
+    Ok(None)
+}
+
+/// Every stored row of a table, with its encoded primary key.
+fn all_stored(ctx: &Ctx<'_>, meta: &TableMeta) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let (start, end) = keys::rows_range(meta.generation);
+    let prefix = keys::data_prefix(meta.generation, keys::ROW).len();
+    let mut out = Vec::new();
+    let mut at = start;
+    loop {
+        let (entries, next) = ctx.snap.scan(Some(ctx.overlay), &at, &end, CHUNK)?;
+        for (k, v) in entries {
+            out.push((k[prefix..].to_vec(), keys::decode_row(&v)?));
+        }
+        match next {
+            Some(n) => at = n,
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Applies a schema change.
+pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
+    match change {
+        Alter::AddIndex { table, name, columns, unique, if_not_exists } => {
+            if index_name_taken(ctx, name)?.is_some() {
+                return if *if_not_exists {
+                    Ok(())
+                } else {
+                    Err(Error::Validation(format!("there is already an index named `{name}`")))
+                };
+            }
+            let Some(mut meta) = ctx.meta(table)? else { return Err(Error::NoSuchTable(table.clone())) };
+            for c in columns {
+                if meta.position(c).is_none() {
+                    return Err(Error::Validation(format!("`{table}` has no column `{c}`")));
+                }
+            }
+            let index = IndexMeta { columns: columns.clone(), unique: *unique, name: Some(name.clone()) };
+            let n = meta.indexes.len();
+            if n >= u16::MAX as usize {
+                return Err(Error::Validation(format!("`{table}` has too many indexes")));
+            }
+            let pos = meta.index_positions(&index).unwrap_or_default();
+            let mut seen = std::collections::HashSet::new();
+            for (pk, stored) in all_stored(ctx, &meta)? {
+                let values: Vec<&Value> = pos.iter().map(|&p| stored.get(p).unwrap_or(&Value::Null)).collect();
+                if values.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                let mut k = keys::index_prefix(meta.generation, n as u16, &values);
+                if *unique && !seen.insert(k.clone()) {
+                    return Err(Error::UniqueViolation { table: table.clone(), column: columns.join(", ") });
+                }
+                k.extend_from_slice(&pk);
+                ctx.put(k, Some(Vec::new()));
+            }
+            meta.indexes.push(index);
+            ctx.put_meta(table, &meta);
+            ctx.written.insert(table.clone());
+            Ok(())
+        }
+        Alter::DropIndex { name, if_exists } => {
+            let Some((table, i)) = index_name_taken(ctx, name)? else {
+                return if *if_exists {
+                    Ok(())
+                } else {
+                    Err(Error::Validation(format!("there is no index named `{name}`")))
+                };
+            };
+            let Some(mut meta) = ctx.meta(&table)? else { return Err(Error::NoSuchTable(table)) };
+            let start = keys::index_prefix(meta.generation, i as u16, &[]);
+            let end = keys::prefix_end(&start);
+            let mut at = start.clone();
+            loop {
+                let (entries, next) = ctx.snap.scan(Some(ctx.overlay), &at, &end, CHUNK)?;
+                for (k, _) in entries {
+                    ctx.put(k, None);
+                }
+                match next {
+                    Some(n) => at = n,
+                    None => break,
+                }
+            }
+            // Its number stays taken: later indexes keep theirs.
+            meta.indexes[i] = IndexMeta { columns: Vec::new(), unique: false, name: None };
+            ctx.put_meta(&table, &meta);
+            ctx.written.insert(table);
+            Ok(())
+        }
+        Alter::AddColumn { table, column, fill } => {
+            let Some(mut meta) = ctx.meta(table)? else { return Err(Error::NoSuchTable(table.clone())) };
+            let name = column.get("name").and_then(Json::as_str).unwrap_or_default().to_owned();
+            if meta.position(&name).is_some() {
+                return Err(Error::Validation(format!("`{table}` already has a column `{name}`")));
+            }
+            meta.columns.push(name);
+            if let Some(cols) = meta.schema.get_mut("columns").and_then(Json::as_array_mut) {
+                cols.push(column.clone());
+            }
+            if !fill.is_null() {
+                let width = meta.columns.len();
+                let mut bytes = ctx.table_bytes(&meta)?;
+                for (pk, mut stored) in all_stored(ctx, &meta)? {
+                    let before = keys::encode_row(&stored).len() as i64;
+                    stored.resize(width, Value::Null);
+                    stored[width - 1] = fill.clone();
+                    let encoded = keys::encode_row(&stored);
+                    bytes += encoded.len() as i64 - before;
+                    ctx.put(row_key_raw(meta.generation, &pk), Some(encoded));
+                }
+                ctx.put(keys::bytes_key(meta.generation), Some(keys::encode_i64(bytes.max(0))));
+            }
+            ctx.put_meta(table, &meta);
+            ctx.written.insert(table.clone());
+            Ok(())
+        }
+    }
 }

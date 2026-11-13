@@ -23,7 +23,6 @@ use memoire_orm::ast::SelectAst;
 use memoire_orm::{Error, Order, Query, TableSchema, Value};
 
 use super::apps::App;
-use super::query::{self, Statement};
 use super::{HttpBody, State, full, random_token, read_body, same_secret};
 use crate::embedded::Embedded;
 use crate::engine::MAIN;
@@ -857,7 +856,7 @@ fn query_form(app: &App, csrf: &str, sql: &str, extra: Option<&str>) -> String {
         r#"<form method="post" action="{}/query"><input type="hidden" name="csrf" value="{}">
 <textarea name="sql" spellcheck="false" placeholder="SELECT * FROM users WHERE age >= 18 ORDER BY name LIMIT 20">{}</textarea>
 <p class="row"><button>Run</button></p></form>
-<p class="muted">SELECT, INSERT, UPDATE and DELETE on one table of this application, with WHERE, ORDER BY, LIMIT and OFFSET; CREATE TABLE and DROP TABLE. Statements that change data ask for a confirmation first. Websites send the same SQL to <code>POST /v1/sql</code>.</p>{}"#,
+<p class="muted">SQL: SELECT with joins, subqueries, GROUP BY, UNION, functions; INSERT (ON CONFLICT, RETURNING), UPDATE, DELETE; CREATE TABLE, CREATE INDEX, ALTER TABLE ADD COLUMN, DROP. Several statements separated by <code>;</code> run in one transaction. Changes ask for a confirmation first. Websites send the same SQL to <code>POST /v1/sql</code>.</p>{}"#,
         app_base(&app.name),
         esc(csrf),
         esc(sql),
@@ -1111,10 +1110,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
     let (sql, confirmed, branch, from) = (field("sql"), field("confirm") == "yes", field("name"), field("from"));
     match sub {
         "/query" => {
-            let db = Embedded::from_engine(engine.clone());
-            let lookup = |n: &str| schema_of(state, &db, n);
-            let result = query::parse(&sql, &lookup)
-                .and_then(|stmt| run_statement(state, &app, &db, &stmt, confirmed, csrf, &sql));
+            let result = run_console_sql(&app, state, &sql, confirmed, csrf);
             let (status, extra) = match result {
                 Ok(extra) => (200, extra),
                 Err(e) => (400, note(false, &e.to_string())),
@@ -1199,31 +1195,17 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
     }
 }
 
-/// Runs a console statement: reads at once, writes after a confirmation.
-fn run_statement(
-    state: &State,
-    app: &App,
-    db: &Embedded,
-    stmt: &Statement,
-    confirmed: bool,
-    csrf: &str,
-    sql: &str,
-) -> memoire_orm::Result<String> {
-    if stmt.writes() && !confirmed {
-        let what = match stmt.preview() {
-            Some(preview) => {
-                let n = db
-                    .fetch_rows(Query::Select(&preview))?
-                    .first()
-                    .and_then(|r| r.first())
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                format!("{n} row(s) would be affected")
-            }
-            None => "it will run once confirmed".into(),
-        };
+/// Runs the console's SQL: reads at once; changes are first run without
+/// being kept (a dry run, to say what they would change), then on confirmation.
+fn run_console_sql(app: &App, state: &State, sql: &str, confirmed: bool, csrf: &str) -> memoire_orm::Result<String> {
+    let script = crate::sql::Script::parse(sql)?;
+    let writes = script.writes();
+    let batch = [(script, Vec::new())];
+    if writes && !confirmed {
+        let dry = crate::sql::run(&app.engine, MAIN, &state.schemas, &batch, false)?;
+        let n: u64 = dry.iter().flatten().map(|r| r.rows_affected).sum();
         return Ok(format!(
-            r#"<div class="msg"><p><b>This statement changes data of {app}: {what}.</b></p>
+            r#"<div class="msg"><p><b>This changes data of {app}: {n} row(s) would be affected.</b></p>
 <form method="post" action="{base}/query"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="sql" value="{}"><input type="hidden" name="confirm" value="yes"><button class="danger">Confirm and run</button></form></div>"#,
             esc(csrf),
             esc(sql),
@@ -1231,16 +1213,14 @@ fn run_statement(
             base = app_base(&app.name),
         ));
     }
-    Ok(match query::run(&state.schemas, db.engine(), MAIN, stmt)? {
-        query::Outcome::Rows(headers, rows) => {
-            format!("<p class=\"muted\">{} row(s).</p>{}", rows.len(), table_html(&headers, &rows))
+    let results = crate::sql::run(&app.engine, MAIN, &state.schemas, &batch, true)?;
+    let mut out = String::new();
+    for r in results.iter().flatten() {
+        if r.returns_rows {
+            let _ = write!(out, "<p class=\"muted\">{} row(s).</p>{}", r.rows.len(), table_html(&r.columns, &r.rows));
+        } else {
+            out.push_str(&note(true, &format!("Done: {} row(s) affected.", r.rows_affected)));
         }
-        query::Outcome::Done(r) => match stmt {
-            Statement::Update(_) => note(true, &format!("{} row(s) updated.", r.rows_affected)),
-            Statement::Delete(_) => note(true, &format!("{} row(s) deleted.", r.rows_affected)),
-            Statement::Insert(_) => note(true, &format!("{} row(s) inserted.", r.rows_affected)),
-            Statement::Create(..) => note(true, "Table created."),
-            _ => note(true, "Done."),
-        },
-    })
+    }
+    Ok(out)
 }

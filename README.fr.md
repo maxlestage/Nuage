@@ -144,13 +144,34 @@ Un serveur accueille plusieurs applications, chacune avec sa base :
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` et `apps` font de
 même depuis Rust.
 
+## SQL
+
+Nuage DB parle SQL (`POST /v1/sql`, l'onglet **Query** de la console, `Embedded::sql` en Rust) :
+
+| | |
+|---|---|
+| **Lire** | `SELECT [DISTINCT]`, `JOIN`, `LEFT JOIN`, `CROSS JOIN` (`ON`, `USING`), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST/LAST`, `LIMIT`/`OFFSET`, `UNION [ALL]`, `INTERSECT`, `EXCEPT`, sous-requêtes (`IN`, `EXISTS`, scalaires, corrélées, dans `FROM`) |
+| **Expressions** | `CASE`, `CAST` et `::`, `\|\|`, `+ - * / %`, `LIKE`, `ILIKE`, `BETWEEN`, `IN`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM` |
+| **Fonctions** | `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg`, `array_agg` (avec `DISTINCT`) ; `lower`, `upper`, `length`, `trim`, `substr`, `replace`, `instr`, `lpad`, `concat`, `coalesce`, `nullif`, `iif`, `greatest`, `least`, `abs`, `round`, `floor`, `ceil`, `power`, `sqrt`, `random`, `now`, `current_date`, `date`, `extract`, `strftime`, `json_extract`, `json_object`, `json_array`, `gen_random_uuid`... |
+| **Écrire** | `INSERT ... VALUES / SELECT / DEFAULT VALUES`, `ON CONFLICT ... DO NOTHING / DO UPDATE SET ... excluded.x`, `INSERT OR IGNORE`, `REPLACE INTO`, `ON DUPLICATE KEY UPDATE`, `UPDATE ... SET col = <expression>`, `DELETE`, `RETURNING` |
+| **Schéma** | `CREATE TABLE [IF NOT EXISTS]` (types de PostgreSQL, MySQL et SQLite ; `PRIMARY KEY`, `SERIAL`/`AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `REFERENCES`, `UNIQUE (a, b)`), `CREATE TABLE ... AS SELECT`, `CREATE [UNIQUE] INDEX` (construit sur les lignes déjà là), `DROP INDEX`, `ALTER TABLE ... ADD COLUMN`, `DROP TABLE`, `EXPLAIN` |
+
+Une requête que les instructions de Memoire savent exprimer s'exécute comme l'une d'elles, par
+les index, en s'arrêtant à la fin de la page ; le reste (fonctions, `CASE`, sous-requêtes,
+`UNION`) est calculé par la couche SQL sur les lignes trouvées par les index, avec des
+jointures par hachage. Absents : jointures `RIGHT`/`FULL`, `WITH`, fonctions de fenêtre, vues,
+déclencheurs, clé primaire sur plusieurs colonnes, changement de clé primaire. Une table créée
+sans clé primaire reçoit une colonne `rowid`.
+
 ## Sites web
 
 Tout site peut utiliser la base d'une application, depuis son serveur ou depuis ses pages :
 
-- **`POST /v1/sql`**, depuis n'importe quel langage : `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
-  `CREATE TABLE`, `DROP TABLE`, avec des paramètres `?` (des valeurs, jamais du SQL : pas
-  d'injection). Les lignes reviennent en objets JSON, un insert renvoie son `last_insert_id`.
+- **`POST /v1/sql`**, depuis n'importe quel langage : du SQL complet, paramètres `?` (ou
+  `$1`), des valeurs jamais lues comme du SQL (pas d'injection). Les lignes reviennent en
+  objets JSON (`"arrays": true` pour des tableaux), un insert renvoie son `last_insert_id`.
+  Plusieurs instructions (séparées par `;`, ou `"statements": [...]`) forment une seule
+  transaction, tout ou rien.
 - **Depuis le navigateur** : ajoutez le site dans la console (**Settings → Websites** :
   `https://site.fr`, `http://localhost:3000`, ou `*`) et ses pages peuvent appeler `/v1`
   (CORS). La requête préalable du navigateur est mise en cache un jour : un aller-retour, une

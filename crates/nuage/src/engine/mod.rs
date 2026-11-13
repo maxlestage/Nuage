@@ -196,6 +196,8 @@ pub struct Engine {
     started_at: SystemTime,
     stop: AtomicBool,
     events_seq: AtomicU64,
+    /// Table schemas read by SQL, made `'static` once.
+    pub(crate) schemas: memoire_orm::nuage::wire::SchemaCache,
     /// `key` or `passphrase` when the data is encrypted.
     encryption: Option<&'static str>,
 }
@@ -239,6 +241,7 @@ impl Engine {
             started_at: SystemTime::now(),
             stop: AtomicBool::new(false),
             events_seq: AtomicU64::new(0),
+            schemas: memoire_orm::nuage::wire::SchemaCache::default(),
             encryption,
         });
         if restored {

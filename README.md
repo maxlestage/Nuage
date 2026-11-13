@@ -141,13 +141,32 @@ One server holds several applications, each with a database of its own:
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` and `apps` do the
 same from Rust.
 
+## SQL
+
+Nuage DB speaks SQL (`POST /v1/sql`, the console's **Query** tab, `Embedded::sql` in Rust):
+
+| | |
+|---|---|
+| **Reading** | `SELECT [DISTINCT]`, `JOIN`, `LEFT JOIN`, `CROSS JOIN` (`ON`, `USING`), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST/LAST`, `LIMIT`/`OFFSET`, `UNION [ALL]`, `INTERSECT`, `EXCEPT`, subqueries (`IN`, `EXISTS`, scalar, correlated, in `FROM`) |
+| **Expressions** | `CASE`, `CAST` and `::`, `\|\|`, `+ - * / %`, `LIKE`, `ILIKE`, `BETWEEN`, `IN`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM` |
+| **Functions** | `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg`, `array_agg` (with `DISTINCT`); `lower`, `upper`, `length`, `trim`, `substr`, `replace`, `instr`, `lpad`, `concat`, `coalesce`, `nullif`, `iif`, `greatest`, `least`, `abs`, `round`, `floor`, `ceil`, `power`, `sqrt`, `random`, `now`, `current_date`, `date`, `extract`, `strftime`, `json_extract`, `json_object`, `json_array`, `gen_random_uuid`... |
+| **Writing** | `INSERT ... VALUES / SELECT / DEFAULT VALUES`, `ON CONFLICT ... DO NOTHING / DO UPDATE SET ... excluded.x`, `INSERT OR IGNORE`, `REPLACE INTO`, `ON DUPLICATE KEY UPDATE`, `UPDATE ... SET col = <expression>`, `DELETE`, `RETURNING` |
+| **Schema** | `CREATE TABLE [IF NOT EXISTS]` (types of PostgreSQL, MySQL and SQLite; `PRIMARY KEY`, `SERIAL`/`AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `REFERENCES`, `UNIQUE (a, b)`), `CREATE TABLE ... AS SELECT`, `CREATE [UNIQUE] INDEX` (built from the rows there), `DROP INDEX`, `ALTER TABLE ... ADD COLUMN`, `DROP TABLE`, `EXPLAIN` |
+
+A query Memoire's statements can express runs as one of them, through the indexes and stopping
+at the end of the page; the rest (functions, `CASE`, subqueries, `UNION`) is computed by the
+SQL layer on the rows the indexes found, with hash joins. Not there: `RIGHT`/`FULL` joins,
+`WITH`, window functions, views, triggers, a primary key of several columns, changing a primary
+key. A table created without a primary key gets a `rowid` column.
+
 ## Websites
 
 Any website can use an application's database, from its server or from its pages:
 
-- **`POST /v1/sql`**, from any language: `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
-  `CREATE TABLE`, `DROP TABLE`, with `?` parameters (values, never SQL: no injection).
-  Rows come back as JSON objects, an insert gives its `last_insert_id`.
+- **`POST /v1/sql`**, from any language: full SQL with `?` (or `$1`) parameters, values
+  never parsed as SQL (no injection). Rows come back as JSON objects (`"arrays": true` for
+  arrays), an insert gives its `last_insert_id`. Several statements (separated by `;`, or
+  `"statements": [...]`) run in one transaction, all or nothing.
 - **From the browser**: list the website in the console (**Settings → Websites**:
   `https://site.fr`, `http://localhost:3000`, or `*`) and its pages may call `/v1` (CORS).
   The browser's preflight is cached for a day, so it costs one round trip, once.

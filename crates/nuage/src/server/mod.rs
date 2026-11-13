@@ -16,7 +16,6 @@
 
 mod admin;
 pub(crate) mod apps;
-pub(crate) mod query;
 mod status;
 
 use std::collections::HashMap;
@@ -846,37 +845,75 @@ async fn app_protocol(
         }
         (Method::POST, ["sql"]) => {
             let body = read_json(state, req).await?;
-            let sql =
-                body.get("sql").and_then(Json::as_str).ok_or_else(|| Error::Conversion("missing `sql`".into()))?;
-            let params = body.get("params").and_then(Json::as_array).cloned().unwrap_or_default();
-            let db = state.db(engine, &branch)?;
-            let stmt = query::parse_with(sql, &params, &|n: &str| admin::schema_of(state, &db, n))?;
-            if read_only && stmt.writes() {
+            // `{"sql", "params"}`, or `{"statements": [{"sql", "params"}, ...]}`:
+            // one transaction either way.
+            let mut batch = Vec::new();
+            let several = match body.get("statements").and_then(Json::as_array) {
+                Some(list) => {
+                    for s in list {
+                        batch.push(script_of(s)?);
+                    }
+                    true
+                }
+                None => {
+                    let (script, params) = script_of(&body)?;
+                    let several = script.len() > 1;
+                    batch.push((script, params));
+                    several
+                }
+            };
+            if read_only && batch.iter().any(|(s, _)| s.writes()) {
                 return Ok(forbidden(READ_ONLY));
             }
-            let (state, engine) = (state.clone(), engine.clone());
-            let outcome = tokio::task::spawn_blocking(move || query::run(&state.schemas, &engine, &branch, &stmt))
-                .await
-                .map_err(|e| Error::Pool(e.to_string()))??;
-            Ok(json_response(
-                200,
-                &match outcome {
-                    query::Outcome::Rows(columns, rows) => {
-                        let rows: Vec<Json> = rows
-                            .iter()
-                            .map(|r| Json::Object(columns.iter().cloned().zip(r.iter().map(query::to_json)).collect()))
-                            .collect();
-                        json!({ "columns": columns, "rows": rows })
-                    }
-                    query::Outcome::Done(r) => json!({
-                        "rows_affected": r.rows_affected,
-                        "last_insert_id": r.last_insert_id.as_ref().map(query::to_json),
-                    }),
-                },
-            ))
+            let arrays = body.get("arrays").and_then(Json::as_bool).unwrap_or(false);
+            let engine = engine.clone();
+            let schemas = state.clone();
+            let results =
+                tokio::task::spawn_blocking(move || crate::sql::run(&engine, &branch, &schemas.schemas, &batch, true))
+                    .await
+                    .map_err(|e| Error::Pool(e.to_string()))??;
+            let mut all: Vec<Json> = results.into_iter().flatten().map(|r| sql_json(&r, arrays)).collect();
+            Ok(json_response(200, &if several || all.len() != 1 { json!({ "results": all }) } else { all.remove(0) }))
         }
         _ => Err(Error::NotFound),
     }
+}
+
+/// A script of a `/v1/sql` request: `{"sql": "...", "params": [...]}`.
+fn script_of(j: &Json) -> Result<(crate::sql::Script, Vec<Json>)> {
+    let sql = j.get("sql").and_then(Json::as_str).ok_or_else(|| Error::Conversion("missing `sql`".into()))?;
+    let params = match j.get("params") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Array(list)) => list.clone(),
+        Some(_) => return Err(Error::Conversion("`params` is a list of values".into())),
+    };
+    Ok((crate::sql::Script::parse(sql)?, params))
+}
+
+/// A statement's result as `/v1/sql` answers it: rows as objects (or arrays).
+fn sql_json(r: &crate::sql::SqlResult, arrays: bool) -> Json {
+    use crate::sql::value_to_json as val;
+    let mut out = serde_json::Map::new();
+    if r.returns_rows {
+        out.insert("columns".into(), json!(r.columns));
+        let rows: Vec<Json> = r
+            .rows
+            .iter()
+            .map(|row| {
+                if arrays {
+                    Json::Array(row.iter().map(val).collect())
+                } else {
+                    Json::Object(r.columns.iter().cloned().zip(row.iter().map(val)).collect())
+                }
+            })
+            .collect();
+        out.insert("rows".into(), Json::Array(rows));
+    }
+    if !r.returns_rows || r.rows_affected > 0 {
+        out.insert("rows_affected".into(), json!(r.rows_affected));
+        out.insert("last_insert_id".into(), r.last_insert_id.as_ref().map_or(Json::Null, val));
+    }
+    Json::Object(out)
 }
 
 fn check_branch(engine: &Engine, branch: &str) -> Result<()> {
