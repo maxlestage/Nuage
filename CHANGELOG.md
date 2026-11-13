@@ -45,6 +45,8 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - `WHERE indexed = ? ORDER BY id [DESC] LIMIT n` (and `LIMIT n` alone) read only the rows they
   need: a page of 20 rows through an index goes from 1.3 ms to 0.5 ms.
 - `examples/bench.rs`: latency and throughput of a server, from a client on the same machine.
+- `NUAGE_KEEP_AWAKE_URL` (`_MINUTES`, `_HOURS`): the server requests its own address so a host
+  that puts idle servers to sleep (Heroku Eco) keeps it awake, always or in given hours.
 
 ### Interface
 

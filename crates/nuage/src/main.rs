@@ -84,7 +84,15 @@ fn main() -> ExitCode {
             }
         };
         log(&format!("listening on {}", running.local_addr()));
+        let keep_awake = config.keep_awake.map(|k| {
+            let hours = k.hours.map_or("always".to_owned(), |(a, b)| format!("from {a}:00 to {b}:00 UTC"));
+            log(&format!("keep-awake: {} every {} min, {hours}", k.url, k.every.as_secs() / 60));
+            tokio::spawn(k.run(log))
+        });
         shutdown_signal().await;
+        if let Some(task) = keep_awake {
+            task.abort();
+        }
         log("stopping: last checkpoint and backup");
         running.shutdown().await;
         let _ = tokio::task::spawn_blocking(move || {
