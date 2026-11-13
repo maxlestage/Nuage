@@ -1051,3 +1051,96 @@ async fn websites() {
     assert_eq!(res.status, 403);
     running.shutdown().await;
 }
+
+/// The console in French and Spanish: every page, form and message (a text
+/// without its translation stops a debug build: an error page here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn console_in_three_languages() {
+    let server = Server::new(engine("langs"), options());
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let (_, token) = server.create_app("shop", "La boutique").unwrap();
+    let shop = NuageDb::connect(&running.url(), &token).await.unwrap();
+    shop.create_table::<common::User>().await.unwrap();
+    common::user("ada@x.dev", "Ada", Some(36), 1.0).insert(&shop).await.unwrap();
+
+    // The browser's language, before any choice.
+    let page = http(addr, "GET", "/admin/login", &[("accept-language", "es-ES,es;q=0.9,en;q=0.5")], "").await;
+    assert!(page.body.contains(r#"<html lang="es">"#) && page.body.contains("Contraseña"), "{}", page.body);
+
+    for (code, words) in [
+        ("fr", ["Applications", "Nouvelle application", "Jetons", "Réglages", "Sites web"]),
+        ("es", ["Aplicaciones", "Nueva aplicación", "Tokens", "Ajustes", "Sitios web"]),
+    ] {
+        let mut c = Console { addr, cookies: HashMap::new() };
+        // `?lang=` sets the language, for every page after.
+        let res = c.request("GET", &format!("/admin/login?lang={code}"), &[]).await;
+        assert_eq!(res.status, 303);
+        let set = res.headers["set-cookie"].to_str().unwrap();
+        assert!(set.starts_with(&format!("nuage_lang={code}")), "{set}");
+        c.cookies.insert("nuage_lang".into(), code.into());
+        let login = c.request("GET", "/admin/login", &[]).await;
+        assert!(login.body.contains(&format!(r#"<html lang="{code}">"#)));
+        c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+        let list = c.request("GET", "/admin", &[]).await;
+        let token = csrf(&list.body);
+        let mut all = list.body.clone();
+        for path in [
+            "/admin/server",
+            "/admin/apps/shop",
+            "/admin/apps/shop/tables",
+            "/admin/apps/shop/tables/users",
+            "/admin/apps/shop/query",
+            "/admin/apps/shop/branches",
+            "/admin/apps/shop/storage",
+            "/admin/apps/shop/tokens",
+            "/admin/apps/shop/settings",
+            "/admin/apps/nuage/settings",
+            "/admin/apps/nowhere",
+        ] {
+            let res = c.request("GET", path, &[]).await;
+            assert!(res.status < 500, "{code} {path}: {}", res.body);
+            all.push_str(&res.body);
+        }
+        let f = |extra: &[(&'static str, &'static str)]| {
+            let mut v = vec![("csrf", token.as_str())];
+            v.extend_from_slice(extra);
+            v
+        };
+        for (path, form) in [
+            ("/admin/apps", f(&[("name", "blog"), ("description", "")])),
+            ("/admin/apps", f(&[("name", "Bad Name")])),
+            ("/admin/apps/shop/query", f(&[("sql", "SELECT name FROM users")])),
+            ("/admin/apps/shop/query", f(&[("sql", "DELETE FROM users WHERE age > 100")])),
+            ("/admin/apps/shop/query", f(&[("sql", "DELETE FROM users WHERE age > 100"), ("confirm", "yes")])),
+            ("/admin/apps/shop/query", f(&[("sql", "SELECT nope")])),
+            ("/admin/apps/shop/branches", f(&[("name", "preview"), ("from", "")])),
+            ("/admin/apps/shop/branches/preview/reset", f(&[])),
+            ("/admin/apps/shop/branches/preview/delete", f(&[])),
+            ("/admin/apps/shop/branches/nope/delete", f(&[])),
+            ("/admin/apps/shop/storage/checkpoint", f(&[])),
+            ("/admin/apps/shop/storage/integrity", f(&[])),
+            ("/admin/apps/shop/storage/compact", f(&[])),
+            ("/admin/apps/shop/storage/backup", f(&[])),
+            ("/admin/apps/shop/tokens", f(&[("scope", "read")])),
+            ("/admin/apps/shop/tokens/zzzz/revoke", f(&[])),
+            ("/admin/apps/shop/origins", f(&[("origins", "https://shop.example")])),
+            ("/admin/apps/shop/origins", f(&[("origins", "")])),
+            ("/admin/apps/shop/description", f(&[("description", "Boutique")])),
+            ("/admin/apps/blog/delete", f(&[("confirm", "no")])),
+            ("/admin/apps/blog/delete", f(&[("confirm", "blog")])),
+        ] {
+            let res = c.request("POST", path, &form).await;
+            assert!(res.status < 500, "{code} POST {path}: {}", res.body);
+            all.push_str(&res.body);
+        }
+        for w in words {
+            assert!(all.contains(w), "{code}: {w}");
+        }
+        for english in ["Log out", "New application", "Size on disk", "Save the websites", "Checkpoint now"] {
+            assert!(!all.contains(english), "{code}: `{english}` left in English");
+        }
+        c.request("POST", "/admin/logout", &[("csrf", &token)]).await;
+    }
+    running.shutdown().await;
+}

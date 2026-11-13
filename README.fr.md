@@ -297,7 +297,7 @@ de la console est `Secure`.
   **Se connecter** passe par `/admin?next=/fr/app/` et revient au tableau de bord. Avec
   `NUAGE_PUBLIC_STATUS=true`, les visiteurs voient la partie publique. Il s'installe comme une
   application (PWA) et montre le dernier état connu hors ligne.
-- **`/admin`**, la console : les applications (des cartes ; en créer une, son jeton s'affiche une fois), puis pour chacune sa vue d'ensemble, ses tables et leurs lignes, ses jetons (nouveau, révocation), ses réglages (description, suppression confirmée par son nom), une console de requêtes (un
+- **`/admin`**, la console (en français, anglais et espagnol : la langue du navigateur, ou les liens EN · FR · ES de chaque page) : les applications (des cartes ; en créer une, son jeton s'affiche une fois), puis pour chacune sa vue d'ensemble, ses tables et leurs lignes, ses jetons (nouveau, révocation), ses réglages (description, suppression confirmée par son nom), une console de requêtes (un
   petit sous-ensemble de SQL, avec confirmation avant les modifications), branches, stockage
   et boutons pour un checkpoint, une sauvegarde, une vérification d'intégrité et un
   compactage. Rendue par le serveur, elle fonctionne sans JavaScript, sur téléphone aussi.

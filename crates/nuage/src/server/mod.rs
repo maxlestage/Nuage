@@ -16,6 +16,7 @@
 
 mod admin;
 pub(crate) mod apps;
+mod i18n;
 mod status;
 
 use std::collections::HashMap;
@@ -572,7 +573,7 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
             }
         }
         if path == "/" {
-            return admin::home_page(state);
+            return admin::home_page(state, req.headers());
         }
     }
     json_response(404, &json!({ "error": { "kind": "not_found", "message": format!("no such page: {path}") } }))

@@ -33,6 +33,12 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   each with its requests, latency, tables, rows, size, branches and encryption; `encryption`
   and `applications` at the top; `log` events name their application.
 
+### Console in three languages
+
+- The console (`/admin`) in English, French and Spanish: the browser's language
+  (`Accept-Language`), or the EN · FR · ES links of every page (a cookie); decimal commas in
+  French and Spanish. A text without its translation stops debug builds and the tests.
+
 ### SQL
 
 - Full SQL (`POST /v1/sql`, the console's Query tab, `Embedded::sql`): `SELECT` with joins

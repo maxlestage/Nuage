@@ -292,7 +292,7 @@ la consola es `Secure`.
   **Iniciar sesión** pasa por `/admin?next=/es/app/` y vuelve al panel. Con
   `NUAGE_PUBLIC_STATUS=true`, los visitantes ven la parte pública. Se instala como una
   aplicación (PWA) y muestra el último estado conocido sin conexión.
-- **`/admin`**, la consola: las aplicaciones (tarjetas; crear una, su token se muestra una vez), y para cada una su vista general, sus tablas y sus filas, sus tokens (nuevo, revocar), sus ajustes (descripción, borrado confirmado con su nombre), consola de consultas (un
+- **`/admin`**, la consola (en español, inglés y francés: el idioma del navegador, o los enlaces EN · FR · ES de cada página): las aplicaciones (tarjetas; crear una, su token se muestra una vez), y para cada una su vista general, sus tablas y sus filas, sus tokens (nuevo, revocar), sus ajustes (descripción, borrado confirmado con su nombre), consola de consultas (un
   pequeño subconjunto de SQL, con confirmación antes de los cambios), ramas, almacenamiento y
   botones para un checkpoint, una copia de seguridad, una comprobación de integridad y una
   compactación. Renderizada por el servidor, funciona sin JavaScript, también en el móvil.

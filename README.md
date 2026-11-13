@@ -289,7 +289,7 @@ A commented example: [`nuage.env.example`](nuage.env.example). Serve the server 
   link goes through `/admin?next=/en/app/` and comes back to the dashboard. With
   `NUAGE_PUBLIC_STATUS=true`, visitors see the public subset. It installs as an app (PWA) and
   shows the last known state offline.
-- **`/admin`**, the console: the applications (cards; create one, its token is shown once), then for each one its overview, tables and their rows, its tokens (new, revoke), its settings (description, deletion confirmed by its name), a query console (a small subset
+- **`/admin`**, the console (in English, French and Spanish: the browser's language, or the EN · FR · ES links of every page): the applications (cards; create one, its token is shown once), then for each one its overview, tables and their rows, its tokens (new, revoke), its settings (description, deletion confirmed by its name), a query console (a small subset
   of SQL, with a confirmation before changes), branches, storage and buttons for a
   checkpoint, a backup, an integrity check and a compaction. Rendered by the server, it works
   without JavaScript, on a phone too. `HttpOnly`, `Secure`, `SameSite=Strict` session cookie,
