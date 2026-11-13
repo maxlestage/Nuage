@@ -122,6 +122,21 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Wrong password.", "Mot de passe incorrect.", "Contraseña incorrecta."),
     (
+        "Set <code>NUAGE_PG_PORT=5432</code> and every language's PostgreSQL driver connects too (psql, psycopg, JDBC, node-postgres, pgx, Npgsql, PDO, the pg gem...).",
+        "Avec <code>NUAGE_PG_PORT=5432</code>, le pilote PostgreSQL de chaque langage se connecte aussi (psql, psycopg, JDBC, node-postgres, pgx, Npgsql, PDO, le gem pg...).",
+        "Con <code>NUAGE_PG_PORT=5432</code>, el driver PostgreSQL de cada lenguaje se conecta también (psql, psycopg, JDBC, node-postgres, pgx, Npgsql, PDO, la gema pg...).",
+    ),
+    (
+        "Every language's PostgreSQL driver, ORM and tool connects: any user name, a token of this application as the password. The database name picks a branch.",
+        "Le pilote PostgreSQL, l'ORM et l'outil de chaque langage se connectent : un nom d'utilisateur quelconque, un jeton de cette application comme mot de passe. Le nom de base choisit une branche.",
+        "El driver PostgreSQL, el ORM y la herramienta de cada lenguaje se conectan: cualquier nombre de usuario, un token de esta aplicación como contraseña. El nombre de la base elige una rama.",
+    ),
+    (
+        "Without TLS the token travels in clear: set NUAGE_TLS_CERT and NUAGE_TLS_KEY (the installer does it with a domain name).",
+        "Sans TLS le jeton circule en clair : définissez NUAGE_TLS_CERT et NUAGE_TLS_KEY (l'installateur le fait avec un nom de domaine).",
+        "Sin TLS el token viaja sin cifrar: define NUAGE_TLS_CERT y NUAGE_TLS_KEY (el instalador lo hace con un nombre de dominio).",
+    ),
+    (
         r#"Complete examples (also TypeScript, Perl and C), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
         r#"Des exemples complets (aussi TypeScript, Perl et C), testés sur un vrai serveur : <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Pour générer un client dans un autre langage : <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
         r#"Ejemplos completos (también TypeScript, Perl y C), probados contra un servidor real: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Para generar un cliente en otro lenguaje: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,

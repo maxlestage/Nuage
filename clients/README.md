@@ -1,5 +1,10 @@
 # Nuage DB from any language
 
+Two ways, both tested in CI: SQL over HTTP (below), and PostgreSQL's protocol: every
+language's PostgreSQL driver, ORM and tool connects with a token as its password, examples in
+[`postgres/`](postgres) (psql, psycopg, SQLAlchemy, node-postgres, Postgres.js, pgx,
+database/sql, JDBC, PDO, the pg gem, tokio-postgres, Npgsql).
+
 Nuage DB speaks SQL over HTTP: one `POST /v1/sql` with JSON in, JSON out. Any language that
 can send an HTTP request uses it, with nothing to install. Each file here is a complete
 program, with a small `sql(query, params)` function to copy into your code:

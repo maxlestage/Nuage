@@ -167,7 +167,32 @@ lo usan, sin instalar nada. [`clients/`](clients) tiene un ejemplo completo, pro
 servidor real en CI, para curl, JavaScript, TypeScript, Python, PHP, Go, Ruby, Java, Kotlin,
 C#, Swift, Dart (Flutter), Elixir, Rust, C y Perl; la consola muestra la misma petición en cada lenguaje con la dirección del servidor.
 Cada servidor describe su API en `/v1/openapi.json` (OpenAPI 3.1) para generar un cliente en
-cualquier otro lenguaje. Rust tiene además el cliente nativo, `NuageDb`.
+cualquier otro lenguaje. Rust tiene además el cliente nativo, `NuageDb`. Y
+cada driver PostgreSQL se conecta también: ver abajo.
+
+## Protocolo PostgreSQL
+
+Nuage DB habla también el protocolo de PostgreSQL (`NUAGE_PG_PORT=5432`; el instalador y
+Docker lo activan): **el driver PostgreSQL, el ORM y la herramienta de cada lenguaje se
+conectan tal cual**, con cualquier nombre de usuario y **un token de aplicación como
+contraseña**; el nombre de la base elige una rama (el nombre de la aplicación, o `main`: la
+principal).
+
+```bash
+PGPASSWORD=<token> psql "host=db.example.com port=5432 user=app dbname=nuage sslmode=require"
+# postgresql://app:<token>@db.example.com:5432/nuage?sslmode=require
+```
+
+Probado en CI con psql, psycopg 2 y 3, SQLAlchemy, node-postgres, Postgres.js, pgx,
+database/sql de Go, JDBC, PDO, la gema pg, tokio-postgres y Npgsql: ejemplos en
+[`clients/postgres/`](clients/postgres). Sentencias preparadas, parámetros `$1` (su tipo
+viene de las columnas con las que se encuentran), valores en texto y binario, `BEGIN` ...
+`COMMIT` entre mensajes, savepoints, códigos de error de PostgreSQL (`40001` en un conflicto
+de escritura: vuelve a ejecutar la transacción). TLS con `NUAGE_TLS_CERT` y `NUAGE_TLS_KEY`
+(el instalador usa el certificado del dominio). El SQL es el de Nuage DB (arriba); los
+catálogos del sistema (`pg_catalog`) no están: las herramientas que los recorren (pgAdmin)
+muestran poco, y Npgsql lleva `Server Compatibility Mode=NoTypeLoading`. Heroku solo
+enruta HTTP: allí, usa `/v1/sql`.
 
 ## Sitios web
 
@@ -301,6 +326,9 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | Variable | Función | Por defecto |
 |---|---|---|
 | `PORT` | puerto de escucha (lo fija Heroku y la mayoría de alojamientos) | `8080` |
+| `NUAGE_PG_PORT` | sirve también el protocolo PostgreSQL en este puerto (`5432`): el driver PostgreSQL de cada lenguaje, un token como contraseña | apagado |
+| `NUAGE_PG_BIND` | su dirección, cuando el sitio queda detrás de un proxy en `127.0.0.1` | `NUAGE_BIND` |
+| `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | archivos PEM de un certificado y su clave: TLS para el protocolo PostgreSQL | ninguno |
 | `NUAGE_BIND` | dirección de escucha (`127.0.0.1`: solo esta máquina, detrás de un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | directorio de datos | `nuage-data` |
 | `NUAGE_NAME` | nombre de la primera aplicación (y de su base) | `nuage` |

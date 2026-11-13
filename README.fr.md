@@ -169,7 +169,32 @@ langages s'en servent, sans rien installer. [`clients/`](clients) contient un ex
 testé sur un vrai serveur en CI, pour curl, JavaScript, TypeScript, Python, PHP, Go, Ruby,
 Java, Kotlin, C#, Swift, Dart (Flutter), Elixir, Rust, C et Perl ; la console montre la même requête dans chaque langage avec l'adresse du
 serveur. Chaque serveur décrit son API à `/v1/openapi.json` (OpenAPI 3.1) pour générer un
-client dans n'importe quel autre langage. Rust a aussi le client natif, `NuageDb`.
+client dans n'importe quel autre langage. Rust a aussi le client natif, `NuageDb`. Et
+chaque pilote PostgreSQL se connecte aussi : voir plus bas.
+
+## Protocole PostgreSQL
+
+Nuage DB parle aussi le protocole de PostgreSQL (`NUAGE_PG_PORT=5432` ; l'installateur et
+Docker l'activent) : **le pilote PostgreSQL, l'ORM et l'outil de chaque langage s'y
+connectent tels quels**, avec un nom d'utilisateur quelconque et **un jeton d'application
+comme mot de passe** ; le nom de base choisit une branche (le nom de l'application, ou `main` :
+la principale).
+
+```bash
+PGPASSWORD=<jeton> psql "host=db.example.com port=5432 user=app dbname=nuage sslmode=require"
+# postgresql://app:<jeton>@db.example.com:5432/nuage?sslmode=require
+```
+
+Testé en CI avec psql, psycopg 2 et 3, SQLAlchemy, node-postgres, Postgres.js, pgx,
+database/sql de Go, JDBC, PDO, le gem pg, tokio-postgres et Npgsql : exemples dans
+[`clients/postgres/`](clients/postgres). Requêtes préparées, paramètres `$1` (leur type vient
+des colonnes qu'ils rencontrent), valeurs texte et binaires, `BEGIN` ... `COMMIT` d'un
+message à l'autre, savepoints, codes d'erreur de PostgreSQL (`40001` sur un conflit
+d'écriture : relancez la transaction). TLS avec `NUAGE_TLS_CERT` et `NUAGE_TLS_KEY`
+(l'installateur prend le certificat du domaine). Le SQL est celui de Nuage DB (ci-dessus) ;
+les catalogues système (`pg_catalog`) n'y sont pas : les outils qui les parcourent (pgAdmin)
+montrent peu de chose, et Npgsql prend `Server Compatibility Mode=NoTypeLoading`. Heroku ne
+route que le HTTP : là, utilisez `/v1/sql`.
 
 ## Sites web
 
@@ -306,6 +331,9 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | Variable | Rôle | Par défaut |
 |---|---|---|
 | `PORT` | port d'écoute (fixé par Heroku et la plupart des hébergeurs) | `8080` |
+| `NUAGE_PG_PORT` | sert aussi le protocole PostgreSQL sur ce port (`5432`) : le pilote PostgreSQL de chaque langage, un jeton comme mot de passe | désactivé |
+| `NUAGE_PG_BIND` | son adresse, quand le site reste derrière un proxy sur `127.0.0.1` | `NUAGE_BIND` |
+| `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | fichiers PEM d'un certificat et de sa clé : TLS pour le protocole PostgreSQL | aucun |
 | `NUAGE_BIND` | adresse d'écoute (`127.0.0.1` : cette machine seulement, derrière un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | répertoire de données | `nuage-data` |
 | `NUAGE_NAME` | nom de la première application (et de sa base) | `nuage` |

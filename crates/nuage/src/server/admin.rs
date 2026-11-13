@@ -687,6 +687,34 @@ NUAGE_TOKEN={token}</code></pre>
     )
 }
 
+/// How to connect with a PostgreSQL driver, when the server speaks it.
+fn postgres_help(cx: &Cx, origin: &str, app: &App, pg: Option<(u16, bool)>) -> String {
+    let Some((port, tls)) = pg else {
+        return format!(
+            "<h2>PostgreSQL</h2><p class=\"muted\">{}</p>",
+            cx.t("Set <code>NUAGE_PG_PORT=5432</code> and every language's PostgreSQL driver connects too (psql, psycopg, JDBC, node-postgres, pgx, Npgsql, PDO, the pg gem...).")
+        );
+    };
+    let host = origin.split("://").nth(1).unwrap_or(origin).split(['/', ':']).next().unwrap_or("localhost");
+    let host = if host.starts_with('[') { "localhost" } else { host };
+    let ssl = if tls { "?sslmode=require" } else { "" };
+    format!(
+        r#"<h2>PostgreSQL</h2><p class="muted">{about}</p>
+<pre><code>postgresql://app:&lt;{a_token}&gt;@{h}:{port}/{db}{ssl}</code></pre>
+<pre><code>PGPASSWORD=&lt;{a_token}&gt; psql "host={h} port={port} user=app dbname={db}{ssl_kv}"</code></pre>{clear}"#,
+        about = cx.t("Every language's PostgreSQL driver, ORM and tool connects: any user name, a token of this application as the password. The database name picks a branch."),
+        a_token = cx.t("a token of this application"),
+        h = esc(host),
+        db = esc(&app.name),
+        ssl_kv = if tls { " sslmode=require" } else { "" },
+        clear = if tls {
+            String::new()
+        } else {
+            format!(r#"<p class="muted">{}</p>"#, cx.t("Without TLS the token travels in clear: set NUAGE_TLS_CERT and NUAGE_TLS_KEY (the installer does it with a domain name)."))
+        },
+    )
+}
+
 fn connect_help(cx: &Cx, origin: &str, app: &App) -> String {
     let sites = app.origins();
     let sites = if sites.is_empty() {
@@ -998,6 +1026,7 @@ fn app_overview(state: &State, cx: &Cx, app: &App, origin: &str) -> String {
     }
     body.push_str("</div>");
     body.push_str(&connect_help(cx, origin, app));
+    body.push_str(&postgres_help(cx, origin, app, state.options.pg_port.map(|p| (p, state.options.pg_tls))));
     let _ = write!(
         body,
         r#"<p class="muted">{}</p>"#,

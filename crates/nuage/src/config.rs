@@ -5,6 +5,7 @@
 //! | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
 //! | `NUAGE_BIND` | address to listen on (`127.0.0.1`: only this machine, behind a proxy such as Caddy) | `0.0.0.0` |
 //! | `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver connects, with a token as its password | off |
+//! | `NUAGE_PG_BIND` | address of the PostgreSQL protocol (`0.0.0.0` while the website stays behind a proxy on `127.0.0.1`) | `NUAGE_BIND` |
 //! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) | none: in clear |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
@@ -44,6 +45,8 @@ pub struct Config {
     pub bind: String,
     /// Port of the PostgreSQL protocol, if it is on.
     pub pg_port: Option<u16>,
+    /// Address of the PostgreSQL protocol.
+    pub pg_bind: String,
     /// Certificate and key (PEM files) for TLS on the PostgreSQL protocol.
     pub tls: Option<(PathBuf, PathBuf)>,
     /// Data directory.
@@ -101,7 +104,18 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         }
         engine.backup = Some(backup);
     }
+    let pg_port = match get("NUAGE_PG_PORT") {
+        Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_PG_PORT", &p))?),
+        None => None,
+    };
+    let tls = match (get("NUAGE_TLS_CERT"), get("NUAGE_TLS_KEY")) {
+        (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
+        (None, None) => None,
+        _ => return Err(Error::Validation("set both NUAGE_TLS_CERT and NUAGE_TLS_KEY, or neither".into())),
+    };
     let server = ServerOptions {
+        pg_port,
+        pg_tls: tls.is_some(),
         token: get("NUAGE_TOKEN"),
         admin_password: get("NUAGE_ADMIN_PASSWORD"),
         public_status: get("NUAGE_PUBLIC_STATUS").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
@@ -119,15 +133,9 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         keep_awake,
         port,
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
-        pg_port: match get("NUAGE_PG_PORT") {
-            Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_PG_PORT", &p))?),
-            None => None,
-        },
-        tls: match (get("NUAGE_TLS_CERT"), get("NUAGE_TLS_KEY")) {
-            (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
-            (None, None) => None,
-            _ => return Err(Error::Validation("set both NUAGE_TLS_CERT and NUAGE_TLS_KEY, or neither".into())),
-        },
+        pg_bind: get("NUAGE_PG_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
+        pg_port,
+        tls,
         data_dir: get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from),
         engine,
         server,

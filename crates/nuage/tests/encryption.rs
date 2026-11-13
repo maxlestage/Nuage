@@ -124,7 +124,7 @@ async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
     let copy = temp_dir("migrate-copy");
     let backup = || BackupOptions::new(Arc::new(DirectoryStore::new(&target)));
     // A database of an earlier version: in clear, backed up in clear.
-    {
+    let gone = {
         let db =
             Embedded::open_with(&dir, EngineOptions { backup: Some(backup()), ..EngineOptions::default() }).unwrap();
         assert_eq!(db.engine().encryption(), None);
@@ -139,7 +139,17 @@ async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
         }
         db.engine().checkpoint().unwrap();
         db.engine().backup_now(false).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    // Its upkeep thread lets go of it a moment later: wait, so that it does not
+    // ship a backup while the next opening replaces them.
+    for _ in 0..400 {
+        if gone.upgrade().is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    assert!(gone.upgrade().is_none(), "the engine in clear is still open");
     assert!(!files_with_needle(&dir).is_empty() && !files_with_needle(&target).is_empty(), "in clear before");
 
     // Opened with a key: encrypted in place, and the backup replaced.
