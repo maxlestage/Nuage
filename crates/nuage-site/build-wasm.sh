@@ -11,7 +11,12 @@ cd "$(dirname "$0")"
 # target/ are there.
 root=../..
 target="${CARGO_TARGET_DIR:-$root/target}"
-cargo build -p nuage-site --lib --locked --target wasm32-unknown-unknown --profile wasm-release
+# Source paths end up in the wasm (panic messages): map the checkout and the Cargo home to
+# fixed names so the bundle has the same bytes on every machine (CI checks pkg/ is current).
+repo=$(cd "$root" && pwd)
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$repo=/nuage --remap-path-prefix=$cargo_home=/cargo" \
+  cargo build -p nuage-site --lib --locked --target wasm32-unknown-unknown --profile wasm-release
 version=$(grep -A1 '^name = "wasm-bindgen"$' "$root/Cargo.lock" | sed -n 's/^version = "\(.*\)"$/\1/p')
 if ! wasm-bindgen --version | grep -q "$version"; then
   echo "wasm-bindgen $version is needed: cargo install wasm-bindgen-cli --version $version" >&2
