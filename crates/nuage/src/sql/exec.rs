@@ -193,7 +193,7 @@ impl<'a> Runner<'a> {
     }
 
     /// The schema of a table (its name in any case).
-    fn schema(&self, name: &str) -> Result<&'static TableSchema> {
+    pub(crate) fn schema(&self, name: &str) -> Result<&'static TableSchema> {
         let json = match self.tx.table_schema(name)? {
             Some(j) => j,
             None => {

@@ -4,6 +4,8 @@
 //! |---|---|---|
 //! | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
 //! | `NUAGE_BIND` | address to listen on (`127.0.0.1`: only this machine, behind a proxy such as Caddy) | `0.0.0.0` |
+//! | `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver connects, with a token as its password | off |
+//! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) | none: in clear |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
@@ -40,6 +42,10 @@ pub struct Config {
     pub port: u16,
     /// Address to listen on.
     pub bind: String,
+    /// Port of the PostgreSQL protocol, if it is on.
+    pub pg_port: Option<u16>,
+    /// Certificate and key (PEM files) for TLS on the PostgreSQL protocol.
+    pub tls: Option<(PathBuf, PathBuf)>,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Engine settings.
@@ -113,6 +119,15 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         keep_awake,
         port,
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
+        pg_port: match get("NUAGE_PG_PORT") {
+            Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_PG_PORT", &p))?),
+            None => None,
+        },
+        tls: match (get("NUAGE_TLS_CERT"), get("NUAGE_TLS_KEY")) {
+            (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
+            (None, None) => None,
+            _ => return Err(Error::Validation("set both NUAGE_TLS_CERT and NUAGE_TLS_KEY, or neither".into())),
+        },
         data_dir: get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from),
         engine,
         server,

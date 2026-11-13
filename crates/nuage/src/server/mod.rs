@@ -5,6 +5,7 @@
 //! |---|---|---|
 //! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) of the application the token opens | `Authorization: Bearer <token of an application>` |
 //! | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects: for websites in any language | the same; a read-only token reads only |
+//! | port `NUAGE_PG_PORT` | the PostgreSQL protocol ([`Server::listen_pg`]): every language's PostgreSQL driver | a token of an application as the password |
 //! | `GET /v1/openapi.json` | the OpenAPI description of `/v1/sql`, for code generators of every language | public |
 //!
 //! Websites: a page calls `/v1` from the browser when its origin is one of
@@ -18,7 +19,10 @@
 mod admin;
 pub(crate) mod apps;
 mod i18n;
+mod pg;
 mod status;
+
+pub use pg::{PgOptions, tls_config};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -332,6 +336,12 @@ impl Server {
         self.state.apps.new_token(&app, false)
     }
 
+    /// A new read-only token of application `name`: it reads, never writes.
+    pub fn new_app_read_only_token(&self, name: &str) -> Result<String> {
+        let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
+        self.state.apps.new_token(&app, true)
+    }
+
     /// A new read-only token for the application `name` (for the JavaScript
     /// of a website: it reads, never writes), returned once.
     pub fn new_app_read_token(&self, name: &str) -> Result<String> {
@@ -392,6 +402,41 @@ impl Server {
                             let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
                             state.metrics.open_connections.fetch_sub(1, Ordering::Relaxed);
                         });
+                    }
+                }
+            }
+        });
+        Ok(RunningServer { addr, stop, task })
+    }
+}
+
+impl Server {
+    /// Binds `addr` and serves the PostgreSQL protocol there, in the
+    /// background: every language's PostgreSQL driver connects, with a token
+    /// of an application as its password (see [`PgOptions`]).
+    pub async fn listen_pg(&self, addr: impl tokio::net::ToSocketAddrs, options: PgOptions) -> Result<RunningServer> {
+        let listener = TcpListener::bind(addr).await.map_err(|e| Error::Pool(format!("cannot listen: {e}")))?;
+        let addr = listener.local_addr().map_err(|e| Error::Pool(e.to_string()))?;
+        let stop = Arc::new(Notify::new());
+        let state = self.state.clone();
+        let stopped = stop.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stopped.notified() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { continue };
+                        let Ok(stream) = stream.into_std() else { continue };
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let (state, options) = (state.clone(), options.clone());
+                        // A thread per connection, as PostgreSQL has a process:
+                        // its statements block on the engine. Not a runtime
+                        // task, so an idle client never delays a shutdown.
+                        let _ = std::thread::Builder::new()
+                            .name("nuage-pg".into())
+                            .spawn(move || pg::serve(state, stream, options));
                     }
                 }
             }

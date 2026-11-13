@@ -1,0 +1,3 @@
+node_modules/
+postgresql.jar
+rust/target/

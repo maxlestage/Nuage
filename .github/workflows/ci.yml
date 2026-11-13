@@ -105,3 +105,43 @@ jobs:
         run: cargo build --locked -p nuage --bin nuage
       - name: Run each example against it
         run: clients/test.sh target/debug/nuage
+
+  postgres:
+    name: PostgreSQL drivers (clients/postgres)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            clients/postgres/rust
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: pdo_pgsql
+      - name: Drivers (psql, psycopg, SQLAlchemy, node-postgres, Postgres.js, pg gem, JDBC)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q postgresql-client libpq-dev
+          pip install -r clients/postgres/requirements.txt
+          (cd clients/postgres && npm install --no-audit --no-fund)
+          gem install pg --no-document
+          curl -fsSLo clients/postgres/postgresql.jar https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
+      - name: Build the server
+        run: cargo build --locked -p nuage --bin nuage
+      - name: Run each driver against it
+        run: clients/postgres/test.sh target/debug/nuage

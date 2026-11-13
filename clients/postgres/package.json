@@ -1,0 +1,9 @@
+{
+  "name": "nuage-postgres-examples",
+  "private": true,
+  "description": "Nuage DB with the Node.js PostgreSQL drivers (npm install, then node node_pg.mjs).",
+  "dependencies": {
+    "pg": "^8.13.0",
+    "postgres": "^3.4.5"
+  }
+}

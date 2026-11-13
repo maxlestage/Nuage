@@ -1,0 +1,15 @@
+# Nuage DB with tokio-postgres (sqlx, Diesel and SeaORM connect the same way). The password
+# is a token of an application.
+#   NUAGE_TOKEN=... cargo run
+[package]
+name = "nuage-postgres-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+
+# Not a member of the repository's workspace.
+[workspace]
