@@ -25,7 +25,7 @@ use memoire_orm::{Error, Order, Query, TableSchema, Value};
 use super::apps::App;
 use super::query::{self, Statement};
 use super::{HttpBody, State, full, random_token, read_body, same_secret};
-use crate::embedded::{self, Embedded};
+use crate::embedded::Embedded;
 use crate::engine::MAIN;
 
 const SESSION_COOKIE: &str = "nuage_session";
@@ -462,9 +462,9 @@ fn origin_of(headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
-fn schema_of(state: &State, db: &Embedded, name: &str) -> memoire_orm::Result<&'static TableSchema> {
-    let info = db.tables()?.into_iter().find(|t| t.name == name).ok_or_else(|| Error::NoSuchTable(name.to_owned()))?;
-    state.schemas.schema(&info.schema)
+pub(crate) fn schema_of(state: &State, db: &Embedded, name: &str) -> memoire_orm::Result<&'static TableSchema> {
+    let schema = db.table_schema(name)?.ok_or_else(|| Error::NoSuchTable(name.to_owned()))?;
+    state.schemas.schema(&schema)
 }
 
 /// `/admin/apps/<name>`.
@@ -558,13 +558,28 @@ NUAGE_TOKEN={token}</code></pre>
     )
 }
 
-fn connect_help(origin: &str) -> String {
+fn connect_help(origin: &str, app: &App) -> String {
+    let sites = app.origins();
+    let sites = if sites.is_empty() {
+        format!(r#"No website yet: add yours in <a href="{}/settings">Settings</a>."#, app_base(&app.name))
+    } else {
+        format!("Websites allowed: {}.", esc(&sites.join(", ")))
+    };
     format!(
         r#"<h2>Connect</h2><p class="muted">The token an application sends picks its database: it reads and writes only its own.</p>
 <pre><code>NUAGE_URL={o}
 NUAGE_TOKEN=&lt;a token of this application&gt;</code></pre>
 <pre><code>let db = nuage::Db::from_env().await?;                      // or
-let db = NuageDb::connect("{o}", token).await?;</code></pre>"#,
+let db = NuageDb::connect("{o}", token).await?;</code></pre>
+<h2>Connect a website</h2><p class="muted">Any language, or a page's JavaScript, sends SQL with <code>?</code> parameters to <code>POST /v1/sql</code> and gets rows as JSON. In a page, use a <b>read-only</b> token. {sites}</p>
+<pre><code>const res = await fetch("{o}/v1/sql", {{
+  method: "POST",
+  headers: {{ "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" }},
+  body: JSON.stringify({{ sql: "SELECT * FROM articles WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }}),
+}});
+const {{ rows }} = await res.json();   // [{{ "id": 42, "title": "…" }}, …]</code></pre>
+<pre><code>curl {o}/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
+  -d '{{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Bonjour"]}}'</code></pre>"#,
         o = esc(origin)
     )
 }
@@ -686,7 +701,7 @@ fn app_overview(state: &State, app: &App, csrf: &str, origin: &str) -> String {
         body.push_str(&card(l, &v));
     }
     body.push_str("</div>");
-    body.push_str(&connect_help(origin));
+    body.push_str(&connect_help(origin, app));
     let _ = write!(
         body,
         r#"<p class="muted">Data is stored in <code>{}</code>.</p>"#,
@@ -842,7 +857,7 @@ fn query_form(app: &App, csrf: &str, sql: &str, extra: Option<&str>) -> String {
         r#"<form method="post" action="{}/query"><input type="hidden" name="csrf" value="{}">
 <textarea name="sql" spellcheck="false" placeholder="SELECT * FROM users WHERE age >= 18 ORDER BY name LIMIT 20">{}</textarea>
 <p class="row"><button>Run</button></p></form>
-<p class="muted">SELECT, UPDATE and DELETE on one table of this application, with WHERE, ORDER BY, LIMIT and OFFSET. Statements that change data ask for a confirmation first.</p>{}"#,
+<p class="muted">SELECT, INSERT, UPDATE and DELETE on one table of this application, with WHERE, ORDER BY, LIMIT and OFFSET; CREATE TABLE and DROP TABLE. Statements that change data ask for a confirmation first. Websites send the same SQL to <code>POST /v1/sql</code>.</p>{}"#,
         app_base(&app.name),
         esc(csrf),
         esc(sql),
@@ -954,29 +969,32 @@ fn tokens_body(state: &State, app: &App, csrf: &str, message: Option<String>) ->
     let mut body = message.unwrap_or_default();
     body.push_str(r#"<p class="muted">A token opens this application's database, and only it. The server keeps a SHA-256 digest of each token, never the token: a lost token cannot be shown again, make a new one.</p>"#);
     let mut out = String::from(
-        r#"<div class="scroll"><table><thead><tr><th>Token</th><th>Created</th><th></th></tr></thead><tbody>"#,
+        r#"<div class="scroll"><table><thead><tr><th>Token</th><th>Rights</th><th>Created</th><th></th></tr></thead><tbody>"#,
     );
     if info.env_token {
-        out.push_str(r#"<tr><td><code>NUAGE_TOKEN</code></td><td class="muted">set on the server</td><td class="muted">change it in the environment</td></tr>"#);
+        out.push_str(r#"<tr><td><code>NUAGE_TOKEN</code></td><td>read and write</td><td class="muted">set on the server</td><td class="muted">change it in the environment</td></tr>"#);
     }
     for t in &info.tokens {
         let _ = write!(
             out,
-            r#"<tr><td><code>nuage_{id}…</code></td><td>{at}</td><td><form method="post" action="{base}/tokens/{id}/revoke" style="display:inline"><input type="hidden" name="csrf" value="{c}"><button class="plain">Revoke</button></form></td></tr>"#,
+            r#"<tr><td><code>nuage_{id}…</code></td><td>{rights}</td><td>{at}</td><td><form method="post" action="{base}/tokens/{id}/revoke" style="display:inline"><input type="hidden" name="csrf" value="{c}"><button class="plain">Revoke</button></form></td></tr>"#,
             id = esc(&t.id),
+            rights = if t.read_only { r#"<span class="pill">read only</span>"# } else { "read and write" },
             at = date_ms(t.created_at),
             c = esc(csrf)
         );
     }
     if info.tokens.is_empty() && !info.env_token {
-        out.push_str(r#"<tr><td colspan="3" class="muted">No token: no application can connect.</td></tr>"#);
+        out.push_str(r#"<tr><td colspan="4" class="muted">No token: no application can connect.</td></tr>"#);
     }
     out.push_str("</tbody></table></div>");
     body.push_str(&out);
     let _ = write!(
         body,
-        r#"<form method="post" action="{base}/tokens" class="row" style="margin-top:.75rem"><input type="hidden" name="csrf" value="{}"><button>New token</button></form>"#,
-        esc(csrf)
+        r#"<div class="row" style="margin-top:.75rem"><form method="post" action="{base}/tokens"><input type="hidden" name="csrf" value="{c}"><input type="hidden" name="scope" value="write"><button>New token (read and write)</button></form>
+<form method="post" action="{base}/tokens"><input type="hidden" name="csrf" value="{c}"><input type="hidden" name="scope" value="read"><button>New read-only token</button></form></div>
+<p class="muted">A token in a web page is public: anyone can read it in the page's code. Give pages a <b>read-only</b> token, and keep read-and-write tokens on servers.</p>"#,
+        c = esc(csrf)
     );
     body
 }
@@ -991,6 +1009,13 @@ fn settings_body(app: &App, csrf: &str, message: Option<String>) -> String {
 <label>Description<input name="description" value="{d}" placeholder="what this application is"></label><button>Save</button></form>"#,
         c = esc(csrf),
         d = esc(&description)
+    );
+    let _ = write!(
+        body,
+        r#"<h2>Websites</h2><p class="muted">The pages of these websites may call this application from the browser (CORS): one origin per line, scheme and host (<code>https://site.fr</code>, <code>http://localhost:3000</code>), or <code>*</code> for any. Servers, and apps outside a browser, need none.</p>
+<form method="post" action="{base}/origins"><input type="hidden" name="csrf" value="{c}"><textarea name="origins" spellcheck="false" placeholder="https://site.fr" style="min-height:5rem">{o}</textarea><p class="row"><button>Save the websites</button></p></form>"#,
+        c = esc(csrf),
+        o = esc(&app.origins().join("\n"))
     );
     if app.first {
         body.push_str(r#"<h2>Delete</h2><p class="muted">The first application is the server's own database: it cannot be deleted.</p>"#);
@@ -1088,8 +1113,8 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
         "/query" => {
             let db = Embedded::from_engine(engine.clone());
             let lookup = |n: &str| schema_of(state, &db, n);
-            let result =
-                query::parse(&sql, &lookup).and_then(|stmt| run_statement(&app, &db, &stmt, confirmed, csrf, &sql));
+            let result = query::parse(&sql, &lookup)
+                .and_then(|stmt| run_statement(state, &app, &db, &stmt, confirmed, csrf, &sql));
             let (status, extra) = match result {
                 Ok(extra) => (200, extra),
                 Err(e) => (400, note(false, &e.to_string())),
@@ -1140,7 +1165,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
             html(200, app_page(state, &app, "/storage", "Storage", csrf, &storage_body(&app, csrf, Some(msg))))
         }
         "/tokens" => {
-            let msg = match state.apps.new_token(&app) {
+            let msg = match state.apps.new_token(&app, field("scope") == "read") {
                 Ok(token) => token_reveal(origin, &app.name, &token),
                 Err(e) => note(false, &e.to_string()),
             };
@@ -1155,6 +1180,14 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
             };
             html(200, app_page(state, &app, "/tokens", "Tokens", csrf, &tokens_body(state, &app, csrf, Some(msg))))
         }
+        "/origins" => {
+            let msg = match state.apps.set_origins(&app, &field("origins")) {
+                Ok(o) if o.is_empty() => note(true, "No website: pages cannot call this application."),
+                Ok(o) => note(true, &format!("Pages of {} may call this application.", o.join(", "))),
+                Err(e) => note(false, &e.to_string()),
+            };
+            html(200, app_page(state, &app, "/settings", "Settings", csrf, &settings_body(&app, csrf, Some(msg))))
+        }
         "/description" => {
             let msg = match state.apps.set_description(&app, &field("description")) {
                 Ok(()) => note(true, "Description saved."),
@@ -1168,6 +1201,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, csrf: &st
 
 /// Runs a console statement: reads at once, writes after a confirmation.
 fn run_statement(
+    state: &State,
     app: &App,
     db: &Embedded,
     stmt: &Statement,
@@ -1176,15 +1210,20 @@ fn run_statement(
     sql: &str,
 ) -> memoire_orm::Result<String> {
     if stmt.writes() && !confirmed {
-        let preview = stmt.preview().ok_or_else(|| Error::Unsupported("no preview".into()))?;
-        let n = db
-            .fetch_rows(Query::Select(&preview))?
-            .first()
-            .and_then(|r| r.first())
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let what = match stmt.preview() {
+            Some(preview) => {
+                let n = db
+                    .fetch_rows(Query::Select(&preview))?
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                format!("{n} row(s) would be affected")
+            }
+            None => "it will run once confirmed".into(),
+        };
         return Ok(format!(
-            r#"<div class="msg"><p><b>This statement changes data of {app}: {n} row(s) would be affected.</b></p>
+            r#"<div class="msg"><p><b>This statement changes data of {app}: {what}.</b></p>
 <form method="post" action="{base}/query"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="sql" value="{}"><input type="hidden" name="confirm" value="yes"><button class="danger">Confirm and run</button></form></div>"#,
             esc(csrf),
             esc(sql),
@@ -1192,31 +1231,16 @@ fn run_statement(
             base = app_base(&app.name),
         ));
     }
-    let engine = db.engine();
-    match stmt {
-        Statement::Select(s) => {
-            let rows = embedded::fetch_rows(engine, MAIN, &Query::Select(s))?;
-            let headers: Vec<String> = match &s.projection {
-                memoire_orm::ast::Projection::Tables(t) => {
-                    t.iter().flat_map(|t| t.columns.iter().map(|c| c.name.to_owned())).collect()
-                }
-                memoire_orm::ast::Projection::Exprs(e) => e
-                    .iter()
-                    .map(|e| match e {
-                        memoire_orm::Expr::Column(c) => c.name.to_owned(),
-                        _ => "count".to_owned(),
-                    })
-                    .collect(),
-            };
-            Ok(format!("<p class=\"muted\">{} row(s).</p>{}", rows.len(), table_html(&headers, &rows)))
+    Ok(match query::run(&state.schemas, db.engine(), MAIN, stmt)? {
+        query::Outcome::Rows(headers, rows) => {
+            format!("<p class=\"muted\">{} row(s).</p>{}", rows.len(), table_html(&headers, &rows))
         }
-        Statement::Update(u) => {
-            let r = embedded::execute_now(engine, MAIN, &Query::Update(u))?;
-            Ok(note(true, &format!("{} row(s) updated.", r.rows_affected)))
-        }
-        Statement::Delete(d) => {
-            let r = embedded::execute_now(engine, MAIN, &Query::Delete(d))?;
-            Ok(note(true, &format!("{} row(s) deleted.", r.rows_affected)))
-        }
-    }
+        query::Outcome::Done(r) => match stmt {
+            Statement::Update(_) => note(true, &format!("{} row(s) updated.", r.rows_affected)),
+            Statement::Delete(_) => note(true, &format!("{} row(s) deleted.", r.rows_affected)),
+            Statement::Insert(_) => note(true, &format!("{} row(s) inserted.", r.rows_affected)),
+            Statement::Create(..) => note(true, "Table created."),
+            _ => note(true, "Done."),
+        },
+    })
 }

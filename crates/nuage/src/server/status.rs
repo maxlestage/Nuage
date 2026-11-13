@@ -57,7 +57,7 @@ pub(crate) enum View {
 fn access(state: &State, req: &Request<Incoming>) -> Option<View> {
     if state.admin.is_logged_in(req.headers()) {
         Some(View::All)
-    } else if let Some(app) = state.app_of(req.headers()) {
+    } else if let Some((app, _)) = state.app_of(req.headers()) {
         Some(View::App(app))
     } else if state.options.public_status {
         Some(View::Public)
@@ -114,6 +114,8 @@ fn app_json(app: &App, env_token: bool) -> Json {
         "bytes": stats.stored_bytes,
         "file_bytes": stats.file_bytes,
         "tokens": info.tokens.len() + usize::from(info.env_token),
+        "read_only_tokens": info.tokens.iter().filter(|t| t.read_only).count(),
+        "websites": info.origins,
         "created_at": rfc3339_ms(app.created_at),
         "last_request_at": (last > 0).then(|| rfc3339_ms(last)).flatten(),
         "requests": requests_json(&app.metrics),

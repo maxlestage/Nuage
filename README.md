@@ -141,6 +141,41 @@ One server holds several applications, each with a database of its own:
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` and `apps` do the
 same from Rust.
 
+## Websites
+
+Any website can use an application's database, from its server or from its pages:
+
+- **`POST /v1/sql`**, from any language: `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `CREATE TABLE`, `DROP TABLE`, with `?` parameters (values, never SQL: no injection).
+  Rows come back as JSON objects, an insert gives its `last_insert_id`.
+- **From the browser**: list the website in the console (**Settings → Websites**:
+  `https://site.fr`, `http://localhost:3000`, or `*`) and its pages may call `/v1` (CORS).
+  The browser's preflight is cached for a day, so it costs one round trip, once.
+- **Read-only tokens** (**Tokens → New read-only token**): a token in a page is public, so
+  pages get one that reads and never writes; keep read-and-write tokens on servers.
+
+```js
+const res = await fetch("https://my-nuage.herokuapp.com/v1/sql", {
+  method: "POST",
+  headers: { "Authorization": "Bearer " + READ_ONLY_TOKEN, "Content-Type": "application/json" },
+  body: JSON.stringify({ sql: "SELECT id, title FROM posts WHERE category = ? ORDER BY id DESC LIMIT 20", params: [3] }),
+});
+const { rows } = await res.json(); // [{ "id": 42, "title": "…" }, …]
+```
+
+```bash
+curl https://my-nuage.herokuapp.com/v1/sql -H "Authorization: Bearer $NUAGE_TOKEN" \
+  -d '{"sql": "INSERT INTO messages (name, text) VALUES (?, ?)", "params": ["Ada", "Hello"]}'
+```
+
+Speed, measured on the server's machine (`cargo run --release -p nuage --example bench`,
+encrypted data, 20 000 rows, 4 cores): a row by key or by a unique column in **0.2 ms**,
+a page of 20 rows through an index in **0.5 ms**, a durable update (fsync) in **0.5 ms**,
+**13 000+ reads/s**. JSON answers of 1 KiB or more are gzip-compressed for clients that accept
+it. What a visitor feels is mostly the network: pick the host's region closest to them, and a
+dyno that never sleeps (Heroku **Basic**, not Eco, whose first request after a pause takes
+seconds).
+
 ## Quick start
 
 ```bash
@@ -241,6 +276,7 @@ A commented example: [`nuage.env.example`](nuage.env.example). Serve the server 
 | Path | What | Access |
 |---|---|---|
 | `/v1/*` | the database protocol, on the database of the application the token opens | `Authorization: Bearer <token of an application>` |
+| `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects (websites, any language) | a token of the application; a read-only token reads only |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
 | `/admin` | the console | `NUAGE_ADMIN_PASSWORD` |

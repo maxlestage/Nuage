@@ -439,6 +439,17 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
     }
 }
 
+/// `Some(descending)` when `order` is the primary key of `schema` alone.
+fn pk_order(order: &[memoire_orm::Order], schema: &TableSchema) -> Option<bool> {
+    match order {
+        [o] => match &o.expr {
+            Expr::Column(c) if c.table == schema.name && c.index == schema.primary_key => Some(o.desc),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// When a single-table `SELECT` may stop reading early.
 #[derive(Clone)]
 enum Stop {
@@ -471,7 +482,31 @@ fn matching_rows(
     let mut select = SelectAst::new(schema);
     select.filter = filter.clone();
     let _ = side_schemas;
-    if let Some(pks) = pushdown(ctx, &meta, schema, parts)? {
+    if let Some(mut pks) = pushdown(ctx, &meta, schema, parts)? {
+        // The keys come in primary-key order: for `LIMIT n` with no order, or
+        // ordered by the primary key, read rows in that order (or reversed)
+        // and stop at the `n`th match, instead of reading every match.
+        let early = match &stop {
+            Stop::First(n) => Some((*n, false)),
+            Stop::Best(order, n) => pk_order(order, schema).map(|desc| (*n, desc)),
+            Stop::Never => None,
+        };
+        if let Some((n, desc)) = early
+            && pks.len() > n
+        {
+            if desc {
+                pks.reverse();
+            }
+            let mut out = Vec::with_capacity(n);
+            for chunk in pks.chunks(n.max(16)) {
+                let rows = ctx.rows_by_pk(&meta, &map, chunk)?;
+                out.extend(if filter.is_some() { keep(rows, &select)? } else { rows });
+                if out.len() >= n {
+                    break;
+                }
+            }
+            return Ok(Some((out, seq)));
+        }
         let rows = ctx.rows_by_pk(&meta, &map, &pks)?;
         let rows = if filter.is_some() { keep(rows, &select)? } else { rows };
         return Ok(Some((rows, seq)));
