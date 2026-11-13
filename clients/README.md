@@ -32,6 +32,17 @@ Set `NUAGE_URL` (default `http://localhost:8080`) and `NUAGE_TOKEN` (a token of 
 application: the console's **Tokens** tab). [`test.sh`](test.sh) runs them all against a fresh
 server, in CI too.
 
+## Check the connection
+
+```bash
+curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
+# {"ok": true, "message": "Connected to Nuage DB 0.4.0: application `blog`, read and write, ...", ...}
+nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # the same, as one line, from any machine
+```
+
+Without a token, or with one that opens nothing, the 401 says what is wrong. The console shows
+each application's last connection.
+
 ## The protocol
 
 ```http

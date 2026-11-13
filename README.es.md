@@ -170,6 +170,14 @@ Cada servidor describe su API en `/v1/openapi.json` (OpenAPI 3.1) para generar u
 cualquier otro lenguaje. Rust tiene además el cliente nativo, `NuageDb`. Y
 cada driver PostgreSQL se conecta también: ver abajo.
 
+**¿Funciona mi conexión?** `GET /v1/ping` responde qué aplicación abre el token:
+`curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` da
+`Connected to Nuage DB 0.4.0: application blog, read and write, branch main, 3 table(s).`,
+y sin token, o con uno que no abre nada, dice qué falla. Desde cualquier máquina:
+`nuage check <url> <token>`. Una conexión PostgreSQL recibe la misma frase como aviso (psql
+la muestra), y la página de cada aplicación en la consola muestra su última conexión (cuándo,
+cómo, qué cliente), o que espera la primera.
+
 ## Protocolo PostgreSQL
 
 Nuage DB habla también el protocolo de PostgreSQL (`NUAGE_PG_PORT=5432`; el instalador y

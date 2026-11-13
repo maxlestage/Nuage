@@ -4,6 +4,18 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## 0.4.0 (2026-11-13)
 
+### Does my connection work?
+
+- `GET /v1/ping`: the application the token opens, its access (read-write or read-only),
+  branch and tables, in one sentence; the 401 says whether the token is missing or opens
+  nothing, and where to find one.
+- `nuage check <url> <token>`: the same from any machine, with what to check when the server
+  does not answer.
+- A PostgreSQL login gets the same sentence as a notice (psql prints it).
+- The console shows each application's last connection (when, HTTP API, SQL over HTTP or
+  PostgreSQL, which client, from where), or that it waits for a first one with the command to
+  test; `/api/status` gives `last_connection`. Each new token comes with its test command.
+
 ### PostgreSQL protocol: every language's driver
 
 - `NUAGE_PG_PORT` (`5432`): Nuage DB speaks version 3 of PostgreSQL's protocol. psql,

@@ -678,13 +678,51 @@ fn token_reveal(cx: &Cx, origin: &str, app: &str, token: &str) -> String {
 <pre><code>{token}</code></pre><p>{connect}</p>
 <pre><code>NUAGE_URL={origin}
 NUAGE_TOKEN={token}</code></pre>
-<pre><code>let db = NuageDb::connect("{origin}", "{token}").await?;</code></pre></div>"#,
+<pre><code>let db = NuageDb::connect("{origin}", "{token}").await?;</code></pre>
+<p>{test}</p><pre><code>curl {origin}/v1/ping -H "Authorization: Bearer {token}"
+nuage check {origin} {token}</code></pre></div>"#,
+        test =
+            cx.t("Test it: the server answers which application the token opens, and this page shows the connection."),
         title = esc(&cx.tf("New token of {}: copy it now, it is not shown again", &[&app])),
         digest = cx.t("(the server keeps only its digest)."),
         connect = cx.t("Connect the application with it:"),
         token = esc(token),
         origin = esc(origin)
     )
+}
+
+/// "2 min ago, PostgreSQL (psql), 203.0.113.7, read only".
+fn connection_text(cx: &Cx, c: &super::apps::Connection) -> String {
+    let mut parts = vec![ago_ms(cx.l, c.at), cx.t(c.via).to_owned()];
+    if !c.client.is_empty() {
+        parts[1] = format!("{} ({})", parts[1], c.client);
+    }
+    if !c.peer.is_empty() {
+        parts.push(c.peer.clone());
+    }
+    if c.read_only {
+        parts.push(cx.t("read only").to_owned());
+    }
+    parts.join(", ")
+}
+
+/// Whether a client of the application connected: so that nobody is left
+/// guessing whether their connection works.
+fn connection_banner(cx: &Cx, origin: &str, app: &App) -> String {
+    match app.last_connection() {
+        Some(c) => format!(
+            r#"<p class="msg ok">✓ {}</p>"#,
+            esc(&cx.tf("Connected: last connection {}.", &[&connection_text(cx, &c)]))
+        ),
+        None => format!(
+            r#"<div class="msg"><p><b>{wait}</b> {how}</p><pre><code>curl {o}/v1/ping -H "Authorization: Bearer &lt;{a_token}&gt;"</code></pre><p><a href="">{refresh}</a></p></div>"#,
+            wait = cx.t("Waiting for a first connection."),
+            how = cx.t("Test yours: the server answers which application the token opens, and this page shows it as soon as it arrives."),
+            o = esc(origin),
+            a_token = cx.t("a token of this application"),
+            refresh = cx.t("Refresh"),
+        ),
+    }
 }
 
 /// How to connect with a PostgreSQL driver, when the server speaks it.
@@ -987,6 +1025,7 @@ fn app_overview(state: &State, cx: &Cx, app: &App, origin: &str) -> String {
     if !info.description.is_empty() {
         let _ = write!(body, r#"<p class="muted">{}</p>"#, esc(&info.description));
     }
+    body.push_str(&connection_banner(cx, origin, app));
     body.push_str(r#"<div class="grid">"#);
     for (label, v) in [
         ("Size on disk", bytes(l, stats.file_bytes)),
@@ -996,7 +1035,7 @@ fn app_overview(state: &State, cx: &Cx, app: &App, origin: &str) -> String {
         ("Requests", cx.tf("{}/s, {} in all", &[&dec(l, format!("{rate:.1}")), &app.metrics.total()])),
         ("Latency", dec(l, format!("p50 {p50:.2} ms, p99 {p99:.2} ms"))),
         ("Errors", dec(l, format!("{errors:.1}/s"))),
-        ("Last request", ago_ms(l, app.last_request.load(std::sync::atomic::Ordering::Relaxed))),
+        ("Last connection", app.last_connection().map_or_else(|| cx.t("never").into(), |c| connection_text(cx, &c))),
         ("Tokens", (info.tokens.len() + usize::from(info.env_token)).to_string()),
         (
             "Encryption",

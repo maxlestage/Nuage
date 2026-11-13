@@ -170,6 +170,16 @@ async fn status_api() {
     assert_eq!((health.status, health.body.as_str()), (200, r#"{"status":"ok"}"#));
     assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 401);
     assert_eq!(http(addr, "GET", "/api/status/stream", &[], "").await.status, 401);
+    // "Does my connection work?": a clear answer either way.
+    let ping = http(addr, "GET", "/v1/ping", &[("authorization", "Bearer t0ken")], "").await;
+    assert_eq!(ping.status, 200, "{}", ping.body);
+    let ping: serde_json::Value = serde_json::from_str(&ping.body).unwrap();
+    assert_eq!((ping["application"].as_str(), ping["access"].as_str()), (Some("nuage"), Some("read-write")));
+    assert!(ping["message"].as_str().unwrap().starts_with("Connected to Nuage DB"));
+    let none = http(addr, "GET", "/v1/ping", &[], "").await;
+    assert!(none.status == 401 && none.body.contains("no token"), "{}", none.body);
+    let wrong = http(addr, "GET", "/v1/ping", &[("authorization", "Bearer nope")], "").await;
+    assert!(wrong.status == 401 && wrong.body.contains("opens no application"), "{}", wrong.body);
     // The description of the API, public, for code generators of every language.
     let openapi = http(addr, "GET", "/v1/openapi.json", &[], "").await;
     assert_eq!(openapi.status, 200);
@@ -339,6 +349,7 @@ async fn console() {
     let app = c.request("GET", "/admin/apps/nuage", &[]).await;
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
     assert!(app.body.contains("NUAGE_PG_PORT=5432"), "PostgreSQL is off here: the console says how to turn it on");
+    assert!(app.body.contains("✓ Connected: last connection"), "the console shows the last connection");
     for language in [
         "JavaScript",
         "Python",

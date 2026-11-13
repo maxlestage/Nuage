@@ -100,6 +100,11 @@ impl KeepAwake {
 
 /// `GET url`: its status.
 async fn get(url: &str) -> Result<u16> {
+    fetch(url, None).await.map(|(status, _)| status)
+}
+
+/// `GET url`, with a bearer token: its status and body.
+pub(crate) async fn fetch(url: &str, token: Option<&str>) -> Result<(u16, Vec<u8>)> {
     let err = |e: &dyn std::fmt::Display| Error::Pool(format!("cannot reach {url}: {e}"));
     let (https, rest) = match url.split_once("://") {
         Some(("https", r)) => (true, r),
@@ -111,11 +116,12 @@ async fn get(url: &str) -> Result<u16> {
         Some((h, p)) => (h, p.parse().map_err(|_| err(&"invalid port"))?),
         None => (authority, if https { 443 } else { 80 }),
     };
-    let request = Request::get(path)
-        .header("host", authority)
-        .header("user-agent", concat!("nuage-keep-awake/", env!("CARGO_PKG_VERSION")))
-        .body(Empty::<Bytes>::new())
-        .map_err(|e| err(&e))?;
+    let mut request =
+        Request::get(path).header("host", authority).header("user-agent", concat!("nuage/", env!("CARGO_PKG_VERSION")));
+    if let Some(t) = token {
+        request = request.header("authorization", format!("Bearer {t}"));
+    }
+    let request = request.body(Empty::<Bytes>::new()).map_err(|e| err(&e))?;
     let tcp = TcpStream::connect((host, port)).await.map_err(|e| err(&e))?;
     let response = if https {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -138,8 +144,31 @@ async fn get(url: &str) -> Result<u16> {
         sender.send_request(request).await.map_err(|e| err(&e))?
     };
     let status = response.status().as_u16();
-    let _ = response.into_body().collect().await;
-    Ok(status)
+    let body = response.into_body().collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+    Ok((status, body))
+}
+
+/// `nuage check [url] [token]`: does a connection to a Nuage DB server work?
+/// One line of answer, and how to fix what does not.
+pub async fn check(url: &str, token: &str) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let started = std::time::Instant::now();
+    let (status, body) = fetch(&format!("{base}/v1/ping"), Some(token)).await.map_err(|e| {
+        let e = e.to_string();
+        let e = e.trim_start_matches("connection pool error: ");
+        format!("{e}\n  Is the server running, and is {base} its address (scheme, host, port)? Try {base}/api/health in a browser.")
+    })?;
+    let ms = started.elapsed().as_millis();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let message = json["message"].as_str().or_else(|| json["error"]["message"].as_str()).unwrap_or_default().to_owned();
+    match status {
+        200 => Ok(format!("{message} ({ms} ms)")),
+        401 => Err(format!("{base} answered, but refused the token: {message}")),
+        404 => Err(format!(
+            "{base} answered 404: it is not a Nuage DB server of version 0.4 or later, or not this address."
+        )),
+        s => Err(format!("{base} answered {s}: {message}")),
+    }
 }
 
 #[cfg(test)]
