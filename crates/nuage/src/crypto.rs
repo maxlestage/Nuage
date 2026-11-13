@@ -344,7 +344,7 @@ impl Xts {
         debug_assert!(offset.is_multiple_of(BLOCK as u64) && buf.len().is_multiple_of(BLOCK));
         let mut at = offset;
         let mut t = self.tweak_at(at);
-        for chunk in buf.chunks_exact_mut(BLOCK) {
+        for chunk in buf.as_chunks_mut::<BLOCK>().0 {
             if at.is_multiple_of(UNIT) && at != offset {
                 t = self.tweak_at(at);
             }
