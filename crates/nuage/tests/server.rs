@@ -329,12 +329,17 @@ async fn console() {
 
     let overview = c.request("GET", "/admin", &[]).await;
     assert_eq!(overview.status, 200);
-    assert!(overview.body.contains("nuage") && overview.body.contains("Size on disk"));
+    assert!(overview.body.contains("Applications") && overview.body.contains(r#"href="/admin/apps/nuage""#));
+    let app = c.request("GET", "/admin/apps/nuage", &[]).await;
+    assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
     assert_eq!(c.request("GET", "/api/status", &[]).await.status, 200, "the session opens the status API");
     let csrf_token = csrf(&overview.body);
-    let tables = c.request("GET", "/admin/tables", &[]).await;
+    // The pages of before the applications lead to the first one's.
+    let moved = c.request("GET", "/admin/tables", &[]).await;
+    assert_eq!((moved.status, moved.headers["location"].to_str().unwrap()), (303, "/admin/apps/nuage/tables"));
+    let tables = c.request("GET", "/admin/apps/nuage/tables", &[]).await;
     assert!(tables.body.contains("users") && tables.body.contains(">3<"));
-    let rows = c.request("GET", "/admin/tables/users", &[]).await;
+    let rows = c.request("GET", "/admin/apps/nuage/tables/users", &[]).await;
     assert!(rows.body.contains("ada@x.dev") && rows.body.contains("cy@x.dev"));
 
     // Forms without the CSRF token are refused.
@@ -378,16 +383,19 @@ async fn console() {
     assert_eq!(res.status, 400);
 
     // Branches.
-    let res = c.request("POST", "/admin/branches", &[("csrf", &csrf_token), ("name", "review-1"), ("from", "")]).await;
+    let res = c
+        .request("POST", "/admin/apps/nuage/branches", &[("csrf", &csrf_token), ("name", "review-1"), ("from", "")])
+        .await;
     assert!(res.body.contains("Branch review-1 created"), "{}", res.body);
     assert_eq!(db.branches().await.unwrap().len(), 1);
-    let res = c.request("POST", "/admin/branches/review-1/delete", &[("csrf", &csrf_token)]).await;
+    let res = c.request("POST", "/admin/apps/nuage/branches/review-1/delete", &[("csrf", &csrf_token)]).await;
     assert!(res.body.contains("Branch review-1 deleted"));
     assert!(db.branches().await.unwrap().is_empty());
 
     // Storage actions.
-    let res = c.request("POST", "/admin/storage/checkpoint", &[("csrf", &csrf_token)]).await;
+    let res = c.request("POST", "/admin/apps/nuage/storage/checkpoint", &[("csrf", &csrf_token)]).await;
     assert!(res.body.contains("Checkpoint at"));
+    // (The old address still works for forms.)
     let res = c.request("POST", "/admin/storage/integrity", &[("csrf", &csrf_token)]).await;
     assert!(res.body.contains("checksum"), "{}", res.body);
 
@@ -585,4 +593,197 @@ async fn s3_backup_and_restore() {
     .unwrap();
     assert!(db.engine().backup_status().restored);
     assert_eq!(common::User::count(&db).await.unwrap(), 2);
+}
+
+const NEEDLE: &str = "ONLY-IN-SHOP";
+
+fn files_with(dir: &std::path::Path, needle: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                files_with(&p, needle)
+            } else {
+                usize::from(std::fs::read(&p).unwrap().windows(needle.len()).any(|w| w == needle.as_bytes()))
+            }
+        })
+        .sum()
+}
+
+fn token_in(page: &str) -> String {
+    let at = page.find("<code>nuage_").expect("a token on the page") + "<code>".len();
+    page[at..].split('<').next().unwrap().to_owned()
+}
+
+/// Several applications on one server: each its own encrypted database,
+/// tokens and backups; the console makes, lists and deletes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applications() {
+    use common::{User, user};
+    let dir = temp_dir("apps");
+    let backups = temp_dir("apps-backup");
+    let open = |dir: &std::path::Path| {
+        let mut backup = nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(&backups)));
+        backup.snapshot_every = Duration::from_secs(3600);
+        let options = EngineOptions {
+            sync: false,
+            encryption: Some(nuage::Encryption::from_key([7; 32])),
+            backup: Some(backup),
+            ..EngineOptions::default()
+        };
+        // The connections of the previous server let go of it in a moment.
+        for _ in 0..100 {
+            match Engine::open(dir, options.clone()) {
+                Ok(e) => return e,
+                Err(e) if e.to_string().contains("already open") => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("{} stays open", dir.display())
+    };
+    let server = Server::new(open(&dir), options());
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let mut c = Console { addr, cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let list = c.request("GET", "/admin", &[]).await;
+    let token = csrf(&list.body);
+
+    // A new application, from the console: its token is shown once.
+    let made =
+        c.request("POST", "/admin/apps", &[("csrf", &token), ("name", "shop"), ("description", "La boutique")]).await;
+    assert!(made.body.contains("Application shop created"), "{}", made.body);
+    let shop_token = token_in(&made.body);
+    assert!(made.body.contains(&format!("NUAGE_TOKEN={shop_token}")));
+    let refused = c.request("POST", "/admin/apps", &[("csrf", &token), ("name", "shop")]).await;
+    assert!(refused.body.contains("already an application"));
+    let refused = c.request("POST", "/admin/apps", &[("csrf", &token), ("name", "Not Valid")]).await;
+    assert!(refused.body.contains("invalid application name"));
+    let (_, blog_token) = server.create_app("blog", "").unwrap();
+    // The first one first, then by name.
+    assert_eq!(server.apps().iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["nuage", "blog", "shop"]);
+
+    // Each token opens its own database, and only it.
+    let first = NuageDb::connect(&running.url(), "t0ken").await.unwrap();
+    let shop = NuageDb::connect(&running.url(), &shop_token).await.unwrap();
+    let blog = NuageDb::connect(&running.url(), &blog_token).await.unwrap();
+    shop.create_table::<User>().await.unwrap();
+    for n in 0..5 {
+        user(&format!("{NEEDLE}-{n}@x.dev"), NEEDLE, Some(30), 1.0).insert(&shop).await.unwrap();
+    }
+    blog.create_table::<User>().await.unwrap();
+    user("only@blog.dev", "Blog", None, 1.0).insert(&blog).await.unwrap();
+    assert_eq!(User::count(&shop).await.unwrap(), 5);
+    assert_eq!(User::count(&blog).await.unwrap(), 1);
+    assert!(User::count(&first).await.is_err(), "the first application has no `users`");
+    assert!(dir.join("apps/shop/nuage.redb").exists() && dir.join("apps/shop/encryption.json").exists());
+    server.app_engine("shop").unwrap().checkpoint().unwrap();
+    assert_eq!(files_with(&dir, NEEDLE), 0, "every application is encrypted");
+
+    // A transaction belongs to its application.
+    let tx = http(addr, "POST", "/v1/transactions", &[("authorization", &format!("Bearer {shop_token}"))], "").await;
+    let id = serde_json::from_str::<serde_json::Value>(&tx.body).unwrap()["id"].as_str().unwrap().to_owned();
+    let other =
+        http(addr, "POST", &format!("/v1/transactions/{id}/commit"), &[("authorization", "Bearer t0ken")], "").await;
+    assert!(other.status >= 400, "{}", other.body);
+    let own = http(
+        addr,
+        "POST",
+        &format!("/v1/transactions/{id}/commit"),
+        &[("authorization", &format!("Bearer {shop_token}"))],
+        "",
+    )
+    .await;
+    assert_eq!(own.status, 200, "{}", own.body);
+
+    // The status: a session sees every application, a token its own.
+    let all: serde_json::Value = serde_json::from_str(&c.request("GET", "/api/status", &[]).await.body).unwrap();
+    let names: Vec<&str> = all["databases"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["nuage", "blog", "shop"]);
+    assert_eq!(all["applications"], 3);
+    assert_eq!(all["encryption"]["enabled"], true);
+    let shop_status = &all["databases"][2];
+    assert_eq!((shop_status["rows"].as_i64(), shop_status["encrypted"].as_bool()), (Some(5), Some(true)));
+    assert!(shop_status["requests"]["total"].as_u64().unwrap() >= 6);
+    assert_eq!(shop_status["description"], "La boutique");
+    let own: serde_json::Value = serde_json::from_str(
+        &http(addr, "GET", "/api/status", &[("authorization", &format!("Bearer {shop_token}"))], "").await.body,
+    )
+    .unwrap();
+    assert_eq!(own["databases"].as_array().unwrap().len(), 1);
+    assert_eq!(own["databases"][0]["name"], "shop");
+
+    // The console shows them all, and each one's pages.
+    let list = c.request("GET", "/admin", &[]).await;
+    for name in ["nuage", "shop", "blog", "La boutique", "encrypted"] {
+        assert!(list.body.contains(name), "{name}");
+    }
+    let tables = c.request("GET", "/admin/apps/shop/tables", &[]).await;
+    assert!(tables.body.contains("users") && tables.body.contains(">5<") && tables.body.contains("/admin/apps/blog"));
+    let res =
+        c.request("POST", "/admin/apps/blog/query", &[("csrf", &token), ("sql", "SELECT email FROM users")]).await;
+    assert!(res.body.contains("only@blog.dev") && !res.body.contains(NEEDLE), "{}", res.body);
+
+    // Tokens: a new one, and a revoked one opens nothing.
+    let page = c.request("POST", "/admin/apps/shop/tokens", &[("csrf", &token)]).await;
+    let second = token_in(&page.body);
+    let first_id = server.apps().iter().find(|a| a.name == "shop").unwrap().tokens[0].id.clone();
+    let res = c.request("POST", &format!("/admin/apps/shop/tokens/{first_id}/revoke"), &[("csrf", &token)]).await;
+    assert!(res.body.contains("revoked"), "{}", res.body);
+    assert_eq!(
+        http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {shop_token}"))], "").await.status,
+        401
+    );
+    let info = http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {second}"))], "").await;
+    let info: serde_json::Value = serde_json::from_str(&info.body).unwrap();
+    assert_eq!((info["application"].as_str(), info["encrypted"].as_bool()), (Some("shop"), Some(true)));
+
+    // Backups: each application under its own prefix.
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    assert!(backups.join("apps/shop/manifest.json").exists() && backups.join("apps/blog/encryption.json").exists());
+    assert_eq!(files_with(&backups, NEEDLE), 0);
+
+    // A restart keeps them; an empty disk restores them all.
+    running.shutdown().await;
+    drop((server, first, shop, blog));
+    for d in [dir.clone(), temp_dir("apps-restored")] {
+        let server = Server::new(open(&d), options());
+        assert_eq!(server.apps().len(), 3, "{}", d.display());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        let shop = NuageDb::connect(&running.url(), &second).await.unwrap();
+        assert_eq!(User::count(&shop).await.unwrap(), 5);
+        running.shutdown().await;
+    }
+
+    // Deleting: only with its name typed, never the first application.
+    let server = Server::new(open(&dir), options());
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let mut c = Console { addr: running.local_addr(), cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let token = csrf(&c.request("GET", "/admin", &[]).await.body);
+    let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "nope")]).await;
+    assert!(res.body.contains("nothing was deleted") && server.app_engine("shop").is_some());
+    let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "shop")]).await;
+    assert!(res.body.contains("Application shop deleted"), "{}", res.body);
+    assert!(server.app_engine("shop").is_none() && !dir.join("apps/shop").exists());
+    assert!(!backups.join("apps/shop/manifest.json").exists());
+    assert!(server.delete_app("nuage").is_err());
+    let settings = c.request("GET", "/admin/apps/nuage/settings", &[]).await;
+    assert!(settings.body.contains("cannot be deleted"));
+    assert_eq!(
+        http(running.local_addr(), "GET", "/v1/info", &[("authorization", &format!("Bearer {second}"))], "")
+            .await
+            .status,
+        401
+    );
+    running.shutdown().await;
+    for d in [dir, backups, temp_dir("apps-restored")] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

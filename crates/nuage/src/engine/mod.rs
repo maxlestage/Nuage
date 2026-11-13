@@ -30,7 +30,7 @@ use redb::ReadableDatabase;
 
 use crate::crypto::{Encryption, Header, Keys};
 
-pub use backup::{BackupStore, DirectoryStore};
+pub use backup::{BackupStore, DirectoryStore, PrefixedStore};
 use store::Store;
 pub(crate) use store::{FILE, MAIN};
 
@@ -486,6 +486,17 @@ impl Engine {
             self.event("info", format!("branch `{name}` reset"));
         }
         Ok(done)
+    }
+
+    /// Metadata entries starting with `prefix` (not data: the server's
+    /// records, such as its applications).
+    pub(crate) fn meta_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.store.meta_entries(prefix)
+    }
+
+    /// Writes or removes a metadata entry, durably (through the log).
+    pub(crate) fn set_meta(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        self.store.set_meta(key, value)
     }
 
     /// Stops the upkeep thread and makes everything durable.

@@ -233,11 +233,12 @@ pub(crate) fn open_redb(path: &Path, cache_bytes: usize, keys: Option<&Keys>) ->
         Some(k) => {
             let file = EncryptedFile::open(path, k.pages.clone())
                 .map_err(|e| storage_err(format!("cannot open {}: {e}", path.display())))?;
-            builder.create_with_backend(file).map_err(|e| {
-                storage_err(format!(
-                    "cannot open the encrypted page store {} ({e}): is it really encrypted with this key?",
+            builder.create_with_backend(file).map_err(|e| match e {
+                redb::DatabaseError::DatabaseAlreadyOpen => redb_err(e),
+                e => storage_err(format!(
+                    "cannot open the encrypted page store {} ({e}): is it damaged, or encrypted with another key?",
                     path.display()
-                ))
+                )),
             })
         }
         None => builder.create(path).map_err(redb_err),
@@ -567,6 +568,35 @@ impl Store {
             true
         });
         Ok(true)
+    }
+
+    /// Entries of the store's own metadata whose key starts with `prefix`
+    /// (the server keeps its list of applications there).
+    pub(crate) fn meta_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let tx = db.begin_read().map_err(redb_err)?;
+        let table = match tx.open_table(def(META)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let end = super::keys::prefix_end(prefix);
+        let mut out = Vec::new();
+        for item in table.range(prefix..end.as_slice()).map_err(redb_err)? {
+            let (k, v) = item.map_err(redb_err)?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Writes (`Some`) or removes (`None`) a metadata entry, through the log.
+    pub(crate) fn set_meta(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        let mut w = self.writer();
+        let op = match value {
+            Some(v) => Op::Put { table: META.into(), key: key.to_vec(), value: v.to_vec() },
+            None => Op::Del { table: META.into(), key: key.to_vec() },
+        };
+        self.log_and_apply(&mut w, vec![op]).map(|_| ())
     }
 
     /// Bytes stored by a branch's own tree.

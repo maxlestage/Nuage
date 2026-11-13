@@ -66,10 +66,10 @@ use memoire_orm::{
 pub use crypto::Encryption;
 pub use embedded::{Embedded, EmbeddedTransaction, TableInfo};
 pub use engine::{
-    BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, StorageStats,
+    BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, PrefixedStore, StorageStats,
 };
 pub use memoire_orm::nuage::Branch;
-pub use server::{Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse};
+pub use server::{AppInfo, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo};
 #[cfg(feature = "site")]
 pub use site::site;
 
