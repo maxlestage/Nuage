@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/nuage", "crates/nuage-site"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.95"
+license-file = "LICENSE"
+homepage = "https://github.com/maxlestage/Nuage"
+repository = "https://github.com/maxlestage/Nuage"
+authors = ["Maxime Nathan Lestage"]
+
+[workspace.dependencies]
+# Pinned to the commit of Memoire that has the `nuage` client and the evaluator Nuage DB uses.
+# TODO: switch to memoire-orm 0.2.1 from crates.io once published
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "fd1fdd5464547ce1f60f4a11e552c394da73cfc8", default-features = false, features = ["memory", "nuage", "chrono", "uuid", "json"] }
+nuage-site = { version = "0.1.0", path = "crates/nuage-site" }
+
+# The browser bundle of the site (crates/nuage-site/build-wasm.sh): cargo build -p nuage-site
+# --lib --target wasm32-unknown-unknown --profile wasm-release, then wasm-bindgen into pkg/.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false

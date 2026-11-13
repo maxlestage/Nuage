@@ -1,0 +1,83 @@
+[package]
+name = "nuage-site"
+version = "0.1.0"
+edition.workspace = true
+rust-version = "1.90"
+publish = false
+description = "The website of Nuage DB (pages, live status dashboard at /app, PWA), written with active: server-rendered pages and Rust/WebAssembly islands. The Nuage DB server mounts it with `nuage_site::handler()`."
+authors.workspace = true
+# The same license as the repository's LICENSE (the site serves its copy, static/LICENSE.txt).
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+# The library holds what both sides share: texts, routes, the status types and the islands
+# (the live dashboard). Compiled to WebAssembly it is the browser bundle (`pkg/`, built by
+# `build-wasm.sh`); compiled for the server it renders the pages and serves every file,
+# embedded in the binary by `build.rs`.
+[lib]
+name = "nuage_site"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# `nuage_site::vitesse_handler()`: the same handler, on Vitesse's request and response types.
+vitesse = ["dep:vitesse"]
+
+[dependencies]
+active = { git = "https://github.com/maxlestage/Active", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+http = "1"
+# Static files are compressed once (brotli, gzip), not on every request.
+brotli = "9"
+flate2 = "1"
+# Content-Security-Policy: hashes of the inline scripts of each page.
+sha2 = "0.11"
+base64 = "0.23"
+vitesse = { git = "https://github.com/maxlestage/Vitesse", default-features = false, features = ["compress"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+active = { git = "https://github.com/maxlestage/Active", default-features = false, features = ["client"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "Document",
+  "VisibilityState",
+  "Element",
+  "Event",
+  "EventSource",
+  "EventTarget",
+  "Headers",
+  "HtmlElement",
+  "Location",
+  "MessageEvent",
+  "Navigator",
+  "Request",
+  "RequestCache",
+  "RequestCredentials",
+  "RequestInit",
+  "Response",
+  "ServiceWorker",
+  "ServiceWorkerContainer",
+  "ServiceWorkerRegistration",
+  "ServiceWorkerState",
+  "Storage",
+  "Window",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+vitesse = { git = "https://github.com/maxlestage/Vitesse", default-features = false, features = ["compress"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# The dev server: the site alone, with a fake status API and a simulated live stream.
+[[example]]
+name = "dev"
+required-features = ["vitesse"]
+
+# Browser bundle: `./build-wasm.sh` (cargo build --lib --target wasm32-unknown-unknown
+# --profile wasm-release, then wasm-bindgen into pkg/). The profile is in the workspace's
+# Cargo.toml.

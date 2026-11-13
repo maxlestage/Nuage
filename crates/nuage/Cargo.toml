@@ -1,0 +1,55 @@
+[package]
+name = "nuage"
+description = "Nuage DB: Memoire's own database, in pure Rust. Tables on disk behind a write-ahead log, copy-on-write branches, backups to a directory or S3, an HTTP server and a management console. Embedded or as a server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/nuage"
+readme = "README.md"
+keywords = ["database", "embedded", "server", "orm", "branching"]
+categories = ["database-implementations", "database", "web-programming::http-server"]
+# The tests (and memoire-orm's backend suite, copied in tests/common) run from the repository.
+exclude = ["tests"]
+
+[features]
+default = ["chrono", "uuid", "json", "site"]
+## The website of Nuage DB (crates/nuage-site: pages, the live dashboard at `/app`, PWA),
+## served by the `nuage` binary next to the database: `nuage::site()`. Without it, `/`
+## is a small home page.
+site = ["dep:nuage-site"]
+## Nuage DB always stores dates, UUIDs and JSON (memoire-orm's `chrono`, `uuid` and
+## `json` features are on). These flags only say so to code shared with
+## memoire-orm, such as its backend test suite.
+chrono = []
+uuid = []
+json = []
+
+[dependencies]
+memoire-orm = { workspace = true }
+nuage-site = { workspace = true, optional = true }
+redb = "4"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+libc = "0.2"
+getrandom = "0.4"
+ring = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+memoire-orm = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "nuage"
+path = "src/main.rs"

@@ -1,0 +1,820 @@
+//! Statements on the store: Memoire's evaluator over rows read from disk.
+//!
+//! Only the rows a statement needs are read: primary-key and index lookups
+//! read the matching rows, other filters stream the table in chunks and keep
+//! the matching rows, `LIMIT` without `ORDER BY` stops early, `ORDER BY ...
+//! LIMIT n` keeps the best `n` rows while streaming, and `COUNT(*)` without a
+//! filter reads a counter. The rows kept are then evaluated by Memoire's
+//! in-memory engine ([`memoire_orm::evaluator`]), so every statement behaves
+//! exactly as on `MemoryDb`. Memory use follows the rows a statement keeps
+//! (its result, or the rows a join or a `GROUP BY` combines), not the size of
+//! the tables.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use memoire_orm::ast::{Projection, SelectAst};
+use memoire_orm::evaluator::{self, Tables};
+use memoire_orm::nuage::wire::schema_to_json;
+use memoire_orm::{AggFunc, BinOp, Error, ExecResult, Expr, JoinKind, Query, Result, TableSchema, Value};
+use serde_json::{Value as Json, json};
+
+use super::keys::{self, push_value};
+use super::store::{Overlay, Snapshot, Store};
+use super::wal::Op;
+
+/// Rows read per step of a table scan.
+pub(crate) const CHUNK: usize = 2048;
+
+/// A stored index: its columns (by name) and whether it is unique.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexMeta {
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+/// A table as the catalog records it.
+#[derive(Clone, Debug)]
+pub(crate) struct TableMeta {
+    pub generation: u64,
+    /// Stored columns, in storage order.
+    pub columns: Vec<String>,
+    /// Position of the primary key in `columns`.
+    pub pk: usize,
+    pub indexes: Vec<IndexMeta>,
+    /// The schema the table was created (or last widened) with, as JSON.
+    pub schema: Json,
+}
+
+impl TableMeta {
+    fn new(schema: &TableSchema, generation: u64) -> TableMeta {
+        let name = |i: usize| schema.columns[i].name.to_owned();
+        let mut indexes = Vec::new();
+        // Same order as the in-memory engine: unique first, then the others.
+        for unique in [true, false] {
+            for (i, c) in schema.columns.iter().enumerate() {
+                if i != schema.primary_key && c.unique == unique && (unique || c.indexed) {
+                    indexes.push(IndexMeta { columns: vec![name(i)], unique });
+                }
+            }
+            for ix in schema.indexes.iter().filter(|ix| ix.unique == unique) {
+                indexes.push(IndexMeta { columns: ix.columns.iter().map(|&i| name(i)).collect(), unique });
+            }
+        }
+        TableMeta {
+            generation,
+            columns: schema.columns.iter().map(|c| c.name.to_owned()).collect(),
+            pk: schema.primary_key,
+            indexes,
+            schema: schema_to_json(schema),
+        }
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        json!({
+            "generation": self.generation,
+            "columns": self.columns,
+            "pk": self.pk,
+            "indexes": self.indexes.iter().map(|i| json!({ "columns": i.columns, "unique": i.unique })).collect::<Vec<_>>(),
+            "schema": self.schema,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<TableMeta> {
+        let bad = || super::storage_err("invalid table metadata");
+        let j: Json = serde_json::from_slice(bytes).map_err(|_| bad())?;
+        let strings = |v: Option<&Json>| -> Result<Vec<String>> {
+            v.and_then(Json::as_array)
+                .ok_or_else(bad)?
+                .iter()
+                .map(|s| s.as_str().map(str::to_owned).ok_or_else(bad))
+                .collect()
+        };
+        Ok(TableMeta {
+            generation: j.get("generation").and_then(Json::as_u64).ok_or_else(bad)?,
+            columns: strings(j.get("columns"))?,
+            pk: j.get("pk").and_then(Json::as_u64).ok_or_else(bad)? as usize,
+            indexes: j
+                .get("indexes")
+                .and_then(Json::as_array)
+                .ok_or_else(bad)?
+                .iter()
+                .map(|i| {
+                    Ok(IndexMeta {
+                        columns: strings(i.get("columns"))?,
+                        unique: i.get("unique").and_then(Json::as_bool).unwrap_or(false),
+                    })
+                })
+                .collect::<Result<_>>()?,
+            schema: j.get("schema").cloned().unwrap_or(Json::Null),
+        })
+    }
+
+    fn position(&self, column: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c == column)
+    }
+
+    /// For each column of `schema`, its position in the stored row.
+    fn map(&self, schema: &TableSchema) -> Vec<Option<usize>> {
+        schema.columns.iter().map(|c| self.position(c.name)).collect()
+    }
+
+    fn index_positions(&self, index: &IndexMeta) -> Option<Vec<usize>> {
+        index.columns.iter().map(|c| self.position(c)).collect()
+    }
+}
+
+/// One statement (or transaction) at work on a branch: what it reads, what
+/// it writes.
+pub(crate) struct Ctx<'a> {
+    pub store: &'a Store,
+    pub snap: &'a Snapshot,
+    pub branch: &'a str,
+    pub overlay: &'a mut Overlay,
+    /// Operations applied after the overlay (dropped table generations).
+    pub extra: &'a mut Vec<Op>,
+    /// Tables read or written, with their version when first touched.
+    pub touched: &'a mut BTreeMap<String, u64>,
+    pub written: &'a mut BTreeSet<String>,
+}
+
+fn pk_enc(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_value(&mut out, v);
+    out
+}
+
+fn row_key_raw(generation: u64, pk: &[u8]) -> Vec<u8> {
+    let mut k = keys::data_prefix(generation, keys::ROW);
+    k.extend_from_slice(pk);
+    k
+}
+
+impl Ctx<'_> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.snap.get(Some(self.overlay), key)
+    }
+
+    fn put(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        self.overlay.insert(key, value);
+    }
+
+    fn touch(&mut self, table: &str) {
+        if !self.touched.contains_key(table) {
+            let v = self.store.version(self.branch, table);
+            self.touched.insert(table.to_owned(), v);
+        }
+    }
+
+    pub(crate) fn meta(&mut self, table: &str) -> Result<Option<TableMeta>> {
+        self.touch(table);
+        self.get(&keys::catalog_key(table))?.map(|b| TableMeta::from_json(&b)).transpose()
+    }
+
+    fn put_meta(&mut self, table: &str, meta: &TableMeta) {
+        self.put(keys::catalog_key(table), Some(meta.to_json()));
+    }
+
+    fn counter(&self, key: &[u8]) -> Result<i64> {
+        Ok(self.get(key)?.map_or(0, |b| keys::decode_i64(&b)))
+    }
+
+    /// Every table of the branch.
+    pub(crate) fn table_names(&self) -> Result<Vec<String>> {
+        let (start, end) = keys::catalog_range();
+        let mut out = Vec::new();
+        let mut at = start;
+        loop {
+            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
+            out.extend(entries.iter().filter_map(|(k, _)| keys::catalog_name(k)));
+            match next {
+                Some(n) => at = n,
+                None => return Ok(out),
+            }
+        }
+    }
+
+    pub(crate) fn row_count(&self, meta: &TableMeta) -> Result<i64> {
+        self.counter(&keys::count_key(meta.generation))
+    }
+
+    /// Bytes of the table's stored rows.
+    pub(crate) fn table_bytes(&self, meta: &TableMeta) -> Result<i64> {
+        self.counter(&keys::bytes_key(meta.generation))
+    }
+
+    fn decode(&self, meta: &TableMeta, map: &[Option<usize>], bytes: &[u8]) -> Result<Vec<Value>> {
+        let stored = keys::decode_row(bytes)?;
+        let _ = meta;
+        Ok(map.iter().map(|m| m.and_then(|i| stored.get(i).cloned()).unwrap_or(Value::Null)).collect())
+    }
+
+    fn rows_by_pk(&self, meta: &TableMeta, map: &[Option<usize>], pks: &[Vec<u8>]) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in pks {
+            if let Some(b) = self.get(&row_key_raw(meta.generation, pk))? {
+                out.push(self.decode(meta, map, &b)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Primary keys of the rows whose index `index` holds `values`.
+    fn index_lookup(&self, meta: &TableMeta, index: usize, values: &[&Value]) -> Result<Vec<Vec<u8>>> {
+        let prefix = keys::index_prefix(meta.generation, index as u16, values);
+        let end = keys::prefix_end(&prefix);
+        let mut out = Vec::new();
+        let mut at = prefix.clone();
+        loop {
+            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
+            out.extend(entries.into_iter().map(|(k, _)| k[prefix.len()..].to_vec()));
+            match next {
+                Some(n) => at = n,
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// Calls `f` with each chunk of rows of the table, in primary-key order,
+    /// until it returns `false`.
+    fn scan_rows(
+        &self,
+        meta: &TableMeta,
+        map: &[Option<usize>],
+        mut f: impl FnMut(Vec<Vec<Value>>) -> Result<bool>,
+    ) -> Result<()> {
+        let (start, end) = keys::rows_range(meta.generation);
+        let mut at = start;
+        loop {
+            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
+            let rows = entries.iter().map(|(_, v)| self.decode(meta, map, v)).collect::<Result<Vec<_>>>()?;
+            if !rows.is_empty() && !f(rows)? {
+                return Ok(());
+            }
+            match next {
+                Some(n) => at = n,
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filters
+// ---------------------------------------------------------------------------
+
+fn conjuncts(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Binary { op: BinOp::And, left, right } => {
+            let mut v = conjuncts(left);
+            v.extend(conjuncts(right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+fn and_all(parts: &[&Expr]) -> Option<Expr> {
+    let mut it = parts.iter();
+    let first = (*it.next()?).clone();
+    Some(it.fold(first, |acc, e| Expr::binary(BinOp::And, acc, (*e).clone())))
+}
+
+/// Tables whose columns `e` reads, outside subqueries.
+fn tables_read(e: &Expr, out: &mut BTreeSet<&'static str>) {
+    match e {
+        Expr::Column(c) => {
+            out.insert(c.table);
+        }
+        Expr::Value(_) => {}
+        Expr::Binary { left, right, .. } => {
+            tables_read(left, out);
+            tables_read(right, out);
+        }
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::InList { expr: x, .. } => tables_read(x, out),
+        Expr::Between { expr, low, high, .. } => {
+            tables_read(expr, out);
+            tables_read(low, out);
+            tables_read(high, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            tables_read(expr, out);
+            tables_read(pattern, out);
+        }
+        Expr::Match(m) => tables_read(&Expr::Column(m_column(m)), out),
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                tables_read(a, out);
+            }
+            // An aggregate is never a row filter.
+            out.insert("");
+        }
+        Expr::InSubquery { expr, .. } => tables_read(expr, out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            out.insert("");
+        }
+    }
+}
+
+/// The column a full-text search reads (its debug form names it; the
+/// in-memory engine needs no more).
+fn m_column(m: &memoire_orm::TextSearch) -> memoire_orm::ColumnRef {
+    match m.expr() {
+        Expr::Column(c) => *c,
+        _ => memoire_orm::ColumnRef { table: "", name: "", index: 0, kind: memoire_orm::ColumnType::Text },
+    }
+}
+
+/// The tables of the subqueries of a statement, recursively.
+fn subquery_tables(ast: &SelectAst, out: &mut Vec<&'static TableSchema>) {
+    fn walk(e: &Expr, out: &mut Vec<&'static TableSchema>) {
+        match e {
+            Expr::InSubquery { expr, query, .. } => {
+                walk(expr, out);
+                for t in query.tables() {
+                    if !out.iter().any(|o| o.name == t.name) {
+                        out.push(t);
+                    }
+                }
+                subquery_tables(query, out);
+            }
+            Expr::Binary { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Not(x) => walk(x, out),
+            _ => {}
+        }
+    }
+    for e in ast.filter.iter().chain(ast.having.iter()).chain(ast.joins.iter().map(|j| &j.on)) {
+        walk(e, out);
+    }
+    if let Projection::Exprs(list) = &ast.projection {
+        for e in list {
+            walk(e, out);
+        }
+    }
+}
+
+fn filter_tables(filter: Option<&Expr>, out: &mut Vec<&'static TableSchema>) {
+    if let Some(f) = filter {
+        let mut fake = SelectAst::new(&EMPTY);
+        fake.filter = Some(f.clone());
+        subquery_tables(&fake, out);
+    }
+}
+
+static EMPTY: TableSchema = TableSchema {
+    name: "",
+    columns: &[],
+    primary_key: 0,
+    indexes: &[],
+    sql: [memoire_orm::StaticSql { columns: "", select: "", find: "", insert: "", update: "", delete: "", upsert: "" };
+        3],
+};
+
+/// Keys found through an index for the pinned conjuncts, when there is one.
+fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Expr]) -> Result<Option<Vec<Vec<u8>>>> {
+    let column = |e: &Expr| match e {
+        Expr::Column(c) if c.table == schema.name => Some(schema.columns.get(c.index)?.name),
+        _ => None,
+    };
+    let mut pins: HashMap<&str, &Value> = HashMap::new();
+    for part in parts {
+        match part {
+            Expr::Binary { op: BinOp::Eq, left, right } => {
+                let pin = match (&**left, &**right) {
+                    (l, Expr::Value(v)) => column(l).map(|c| (c, v)),
+                    (Expr::Value(v), r) => column(r).map(|c| (c, v)),
+                    _ => None,
+                };
+                if let Some((c, v)) = pin {
+                    if c == meta.columns[meta.pk] {
+                        return Ok(Some(vec![pk_enc(v)]));
+                    }
+                    pins.insert(c, v);
+                }
+            }
+            Expr::InList { expr, list, negated: false } => {
+                if let Some(c) = column(expr) {
+                    if c == meta.columns[meta.pk] {
+                        let mut keys: Vec<Vec<u8>> = list.iter().map(pk_enc).collect();
+                        keys.sort();
+                        keys.dedup();
+                        return Ok(Some(keys));
+                    }
+                    if let Some(i) = meta.indexes.iter().position(|ix| ix.columns.len() == 1 && ix.columns[0] == c) {
+                        let mut keys = Vec::new();
+                        for v in list {
+                            keys.extend(ctx.index_lookup(meta, i, &[v])?);
+                        }
+                        keys.sort();
+                        keys.dedup();
+                        return Ok(Some(keys));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // The index with the most columns that are all pinned.
+    let best = meta
+        .indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, ix)| ix.columns.iter().all(|c| pins.contains_key(c.as_str())))
+        .max_by_key(|(_, ix)| ix.columns.len());
+    match best {
+        Some((i, ix)) => {
+            let values: Vec<&Value> = ix.columns.iter().map(|c| pins[c.as_str()]).collect();
+            // NULL is never indexed (and never equal).
+            if values.iter().any(|v| v.is_null()) {
+                return Ok(Some(Vec::new()));
+            }
+            Ok(Some(ctx.index_lookup(meta, i, &values)?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// When a single-table `SELECT` may stop reading early.
+#[derive(Clone)]
+enum Stop {
+    Never,
+    /// No order: the first `n` matches are the answer.
+    First(usize),
+    /// `ORDER BY ... LIMIT`: keep the best `n` while reading.
+    Best(Vec<memoire_orm::Order>, usize),
+}
+
+/// Rows of `schema` matching `parts`, read through an index when possible.
+fn matching_rows(
+    ctx: &mut Ctx<'_>,
+    schema: &'static TableSchema,
+    parts: &[&Expr],
+    side: &Tables,
+    side_schemas: &[&'static TableSchema],
+    stop: Stop,
+) -> Result<Option<(Vec<Vec<Value>>, i64)>> {
+    let Some(meta) = ctx.meta(schema.name)? else { return Ok(None) };
+    let map = meta.map(schema);
+    let seq = ctx.counter(&keys::seq_key(meta.generation))?;
+    let filter = and_all(parts);
+    // Keeps the rows of `chunk` that match, evaluated by Memoire.
+    let keep = |chunk: Vec<Vec<Value>>, ast: &SelectAst| -> Result<Vec<Vec<Value>>> {
+        let mut t = side.clone();
+        t.insert(schema, chunk, seq);
+        evaluator::fetch(&t, Query::Select(ast))
+    };
+    let mut select = SelectAst::new(schema);
+    select.filter = filter.clone();
+    let _ = side_schemas;
+    if let Some(pks) = pushdown(ctx, &meta, schema, parts)? {
+        let rows = ctx.rows_by_pk(&meta, &map, &pks)?;
+        let rows = if filter.is_some() { keep(rows, &select)? } else { rows };
+        return Ok(Some((rows, seq)));
+    }
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    ctx.scan_rows(&meta, &map, |chunk| {
+        let matched = if filter.is_some() { keep(chunk, &select)? } else { chunk };
+        out.extend(matched);
+        Ok(match &stop {
+            Stop::Never => true,
+            Stop::First(n) => out.len() < *n,
+            Stop::Best(order, n) => {
+                if out.len() > *n {
+                    let mut best = SelectAst::new(schema);
+                    best.order = order.clone();
+                    best.limit = Some(*n as u64);
+                    out = keep(std::mem::take(&mut out), &best)?;
+                }
+                true
+            }
+        })
+    })?;
+    Ok(Some((out, seq)))
+}
+
+fn load_all(ctx: &mut Ctx<'_>, schema: &'static TableSchema, into: &mut Tables) -> Result<()> {
+    if into.contains(schema.name) {
+        return Ok(());
+    }
+    if let Some((rows, seq)) = matching_rows(ctx, schema, &[], &Tables::new(), &[], Stop::Never)? {
+        into.insert(schema, rows, seq);
+    }
+    Ok(())
+}
+
+fn is_count_all(ast: &SelectAst) -> bool {
+    ast.joins.is_empty()
+        && ast.filter.is_none()
+        && ast.group_by.is_empty()
+        && ast.having.is_none()
+        && ast.limit.is_none()
+        && ast.offset.unwrap_or(0) == 0
+        && !ast.distinct
+        && matches!(&ast.projection, Projection::Exprs(e)
+            if matches!(e.as_slice(), [Expr::Aggregate { func: AggFunc::Count, arg: None, distinct: false }]))
+}
+
+/// The answer to a statement that returns rows.
+pub(crate) enum Fetched {
+    /// Rows already final.
+    Rows(Vec<Vec<Value>>),
+    /// Tables to evaluate the statement on.
+    Tables(Tables),
+}
+
+/// Reads what `query` needs.
+pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
+    match *query {
+        Query::FindByKey { table, key } => {
+            let Some(meta) = ctx.meta(table.name)? else { return Err(Error::NoSuchTable(table.name.to_owned())) };
+            let map = meta.map(table);
+            Ok(Fetched::Rows(ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?))
+        }
+        Query::Select(ast) => {
+            if is_count_all(ast) {
+                let Some(meta) = ctx.meta(ast.from.name)? else {
+                    return Err(Error::NoSuchTable(ast.from.name.to_owned()));
+                };
+                return Ok(Fetched::Rows(vec![vec![Value::I64(ctx.row_count(&meta)?)]]));
+            }
+            let mut side_schemas = Vec::new();
+            subquery_tables(ast, &mut side_schemas);
+            let mut side = Tables::new();
+            for s in &side_schemas {
+                load_all(ctx, s, &mut side)?;
+            }
+            let parts: Vec<&Expr> = ast.filter.as_ref().map(conjuncts).unwrap_or_default();
+            let single = ast.joins.is_empty()
+                && ast.group_by.is_empty()
+                && ast.having.is_none()
+                && !ast.distinct
+                && !matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(|x| matches!(x, Expr::Aggregate { .. })));
+            let mut tables = side.clone();
+            for (i, schema) in ast.tables().enumerate() {
+                if tables.contains(schema.name) && !side_schemas.iter().any(|s| s.name == schema.name) {
+                    continue;
+                }
+                // The nullable side of a LEFT JOIN is read whole: filtering it
+                // first would change which rows get NULLs.
+                let nullable = i > 0 && ast.joins[i - 1].kind == JoinKind::Left;
+                let own: Vec<&Expr> = if nullable {
+                    Vec::new()
+                } else {
+                    parts
+                        .iter()
+                        .copied()
+                        .filter(|p| {
+                            let mut t = BTreeSet::new();
+                            tables_read(p, &mut t);
+                            t.len() == 1 && t.contains(schema.name)
+                        })
+                        .collect()
+                };
+                // Stopping early is only right when this table's filter is the whole filter.
+                let whole = own.len() == parts.len();
+                let stop = match (single && whole, ast.limit) {
+                    (true, Some(limit)) => {
+                        let n = (limit + ast.offset.unwrap_or(0)) as usize;
+                        if ast.order.is_empty() { Stop::First(n) } else { Stop::Best(ast.order.clone(), n) }
+                    }
+                    _ => Stop::Never,
+                };
+                if let Some((rows, seq)) = matching_rows(ctx, schema, &own, &side, &side_schemas, stop)? {
+                    tables.insert(schema, rows, seq);
+                }
+            }
+            Ok(Fetched::Tables(tables))
+        }
+        Query::Raw { .. } | Query::Script { .. } => {
+            Err(Error::Unsupported("raw SQL is not supported by Nuage DB (it runs Memoire statements, not SQL)".into()))
+        }
+        _ => Err(Error::Unsupported("statement does not return rows".into())),
+    }
+}
+
+/// Rows of a statement returning rows.
+pub(crate) fn fetch_rows(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Vec<Vec<Value>>> {
+    match fetch(ctx, query)? {
+        Fetched::Rows(rows) => Ok(rows),
+        Fetched::Tables(t) => evaluator::fetch(&t, *query),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
+
+fn index_entries(meta: &TableMeta, stored: &[Value], pk: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for (i, ix) in meta.indexes.iter().enumerate() {
+        let Some(pos) = meta.index_positions(ix) else { continue };
+        let values: Vec<&Value> = pos.iter().map(|&p| stored.get(p).unwrap_or(&Value::Null)).collect();
+        if values.iter().any(|v| v.is_null()) {
+            continue;
+        }
+        let mut k = keys::index_prefix(meta.generation, i as u16, &values);
+        k.extend_from_slice(pk);
+        out.push(k);
+    }
+    out
+}
+
+/// Runs a write statement.
+pub(crate) fn execute(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<ExecResult> {
+    match *query {
+        Query::CreateTable { table, if_not_exists } => {
+            if ctx.meta(table.name)?.is_some() {
+                return if if_not_exists {
+                    Ok(ExecResult::default())
+                } else {
+                    Err(Error::TableExists(table.name.to_owned()))
+                };
+            }
+            let meta = TableMeta::new(table, ctx.store.next_generation());
+            ctx.put_meta(table.name, &meta);
+            ctx.written.insert(table.name.to_owned());
+            Ok(ExecResult::default())
+        }
+        Query::DropTable { name, if_exists } => {
+            let Some(meta) = ctx.meta(name)? else {
+                return if if_exists { Ok(ExecResult::default()) } else { Err(Error::NoSuchTable(name.to_owned())) };
+            };
+            ctx.put(keys::catalog_key(name), None);
+            // The rows go too, unless a branch made before still reads them.
+            if ctx.store.children_of(ctx.branch).is_empty() {
+                let (start, end) = keys::generation_range(meta.generation);
+                ctx.overlay.retain(|k, _| !(k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice()));
+                ctx.extra.push(Op::DelRange { table: super::store::branch_table(ctx.branch), start, end });
+            }
+            ctx.written.insert(name.to_owned());
+            Ok(ExecResult::default())
+        }
+        Query::Raw { .. } | Query::Script { .. } => {
+            Err(Error::Unsupported("raw SQL is not supported by Nuage DB (it runs Memoire statements, not SQL)".into()))
+        }
+        Query::Select(_) | Query::FindByKey { .. } => {
+            Err(Error::Unsupported("use `fetch_all` for statements returning rows".into()))
+        }
+        Query::Insert(i) => write_rows(ctx, query, i.table),
+        Query::Update(u) => write_rows(ctx, query, u.table),
+        Query::Delete(d) => write_rows(ctx, query, d.table),
+        Query::InsertRow { table, .. }
+        | Query::UpsertRow { table, .. }
+        | Query::UpdateRow { table, .. }
+        | Query::DeleteByKey { table, .. } => write_rows(ctx, query, table),
+        _ => Err(Error::Unsupported("statement not supported by Nuage DB".into())),
+    }
+}
+
+fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema) -> Result<ExecResult> {
+    let Some(mut meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    // A model with new columns widens the stored rows.
+    let missing: Vec<String> =
+        schema.columns.iter().filter(|c| meta.position(c.name).is_none()).map(|c| c.name.to_owned()).collect();
+    if !missing.is_empty() {
+        meta.columns.extend(missing);
+        meta.schema = schema_to_json(schema);
+        ctx.put_meta(schema.name, &meta);
+    }
+    let map = meta.map(schema);
+    let pk = schema.primary_key;
+    let seq = ctx.counter(&keys::seq_key(meta.generation))?;
+
+    // The rows the statement may change, and the tables its filter reads.
+    let mut side_schemas = Vec::new();
+    let (candidates, side) = match *query {
+        Query::InsertRow { .. } | Query::Insert(_) => (Vec::new(), Tables::new()),
+        Query::UpsertRow { values, .. } | Query::UpdateRow { values, .. } => {
+            let key = values.get(pk).ok_or_else(|| Error::Conversion(format!("`{}`: row too short", schema.name)))?;
+            (ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?, Tables::new())
+        }
+        Query::DeleteByKey { key, .. } => (ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?, Tables::new()),
+        Query::Update(u) => {
+            filter_tables(u.filter.as_ref(), &mut side_schemas);
+            let mut side = Tables::new();
+            for s in &side_schemas {
+                load_all(ctx, s, &mut side)?;
+            }
+            let parts: Vec<&Expr> = u.filter.as_ref().map(conjuncts).unwrap_or_default();
+            let rows =
+                matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never)?.map_or(Vec::new(), |r| r.0);
+            (rows, side)
+        }
+        Query::Delete(d) => {
+            filter_tables(d.filter.as_ref(), &mut side_schemas);
+            let mut side = Tables::new();
+            for s in &side_schemas {
+                load_all(ctx, s, &mut side)?;
+            }
+            let parts: Vec<&Expr> = d.filter.as_ref().map(conjuncts).unwrap_or_default();
+            let rows =
+                matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never)?.map_or(Vec::new(), |r| r.0);
+            (rows, side)
+        }
+        _ => unreachable!("write_rows is only called for row writes"),
+    };
+
+    // Memoire evaluates the statement on those rows.
+    let mut tables = side;
+    tables.insert(schema, candidates.clone(), seq);
+    let result = evaluator::execute(&mut tables, *query)?;
+    let after = tables.rows(schema.name).unwrap_or_default();
+
+    let before: BTreeMap<Vec<u8>, &Vec<Value>> = candidates.iter().map(|r| (pk_enc(&r[pk]), r)).collect();
+    let after_map: BTreeMap<Vec<u8>, &Vec<Value>> = after.iter().map(|r| (pk_enc(&r[pk]), r)).collect();
+    let deleted: Vec<&Vec<u8>> = before.keys().filter(|k| !after_map.contains_key(*k)).collect();
+    let changed: Vec<(&Vec<u8>, &Vec<Value>)> =
+        after_map.iter().filter(|(k, r)| before.get(*k).is_none_or(|b| *b != **r)).map(|(k, r)| (k, *r)).collect();
+    if deleted.is_empty() && changed.is_empty() {
+        return Ok(result);
+    }
+
+    // Unique keys: the rows this statement did not read may hold the values.
+    for (key, row) in &changed {
+        if !before.contains_key(*key) && ctx.get(&row_key_raw(meta.generation, key))?.is_some() {
+            return Err(Error::UniqueViolation {
+                table: schema.name.to_owned(),
+                column: meta.columns[meta.pk].clone(),
+            });
+        }
+        let stored = to_stored(&meta, &map, row, None);
+        for (i, ix) in meta.indexes.iter().enumerate().filter(|(_, ix)| ix.unique) {
+            let Some(pos) = meta.index_positions(ix) else { continue };
+            let values: Vec<&Value> = pos.iter().map(|&p| &stored[p]).collect();
+            if values.iter().any(|v| v.is_null()) {
+                continue;
+            }
+            for other in ctx.index_lookup(&meta, i, &values)? {
+                if !before.contains_key(&other) && other != **key {
+                    return Err(Error::UniqueViolation {
+                        table: schema.name.to_owned(),
+                        column: ix.columns.join(", "),
+                    });
+                }
+            }
+        }
+    }
+
+    // Old index entries out, new rows and entries in.
+    let mut old_stored: HashMap<Vec<u8>, Vec<Value>> = HashMap::new();
+    for key in before.keys() {
+        if let Some(b) = ctx.get(&row_key_raw(meta.generation, key))? {
+            old_stored.insert(key.clone(), keys::decode_row(&b)?);
+        }
+    }
+    let mut count = ctx.row_count(&meta)?;
+    let mut bytes = ctx.table_bytes(&meta)?;
+    for key in &deleted {
+        if let Some(old) = old_stored.get(*key) {
+            for e in index_entries(&meta, old, key) {
+                ctx.put(e, None);
+            }
+            ctx.put(row_key_raw(meta.generation, key), None);
+            count -= 1;
+            bytes -= keys::encode_row(old).len() as i64;
+        }
+    }
+    for (key, row) in &changed {
+        let old = old_stored.get(*key);
+        if let Some(old) = old {
+            for e in index_entries(&meta, old, key) {
+                ctx.put(e, None);
+            }
+            bytes -= keys::encode_row(old).len() as i64;
+        } else {
+            count += 1;
+        }
+        let stored = to_stored(&meta, &map, row, old);
+        for e in index_entries(&meta, &stored, key) {
+            ctx.put(e, Some(Vec::new()));
+        }
+        let encoded = keys::encode_row(&stored);
+        bytes += encoded.len() as i64;
+        ctx.put(row_key_raw(meta.generation, key), Some(encoded));
+    }
+    ctx.put(keys::count_key(meta.generation), Some(keys::encode_i64(count)));
+    ctx.put(keys::bytes_key(meta.generation), Some(keys::encode_i64(bytes.max(0))));
+    if let Some(last) = tables.last_id(schema.name).filter(|&l| l > seq) {
+        ctx.put(keys::seq_key(meta.generation), Some(keys::encode_i64(last)));
+    }
+    ctx.written.insert(schema.name.to_owned());
+    Ok(result)
+}
+
+/// A row in storage order; stored columns the model does not know keep
+/// their old value.
+fn to_stored(meta: &TableMeta, map: &[Option<usize>], row: &[Value], old: Option<&Vec<Value>>) -> Vec<Value> {
+    let mut stored = old.cloned().unwrap_or_default();
+    stored.resize(meta.columns.len(), Value::Null);
+    for (i, m) in map.iter().enumerate() {
+        if let Some(p) = m {
+            stored[*p] = row[i].clone();
+        }
+    }
+    stored
+}

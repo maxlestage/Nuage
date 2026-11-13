@@ -1,0 +1,8 @@
+# Heroku with the emk/rust buildpack (https://elements.heroku.com/buildpacks/emk/heroku-buildpack-rust).
+# The buildpack sources this file and installs Rust; its own build is skipped, and
+# heroku-build.sh builds the `nuage` binary (with the website) into target/release, where
+# the Procfile starts it.
+# The same pinned toolchain as the Dockerfile: bump both together.
+VERSION=1.99
+RUST_SKIP_BUILD=1
+trap 'status=$?; if [ "$status" -eq 0 ]; then ENV_DIR="$ENV_DIR" bash "$BUILD_DIR/heroku-build.sh" || exit 1; fi' EXIT
