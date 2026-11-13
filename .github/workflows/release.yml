@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to (re)build the release of
+        description: Tag of the release (made on the chosen branch's last commit if it does not exist)
         required: true
 
 permissions:
@@ -35,8 +35,6 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -85,8 +83,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ env.TAG }}
       - uses: actions/download-artifact@v5
         with:
           path: out
@@ -107,6 +103,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           name: Nuage DB ${{ env.TAG }}
           body_path: notes.md
           files: out/*
