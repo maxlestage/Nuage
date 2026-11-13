@@ -12,6 +12,7 @@
 //! | Object | Content |
 //! |---|---|
 //! | `manifest.json` | latest snapshot and its LSN |
+//! | `encryption.json` | the header of an encrypted database (salt, check value: no key) |
 //! | `snapshots/<lsn>.redb` | page store files |
 //! | `wal/<first lsn>.log` | log segments |
 
@@ -22,8 +23,9 @@ use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
 use super::storage_err;
-use super::store::{Store, now_millis};
+use super::store::{FILE, Store, now_millis};
 use super::wal::{self, segment_lsn, segment_name};
+use crate::crypto::HEADER_FILE;
 
 /// Where backups go: a directory, object storage...
 ///
@@ -162,14 +164,20 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
         // No commit may land while the file is copied.
         let mut w = store.writer();
         let lsn = store.checkpoint_locked(&mut w, Some(0))?;
-        fs::copy(store.dir.join("nuage.redb"), &local).map_err(io)?;
+        fs::copy(store.dir.join(FILE), &local).map_err(io)?;
         lsn
     };
     let name = format!("snapshots/{lsn:020}.redb");
     let uploaded = backup.put_file(&name, &local);
     let _ = fs::remove_file(&local);
     uploaded?;
-    backup.put(MANIFEST, json!({ "snapshot": name, "lsn": lsn, "at": now_millis() }).to_string().as_bytes())?;
+    // An encrypted snapshot needs its header (salt, check value) to be read.
+    let header = fs::read(store.dir.join(HEADER_FILE)).ok();
+    if let Some(h) = &header {
+        backup.put(HEADER_FILE, h)?;
+    }
+    let manifest = json!({ "snapshot": name, "lsn": lsn, "at": now_millis(), "encrypted": header.is_some() });
+    backup.put(MANIFEST, manifest.to_string().as_bytes())?;
     let mut snapshots = backup.list("snapshots/")?;
     snapshots.sort();
     if snapshots.len() > keep.max(1) {
@@ -197,9 +205,30 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
     Ok(lsn)
 }
 
+/// After a database in clear was encrypted and a snapshot of it taken:
+/// removes every older snapshot and the log segments before the latest one,
+/// which were in clear.
+pub(crate) fn purge_older(backup: &dyn BackupStore) -> Result<()> {
+    let Some(manifest) = backup.get(MANIFEST)? else { return Ok(()) };
+    let manifest: Json = serde_json::from_slice(&manifest).map_err(|e| storage_err(format!("backup manifest: {e}")))?;
+    let latest = manifest.get("snapshot").and_then(Json::as_str).unwrap_or_default().to_owned();
+    let lsn = manifest.get("lsn").and_then(Json::as_u64).unwrap_or(0);
+    for old in backup.list("snapshots/")? {
+        if old != latest {
+            backup.delete(&old)?;
+        }
+    }
+    for seg in backup.list("wal/")? {
+        if segment_lsn(seg.trim_start_matches("wal/")).is_some_and(|first| first <= lsn) {
+            backup.delete(&seg)?;
+        }
+    }
+    Ok(())
+}
+
 /// `true` when `dir` holds no database.
 pub(crate) fn is_empty(dir: &Path) -> bool {
-    !dir.join("nuage.redb").exists()
+    !dir.join(FILE).exists()
 }
 
 /// Restores the latest backup into `dir`. Returns `false` when there is
@@ -211,6 +240,11 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
     let lsn = manifest.get("lsn").and_then(Json::as_u64).unwrap_or(0);
     let data = backup.get(name)?.ok_or_else(|| storage_err(format!("backup snapshot `{name}` is missing")))?;
     fs::create_dir_all(dir.join("wal")).map_err(io)?;
+    // The header first: the snapshot is unreadable without it.
+    if manifest.get("encrypted").and_then(Json::as_bool) == Some(true) {
+        let header = backup.get(HEADER_FILE)?.ok_or_else(|| storage_err(format!("the backup has no {HEADER_FILE}")))?;
+        fs::write(dir.join(HEADER_FILE), header).map_err(io)?;
+    }
     let tmp = dir.join("nuage.redb.partial");
     fs::write(&tmp, data).map_err(io)?;
     for seg in backup.list("wal/")? {
@@ -223,7 +257,7 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
             fs::write(dir.join("wal").join(segment_name(first)), bytes).map_err(io)?;
         }
     }
-    fs::rename(&tmp, dir.join("nuage.redb")).map_err(io)?;
+    fs::rename(&tmp, dir.join(FILE)).map_err(io)?;
     wal::sync_dir(dir);
     Ok(true)
 }

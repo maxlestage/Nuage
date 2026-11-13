@@ -26,3 +26,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = false
+
+# Argon2id (64 MiB, a passphrase as encryption key) and AES are slow without optimization:
+# optimized even in debug, so `cargo test` stays fast.
+[profile.dev.package]
+argon2 = { opt-level = 3 }
+blake2 = { opt-level = 3 }
+aes = { opt-level = 3 }

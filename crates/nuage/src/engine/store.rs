@@ -16,13 +16,16 @@ use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::SystemTime;
 
 use memoire_orm::{Error, Result};
-use redb::{Durability, ReadOnlyTable, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use redb::{Durability, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::{Value as Json, json};
 
 use super::storage_err;
 use super::wal::{self, Op, Record};
+use crate::crypto::{EncryptedFile, Keys};
 
 pub(crate) const MAIN: &str = "main";
+/// The page store's file in a data directory.
+pub(crate) const FILE: &str = "nuage.redb";
 pub(crate) const META: &str = "meta";
 const CHECKPOINT_LSN: &[u8] = b"checkpoint_lsn";
 const GENERATION: &[u8] = b"generation";
@@ -219,6 +222,46 @@ fn apply(db: &redb::Database, ops: &[Op], durable: bool) -> Result<()> {
     tx.commit().map_err(redb_err)
 }
 
+/// Opens (or creates) a page store file, encrypted with `keys` if any.
+pub(crate) fn open_redb(path: &Path, cache_bytes: usize, keys: Option<&Keys>) -> Result<redb::Database> {
+    let builder = {
+        let mut b = redb::Builder::new();
+        b.set_cache_size(cache_bytes);
+        b
+    };
+    match keys {
+        Some(k) => {
+            let file = EncryptedFile::open(path, k.pages.clone())
+                .map_err(|e| storage_err(format!("cannot open {}: {e}", path.display())))?;
+            builder.create_with_backend(file).map_err(|e| {
+                storage_err(format!(
+                    "cannot open the encrypted page store {} ({e}): is it really encrypted with this key?",
+                    path.display()
+                ))
+            })
+        }
+        None => builder.create(path).map_err(redb_err),
+    }
+}
+
+/// Copies every table of `from` into `to` (a page store encrypted, or
+/// re-encrypted). Both are closed by the caller.
+pub(crate) fn copy_tables(from: &redb::Database, to: &redb::Database) -> Result<()> {
+    use redb::TableHandle;
+    let r = from.begin_read().map_err(redb_err)?;
+    let w = to.begin_write().map_err(redb_err)?;
+    for handle in r.list_tables().map_err(redb_err)? {
+        let name = handle.name().to_owned();
+        let src = r.open_table(def(&name)).map_err(redb_err)?;
+        let mut dst = w.open_table(def(&name)).map_err(redb_err)?;
+        for item in src.iter().map_err(redb_err)? {
+            let (k, v) = item.map_err(redb_err)?;
+            dst.insert(k.value(), v.value()).map_err(redb_err)?;
+        }
+    }
+    w.commit().map_err(redb_err)
+}
+
 fn read_meta(db: &redb::Database, key: &[u8]) -> Result<Option<Vec<u8>>> {
     let tx = db.begin_read().map_err(redb_err)?;
     let table = match tx.open_table(def(META)) {
@@ -240,12 +283,12 @@ pub(crate) fn now_millis() -> i64 {
 impl Store {
     /// Opens the store in `dir`, replaying the log written since the last
     /// checkpoint, then checkpoints.
-    pub(crate) fn open(dir: &Path, cache_bytes: usize, sync: bool) -> Result<Store> {
+    pub(crate) fn open(dir: &Path, cache_bytes: usize, sync: bool, keys: Option<&Keys>) -> Result<Store> {
         fs::create_dir_all(dir).map_err(|e| storage_err(format!("cannot create {}: {e}", dir.display())))?;
-        let db = redb::Builder::new().set_cache_size(cache_bytes).create(dir.join("nuage.redb")).map_err(redb_err)?;
+        let db = open_redb(&dir.join(FILE), cache_bytes, keys)?;
         let checkpoint_lsn = u64_of(read_meta(&db, CHECKPOINT_LSN)?);
         let wal_dir = dir.join("wal");
-        let records = wal::recover(&wal_dir)?;
+        let records = wal::recover(&wal_dir, keys.map(|k| k.wal.as_ref()))?;
         let mut last = checkpoint_lsn;
         for r in records.iter().filter(|r| r.lsn > checkpoint_lsn) {
             apply(&db, &r.ops, false)?;
@@ -256,7 +299,7 @@ impl Store {
             db: RwLock::new(db),
             dir: dir.to_owned(),
             writer: Mutex::new(Writer {
-                wal: wal::Writer::open(&wal_dir, last + 1, sync)?,
+                wal: wal::Writer::open(&wal_dir, last + 1, sync, keys.map(|k| k.wal.clone()))?,
                 next_lsn: last + 1,
                 checkpoint_lsn,
                 last_checkpoint: None,

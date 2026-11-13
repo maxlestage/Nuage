@@ -5,7 +5,8 @@
 //! | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
-//! | `NUAGE_TOKEN` | token of the database API and of the status API | none: the API is off |
+//! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
+//! | `NUAGE_TOKEN` | token of the first application (named `NUAGE_NAME`); the console creates the others | none: that application has no token |
 //! | `NUAGE_ADMIN_PASSWORD` | password of the console (`/admin`) | none: the console is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
 //! | `NUAGE_CACHE_MB` | page cache, in MiB | `64` |
@@ -23,6 +24,7 @@ use std::time::Duration;
 
 use memoire_orm::{Error, Result};
 
+use crate::crypto::Encryption;
 use crate::engine::{BackupOptions, DirectoryStore, EngineOptions};
 use crate::s3::{S3Options, S3Store};
 use crate::server::ServerOptions;
@@ -51,6 +53,9 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
     let mut engine = EngineOptions::default();
     if let Some(name) = get("NUAGE_NAME") {
         engine.name = name;
+    }
+    if let Some(secret) = get("NUAGE_ENCRYPTION_KEY") {
+        engine.encryption = Some(Encryption::parse(&secret)?);
     }
     if let Some(mb) = get("NUAGE_CACHE_MB") {
         engine.cache_bytes = mb.parse::<usize>().map_err(|_| bad("NUAGE_CACHE_MB", &mb))? << 20;
@@ -122,6 +127,10 @@ mod tests {
         assert_eq!(c.data_dir, PathBuf::from("nuage-data"));
         assert_eq!(c.engine.backup.unwrap().store.describe(), "/tmp/b");
         assert!(from_vars(|k| (k == "PORT").then(|| "x".to_owned())).is_err());
+        assert!(c.engine.encryption.is_none());
+        let key = from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "0f".repeat(32))).unwrap();
+        assert_eq!(key.engine.encryption.unwrap().kind(), "key");
+        assert!(from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "short".to_owned())).is_err());
         assert!(from_vars(|k| (k == "NUAGE_BACKUP_S3_BUCKET").then(|| "b".to_owned())).is_err(), "credentials needed");
     }
 }

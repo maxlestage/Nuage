@@ -51,6 +51,7 @@
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod config;
+pub mod crypto;
 mod embedded;
 pub mod engine;
 pub mod s3;
@@ -62,6 +63,7 @@ use memoire_orm::{
     Database, Dialect, ExecResult, Executor, FromRow, NuageDb, NuageTransaction, Query, Result, Transaction,
 };
 
+pub use crypto::Encryption;
 pub use embedded::{Embedded, EmbeddedTransaction, TableInfo};
 pub use engine::{
     BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, StorageStats,
@@ -85,7 +87,8 @@ pub enum Db {
 
 impl Db {
     /// Opens `target`: an `http://` or `https://` URL is a server (with
-    /// `token`), anything else a data directory.
+    /// `token`), anything else a data directory (in clear: see
+    /// [`Db::from_env`] and [`EngineOptions::encryption`]).
     pub async fn open(target: &str, token: Option<&str>) -> Result<Db> {
         if target.starts_with("http://") || target.starts_with("https://") {
             let mut b = NuageDb::builder(target);
@@ -99,11 +102,20 @@ impl Db {
     }
 
     /// [`Db::open`] with `NUAGE_URL` (a URL or a directory; default: the
-    /// directory `nuage-data`) and `NUAGE_TOKEN`.
+    /// directory `nuage-data`) and `NUAGE_TOKEN`. An embedded database is
+    /// encrypted with `NUAGE_ENCRYPTION_KEY` when it is set.
     pub async fn from_env() -> Result<Db> {
-        let target = std::env::var("NUAGE_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "nuage-data".into());
-        let token = std::env::var("NUAGE_TOKEN").ok().filter(|s| !s.is_empty());
-        Db::open(&target, token.as_deref()).await
+        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        let target = var("NUAGE_URL").unwrap_or_else(|| "nuage-data".into());
+        let token = var("NUAGE_TOKEN");
+        match var("NUAGE_ENCRYPTION_KEY") {
+            Some(secret) if !target.starts_with("http://") && !target.starts_with("https://") => {
+                let options =
+                    EngineOptions { encryption: Some(Encryption::parse(&secret)?), ..EngineOptions::default() };
+                Ok(Db::Embedded(Embedded::open_with(&target, options)?))
+            }
+            _ => Db::open(&target, token.as_deref()).await,
+        }
     }
 }
 

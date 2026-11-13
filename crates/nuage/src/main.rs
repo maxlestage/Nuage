@@ -11,6 +11,11 @@ fn log(message: &str) {
 }
 
 fn main() -> ExitCode {
+    // `nuage genkey`: a new encryption key, for NUAGE_ENCRYPTION_KEY.
+    if std::env::args().nth(1).as_deref() == Some("genkey") {
+        println!("{}", nuage::Encryption::generate_key());
+        return ExitCode::SUCCESS;
+    }
     let config = match nuage::config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -25,6 +30,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if config.engine.encryption.is_none() {
+        eprintln!(
+            "nuage: NUAGE_ENCRYPTION_KEY is not set. Nuage DB encrypts everything it stores (pages, log, backups).\n\
+             nuage: generate a key with `nuage genkey` or `openssl rand -hex 32`, set it, and keep it safe:\n\
+             nuage: without it the data and its backups cannot be read."
+        );
+        return ExitCode::FAILURE;
+    }
     runtime.block_on(async move {
         let backup = config.engine.backup.as_ref().map(|b| b.store.describe());
         let engine = match Engine::open(&config.data_dir, config.engine) {
@@ -37,6 +50,9 @@ fn main() -> ExitCode {
         let dir = std::fs::canonicalize(&config.data_dir).unwrap_or(config.data_dir.clone());
         log(&format!("Nuage DB {} — database `{}`", nuage::VERSION, engine.options().name));
         log(&format!("data is stored in {} on this server's disk", dir.display()));
+        if let Some(kind) = engine.encryption() {
+            log(&format!("everything is encrypted ({}), with the {kind} of NUAGE_ENCRYPTION_KEY", nuage::crypto::SCHEME));
+        }
         match &backup {
             Some(target) => {
                 log(&format!("backups go to {target}; an empty data directory is restored from there at startup"));

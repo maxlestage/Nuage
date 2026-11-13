@@ -69,7 +69,11 @@ fn crash_child(dir: &str) -> ! {
     rt.block_on(async {
         let db = Embedded::open_with(
             dir,
-            EngineOptions { checkpoint_every: Duration::from_millis(50), ..EngineOptions::default() },
+            EngineOptions {
+                checkpoint_every: Duration::from_millis(50),
+                encryption: crash_key(),
+                ..EngineOptions::default()
+            },
         )
         .unwrap();
         db.create_table_if_not_exists::<Item>().await.unwrap();
@@ -87,15 +91,38 @@ fn crash_child(dir: &str) -> ! {
     })
 }
 
+/// The key of the child, from `NUAGE_CRASH_KEY` (set: an encrypted database).
+fn crash_key() -> Option<nuage::Encryption> {
+    std::env::var("NUAGE_CRASH_KEY").ok().map(|k| nuage::Encryption::parse(&k).unwrap())
+}
+
 #[test]
 fn crash_recovery() {
+    crash_rounds("crash_recovery", None);
+}
+
+/// The same, with an encrypted page store and log.
+#[test]
+fn crash_recovery_encrypted() {
+    crash_rounds("crash_recovery_encrypted", Some("5a".repeat(32)));
+}
+
+fn crash_rounds(test: &str, key: Option<String>) {
     if let Ok(dir) = std::env::var("NUAGE_CRASH_CHILD") {
         crash_child(&dir);
     }
-    let dir = temp_dir("crash");
+    let dir = temp_dir(test);
+    let options = || EngineOptions {
+        encryption: key.as_deref().map(|k| nuage::Encryption::parse(k).unwrap()),
+        ..EngineOptions::default()
+    };
     for round in 0..3 {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "crash_recovery", "--nocapture", "--test-threads=1"])
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if let Some(k) = &key {
+            command.env("NUAGE_CRASH_KEY", k);
+        }
+        let mut child = command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env("NUAGE_CRASH_CHILD", &dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -119,7 +146,7 @@ fn crash_recovery() {
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let db = Embedded::open(&dir).unwrap();
+            let db = Embedded::open_with(&dir, options()).unwrap();
             let count = Item::count(&db).await.unwrap() as usize;
             // Every acknowledged commit is there; at most the one in flight more.
             assert!(count > acknowledged, "round {round}: {count} rows, {acknowledged} acknowledged");

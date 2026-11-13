@@ -37,6 +37,12 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 libc = "0.2"
 getrandom = "0.4"
 ring = "0.17"
+# Encryption at rest (see src/crypto.rs): XTS-AES-256 for the page store (`aes`), Argon2id
+# when the key is a passphrase, base64 keys; AES-256-GCM and HKDF come from `ring`.
+aes = "0.9"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
