@@ -221,8 +221,23 @@ fn redirect(to: &str) -> Response<HttpBody> {
     res
 }
 
-fn set_cookie(res: &mut Response<HttpBody>, name: &str, value: &str, max_age: u64) {
-    let c = format!("{name}={value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}");
+/// The request reached the server over HTTPS (behind a proxy that says so),
+/// or from this machine: browsers keep `Secure` cookies there only.
+fn secure_context(headers: &HeaderMap) -> bool {
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.split(',').next().unwrap_or_default().trim().eq_ignore_ascii_case("https"));
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    https || host.starts_with("localhost") || host.starts_with("127.") || host.starts_with("[::1]")
+}
+
+/// A cookie of the console: `Secure` where the browser can keep it so (a
+/// server reached in plain HTTP, freshly installed, could not log in
+/// otherwise; its login page says to put HTTPS in front).
+fn set_cookie(res: &mut Response<HttpBody>, secure: bool, name: &str, value: &str, max_age: u64) {
+    let flag = if secure { " Secure;" } else { "" };
+    let c = format!("{name}={value}; Path=/; HttpOnly;{flag} SameSite=Strict; Max-Age={max_age}");
     if let Ok(v) = HeaderValue::from_str(&c) {
         res.headers_mut().append(header::SET_COOKIE, v);
     }
@@ -379,14 +394,25 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-fn login_page(l: Lang, message: Option<&str>, status: u16, next: Option<&str>) -> Response<HttpBody> {
+fn login_page(l: Lang, secure: bool, message: Option<&str>, status: u16, next: Option<&str>) -> Response<HttpBody> {
     let token = random_token();
     let msg = message.map_or(String::new(), |m| format!(r#"<p class="msg bad">{}</p>"#, esc(m)));
     let next = next
         .and_then(safe_next)
         .map_or(String::new(), |n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n)));
+    let clear = if secure {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="msg bad">{}</p>"#,
+            t(
+                l,
+                "This connection is not encrypted (HTTP): the password travels in clear. Reach the console over HTTPS (a domain name with the installer's NUAGE_DOMAIN, or a proxy), or through an SSH tunnel to localhost."
+            )
+        )
+    };
     let body = format!(
-        r#"<div class="login card"><h1>{console}</h1>{msg}<form method="post" action="/admin/login">
+        r#"<div class="login card"><h1>{console}</h1>{clear}{msg}<form method="post" action="/admin/login">
 <input type="hidden" name="csrf" value="{token}">{next}<p><label>{password}<br><input type="password" name="password" autocomplete="current-password" required autofocus></label></p>
 <button>{login}</button></form></div>"#,
         console = t(l, "Console"),
@@ -394,7 +420,7 @@ fn login_page(l: Lang, message: Option<&str>, status: u16, next: Option<&str>) -
         login = t(l, "Log in")
     );
     let mut res = html(status, page(l, "/admin/login", t(l, "Log in"), None, &body));
-    set_cookie(&mut res, LOGIN_COOKIE, &token, 3600);
+    set_cookie(&mut res, secure, LOGIN_COOKIE, &token, 3600);
     res
 }
 
@@ -403,10 +429,11 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
     if let Some(choice) = query_param(&req, "lang").as_deref().and_then(Lang::from_code) {
         let back = req.uri().path().to_owned();
         let mut res = redirect(safe_next(&back).unwrap_or("/admin"));
-        set_cookie(&mut res, LANG_COOKIE, choice.code(), 365 * 24 * 3600);
+        set_cookie(&mut res, secure_context(req.headers()), LANG_COOKIE, choice.code(), 365 * 24 * 3600);
         return res;
     }
     let l = Lang::of(req.headers());
+    let secure = secure_context(req.headers());
     let Some(password) = state.options.admin_password.clone() else {
         return html(
             503,
@@ -429,37 +456,37 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
     let next_param = query_param(&req, "next");
     if path == "/admin/login" {
         if method != Method::POST {
-            return login_page(l, None, 200, next_param.as_deref());
+            return login_page(l, secure, None, 200, next_param.as_deref());
         }
         let ip = client_ip(req.headers(), peer);
         let expected = cookie(req.headers(), LOGIN_COOKIE).map(str::to_owned);
         let Ok(body) = read_body(state, req).await else {
-            return login_page(l, Some(t(l, "Invalid request.")), 400, None);
+            return login_page(l, secure, Some(t(l, "Invalid request.")), 400, None);
         };
         let form = parse_form(&body);
         let next = form.get("next").map(String::as_str);
         if !state.admin.may_try(ip) {
-            return login_page(l, Some(t(l, "Too many failed attempts. Wait a few minutes.")), 429, next);
+            return login_page(l, secure, Some(t(l, "Too many failed attempts. Wait a few minutes.")), 429, next);
         }
         let csrf_ok =
             matches!((&expected, form.get("csrf")), (Some(a), Some(b)) if same_secret(a.as_bytes(), b.as_bytes()));
         if !csrf_ok {
-            return login_page(l, Some(t(l, "The form expired. Try again.")), 403, next);
+            return login_page(l, secure, Some(t(l, "The form expired. Try again.")), 403, next);
         }
         let given = form.get("password").map(String::as_str).unwrap_or_default();
         if !same_secret(given.as_bytes(), password.as_bytes()) {
             state.admin.failed(ip);
-            return login_page(l, Some(t(l, "Wrong password.")), 401, next);
+            return login_page(l, secure, Some(t(l, "Wrong password.")), 401, next);
         }
         let mut res = redirect(next.and_then(safe_next).unwrap_or("/admin"));
-        set_cookie(&mut res, SESSION_COOKIE, &state.admin.create(), SESSION_TTL.as_secs());
-        set_cookie(&mut res, LOGIN_COOKIE, "", 0);
+        set_cookie(&mut res, secure, SESSION_COOKIE, &state.admin.create(), SESSION_TTL.as_secs());
+        set_cookie(&mut res, secure, LOGIN_COOKIE, "", 0);
         return res;
     }
 
     let Some((session, csrf)) = state.admin.current(req.headers()) else {
         if method != Method::GET {
-            return login_page(l, Some(t(l, "Log in first.")), 401, None);
+            return login_page(l, secure, Some(t(l, "Log in first.")), 401, None);
         }
         // `/admin?next=/fr/app/` (from the site's dashboard) keeps its target;
         // any other console page comes back to itself.
@@ -492,7 +519,7 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
     }
 
     let origin = origin_of(req.headers());
-    let cx = Cx { l, csrf: csrf.clone(), here: path.clone() };
+    let cx = Cx { l, secure, csrf: csrf.clone(), here: path.clone() };
     if method == Method::POST {
         let Ok(body) = read_body(state, req).await else {
             return html(400, cx.page(t(l, "Error"), &format!("<p>{}</p>", t(l, "Invalid request."))));
@@ -526,6 +553,7 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: Sock
 #[derive(Clone)]
 struct Cx {
     l: Lang,
+    secure: bool,
     csrf: String,
     here: String,
 }
@@ -913,6 +941,7 @@ fn server_body(state: &State, cx: &Cx) -> String {
     let (p50, p99) = state.metrics.percentiles();
     let all = state.apps.all();
     let disk: u64 = all.iter().map(|a| a.engine.stats().file_bytes).sum();
+    let memory = crate::memory::MemoryInfo::now();
     let mut body = format!(r#"<h1>{}</h1><div class="grid">"#, cx.t("Server"));
     for (label, v) in [
         ("Version", format!("Nuage DB {}", crate::VERSION)),
@@ -933,6 +962,24 @@ fn server_body(state: &State, cx: &Cx) -> String {
         ),
         ("Backup target", engine.backup_status().target.unwrap_or_else(|| cx.t("off").into())),
         ("Free disk", engine.stats().disk_free_bytes.map_or_else(|| cx.t("unknown").into(), |b| bytes(l, b))),
+        (
+            "Memory",
+            match (memory.process_bytes, memory.available_bytes, memory.total_bytes) {
+                (Some(p), Some(a), Some(t)) => {
+                    cx.tf("{} used by Nuage, {} free of {}", &[&bytes(l, p), &bytes(l, a), &bytes(l, t)])
+                }
+                _ => cx.t("unknown").into(),
+            },
+        ),
+        (
+            "Swap",
+            match (memory.swap_total_bytes, memory.swap_free_bytes) {
+                (Some(0), _) => cx.t("none").into(),
+                (Some(t), Some(f)) => cx.tf("{} free of {}", &[&bytes(l, f), &bytes(l, t)]),
+                _ => cx.t("unknown").into(),
+            },
+        ),
+        ("Cache of each application", bytes(l, engine.options().cache_bytes as u64)),
     ] {
         body.push_str(&card(cx.t(label), &v));
     }
@@ -1266,7 +1313,7 @@ async fn post(
     if path == "/admin/logout" {
         state.admin.remove(session);
         let mut res = redirect("/admin/login");
-        set_cookie(&mut res, SESSION_COOKIE, "", 0);
+        set_cookie(&mut res, cx.secure, SESSION_COOKIE, "", 0);
         return res;
     }
     let state2 = state.clone();

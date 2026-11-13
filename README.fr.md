@@ -28,7 +28,7 @@ ligne.
 
 | | |
 |---|---|
-| **Chiffré au repos** | Tout ce qui est stocké est chiffré (`NUAGE_ENCRYPTION_KEY`) : les pages en XTS-AES-256, chaque enregistrement du journal en AES-256-GCM, et les sauvegardes, qui en sont des copies. Clés dérivées par application (HKDF, ou Argon2id depuis une phrase de passe), comme dans [brocolis](https://github.com/maxlestage/brocolis). |
+| **Chiffré au repos** | Tout ce qui est stocké est chiffré (`NUAGE_ENCRYPTION_KEY`) : les pages en XTS-AES-256, chaque enregistrement du journal en AES-256-GCM, et les sauvegardes, qui en sont des copies. Clés dérivées par application (HKDF, ou Argon2id depuis une phrase de passe). |
 | **Plusieurs applications** | Un serveur, une base par application : ses jetons, ses clés, ses sauvegardes. Le jeton qu'envoie une application choisit sa base. La console et `/app` les montrent côte à côte. |
 | **Pages sur disque** | Tables et index dans un seul fichier B-tree, avec un cache de pages borné (`NUAGE_CACHE_MB`) : les données ne sont pas limitées par la mémoire. Les recherches par clé primaire et par index ne lisent que les lignes utiles. |
 | **Journal d'écriture** | Chaque commit est ajouté au journal et synchronisé sur disque avant d'être appliqué. Checkpoints, reprise après crash, CRC-32 sur les enregistrements du journal et sommes de contrôle sur les pages. |
@@ -105,8 +105,7 @@ db.delete_branch("preview-42").await?;
 
 ## Chiffrement
 
-Nuage DB chiffre tout ce qu'il stocke, avec les primitives de
-[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id) :
+Nuage DB chiffre tout ce qu'il stocke (AES-256, HKDF-SHA256, Argon2id) :
 
 | Quoi | Comment |
 |---|---|
@@ -203,6 +202,39 @@ surtout le réseau : choisissez la région de l'hébergeur la plus proche de lui
 ne se met jamais en veille (Heroku **Basic**, pas Eco, dont la première requête après une
 pause prend plusieurs secondes).
 
+## Installer sur un serveur
+
+Sur n'importe quel serveur Linux (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 ou ARM64,
+dès 512 Mio de mémoire), une commande :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
+```
+
+Elle installe le binaire `nuage` (compilé en statique : aucune dépendance), **crée un swap**
+si le serveur n'en a pas (la taille de la mémoire, de 1 à 4 Gio ; `vm.swappiness=10`, pour
+que la mémoire aille à la base), un utilisateur `nuage`, les données dans `/var/lib/nuage`,
+les réglages dans `/etc/nuage/nuage.env` avec une clé, un jeton et un mot de passe de console
+générés, et un service systemd lancé au démarrage. Elle affiche une fois l'adresse, le jeton
+et le mot de passe : **copiez `/etc/nuage/nuage.env` en lieu sûr**, personne ne peut lire les
+données sans sa clé.
+
+- **HTTPS** : faites pointer un nom de domaine vers le serveur, puis
+  `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, avec un
+  certificat gratuit ; Nuage DB n'écoute alors que sur `127.0.0.1`). Sans HTTPS la console
+  fonctionne, mais prévient que le mot de passe circule en clair.
+- **Mise à jour** : relancez la commande ; données, clé et réglages restent.
+- **Options** : `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0` : pas de swap), `NUAGE_VERSION=v0.3.0`,
+  `NUAGE_FROM_SOURCE=1` (compilation avec cargo).
+- **Désinstaller** : `... | sudo bash -s uninstall` (garde les données),
+  `... | sudo bash -s purge`.
+- **Mémoire** : le cache de pages de chaque application est `NUAGE_CACHE_MB=auto`, un
+  huitième de la mémoire (de 8 à 512 Mio) ; le reste reste sur disque. La page *Serveur* de la
+  console montre la mémoire utilisée par Nuage DB, la mémoire libre et le swap.
+
+Des binaires pour Linux, macOS et Windows sont sur la
+[page des versions](https://github.com/maxlestage/Nuage/releases).
+
 ## Démarrage rapide
 
 ```bash
@@ -222,11 +254,11 @@ Puis ouvrez :
 
 Les applications se connectent avec `NuageDb::connect("http://localhost:8080", "dev-token")`.
 
-Docker :
+Docker (Compose, avec les réglages dans `.env`, d'après [`nuage.env.example`](nuage.env.example)) :
 
 ```bash
-docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+cp nuage.env.example .env   # puis renseignez NUAGE_ENCRYPTION_KEY, NUAGE_TOKEN, NUAGE_ADMIN_PASSWORD
+docker compose up -d
 ```
 
 ## Déployer sur Heroku
@@ -265,13 +297,14 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | Variable | Rôle | Par défaut |
 |---|---|---|
 | `PORT` | port d'écoute (fixé par Heroku et la plupart des hébergeurs) | `8080` |
+| `NUAGE_BIND` | adresse d'écoute (`127.0.0.1` : cette machine seulement, derrière un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | répertoire de données | `nuage-data` |
 | `NUAGE_NAME` | nom de la première application (et de sa base) | `nuage` |
 | `NUAGE_ENCRYPTION_KEY` | la clé qui chiffre tout : 64 chiffres hexadécimaux (`openssl rand -hex 32`, `nuage genkey`), le base64 de 32 octets, ou une phrase de passe d'au moins 12 caractères | **obligatoire** : le binaire ne démarre pas sans |
 | `NUAGE_TOKEN` | un jeton de la première application (nommée `NUAGE_NAME`) ; la console crée les autres applications et leurs jetons | aucun |
 | `NUAGE_ADMIN_PASSWORD` | mot de passe de la console (et du tableau de bord) | aucun : la console est coupée |
 | `NUAGE_PUBLIC_STATUS` | `true` : `/api/status` et `/app` montrent une partie publique sans connexion | `false` |
-| `NUAGE_CACHE_MB` | cache de pages de chaque application, en Mio | `64` |
+| `NUAGE_CACHE_MB` | cache de pages de chaque application, en Mio, ou `auto` | `auto` : un huitième de la mémoire, de 8 à 512 Mio |
 | `NUAGE_BACKUP_DIR` | sauvegarde vers ce dossier | |
 | `NUAGE_BACKUP_S3_BUCKET` | sauvegarde vers ce bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | point d'accès du stockage compatible S3 | `https://s3.<region>.amazonaws.com` |
@@ -285,8 +318,9 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `SITE_URL` | adresse publique du site (liens canoniques, carte de partage) | l'hôte de chaque requête |
 
 Un exemple commenté : [`nuage.env.example`](nuage.env.example). Servez le serveur en HTTPS
-(la plupart des hébergeurs le font pour vous) : le jeton voyage dans un en-tête, et le cookie
-de la console est `Secure`.
+(la plupart des hébergeurs le font pour vous ; sur votre serveur, `NUAGE_DOMAIN` de
+l'installateur) : le jeton voyage dans un en-tête, et le cookie de la console est `Secure` en
+HTTPS.
 
 ## `/app` et `/admin`
 
@@ -297,8 +331,8 @@ de la console est `Secure`.
   **Se connecter** passe par `/admin?next=/fr/app/` et revient au tableau de bord. Avec
   `NUAGE_PUBLIC_STATUS=true`, les visiteurs voient la partie publique. Il s'installe comme une
   application (PWA) et montre le dernier état connu hors ligne.
-- **`/admin`**, la console (en français, anglais et espagnol : la langue du navigateur, ou les liens EN · FR · ES de chaque page) : les applications (des cartes ; en créer une, son jeton s'affiche une fois), puis pour chacune sa vue d'ensemble, ses tables et leurs lignes, ses jetons (nouveau, révocation), ses réglages (description, suppression confirmée par son nom), une console de requêtes (un
-  petit sous-ensemble de SQL, avec confirmation avant les modifications), branches, stockage
+- **`/admin`**, la console (en français, anglais et espagnol : la langue du navigateur, ou les liens EN · FR · ES de chaque page) : les applications (des cartes ; en créer une, son jeton s'affiche une fois), puis pour chacune sa vue d'ensemble, ses tables et leurs lignes, ses jetons (nouveau, révocation), ses réglages (description, suppression confirmée par son nom), une console de requêtes (tout
+  SQL, avec confirmation avant les modifications), branches, stockage
   et boutons pour un checkpoint, une sauvegarde, une vérification d'intégrité et un
   compactage. Rendue par le serveur, elle fonctionne sans JavaScript, sur téléphone aussi.
   Cookie de session `HttpOnly`, `Secure`, `SameSite=Strict`, jetons CSRF, tentatives de

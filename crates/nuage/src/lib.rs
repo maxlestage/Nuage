@@ -55,6 +55,7 @@ pub mod crypto;
 mod embedded;
 pub mod engine;
 pub mod keepawake;
+pub mod memory;
 pub mod s3;
 pub mod server;
 #[cfg(feature = "site")]

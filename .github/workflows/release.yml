@@ -1,0 +1,113 @@
+name: Release
+
+# A tag `v0.3.0` publishes the release `v0.3.0`: the `nuage` binary for Linux (static,
+# x86_64 and ARM64: any distribution), macOS and Windows, each with its sha256. install.sh
+# downloads the Linux ones.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build the release of
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (static, with zig as the linker)
+        if: matrix.zig
+        run: |
+          pip install ziglang cargo-zigbuild
+          cargo zigbuild --release --locked -p nuage --bin nuage --target ${{ matrix.target }}
+      - name: Build
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked -p nuage --bin nuage --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          dir=target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" = Windows ]; then
+            name=nuage-${{ matrix.target }}.zip
+            cp "$dir/nuage.exe" LICENSE README.md dist/
+            (cd dist && 7z a -bd -tzip "../$name" nuage.exe LICENSE README.md >/dev/null)
+          else
+            name=nuage-${{ matrix.target }}.tar.gz
+            cp "$dir/nuage" LICENSE README.md dist/
+            tar -czf "$name" -C dist nuage LICENSE README.md
+          fi
+          if command -v sha256sum >/dev/null; then sha256sum "$name" > "$name.sha256"; else shasum -a 256 "$name" > "$name.sha256"; fi
+          cat "$name.sha256"
+          mkdir out && mv "$name" "$name.sha256" out/
+      - name: Check that the Linux binary is static and runs
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          file target/${{ matrix.target }}/release/nuage
+          target/${{ matrix.target }}/release/nuage --version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.target }}
+          path: out/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v5
+        with:
+          path: out
+          merge-multiple: true
+      - name: Notes from CHANGELOG.md
+        run: |
+          v=${TAG#v}
+          awk -v v="$v" '$0 ~ "^## \\[?" v "\\]?" { on = 1; next } on && /^## / { exit } on' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install on a server
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/install.sh | sudo bash
+          \`\`\`
+          EOF
+          cat notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Nuage DB ${{ env.TAG }}
+          body_path: notes.md
+          files: out/*
+          fail_on_unmatched_files: true

@@ -28,7 +28,7 @@ Nuage DB en producción, sin cambiar una línea.
 
 | | |
 |---|---|
-| **Cifrado en reposo** | Todo lo almacenado se cifra (`NUAGE_ENCRYPTION_KEY`): las páginas con XTS-AES-256, cada registro del log con AES-256-GCM, y las copias de seguridad, que son copias de ellos. Claves derivadas por aplicación (HKDF, o Argon2id desde una frase de contraseña), como en [brocolis](https://github.com/maxlestage/brocolis). |
+| **Cifrado en reposo** | Todo lo almacenado se cifra (`NUAGE_ENCRYPTION_KEY`): las páginas con XTS-AES-256, cada registro del log con AES-256-GCM, y las copias de seguridad, que son copias de ellos. Claves derivadas por aplicación (HKDF, o Argon2id desde una frase de contraseña). |
 | **Varias aplicaciones** | Un servidor, una base por aplicación: sus tokens, sus claves, sus copias. El token que envía una aplicación elige su base. La consola y `/app` las muestran una junto a otra. |
 | **Páginas en disco** | Tablas e índices en un solo archivo B-tree con una caché de páginas acotada (`NUAGE_CACHE_MB`): los datos no están limitados por la memoria. Las búsquedas por clave primaria e índice solo leen las filas necesarias. |
 | **Registro de escritura** | Cada commit se añade al registro y se sincroniza en disco antes de aplicarse. Checkpoints, recuperación tras un fallo, CRC-32 en los registros y sumas de comprobación en las páginas. |
@@ -105,8 +105,7 @@ db.delete_branch("preview-42").await?;
 
 ## Cifrado
 
-Nuage DB cifra todo lo que guarda, con las primitivas de
-[brocolis](https://github.com/maxlestage/brocolis) (AES-256, HKDF-SHA256, Argon2id):
+Nuage DB cifra todo lo que guarda (AES-256, HKDF-SHA256, Argon2id):
 
 | Qué | Cómo |
 |---|---|
@@ -198,6 +197,39 @@ comprimen con gzip para los clientes que lo aceptan. Lo que nota un visitante es
 la red: elige la región del proveedor más cercana a él, y un dyno que nunca se duerme
 (Heroku **Basic**, no Eco, cuya primera petición tras una pausa tarda varios segundos).
 
+## Instalar en un servidor
+
+En cualquier servidor Linux (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 o ARM64, desde
+512 MiB de memoria), un comando:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
+```
+
+Instala el binario `nuage` (compilado estático: sin dependencias), **crea swap** si el
+servidor no tiene (el tamaño de la memoria, de 1 a 4 GiB; `vm.swappiness=10`, para que la
+memoria sea para la base), un usuario `nuage`, los datos en `/var/lib/nuage`, los ajustes en
+`/etc/nuage/nuage.env` con una clave, un token y una contraseña de consola generados, y un
+servicio systemd que arranca con el sistema. Muestra una vez la dirección, el token y la
+contraseña: **copia `/etc/nuage/nuage.env` en un lugar seguro**, nadie puede leer los datos
+sin su clave.
+
+- **HTTPS**: apunta un nombre de dominio al servidor y ejecuta
+  `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, con un
+  certificado gratuito; Nuage DB escucha entonces solo en `127.0.0.1`). Sin HTTPS la consola
+  funciona, pero avisa de que la contraseña viaja sin cifrar.
+- **Actualizar**: vuelve a ejecutar el comando; datos, clave y ajustes se conservan.
+- **Opciones**: `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0`: sin swap), `NUAGE_VERSION=v0.3.0`,
+  `NUAGE_FROM_SOURCE=1` (compilar con cargo).
+- **Desinstalar**: `... | sudo bash -s uninstall` (conserva los datos),
+  `... | sudo bash -s purge`.
+- **Memoria**: la caché de páginas de cada aplicación es `NUAGE_CACHE_MB=auto`, un octavo de
+  la memoria (de 8 a 512 MiB); el resto queda en disco. La página *Servidor* de la consola
+  muestra la memoria que usa Nuage DB, la memoria libre y el swap.
+
+Hay binarios para Linux, macOS y Windows en la
+[página de versiones](https://github.com/maxlestage/Nuage/releases).
+
 ## Inicio rápido
 
 ```bash
@@ -217,11 +249,11 @@ Después abre:
 
 Las aplicaciones se conectan con `NuageDb::connect("http://localhost:8080", "dev-token")`.
 
-Docker:
+Docker (Compose, con los ajustes en `.env`, a partir de [`nuage.env.example`](nuage.env.example)):
 
 ```bash
-docker build -t nuage .
-docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+cp nuage.env.example .env   # y define NUAGE_ENCRYPTION_KEY, NUAGE_TOKEN, NUAGE_ADMIN_PASSWORD
+docker compose up -d
 ```
 
 ## Desplegar en Heroku
@@ -260,13 +292,14 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | Variable | Función | Por defecto |
 |---|---|---|
 | `PORT` | puerto de escucha (lo fija Heroku y la mayoría de alojamientos) | `8080` |
+| `NUAGE_BIND` | dirección de escucha (`127.0.0.1`: solo esta máquina, detrás de un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | directorio de datos | `nuage-data` |
 | `NUAGE_NAME` | nombre de la primera aplicación (y de su base) | `nuage` |
 | `NUAGE_ENCRYPTION_KEY` | la clave que lo cifra todo: 64 dígitos hexadecimales (`openssl rand -hex 32`, `nuage genkey`), el base64 de 32 bytes, o una frase de al menos 12 caracteres | **obligatoria**: el binario no arranca sin ella |
 | `NUAGE_TOKEN` | un token de la primera aplicación (llamada `NUAGE_NAME`); la consola crea las demás aplicaciones y sus tokens | ninguno |
 | `NUAGE_ADMIN_PASSWORD` | contraseña de la consola (y del panel) | ninguna: la consola está desactivada |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` y `/app` muestran una parte pública sin iniciar sesión | `false` |
-| `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB | `64` |
+| `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB, o `auto` | `auto`: un octavo de la memoria, de 8 a 512 MiB |
 | `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta | |
 | `NUAGE_BACKUP_S3_BUCKET` | copias de seguridad en este bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint del almacenamiento compatible con S3 | `https://s3.<region>.amazonaws.com` |
@@ -280,8 +313,8 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `SITE_URL` | dirección pública del sitio (enlaces canónicos, tarjeta para compartir) | el host de cada petición |
 
 Un ejemplo comentado: [`nuage.env.example`](nuage.env.example). Sirve el servidor por HTTPS
-(la mayoría de alojamientos lo hacen por ti): el token viaja en una cabecera, y la cookie de
-la consola es `Secure`.
+(la mayoría de alojamientos lo hacen por ti; en tu propio servidor, `NUAGE_DOMAIN` del
+instalador): el token viaja en una cabecera, y la cookie de la consola es `Secure` por HTTPS.
 
 ## `/app` y `/admin`
 
@@ -292,8 +325,8 @@ la consola es `Secure`.
   **Iniciar sesión** pasa por `/admin?next=/es/app/` y vuelve al panel. Con
   `NUAGE_PUBLIC_STATUS=true`, los visitantes ven la parte pública. Se instala como una
   aplicación (PWA) y muestra el último estado conocido sin conexión.
-- **`/admin`**, la consola (en español, inglés y francés: el idioma del navegador, o los enlaces EN · FR · ES de cada página): las aplicaciones (tarjetas; crear una, su token se muestra una vez), y para cada una su vista general, sus tablas y sus filas, sus tokens (nuevo, revocar), sus ajustes (descripción, borrado confirmado con su nombre), consola de consultas (un
-  pequeño subconjunto de SQL, con confirmación antes de los cambios), ramas, almacenamiento y
+- **`/admin`**, la consola (en español, inglés y francés: el idioma del navegador, o los enlaces EN · FR · ES de cada página): las aplicaciones (tarjetas; crear una, su token se muestra una vez), y para cada una su vista general, sus tablas y sus filas, sus tokens (nuevo, revocar), sus ajustes (descripción, borrado confirmado con su nombre), consola de consultas (todo
+  SQL, con confirmación antes de los cambios), ramas, almacenamiento y
   botones para un checkpoint, una copia de seguridad, una comprobación de integridad y una
   compactación. Renderizada por el servidor, funciona sin JavaScript, también en el móvil.
   Cookie de sesión `HttpOnly`, `Secure`, `SameSite=Strict`, tokens CSRF, intentos de inicio

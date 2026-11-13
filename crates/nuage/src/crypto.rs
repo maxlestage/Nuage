@@ -1,5 +1,4 @@
-//! Encryption at rest: everything Nuage DB writes is encrypted, with the
-//! primitives of [brocolis](https://github.com/maxlestage/brocolis) (AES-256,
+//! Encryption at rest: everything Nuage DB writes is encrypted (AES-256,
 //! HKDF-SHA256, Argon2id for a passphrase).
 //!
 //! | What | How |
@@ -12,7 +11,7 @@
 //! digits or base64) or a passphrase. Each data directory has a header,
 //! `encryption.json`, with a random salt and a check value (never the key):
 //! the directory's root key is HKDF-SHA256(key, salt), or Argon2id(passphrase,
-//! salt) for a passphrase (64 MiB, 3 passes, as brocolis' protected keys), and
+//! salt) for a passphrase (64 MiB, 3 passes), and
 //! the keys of the pages, of the log and the check value are derived from it
 //! with HKDF. Each application has its own directory and salt, hence keys of
 //! its own. A wrong key is reported as such at startup, before any data is
@@ -49,7 +48,7 @@ pub const SCHEME: &str = "XTS-AES-256 (pages), AES-256-GCM (log)";
 const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 32;
 const CHECK_LEN: usize = 16;
-/// Argon2id for a passphrase: 64 MiB, 3 passes, 1 lane (brocolis' default).
+/// Argon2id for a passphrase: 64 MiB, 3 passes, 1 lane (OWASP's recommendation is lower: this is safer).
 const ARGON2_M_KIB: u32 = 65_536;
 const ARGON2_T: u32 = 3;
 const ARGON2_P: u32 = 1;

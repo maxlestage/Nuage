@@ -184,6 +184,15 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
     let databases: Vec<Json> = view.apps(state).iter().map(|a| app_json(a, env_token)).collect();
     let sum = |f: fn(&crate::engine::StorageStats) -> u64| every.iter().map(|(s, _)| f(s)).sum::<u64>();
     let first = &every[0].0;
+    let m = crate::memory::MemoryInfo::now();
+    let memory = json!({
+        "total_bytes": m.total_bytes,
+        "available_bytes": m.available_bytes,
+        "process_bytes": m.process_bytes,
+        "swap_total_bytes": m.swap_total_bytes,
+        "swap_free_bytes": m.swap_free_bytes,
+        "cache_per_app_bytes": engine.options().cache_bytes,
+    });
     json!({
         "name": "Nuage DB",
         "version": crate::VERSION,
@@ -192,6 +201,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
         "started_at": rfc3339(engine.started_at()),
         "requests": requests_json(&state.metrics),
         "connections": { "active": active, "idle": open.saturating_sub(active) },
+        "memory": memory,
         "storage": {
             "bytes": sum(|s| s.file_bytes),
             "disk_free_bytes": first.disk_free_bytes,

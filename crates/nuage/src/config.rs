@@ -3,13 +3,14 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
+//! | `NUAGE_BIND` | address to listen on (`127.0.0.1`: only this machine, behind a proxy such as Caddy) | `0.0.0.0` |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
 //! | `NUAGE_TOKEN` | token of the first application (named `NUAGE_NAME`); the console creates the others | none: that application has no token |
 //! | `NUAGE_ADMIN_PASSWORD` | password of the console (`/admin`) | none: the console is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
-//! | `NUAGE_CACHE_MB` | page cache, in MiB | `64` |
+//! | `NUAGE_CACHE_MB` | page cache of each application's database, in MiB, or `auto` | `auto`: an eighth of the memory (8 to 512 MiB) |
 //! | `NUAGE_BACKUP_DIR` | back up to this directory | |
 //! | `NUAGE_BACKUP_S3_BUCKET` | back up to this S3 bucket | |
 //! | `NUAGE_BACKUP_S3_ENDPOINT` | S3 endpoint URL | `https://s3.<region>.amazonaws.com` |
@@ -37,6 +38,8 @@ use crate::server::ServerOptions;
 pub struct Config {
     /// Port to listen on.
     pub port: u16,
+    /// Address to listen on.
+    pub bind: String,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Engine settings.
@@ -62,9 +65,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
     if let Some(secret) = get("NUAGE_ENCRYPTION_KEY") {
         engine.encryption = Some(Encryption::parse(&secret)?);
     }
-    if let Some(mb) = get("NUAGE_CACHE_MB") {
-        engine.cache_bytes = mb.parse::<usize>().map_err(|_| bad("NUAGE_CACHE_MB", &mb))? << 20;
-    }
+    engine.cache_bytes = crate::memory::cache_bytes(get("NUAGE_CACHE_MB").as_deref()).map_err(Error::Validation)?;
     let store: Option<Arc<dyn crate::engine::BackupStore>> = if let Some(dir) = get("NUAGE_BACKUP_DIR") {
         Some(Arc::new(DirectoryStore::new(dir)))
     } else if let Some(bucket) = get("NUAGE_BACKUP_S3_BUCKET") {
@@ -111,6 +112,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
     Ok(Config {
         keep_awake,
         port,
+        bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
         data_dir: get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from),
         engine,
         server,
@@ -139,6 +141,7 @@ mod tests {
         let c = from_vars(vars).unwrap();
         assert_eq!((c.port, c.engine.cache_bytes, c.server.public_status), (5000, 8 << 20, true));
         assert_eq!(c.data_dir, PathBuf::from("nuage-data"));
+        assert_eq!(c.bind, "0.0.0.0");
         assert_eq!(c.engine.backup.unwrap().store.describe(), "/tmp/b");
         assert!(from_vars(|k| (k == "PORT").then(|| "x".to_owned())).is_err());
         assert!(c.engine.encryption.is_none() && c.keep_awake.is_none());
