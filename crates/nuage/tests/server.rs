@@ -377,7 +377,7 @@ async fn console() {
             &[("csrf", &csrf_token), ("sql", "DELETE FROM users WHERE age < 18"), ("confirm", "yes")],
         )
         .await;
-    assert!(res.body.contains("1 row(s) deleted"), "{}", res.body);
+    assert!(res.body.contains("1 row(s) affected"), "{}", res.body);
     assert_eq!(User::count(&db).await.unwrap(), 2);
     let res = c.request("POST", "/admin/query", &[("csrf", &csrf_token), ("sql", "SELECT * FROM nowhere")]).await;
     assert_eq!(res.status, 400);
@@ -876,6 +876,47 @@ async fn websites() {
         http(addr, "POST", "/v1/sql", &[("authorization", &r)], &sql("SELECT * FROM nowhere", serde_json::json!([])))
             .await;
     assert_eq!(bad.status, 404, "{}", bad.body);
+
+    // Several statements, one transaction; rows as arrays on request.
+    let res = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &w)],
+        &serde_json::json!({
+            "statements": [
+                { "sql": "CREATE TABLE tags (id SERIAL PRIMARY KEY, post_id BIGINT NOT NULL, name TEXT NOT NULL)" },
+                { "sql": "INSERT INTO tags (post_id, name) VALUES (?, ?), (?, ?)", "params": [1, "rust", 2, "web"] },
+                { "sql": "SELECT p.title, group_concat(t.name, ',') AS tags FROM posts p JOIN tags t ON t.post_id = p.id GROUP BY p.id, p.title ORDER BY p.id" },
+            ],
+            "arrays": true,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    let all = json(&res.body);
+    assert_eq!(all["results"][1]["rows_affected"], 2);
+    assert_eq!(all["results"][2]["rows"], serde_json::json!([["Post 0 — l'été", "rust"], ["Post 1 — l'été", "web"]]));
+    // A failing statement undoes the batch.
+    let res = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &w)],
+        &sql("INSERT INTO tags (post_id, name) VALUES (3, 'x'); INSERT INTO nowhere VALUES (1)", serde_json::json!([])),
+    )
+    .await;
+    assert!(res.status >= 400);
+    let count = http(
+        addr,
+        "POST",
+        "/v1/sql",
+        &[("authorization", &r)],
+        &sql("SELECT count(*) AS n FROM tags", serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(json(&count.body)["rows"][0]["n"], 2);
 
     // A read-only token reads, and nothing else.
     for (path, body) in [

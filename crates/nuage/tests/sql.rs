@@ -1,0 +1,340 @@
+//! SQL on Nuage DB, end to end (`Embedded::sql`, the same code as `POST
+//! /v1/sql`): definitions, writes, and every kind of `SELECT`.
+
+use memoire_orm::Value;
+use nuage::{Embedded, SqlResult};
+use serde_json::{Value as Json, json};
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nuage-sql-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+struct Db(Embedded, std::path::PathBuf);
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
+impl Db {
+    fn open(name: &str) -> Db {
+        let dir = temp_dir(name);
+        Db(Embedded::open(&dir).unwrap(), dir)
+    }
+
+    fn run(&self, sql: &str, params: &[Json]) -> Vec<SqlResult> {
+        self.0.sql(sql, params).unwrap_or_else(|e| panic!("{sql}\n→ {e}"))
+    }
+
+    fn one(&self, sql: &str, params: &[Json]) -> SqlResult {
+        self.run(sql, params).pop().unwrap()
+    }
+
+    /// Rows as JSON arrays, to compare at a glance.
+    fn rows(&self, sql: &str, params: &[Json]) -> Json {
+        let r = self.one(sql, params);
+        Json::Array(r.rows.iter().map(|row| Json::Array(row.iter().map(nuage::sql::value_to_json).collect())).collect())
+    }
+
+    fn err(&self, sql: &str) -> String {
+        self.0.sql(sql, &[]).expect_err(sql).to_string()
+    }
+}
+
+fn blog() -> Db {
+    let db = Db::open(&format!("blog-{}", std::thread::current().name().unwrap_or("t").replace("::", "-")));
+    db.run(
+        "CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(120) NOT NULL UNIQUE, name TEXT NOT NULL, age INT, city TEXT, \
+           created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP);
+         CREATE TABLE posts (id BIGINT PRIMARY KEY AUTOINCREMENT, user_id BIGINT NOT NULL REFERENCES users(id), \
+           title TEXT NOT NULL, views INT NOT NULL DEFAULT 0, published BOOLEAN DEFAULT TRUE, tags JSON);
+         CREATE INDEX posts_user ON posts (user_id);
+         INSERT INTO users (email, name, age, city) VALUES
+           ('ada@x.dev', 'Ada', 36, 'Paris'), ('bob@x.dev', 'Bob', 17, 'Lyon'),
+           ('cy@x.dev', 'Cy', 52, 'Paris'), ('dee@x.dev', 'Dee', NULL, NULL);
+         INSERT INTO posts (user_id, title, views, published, tags) VALUES
+           (1, 'Hello', 10, true, '{\"t\": [\"intro\"]}'), (1, 'Rust', 250, true, NULL),
+           (2, 'Skate', 5, false, NULL), (3, 'Été à Paris', 120, true, '{\"t\": [\"voyage\", \"paris\"]}');",
+        &[],
+    );
+    db
+}
+
+#[test]
+fn definitions_and_writes() {
+    let db = blog();
+    // Generated keys, defaults, RETURNING.
+    let r = db.one(
+        "INSERT INTO posts (user_id, title) VALUES (?, ?) RETURNING id, views, published",
+        &[json!(4), json!("Premier")],
+    );
+    assert_eq!(
+        (r.columns.clone(), r.rows[0].clone()),
+        (vec!["id".into(), "views".into(), "published".into()], vec![Value::I64(5), Value::I32(0), Value::Bool(true)])
+    );
+    assert_eq!(r.last_insert_id, Some(Value::I64(5)));
+    let r = db.one("INSERT INTO posts (user_id, title) VALUES ($1, $2)", &[json!(4), json!("Second")]);
+    assert_eq!((r.rows_affected, r.last_insert_id), (1, Some(Value::I64(6))));
+    assert!(db.err("INSERT INTO posts (user_id) VALUES (1)").contains("title"));
+    assert!(db.err("INSERT INTO users (email, name) VALUES ('ada@x.dev', 'Twin')").to_lowercase().contains("unique"));
+
+    // UPDATE with expressions, RETURNING the new values.
+    let r = db.one(
+        "UPDATE posts SET views = views * 2 + 1, title = upper(title) WHERE user_id = 1 RETURNING id, title, views",
+        &[],
+    );
+    assert_eq!(r.rows_affected, 2);
+    assert_eq!(r.rows[0], vec![Value::I64(1), Value::Text("HELLO".into()), Value::I32(21)]);
+    // Constant values: one engine statement.
+    assert_eq!(
+        db.one("UPDATE posts SET published = ? WHERE id IN (?, ?)", &[json!(false), json!(1), json!(2)]).rows_affected,
+        2
+    );
+    assert_eq!(db.rows("SELECT count(*) FROM posts WHERE published = false", &[]), json!([[3]]));
+
+    // Upserts.
+    db.run("INSERT INTO users (email, name, age) VALUES ('ada@x.dev', 'Ada L.', 37) ON CONFLICT (email) DO UPDATE SET name = excluded.name, age = excluded.age", &[]);
+    assert_eq!(db.rows("SELECT name, age FROM users WHERE email = 'ada@x.dev'", &[]), json!([["Ada L.", 37]]));
+    let r = db.one("INSERT OR IGNORE INTO users (email, name) VALUES ('bob@x.dev', 'Nope'), ('eve@x.dev', 'Eve')", &[]);
+    assert_eq!(r.rows_affected, 1);
+    db.run("INSERT INTO users (email, name) VALUES ('eve@x.dev', 'Eve 2') ON CONFLICT DO NOTHING", &[]);
+    assert_eq!(db.rows("SELECT name FROM users WHERE email = 'eve@x.dev'", &[]), json!([["Eve"]]));
+    db.run("REPLACE INTO users (id, email, name) VALUES (2, 'bob@x.dev', 'Robert')", &[]);
+    assert_eq!(db.rows("SELECT name, age FROM users WHERE id = 2", &[]), json!([["Robert", null]]));
+
+    // DELETE ... RETURNING, with a subquery (Robert, replaced, has no city any more).
+    let r = db.one("DELETE FROM posts WHERE user_id IN (SELECT id FROM users WHERE city IS NULL) RETURNING title", &[]);
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Text("Skate".into())],
+            vec![Value::Text("Premier".into())],
+            vec![Value::Text("Second".into())]
+        ]
+    );
+    assert_eq!(r.rows_affected, 3);
+
+    // Indexes on existing tables, unique ones checked against the rows there.
+    db.run("CREATE UNIQUE INDEX users_name ON users (name)", &[]);
+    assert!(db.err("INSERT INTO users (email, name) VALUES ('z@x.dev', 'Eve')").to_lowercase().contains("unique"));
+    db.run("DROP INDEX users_name", &[]);
+    db.run("INSERT INTO users (email, name) VALUES ('z@x.dev', 'Eve')", &[]);
+    assert!(db.err("CREATE UNIQUE INDEX users_name2 ON users (name)").to_lowercase().contains("unique"));
+    db.run("CREATE INDEX IF NOT EXISTS posts_user ON posts (user_id)", &[]);
+    assert_eq!(db.one("EXPLAIN SELECT * FROM posts WHERE user_id = 1", &[]).columns, vec!["plan".to_string()]);
+
+    // New columns: the rows there get the default.
+    db.run("ALTER TABLE users ADD COLUMN score DOUBLE PRECISION NOT NULL DEFAULT 1.5", &[]);
+    db.run("ALTER TABLE users ADD COLUMN nick TEXT UNIQUE", &[]);
+    assert_eq!(db.rows("SELECT score, nick FROM users WHERE id = 1", &[]), json!([[1.5, null]]));
+    db.run("UPDATE users SET nick = 'ada' WHERE id = 1", &[]);
+    assert!(db.err("UPDATE users SET nick = 'ada' WHERE id = 3").to_lowercase().contains("unique"));
+    assert!(db.err("ALTER TABLE users ADD COLUMN must TEXT NOT NULL").contains("DEFAULT"));
+
+    // A table without a key, and one made from a query.
+    db.run("CREATE TABLE logs (msg TEXT, at TIMESTAMP DEFAULT now())", &[]);
+    db.run("INSERT INTO logs (msg) VALUES ('a'), ('b'); INSERT INTO logs VALUES ('c', '2026-11-13 10:00:00')", &[]);
+    assert_eq!(db.rows("SELECT msg FROM logs ORDER BY rowid", &[]), json!([["a"], ["b"], ["c"]]));
+    db.run("CREATE TABLE paris AS SELECT id, name FROM users WHERE city = 'Paris'", &[]);
+    assert_eq!(db.rows("SELECT name FROM paris ORDER BY id", &[]), json!([["Ada L."], ["Cy"]]));
+    db.run("DROP TABLE IF EXISTS paris, nothing", &[]);
+    assert!(db.err("SELECT * FROM paris").contains("paris"));
+}
+
+#[test]
+fn one_transaction_per_request() {
+    let db = blog();
+    // A failure undoes the statements before it.
+    let err =
+        db.0.sql("INSERT INTO users (email, name) VALUES ('new@x.dev', 'New'); INSERT INTO nowhere VALUES (1)", &[]);
+    assert!(err.is_err());
+    assert_eq!(db.rows("SELECT count(*) FROM users WHERE email = 'new@x.dev'", &[]), json!([[0]]));
+    // A table created and filled in one request.
+    let all = db.run(
+        "BEGIN; CREATE TABLE t (k TEXT PRIMARY KEY, n INT); INSERT INTO t VALUES ('a', 1); SELECT * FROM t; COMMIT",
+        &[],
+    );
+    assert_eq!(all.len(), 5);
+    assert_eq!(all[3].rows, vec![vec![Value::Text("a".into()), Value::I32(1)]]);
+    // Parameters: the number must match.
+    assert!(db.0.sql("SELECT * FROM users WHERE id = ?", &[]).unwrap_err().to_string().contains("parameter"));
+    assert!(db.0.sql("SELECT * FROM users", &[json!(1)]).is_err());
+}
+
+#[test]
+fn queries() {
+    let db = blog();
+    let q = |sql: &str| db.rows(sql, &[]);
+    // Filters, order, limits, NULLs.
+    assert_eq!(q("SELECT name FROM users WHERE age >= 18 ORDER BY age DESC"), json!([["Cy"], ["Ada"]]));
+    assert_eq!(q("SELECT name FROM users ORDER BY age NULLS FIRST LIMIT 2"), json!([["Dee"], ["Bob"]]));
+    assert_eq!(q("SELECT name FROM users ORDER BY age LIMIT 2 OFFSET 1"), json!([["Ada"], ["Cy"]]));
+    assert_eq!(q("SELECT name FROM users ORDER BY id LIMIT 1, 2"), json!([["Bob"], ["Cy"]]));
+    assert_eq!(q("SELECT name FROM users WHERE city IS NULL OR age < 18 ORDER BY 1"), json!([["Bob"], ["Dee"]]));
+    assert_eq!(q("SELECT count(*) FROM users WHERE age > 100"), json!([[0]]));
+    assert_eq!(q("SELECT name FROM users WHERE name ILIKE 'a%' OR name LIKE '_y'"), json!([["Ada"], ["Cy"]]));
+    assert_eq!(q("SELECT name FROM users WHERE age NOT BETWEEN 18 AND 40 ORDER BY name"), json!([["Bob"], ["Cy"]]));
+    assert_eq!(q("SELECT name FROM users WHERE id IN (1, 3) AND city IN ('Paris')"), json!([["Ada"], ["Cy"]]));
+    assert_eq!(q("SELECT DISTINCT city FROM users WHERE city IS NOT NULL ORDER BY city"), json!([["Lyon"], ["Paris"]]));
+    // Expressions, functions, CASE, CAST.
+    assert_eq!(
+        q(
+            "SELECT upper(name) || ' (' || coalesce(city, '?') || ')' AS who, CASE WHEN age >= 18 THEN 'adult' WHEN age IS NULL THEN 'unknown' ELSE 'minor' END AS kind, \
+           age % 10, CAST(age AS TEXT), length(email) FROM users ORDER BY id"
+        ),
+        json!([
+            ["ADA (Paris)", "adult", 6, "36", 9],
+            ["BOB (Lyon)", "minor", 7, "17", 9],
+            ["CY (Paris)", "adult", 2, "52", 8],
+            ["DEE (?)", "unknown", null, null, 9]
+        ])
+    );
+    assert_eq!(
+        q("SELECT 1 + 2 * 3, 7 / 2, 7.0 / 2, -(4), 'a' || 1, round(2.567, 1), abs(-3), nullif(1, 1)"),
+        json!([[7, 3, 3.5, -4, "a1", 2.6, 3, null]])
+    );
+    assert_eq!(
+        q("SELECT json_extract(tags, '$.t[0]') FROM posts WHERE tags IS NOT NULL ORDER BY id"),
+        json!([["intro"], ["voyage"]])
+    );
+    assert_eq!(
+        q("SELECT name FROM users WHERE created_at > '2020-01-01' AND created_at <= now() ORDER BY id LIMIT 1"),
+        json!([["Ada"]])
+    );
+    // Joins.
+    assert_eq!(
+        q(
+            "SELECT u.name, p.title FROM posts p JOIN users u ON u.id = p.user_id WHERE p.views > 6 ORDER BY p.views DESC"
+        ),
+        json!([["Ada", "Rust"], ["Cy", "Été à Paris"], ["Ada", "Hello"]])
+    );
+    assert_eq!(
+        q(
+            "SELECT u.name, count(p.id) AS n, coalesce(sum(p.views), 0) AS views FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+           GROUP BY u.id, u.name ORDER BY views DESC, u.name"
+        ),
+        json!([["Ada", 2, 260], ["Cy", 1, 120], ["Bob", 1, 5], ["Dee", 0, 0]])
+    );
+    assert_eq!(q("SELECT count(*) FROM users CROSS JOIN posts"), json!([[16]]));
+    assert_eq!(
+        q("SELECT count(*) FROM users, posts WHERE posts.user_id = users.id AND users.city = 'Paris'"),
+        json!([[3]])
+    );
+    assert_eq!(q("SELECT title FROM posts JOIN users USING (id) WHERE users.name = 'Bob'"), json!([["Rust"]]));
+    // Grouping.
+    assert_eq!(
+        q(
+            "SELECT city, count(*) AS n, avg(age), min(name), max(age) FROM users GROUP BY city HAVING count(*) >= 1 ORDER BY n DESC, city NULLS LAST"
+        ),
+        json!([["Paris", 2, 44.0, "Ada", 52], ["Lyon", 1, 17.0, "Bob", 17], [null, 1, null, "Dee", null]])
+    );
+    assert_eq!(q("SELECT group_concat(name, '|') FROM users WHERE city = 'Paris'"), json!([["Ada|Cy"]]));
+    assert_eq!(q("SELECT count(DISTINCT city), count(city), count(*) FROM users"), json!([[2, 3, 4]]));
+    assert_eq!(
+        q("SELECT published, sum(views) FROM posts GROUP BY published ORDER BY published"),
+        json!([[false, 5], [true, 380]])
+    );
+    // Subqueries.
+    assert_eq!(
+        q("SELECT name FROM users WHERE id IN (SELECT user_id FROM posts WHERE views > 100) ORDER BY name"),
+        json!([["Ada"], ["Cy"]])
+    );
+    assert_eq!(
+        q("SELECT name FROM users u WHERE NOT EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)"),
+        json!([["Dee"]])
+    );
+    assert_eq!(
+        q(
+            "SELECT name, (SELECT max(views) FROM posts p WHERE p.user_id = u.id) AS best FROM users u ORDER BY best DESC NULLS LAST, name"
+        ),
+        json!([["Ada", 250], ["Cy", 120], ["Bob", 5], ["Dee", null]])
+    );
+    assert_eq!(
+        q("SELECT title FROM posts WHERE views > (SELECT avg(views) FROM posts)"),
+        json!([["Rust"], ["Été à Paris"]])
+    );
+    assert_eq!(
+        q(
+            "SELECT t.city, t.n FROM (SELECT city, count(*) AS n FROM users WHERE city IS NOT NULL GROUP BY city) AS t WHERE t.n > 1"
+        ),
+        json!([["Paris", 2]])
+    );
+    // Compounds.
+    assert_eq!(
+        q("SELECT name FROM users WHERE city = 'Paris' UNION SELECT name FROM users WHERE age < 40 ORDER BY 1"),
+        json!([["Ada"], ["Bob"], ["Cy"]])
+    );
+    assert_eq!(
+        q("SELECT city FROM users UNION ALL SELECT 'Nice' ORDER BY city LIMIT 3"),
+        json!([["Lyon"], ["Nice"], ["Paris"]])
+    );
+    assert_eq!(q("SELECT id FROM users INTERSECT SELECT user_id FROM posts ORDER BY 1"), json!([[1], [2], [3]]));
+    assert_eq!(q("SELECT id FROM users EXCEPT SELECT user_id FROM posts"), json!([[4]]));
+    // Column names: aliases, then expressions, then repeated names qualified.
+    let r = db.one("SELECT u.id, p.id, name AS who, count(*) FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.id, p.id, name", &[]);
+    assert_eq!(r.columns, vec!["id", "p.id", "who", "count"]);
+    // Parameters in every place.
+    assert_eq!(
+        db.rows(
+            "SELECT name FROM users WHERE age > ? AND city = ?2 ORDER BY name LIMIT ?3",
+            &[json!(18), json!("Paris"), json!(1)]
+        ),
+        json!([["Ada"]])
+    );
+    assert_eq!(db.rows("SELECT ? || '!', ?1", &[json!("hé")]), json!([["hé!", "hé"]]));
+    // Names in any case.
+    assert_eq!(q("select NAME from USERS where ID = 1"), json!([["Ada"]]));
+    // Errors say what is wrong.
+    assert!(db.err("SELECT nope FROM users").contains("nope"));
+    assert!(db.err("SELECT id FROM users JOIN posts ON posts.user_id = users.id").contains("ambiguous"));
+    assert!(db.err("SELECT * FROM users WHERE count(*) > 1").contains("aggregate"));
+    assert!(db.err("SELECT 1/0").contains("division by zero"));
+    assert!(db.err("SELECT * FROM users RIGHT JOIN posts ON 1 = 1").contains("RIGHT"));
+}
+
+#[test]
+fn fast_paths_and_big_tables() {
+    let db = Db::open("big");
+    db.run("CREATE TABLE items (id INTEGER PRIMARY KEY, grp INT INDEX, name TEXT NOT NULL, price DOUBLE)", &[]);
+    for chunk in 0..10 {
+        let values: Vec<String> = (0..500)
+            .map(|i| {
+                let n = chunk * 500 + i;
+                format!("({n}, {}, 'item {n}', {})", n % 25, f64::from(n) / 10.0)
+            })
+            .collect();
+        db.run(&format!("INSERT INTO items (id, grp, name, price) VALUES {}", values.join(",")), &[]);
+    }
+    assert_eq!(db.rows("SELECT count(*) FROM items", &[]), json!([[5000]]));
+    // Through an index, ordered by the key, a page.
+    assert_eq!(
+        db.rows("SELECT id FROM items WHERE grp = ? ORDER BY id DESC LIMIT 3", &[json!(7)]),
+        json!([[4982], [4957], [4932]])
+    );
+    // A function in the projection: tables read with the filter, early stop kept.
+    assert_eq!(
+        db.rows("SELECT upper(name) FROM items WHERE grp = 3 ORDER BY id LIMIT 2 OFFSET 1", &[]),
+        json!([["ITEM 28"], ["ITEM 53"]])
+    );
+    // A parameter compared with an integer key, as text: still found.
+    assert_eq!(db.rows("SELECT name FROM items WHERE id = ?", &[json!("42")]), json!([["item 42"]]));
+    assert_eq!(db.rows("SELECT name FROM items WHERE id = 42.0", &[]), json!([["item 42"]]));
+    // A self join through a hash join.
+    assert_eq!(
+        db.rows("SELECT count(*) FROM items a JOIN items b ON b.id = a.id + 1 WHERE a.grp = 0", &[]),
+        json!([[200]])
+    );
+    assert_eq!(
+        db.rows("SELECT grp, count(*), round(sum(price), 1) FROM items GROUP BY grp ORDER BY grp LIMIT 2", &[]),
+        json!([[0, 200, 49750.0], [1, 200, 49770.0]])
+    );
+    let started = std::time::Instant::now();
+    for i in 0..200 {
+        db.rows("SELECT id, name FROM items WHERE grp = ? ORDER BY id DESC LIMIT 20", &[json!(i % 25)]);
+    }
+    let each = started.elapsed() / 200;
+    assert!(each < std::time::Duration::from_millis(50), "{each:?} per page");
+}

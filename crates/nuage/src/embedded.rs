@@ -194,6 +194,25 @@ impl Embedded {
         Ok(work.ctx(&self.engine.store, &self.branch).meta(name)?.map(|m| m.schema))
     }
 
+    /// Runs SQL (see [`crate::sql`]): one statement or several separated by
+    /// `;`, in one transaction, `?` parameters from `params`. One result per
+    /// statement.
+    ///
+    /// ```no_run
+    /// # fn demo(db: &nuage::Embedded) -> memoire_orm::Result<()> {
+    /// db.sql("CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, text TEXT NOT NULL)", &[])?;
+    /// db.sql("INSERT INTO notes (text) VALUES (?)", &["hello".into()])?;
+    /// let page = db.sql("SELECT id, upper(text) AS t FROM notes ORDER BY id DESC LIMIT 10", &[])?;
+    /// println!("{:?}", page[0].rows);
+    /// # Ok(()) }
+    /// ```
+    pub fn sql(&self, sql: &str, params: &[Json]) -> Result<Vec<crate::sql::SqlResult>> {
+        let script = crate::sql::Script::parse(sql)?;
+        let mut out =
+            crate::sql::run(&self.engine, &self.branch, &self.engine.schemas, &[(script, params.to_vec())], true)?;
+        Ok(out.pop().unwrap_or_default())
+    }
+
     /// Statements run in one transaction: all of them apply, or none. Each
     /// is `(returns_rows, statement)`; the result is the rows, or the write's
     /// outcome.
@@ -280,6 +299,22 @@ impl EmbeddedTransaction {
     /// Runs a write in the transaction.
     pub fn execute_now(&self, query: &Query<'_>) -> Result<ExecResult> {
         self.with(|ctx| exec::execute(ctx, query))
+    }
+
+    /// The schema of one table as this transaction sees it (its own
+    /// `CREATE TABLE` included), `None` when there is none.
+    pub(crate) fn table_schema(&self, name: &str) -> Result<Option<Json>> {
+        self.with(|ctx| Ok(ctx.meta(name)?.map(|m| m.schema)))
+    }
+
+    /// The tables as this transaction sees them.
+    pub(crate) fn table_names(&self) -> Result<Vec<String>> {
+        self.with(|ctx| ctx.table_names())
+    }
+
+    /// A change to an existing table (index, column), in the transaction.
+    pub(crate) fn alter(&self, change: &exec::Alter) -> Result<()> {
+        self.with(|ctx| exec::alter(ctx, change))
     }
 
     /// Commits (the synchronous form of [`Transaction::commit`]).

@@ -142,13 +142,33 @@ Un servidor aloja varias aplicaciones, cada una con su base:
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` y `apps` hacen lo
 mismo desde Rust.
 
+## SQL
+
+Nuage DB habla SQL (`POST /v1/sql`, la pestaña **Query** de la consola, `Embedded::sql` en Rust):
+
+| | |
+|---|---|
+| **Leer** | `SELECT [DISTINCT]`, `JOIN`, `LEFT JOIN`, `CROSS JOIN` (`ON`, `USING`), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST/LAST`, `LIMIT`/`OFFSET`, `UNION [ALL]`, `INTERSECT`, `EXCEPT`, subconsultas (`IN`, `EXISTS`, escalares, correlacionadas, en `FROM`) |
+| **Expresiones** | `CASE`, `CAST` y `::`, `\|\|`, `+ - * / %`, `LIKE`, `ILIKE`, `BETWEEN`, `IN`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM` |
+| **Funciones** | `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg`, `array_agg` (con `DISTINCT`); `lower`, `upper`, `length`, `trim`, `substr`, `replace`, `instr`, `lpad`, `concat`, `coalesce`, `nullif`, `iif`, `greatest`, `least`, `abs`, `round`, `floor`, `ceil`, `power`, `sqrt`, `random`, `now`, `current_date`, `date`, `extract`, `strftime`, `json_extract`, `json_object`, `json_array`, `gen_random_uuid`... |
+| **Escribir** | `INSERT ... VALUES / SELECT / DEFAULT VALUES`, `ON CONFLICT ... DO NOTHING / DO UPDATE SET ... excluded.x`, `INSERT OR IGNORE`, `REPLACE INTO`, `ON DUPLICATE KEY UPDATE`, `UPDATE ... SET col = <expresión>`, `DELETE`, `RETURNING` |
+| **Esquema** | `CREATE TABLE [IF NOT EXISTS]` (tipos de PostgreSQL, MySQL y SQLite; `PRIMARY KEY`, `SERIAL`/`AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `REFERENCES`, `UNIQUE (a, b)`), `CREATE TABLE ... AS SELECT`, `CREATE [UNIQUE] INDEX` (construido sobre las filas existentes), `DROP INDEX`, `ALTER TABLE ... ADD COLUMN`, `DROP TABLE`, `EXPLAIN` |
+
+Una consulta que las instrucciones de Memoire saben expresar se ejecuta como una de ellas, por
+los índices, deteniéndose al final de la página; el resto (funciones, `CASE`, subconsultas,
+`UNION`) lo calcula la capa SQL sobre las filas encontradas por los índices, con joins por
+hash. No están: joins `RIGHT`/`FULL`, `WITH`, funciones de ventana, vistas, disparadores, clave
+primaria de varias columnas, cambiar una clave primaria. Una tabla creada sin clave primaria
+recibe una columna `rowid`.
+
 ## Sitios web
 
 Cualquier sitio puede usar la base de una aplicación, desde su servidor o desde sus páginas:
 
-- **`POST /v1/sql`**, desde cualquier lenguaje: `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
-  `CREATE TABLE`, `DROP TABLE`, con parámetros `?` (valores, nunca SQL: sin inyección). Las
-  filas vuelven como objetos JSON; un insert devuelve su `last_insert_id`.
+- **`POST /v1/sql`**, desde cualquier lenguaje: SQL completo con parámetros `?` (o `$1`),
+  valores nunca leídos como SQL (sin inyección). Las filas vuelven como objetos JSON
+  (`"arrays": true` para arrays); un insert devuelve su `last_insert_id`. Varias instrucciones
+  (separadas por `;`, o `"statements": [...]`) forman una sola transacción, todo o nada.
 - **Desde el navegador**: añade el sitio en la consola (**Settings → Websites**:
   `https://sitio.es`, `http://localhost:3000`, o `*`) y sus páginas pueden llamar a `/v1`
   (CORS). La petición previa del navegador se guarda en caché un día: un viaje, una sola vez.

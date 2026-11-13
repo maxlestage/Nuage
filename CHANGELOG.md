@@ -33,6 +33,21 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   each with its requests, latency, tables, rows, size, branches and encryption; `encryption`
   and `applications` at the top; `log` events name their application.
 
+### SQL
+
+- Full SQL (`POST /v1/sql`, the console's Query tab, `Embedded::sql`): `SELECT` with joins
+  (`JOIN`, `LEFT JOIN`, `CROSS JOIN`, `USING`), `GROUP BY`/`HAVING`, `UNION`/`INTERSECT`/`EXCEPT`,
+  subqueries (`IN`, `EXISTS`, scalar, correlated, derived tables), `CASE`, `CAST`, `||`, `%`,
+  `ILIKE`, `IS DISTINCT FROM`, aggregates and some sixty scalar functions; `INSERT` with
+  `ON CONFLICT`, `OR IGNORE`, `REPLACE`, `RETURNING`, `INSERT ... SELECT`; `UPDATE` and `DELETE`
+  with any expression and `RETURNING`; `CREATE TABLE` (PostgreSQL, MySQL and SQLite types,
+  `DEFAULT`, `REFERENCES`, `UNIQUE (a, b)`), `CREATE TABLE AS`, `CREATE INDEX` on existing
+  rows, `DROP INDEX`, `ALTER TABLE ADD COLUMN`, `EXPLAIN`; several statements in one
+  transaction; `?`, `?N` and `$N` parameters.
+- What Memoire's statements express runs as one of them (indexes, early stop); the rest is
+  computed by the SQL layer on the rows the indexes found, with hash joins.
+- The engine adds indexes to tables that have rows (and drops them), and columns.
+
 ### Websites and speed
 
 - `POST /v1/sql`: SQL from any language or a page (`SELECT`, `INSERT`, `UPDATE`, `DELETE`,

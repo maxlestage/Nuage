@@ -59,6 +59,7 @@ pub mod s3;
 pub mod server;
 #[cfg(feature = "site")]
 mod site;
+pub mod sql;
 
 use memoire_orm::{
     Database, Dialect, ExecResult, Executor, FromRow, NuageDb, NuageTransaction, Query, Result, Transaction,
@@ -73,6 +74,7 @@ pub use memoire_orm::nuage::Branch;
 pub use server::{AppInfo, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo};
 #[cfg(feature = "site")]
 pub use site::site;
+pub use sql::SqlResult;
 
 /// The version of Nuage DB.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
