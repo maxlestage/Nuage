@@ -1,0 +1,25 @@
+{
+  "name": "Nuage DB",
+  "description": "Nuage DB, Memoire's own database in Rust: tables on disk behind a write-ahead log, instant branches, backups restored at boot, an HTTP API, a management console at /admin and a live dashboard at /app.",
+  "repository": "https://github.com/maxlestage/Nuage",
+  "website": "https://github.com/maxlestage/Nuage",
+  "logo": "https://raw.githubusercontent.com/maxlestage/Nuage/master/crates/nuage-site/static/favicon.svg",
+  "keywords": ["rust", "database", "memoire", "nuage"],
+  "stack": "heroku-26",
+  "buildpacks": [{ "url": "emk/rust" }],
+  "formation": { "web": { "quantity": 1, "size": "basic" } },
+  "env": {
+    "NUAGE_TOKEN": { "description": "Token of the database API (clients send it as a bearer token).", "generator": "secret" },
+    "NUAGE_ADMIN_PASSWORD": { "description": "Password of the console at /admin (it also opens the live dashboard at /app)." },
+    "NUAGE_NAME": { "description": "Name of the database.", "value": "nuage", "required": false },
+    "NUAGE_PUBLIC_STATUS": { "description": "true: /api/status and /app show a public subset (status, uptime, services) without signing in.", "value": "false", "required": false },
+    "NUAGE_BACKUP_S3_BUCKET": { "description": "Bucket for the backups. The dyno's disk is erased at each restart: the data is restored from here at boot.", "required": true },
+    "NUAGE_BACKUP_S3_REGION": { "description": "Region of the bucket.", "value": "us-east-1", "required": false },
+    "NUAGE_BACKUP_S3_ENDPOINT": { "description": "Endpoint URL of S3-compatible storage (leave empty for AWS).", "required": false },
+    "NUAGE_BACKUP_S3_PREFIX": { "description": "Prefix of the backup objects.", "value": "nuage/", "required": false },
+    "NUAGE_BACKUP_S3_ACCESS_KEY_ID": { "description": "Access key of the bucket." },
+    "NUAGE_BACKUP_S3_SECRET_ACCESS_KEY": { "description": "Secret key of the bucket." },
+    "SITE_URL": { "description": "Public address of the website (canonical links, share card), e.g. https://my-nuage.herokuapp.com. Empty: taken from each request.", "required": false }
+  },
+  "success_url": "/"
+}

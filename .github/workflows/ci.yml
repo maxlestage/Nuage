@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (both crates, every target, all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Clippy (nuage without the website)
+        run: cargo clippy -p nuage --all-targets --no-default-features --locked -- -D warnings
+      - name: Clippy (the site's browser bundle, wasm32)
+        run: cargo clippy -p nuage-site --lib --target wasm32-unknown-unknown --locked -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine, embedded mode, server, console, backups, website (and doc tests)
+        run: cargo test --workspace --all-features --locked
+
+  msrv:
+    name: MSRV (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The `rust-version` of crates/nuage (the workspace's).
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  pkg:
+    name: Browser bundle up to date (crates/nuage-site/pkg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The toolchain the committed bundle is built with (RustConfig, Dockerfile): the
+      # WebAssembly output depends on the compiler version.
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen (the version in Cargo.lock)
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          curl -sSfL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$v/wasm-bindgen-$v-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz --strip-components=1 -C "$HOME/.cargo/bin"
+          wasm-bindgen --version
+      - name: Rebuild the bundle and compare
+        run: |
+          crates/nuage-site/build-wasm.sh
+          if ! git diff --exit-code --stat -- crates/nuage-site/pkg; then
+            echo "::error::crates/nuage-site/pkg is out of date: run crates/nuage-site/build-wasm.sh (Rust 1.99) and commit pkg/"
+            exit 1
+          fi

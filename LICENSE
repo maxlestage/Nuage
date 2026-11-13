@@ -1,0 +1,66 @@
+Nuage DB — Proprietary Software License
+
+Copyright (c) 2026 Maxime Nathan Lestage. All rights reserved.
+
+This software, including its source code, documentation, website, examples and
+every other file distributed with it (the "Software"), is the exclusive
+property of Maxime Nathan Lestage (the "Author"). It is not open-source
+software. The source code may be made visible so that it can be built and
+audited; that visibility grants no right other than those written below.
+
+1. Permitted use
+   Subject to the terms of this license, the Author grants you a worldwide,
+   non-exclusive, non-transferable, royalty-free and revocable right to:
+   a. download the Software and compile it, unmodified, as a dependency of
+      your own programs or to run its server;
+   b. use, run and distribute those programs, including for commercial
+      purposes, in compiled form or as source code that depends on the
+      Software through a package registry, without including a copy of the
+      Software's source code.
+   What you write yourself with the Software (your own code, and the files a
+   tool of the Software generates from it) belongs to you.
+
+2. Restrictions
+   Except as expressly permitted above, or with the Author's prior written
+   permission, you may not:
+   a. copy, modify, translate, adapt or create derivative works of the
+      Software or of any part of its source code;
+   b. redistribute, publish, sell, rent, lend or sublicense the Software or
+      its source code, in whole or in part, including as a fork, a mirror or
+      a re-published package under another name;
+   c. use the Software or its source code to build a product that competes
+      with it, or to train or evaluate any machine-learning model;
+   d. remove or alter any copyright notice, credit or this license.
+
+3. Contributions
+   Any contribution submitted to the Author (code, documentation, issue or
+   suggestion) may be used by the Author freely and without compensation;
+   by submitting it, you assign to the Author all rights in it to the extent
+   permitted by law.
+
+4. Trademarks
+   The names and logos "Nuage DB", "Nuage", "Active", "Vitesse", "Securite",
+   "Memoire", "Paquets", "Facile" and "Rythme" identify the Author's projects. This license
+   grants no right to use them, except to truthfully state that your program
+   uses the Software.
+
+5. Termination
+   This license ends automatically if you breach any of its terms. You must
+   then stop using the Software and delete every copy in your possession.
+   Programs distributed lawfully before the termination are not affected.
+
+6. No warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+   THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+   AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+7. Governing law
+   This license is governed by French law. Any dispute that cannot be
+   settled amicably falls under the jurisdiction of the competent French
+   courts.
+
+For any other use (modification, redistribution, commercial licensing), contact
+the Author.
