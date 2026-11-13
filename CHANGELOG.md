@@ -2,7 +2,28 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.4.0 (2026-11-13)
+
+### PostgreSQL protocol: every language's driver
+
+- `NUAGE_PG_PORT` (`5432`): Nuage DB speaks version 3 of PostgreSQL's protocol. psql,
+  psycopg 2 and 3, SQLAlchemy, node-postgres, Postgres.js, pgx, database/sql, JDBC, PDO, the
+  pg gem, tokio-postgres, Npgsql and everything on libpq connect as is: any user name, a token
+  of an application as the password, the database name picks a branch.
+- The simple protocol (several statements, one transaction) and the extended one (prepared
+  statements, `$1` parameters, text and binary formats); `BEGIN` ... `COMMIT` held across
+  messages; `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`; PostgreSQL's SQLSTATE codes; read-only
+  tokens read only.
+- Types of parameters and result columns come from the columns of the tables (`id = $1`).
+- The questions drivers ask (`SET`, `SHOW`, `version()`, `current_schema()`, catalogs) get
+  PostgreSQL's answers.
+- TLS: `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY`; `NUAGE_PG_BIND`. `Server::listen_pg`,
+  `nuage::PgOptions`, `nuage::tls_config`, `Server::new_app_read_only_token`.
+- The installer turns it on (port 5432, the firewall), with the domain's certificate copied
+  from Caddy every day; Docker and Compose publish 5432; the console shows each
+  application's PostgreSQL address.
+- `clients/postgres/`: an example per driver, all run in CI.
+
 
 ### Every language
 

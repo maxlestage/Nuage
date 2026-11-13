@@ -113,6 +113,11 @@ pub struct ServerOptions {
     pub max_body_bytes: usize,
     /// The website served next to the database, if any.
     pub site: Option<Arc<dyn SiteHandler>>,
+    /// Port of the PostgreSQL protocol ([`Server::listen_pg`]), for the
+    /// console to show how to connect.
+    pub pg_port: Option<u16>,
+    /// The PostgreSQL protocol has TLS.
+    pub pg_tls: bool,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -122,6 +127,8 @@ impl std::fmt::Debug for ServerOptions {
             .field("admin_password", &self.admin_password.as_ref().map(|_| "***"))
             .field("public_status", &self.public_status)
             .field("site", &self.site.is_some())
+            .field("pg_port", &self.pg_port)
+            .field("pg_tls", &self.pg_tls)
             .finish()
     }
 }
@@ -135,6 +142,8 @@ impl Default for ServerOptions {
             transaction_timeout: Duration::from_secs(30),
             max_body_bytes: 16 << 20,
             site: None,
+            pg_port: None,
+            pg_tls: false,
         }
     }
 }

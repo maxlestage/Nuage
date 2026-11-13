@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nuage DB",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
     "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients",
     "license": { "name": "MIT OR Apache-2.0" }

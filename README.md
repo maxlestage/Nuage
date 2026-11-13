@@ -166,7 +166,30 @@ server in CI, for curl, JavaScript, TypeScript, Python, PHP, Go, Ruby, Java, Kot
 (Flutter), Elixir, Rust, C and Perl;
 the console shows the same request in each language with the server's address. Every server
 describes its API at `/v1/openapi.json` (OpenAPI 3.1) to generate a client for any other
-language. Rust also has the native client, `NuageDb`.
+language. Rust also has the native client, `NuageDb`. And
+every PostgreSQL driver connects too: see below.
+
+## PostgreSQL protocol
+
+Nuage DB also speaks PostgreSQL's protocol (`NUAGE_PG_PORT=5432`; the installer and Docker
+turn it on): **every language's PostgreSQL driver, ORM and tool connects as is**, with any
+user name and **a token of an application as the password**; the database name picks a branch
+(the application's name, or `main`: the main one).
+
+```bash
+PGPASSWORD=<token> psql "host=db.example.com port=5432 user=app dbname=nuage sslmode=require"
+# postgresql://app:<token>@db.example.com:5432/nuage?sslmode=require
+```
+
+Tested in CI with psql, psycopg 2 and 3, SQLAlchemy, node-postgres, Postgres.js, pgx, Go's
+database/sql, JDBC, PDO, the pg gem, tokio-postgres and Npgsql: examples in
+[`clients/postgres/`](clients/postgres). Prepared statements, `$1` parameters (their types
+come from the columns they meet), text and binary values, `BEGIN` ... `COMMIT` across
+messages, savepoints, PostgreSQL's error codes (`40001` on a write conflict: run the
+transaction again). TLS with `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY` (the installer uses the
+domain's certificate). The SQL is Nuage DB's (above); the system catalogs (`pg_catalog`) are
+not there, so tools that browse them (pgAdmin) show little, and Npgsql takes
+`Server Compatibility Mode=NoTypeLoading`. Heroku routes only HTTP: there, use `/v1/sql`.
 
 ## Websites
 
@@ -297,6 +320,9 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | Variable | Meaning | Default |
 |---|---|---|
 | `PORT` | port to listen on (set by Heroku and most hosts) | `8080` |
+| `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver, a token as the password | off |
+| `NUAGE_PG_BIND` | its address, when the website stays behind a proxy on `127.0.0.1` | `NUAGE_BIND` |
+| `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol | none |
 | `NUAGE_BIND` | address to listen on (`127.0.0.1`: this machine only, behind a proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 | `NUAGE_NAME` | name of the first application (and of its database) | `nuage` |

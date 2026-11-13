@@ -338,6 +338,7 @@ async fn console() {
     assert!(overview.body.contains("Applications") && overview.body.contains(r#"href="/admin/apps/nuage""#));
     let app = c.request("GET", "/admin/apps/nuage", &[]).await;
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
+    assert!(app.body.contains("NUAGE_PG_PORT=5432"), "PostgreSQL is off here: the console says how to turn it on");
     for language in [
         "JavaScript",
         "Python",

@@ -4,7 +4,7 @@
 # dashboard at /app), for any container host:
 #
 #   docker build -t nuage .
-#   docker run -p 8080:8080 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
+#   docker run -p 8080:8080 -p 5432:5432 -v nuage-data:/data -e NUAGE_ENCRYPTION_KEY=... -e NUAGE_TOKEN=... -e NUAGE_ADMIN_PASSWORD=... nuage
 #
 # The browser bundle of the dashboard is committed (crates/nuage-site/pkg) and embedded in
 # the binary: no WebAssembly build here.
@@ -22,8 +22,9 @@ FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin nuage \
  && mkdir /data && chown nuage /data
 COPY --from=builder /app/target/release/nuage /usr/local/bin/nuage
-ENV NUAGE_DATA_DIR=/data PORT=8080
+# 8080: HTTP (the API, the console, the website); 5432: the PostgreSQL protocol.
+ENV NUAGE_DATA_DIR=/data PORT=8080 NUAGE_PG_PORT=5432
 VOLUME /data
 USER 10001
-EXPOSE 8080
+EXPOSE 8080 5432
 CMD ["nuage"]

@@ -12,6 +12,8 @@
 # Options (environment variables, after `sudo`):
 #   NUAGE_DOMAIN=db.example.com   HTTPS on this name (its DNS must point to this server)
 #   NUAGE_PORT=8080               port of Nuage DB (without a domain, the one to open)
+#   NUAGE_PG_PORT=5432            port of the PostgreSQL protocol: every language's PostgreSQL
+#                                 driver connects there, its password a token (0: off)
 #   NUAGE_SWAP_MB=2048            swap to create when there is none (0: none);
 #                                 default: the memory size, between 1 and 4 GiB
 #   NUAGE_VERSION=v0.3.0          a release (default: the latest)
@@ -49,10 +51,11 @@ ACTION=${1:-install}
 # --- uninstall ---------------------------------------------------------------------------
 if [ "$ACTION" = uninstall ] || [ "$ACTION" = purge ]; then
 	if has_systemd; then
-		systemctl disable --now nuage 2>/dev/null || true
-		rm -f "$UNIT"
+		systemctl disable --now nuage nuage-tls.timer 2>/dev/null || true
+		rm -f "$UNIT" /etc/systemd/system/nuage-tls.service /etc/systemd/system/nuage-tls.timer
 		systemctl daemon-reload
 	fi
+	rm -f /usr/local/lib/nuage/tls-sync
 	rm -f "$BIN"
 	if [ "$ACTION" = purge ]; then
 		rm -rf "$DATA" "$CONF_DIR"
@@ -67,8 +70,10 @@ fi
 [ "$ACTION" = install ] || die "unknown command \`$ACTION\` (install, uninstall or purge)"
 
 PORT=${NUAGE_PORT:-8080}
+PG_PORT=${NUAGE_PG_PORT:-5432}
 DOMAIN=${NUAGE_DOMAIN:-}
 case "$PORT" in '' | *[!0-9]*) die "NUAGE_PORT=$PORT is not a port number" ;; esac
+case "$PG_PORT" in '' | *[!0-9]*) die "NUAGE_PG_PORT=$PG_PORT is not a port number" ;; esac
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -240,6 +245,9 @@ if [ ! -f "$ENV_FILE" ]; then
 # backups cannot be read, by anyone.
 PORT=$PORT
 NUAGE_BIND=$bind
+# The PostgreSQL protocol: any PostgreSQL driver, user any name, password a token.
+NUAGE_PG_PORT=$PG_PORT
+NUAGE_PG_BIND=0.0.0.0
 NUAGE_DATA_DIR=$DATA
 NUAGE_NAME=nuage
 NUAGE_ENCRYPTION_KEY=$key
@@ -253,10 +261,21 @@ NUAGE_PUBLIC_STATUS=false
 # NUAGE_BACKUP_S3_BUCKET=...
 EOF
 	umask 022
+	[ "$PG_PORT" = 0 ] && sed -i 's/^NUAGE_PG_PORT=0/# NUAGE_PG_PORT=5432/' "$ENV_FILE"
 else
 	say "Keeping the settings and secrets of $ENV_FILE"
 	PORT=$(sed -n 's/^PORT=//p' "$ENV_FILE" | tail -n1)
 	PORT=${PORT:-8080}
+	# Upgrades get the PostgreSQL protocol too, unless the file already says something of it.
+	if ! grep -q 'NUAGE_PG_PORT=' "$ENV_FILE" && [ "$PG_PORT" != 0 ]; then
+		{
+			echo "# The PostgreSQL protocol: any PostgreSQL driver, password a token."
+			echo "NUAGE_PG_PORT=$PG_PORT"
+			echo "NUAGE_PG_BIND=0.0.0.0"
+		} >>"$ENV_FILE"
+	fi
+	PG_PORT=$(sed -n 's/^NUAGE_PG_PORT=//p' "$ENV_FILE" | tail -n1)
+	PG_PORT=${PG_PORT:-0}
 fi
 chown root:nuage "$ENV_FILE"
 chmod 640 "$ENV_FILE"
@@ -348,15 +367,66 @@ if [ -n "$DOMAIN" ]; then
 	fi
 fi
 
+# TLS for the PostgreSQL protocol, from Caddy's certificate of the domain: copied now (once
+# Caddy has it) and every day by a timer, which restarts Nuage DB when it changed.
+if [ -n "$DOMAIN" ] && [ "$PG_PORT" != 0 ] && has_systemd && have caddy; then
+	mkdir -p /usr/local/lib/nuage "$CONF_DIR/tls"
+	cat >/usr/local/lib/nuage/tls-sync <<EOF
+#!/bin/sh
+# Copies Caddy's certificate of $DOMAIN for Nuage DB's PostgreSQL protocol (NUAGE_TLS_*).
+set -e
+crt=\$(find /var/lib/caddy -name '$DOMAIN.crt' 2>/dev/null | head -n1)
+[ -n "\$crt" ] || exit 0
+key=\${crt%.crt}.key
+if cmp -s "\$crt" $CONF_DIR/tls/cert.pem && cmp -s "\$key" $CONF_DIR/tls/key.pem; then exit 0; fi
+install -m 640 -o root -g nuage "\$crt" $CONF_DIR/tls/cert.pem
+install -m 640 -o root -g nuage "\$key" $CONF_DIR/tls/key.pem
+if ! grep -q '^NUAGE_TLS_CERT=' $ENV_FILE; then
+	echo 'NUAGE_TLS_CERT=$CONF_DIR/tls/cert.pem' >>$ENV_FILE
+	echo 'NUAGE_TLS_KEY=$CONF_DIR/tls/key.pem' >>$ENV_FILE
+fi
+systemctl try-restart nuage
+EOF
+	chmod 755 /usr/local/lib/nuage/tls-sync
+	cat >/etc/systemd/system/nuage-tls.service <<EOF
+[Unit]
+Description=Nuage DB: TLS certificate of the PostgreSQL protocol, from Caddy
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nuage/tls-sync
+EOF
+	cat >/etc/systemd/system/nuage-tls.timer <<EOF
+[Unit]
+Description=Nuage DB: copy Caddy's renewed certificate every day
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+	systemctl daemon-reload
+	systemctl enable --now nuage-tls.timer >/dev/null 2>&1 || true
+	# Caddy gets the certificate within a minute of its first start.
+	say "Waiting for the certificate of $DOMAIN (TLS of the PostgreSQL protocol)"
+	for _ in $(seq 1 60); do
+		/usr/local/lib/nuage/tls-sync && [ -f "$CONF_DIR/tls/cert.pem" ] && break
+		sleep 2
+	done
+	[ -f "$CONF_DIR/tls/cert.pem" ] || warn "no certificate yet: the timer adds TLS to the PostgreSQL protocol once Caddy has it"
+fi
+
 # Open the firewall, when one is on.
 if have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
 	if [ -n "$DOMAIN" ]; then ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null; else ufw allow "$PORT/tcp" >/dev/null; fi
+	[ "$PG_PORT" = 0 ] || ufw allow "$PG_PORT/tcp" >/dev/null
 elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
 	if [ -n "$DOMAIN" ]; then
 		firewall-cmd -q --permanent --add-service=http --add-service=https
 	else
 		firewall-cmd -q --permanent --add-port="$PORT/tcp"
 	fi
+	[ "$PG_PORT" = 0 ] || firewall-cmd -q --permanent --add-port="$PG_PORT/tcp"
 	firewall-cmd -q --reload
 fi
 
@@ -383,6 +453,12 @@ echo
 if has_systemd; then say "Nuage DB is running: $url"; else say "Nuage DB is installed: $url (once started)"; fi
 echo "    console:      $url/admin"
 echo "    SQL:          POST $url/v1/sql   (Authorization: Bearer <token>)"
+if [ "$PG_PORT" != 0 ]; then
+	pg_host=${DOMAIN:-${ip:-this-server}}
+	pg_ssl=""
+	[ -f "$CONF_DIR/tls/cert.pem" ] && pg_ssl="?sslmode=require"
+	echo "    PostgreSQL:   postgresql://app:<token>@$pg_host:$PG_PORT/nuage$pg_ssl   (any language's driver)"
+fi
 echo "    settings:     $ENV_FILE"
 echo "    data:         $DATA"
 echo "    logs:         journalctl -u nuage -f"

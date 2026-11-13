@@ -102,7 +102,7 @@ fn main() -> ExitCode {
                     None => None,
                 };
                 let encrypted = tls.is_some();
-                match server.listen_pg((config.bind.as_str(), port), nuage::PgOptions { tls }).await {
+                match server.listen_pg((config.pg_bind.as_str(), port), nuage::PgOptions { tls }).await {
                     Ok(r) => {
                         let how = if encrypted { "with TLS" } else { "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)" };
                         log(&format!(
