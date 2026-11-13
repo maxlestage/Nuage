@@ -122,6 +122,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Wrong password.", "Mot de passe incorrect.", "Contraseña incorrecta."),
     (
+        r#"Complete examples (also TypeScript and Perl), tested against a real server: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. To generate a client in another language: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+        r#"Des exemples complets (aussi TypeScript et Perl), testés sur un vrai serveur : <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Pour générer un client dans un autre langage : <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+        r#"Ejemplos completos (también TypeScript y Perl), probados contra un servidor real: <a href="https://github.com/maxlestage/Nuage/tree/master/clients">clients/</a>. Para generar un cliente en otro lenguaje: <a href="/v1/openapi.json">/v1/openapi.json</a> (OpenAPI)."#,
+    ),
+    (
         "This connection is not encrypted (HTTP): the password travels in clear. Reach the console over HTTPS (a domain name with the installer's NUAGE_DOMAIN, or a proxy), or through an SSH tunnel to localhost.",
         "Cette connexion n'est pas chiffrée (HTTP) : le mot de passe circule en clair. Ouvrez la console en HTTPS (un nom de domaine avec NUAGE_DOMAIN de l'installateur, ou un proxy), ou par un tunnel SSH vers localhost.",
         "Esta conexión no está cifrada (HTTP): la contraseña viaja sin cifrar. Abre la consola por HTTPS (un nombre de dominio con NUAGE_DOMAIN del instalador, o un proxy), o por un túnel SSH a localhost.",

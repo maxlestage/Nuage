@@ -2,6 +2,18 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Every language
+
+- `clients/`: a complete example for curl, JavaScript, TypeScript, Python, PHP, Go, Ruby,
+  Java, C# and Perl, each with a `sql(query, params)` function to copy; `clients/test.sh`
+  runs them all against a server, in CI.
+- `GET /v1/openapi.json`: the OpenAPI 3.1 description of `/v1/sql`, public, to generate a
+  client in any other language.
+- The console's **Connect** section shows the request in each language, with the server's
+  address.
+
 ## 0.3.0 (2026-11-13)
 
 ### Install on any server

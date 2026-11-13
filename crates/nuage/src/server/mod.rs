@@ -5,6 +5,7 @@
 //! |---|---|---|
 //! | `/v1/*` | the database protocol (`memoire_orm::nuage::wire`) of the application the token opens | `Authorization: Bearer <token of an application>` |
 //! | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects: for websites in any language | the same; a read-only token reads only |
+//! | `GET /v1/openapi.json` | the OpenAPI description of `/v1/sql`, for code generators of every language | public |
 //!
 //! Websites: a page calls `/v1` from the browser when its origin is one of
 //! its application's websites (CORS, preflight cached for a day); JSON
@@ -521,6 +522,9 @@ async fn handle(state: Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     res
 }
 
+/// The OpenAPI description of `/v1/sql` and `/api/*` (`openapi.json`).
+const OPENAPI: &str = include_str!("../../openapi.json");
+
 async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
@@ -532,6 +536,14 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     }
     if path == "/admin" || path.starts_with("/admin/") {
         return admin::route(state, req, peer).await;
+    }
+    if path == "/v1/openapi.json" {
+        // The description of this API, for code generators of every language.
+        let mut res = json_response(200, &json!(null));
+        *res.body_mut() = full(OPENAPI);
+        res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+        res.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        return res;
     }
     if path.starts_with("/v1/") {
         let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);

@@ -80,3 +80,20 @@ jobs:
             echo "::error::crates/nuage-site/pkg is out of date: run crates/nuage-site/build-wasm.sh (Rust 1.99) and commit pkg/"
             exit 1
           fi
+
+  clients:
+    name: Every language (clients/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The runner has curl, Node, Python, PHP, Go, Ruby, Java and Perl; these two are added.
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build the server
+        run: cargo build --locked -p nuage --bin nuage
+      - name: Run each example against it
+        run: clients/test.sh target/debug/nuage
