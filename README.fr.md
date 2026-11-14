@@ -161,7 +161,8 @@ Un serveur accueille plusieurs applications, chacune avec sa base :
 - la **première application** est la base du serveur (`NUAGE_NAME`, données à la racine de
   `NUAGE_DATA_DIR`, jeton `NUAGE_TOKEN`) : un déploiement existant garde ses données telles
   quelles ;
-- les **autres** se créent dans la console (`/admin`, **New application**) : une base dans
+- les **autres** se créent dans la console (`/admin`, **New application**), ou d'une
+  requête à l'API de gestion (`nuage apps create`, voir plus bas) : une base dans
   `apps/<nom>/`, chiffrée sous ses propres clés, sauvegardée sous `apps/<nom>/`, et un premier
   jeton, affiché une seule fois (le serveur n'en garde que l'empreinte SHA-256) ;
 - le **jeton** qu'envoie une application choisit sa base : `NuageDb::connect(url, jeton)` ne
@@ -171,6 +172,77 @@ Un serveur accueille plusieurs applications, chacune avec sa base :
 
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` et `apps` font de
 même depuis Rust.
+
+### Créer une application en une commande
+
+L'API de gestion, `/api/apps`, crée les applications et leurs jetons en une requête HTTP :
+depuis un script, une CI, une étape de déploiement, sans le formulaire de la console. Elle
+s'ouvre avec un jeton à elle, `NUAGE_ADMIN_TOKEN`.
+
+1. **L'activer**, une fois, sur le serveur : `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32
+   caractères au moins ; plus court, le serveur refuse de démarrer et dit pourquoi). Sur
+   Heroku : l'app du serveur → **Settings** → **Config Vars**. Le journal de démarrage dit
+   `the management API (/api/apps) is on`.
+2. **Créer une application**, avec le binaire `nuage` :
+
+   ```bash
+   export NUAGE_URL=https://mon-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
+   nuage apps create boutique "La boutique"
+   # NUAGE_URL=https://mon-nuage.herokuapp.com
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   nuage apps list
+   # nuage       1 token(s)
+   # boutique    1 token(s)   La boutique
+   ```
+
+   ou avec n'importe quel client HTTP :
+
+   ```bash
+   curl https://mon-nuage.herokuapp.com/api/apps \
+     -H "Authorization: Bearer $NUAGE_ADMIN_TOKEN" \
+     -d '{"name": "boutique", "description": "La boutique"}'
+   ```
+
+   ```json
+   {
+     "application": { "name": "boutique", "description": "La boutique", "first": false, "created_at": 1794690000000,
+                      "tokens": [{ "id": "3f9a12c0", "created_at": 1794690000000, "read_only": false }],
+                      "env_token": false, "origins": [] },
+     "token": "nuage_3f9a12c0…",
+     "env": { "NUAGE_URL": "https://mon-nuage.herokuapp.com", "NUAGE_TOKEN": "nuage_3f9a12c0…" },
+     "message": "Application `boutique` created, with its own encrypted database. Copy its token now: it is not shown again."
+   }
+   ```
+
+3. **Brancher l'application** : les deux lignes de `env` dans sa configuration (sur Heroku,
+   ses Config Vars). Elle se connecte et crée ses tables à son premier démarrage.
+
+| Méthode | Chemin | Corps | Réponse |
+|---|---|---|---|
+| `GET` | `/api/apps` | | `200 {"applications": [...]}`, la première d'abord, puis par nom |
+| `POST` | `/api/apps` | `{"name": "boutique", "description": "…"}` (description facultative) | `201` l'application, son `token` et `env` ; `409` le nom est pris ; `400` un nom invalide (1 à 63 de `a-z 0-9 - _`) |
+| `GET` | `/api/apps/{nom}` | | `200` l'application ; `404` |
+| `POST` | `/api/apps/{nom}/tokens` | `{"read_only": true}` (facultatif, `false` par défaut) | `201 {"application", "token", "read_only", "env"}` |
+| `DELETE` | `/api/apps/{nom}/tokens/{id}` | | `200 {"revoked": true}` ; `404` pas de tel jeton |
+
+Un refus est du JSON, `{"error": {"kind", "message"}}`, avec un message qui dit quoi faire :
+`401` sans le jeton de gestion ou avec un mauvais, `403` quand `NUAGE_ADMIN_TOKEN` n'est pas
+défini, `400`, `404`, `405`, `409`. La description complète est dans
+[`/v1/openapi.json`](crates/nuage/openapi.json).
+
+Ce qui la protège :
+
+- **Un secret à elle**, ni le mot de passe de la console (un mot de passe se tape, donc se
+  devine), ni le jeton d'une application : un jeton ouvre sa base et rien d'autre, le
+  `NUAGE_TOKEN` de la première application compris. Il est comparé en temps constant.
+- **Un jeton ne se voit qu'une fois**, dans la réponse qui le crée : le serveur n'en garde
+  que l'empreinte SHA-256, et la liste montre les jetons par leur identifiant (leurs premiers
+  caractères).
+- **Pas de suppression** : supprimer une application efface ses données et ses
+  sauvegardes ; cela reste dans la console, derrière son nom tapé à nouveau.
+- Gardez `NUAGE_ADMIN_TOKEN` avec les autres secrets du serveur, jamais dans une application
+  ni dans une page. Pour le changer, donnez-lui une nouvelle valeur : l'ancienne ne sert plus
+  au démarrage suivant.
 
 ## SQL
 
@@ -377,6 +449,7 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_ENCRYPTION_KEY` | la clé qui chiffre tout : 64 chiffres hexadécimaux (`openssl rand -hex 32`, `nuage genkey`), le base64 de 32 octets, ou une phrase de passe d'au moins 12 caractères | **obligatoire** : le binaire ne démarre pas sans |
 | `NUAGE_TOKEN` | un jeton de la première application (nommée `NUAGE_NAME`) ; la console crée les autres applications et leurs jetons | aucun |
 | `NUAGE_ADMIN_PASSWORD` | mot de passe de la console (et du tableau de bord) | aucun : la console est coupée |
+| `NUAGE_ADMIN_TOKEN` | jeton de l'API de gestion (`/api/apps`, `nuage apps`) : crée les applications et leurs jetons ; 32 caractères au moins (`nuage genkey`) | aucun : l'API est coupée |
 | `NUAGE_PUBLIC_STATUS` | `true` : `/api/status` et `/app` montrent une partie publique sans connexion | `false` |
 | `NUAGE_CACHE_MB` | cache de pages de chaque application, en Mio, ou `auto` | `auto` : un huitième de la mémoire, de 8 à 512 Mio |
 | `NUAGE_BACKUP_DIR` | sauvegarde vers ce dossier | |
@@ -418,6 +491,7 @@ HTTPS.
 | `POST /v1/sql` | SQL avec paramètres `?`, lignes en objets JSON (sites, tout langage) | un jeton de l'application ; un jeton en lecture seule ne fait que lire |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |
+| `/api/apps` | l'API de gestion : les applications et leurs jetons (voir [Créer une application en une commande](#créer-une-application-en-une-commande)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | la console | `NUAGE_ADMIN_PASSWORD` |
 | tout le reste | le site, `/app` compris | public |
 

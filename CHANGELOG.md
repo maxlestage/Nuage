@@ -4,6 +4,22 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Create an application in one command
+
+- `/api/apps`, the management API: `POST /api/apps {"name", "description"}` creates an
+  application, with its own encrypted database, and answers its first token and the two lines
+  to paste in its configuration (`env`: `NUAGE_URL`, `NUAGE_TOKEN`). `GET /api/apps` and
+  `GET /api/apps/{name}` show them, `POST /api/apps/{name}/tokens` makes another token
+  (`{"read_only": true}` for a website), `DELETE /api/apps/{name}/tokens/{id}` revokes one.
+  JSON refusals that say what to do (`401`, `403`, `400`, `404`, `409`). Deleting an
+  application stays in the console.
+- It opens with `NUAGE_ADMIN_TOKEN`, a secret of its own (32 characters at least, `nuage
+  genkey`; a shorter one stops the server at startup), compared in constant time. An
+  application's token, `NUAGE_TOKEN` included, never opens it. Without it, the API is off.
+- `nuage apps create <name> [description]` and `nuage apps list`, with `NUAGE_URL` and
+  `NUAGE_ADMIN_TOKEN`: the same from a terminal.
+- In `/v1/openapi.json`, the READMEs, `nuage.env.example` and `app.json`.
+
 ### The dashboard's cards open
 
 - Every card of `/app` opens its details, live: the requests (the last minute larger, its

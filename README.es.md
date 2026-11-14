@@ -160,7 +160,8 @@ Un servidor aloja varias aplicaciones, cada una con su base:
 
 - la **primera aplicación** es la base del servidor (`NUAGE_NAME`, datos en la raíz de
   `NUAGE_DATA_DIR`, token `NUAGE_TOKEN`): un despliegue existente conserva sus datos;
-- las **demás** se crean en la consola (`/admin`, **New application**): una base en
+- las **demás** se crean en la consola (`/admin`, **New application**), o con una
+  petición a la API de gestión (`nuage apps create`, ver más abajo): una base en
   `apps/<nombre>/`, cifrada con sus propias claves, copiada bajo `apps/<nombre>/`, y un primer
   token, mostrado una sola vez (el servidor solo guarda su huella SHA-256);
 - el **token** que envía una aplicación elige su base: `NuageDb::connect(url, token)` no
@@ -170,6 +171,77 @@ Un servidor aloja varias aplicaciones, cada una con su base:
 
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` y `apps` hacen lo
 mismo desde Rust.
+
+### Crear una aplicación con un comando
+
+La API de gestión, `/api/apps`, crea las aplicaciones y sus tokens con una petición HTTP:
+desde un script, una CI, un paso de despliegue, sin el formulario de la consola. Se abre con
+un token propio, `NUAGE_ADMIN_TOKEN`.
+
+1. **Activarla**, una vez, en el servidor: `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32
+   caracteres como mínimo; más corto, el servidor no arranca y dice por qué). En Heroku: la
+   app del servidor → **Settings** → **Config Vars**. El registro de arranque dice
+   `the management API (/api/apps) is on`.
+2. **Crear una aplicación**, con el binario `nuage`:
+
+   ```bash
+   export NUAGE_URL=https://mi-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
+   nuage apps create tienda "La tienda"
+   # NUAGE_URL=https://mi-nuage.herokuapp.com
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   nuage apps list
+   # nuage     1 token(s)
+   # tienda    1 token(s)   La tienda
+   ```
+
+   o con cualquier cliente HTTP:
+
+   ```bash
+   curl https://mi-nuage.herokuapp.com/api/apps \
+     -H "Authorization: Bearer $NUAGE_ADMIN_TOKEN" \
+     -d '{"name": "tienda", "description": "La tienda"}'
+   ```
+
+   ```json
+   {
+     "application": { "name": "tienda", "description": "La tienda", "first": false, "created_at": 1794690000000,
+                      "tokens": [{ "id": "3f9a12c0", "created_at": 1794690000000, "read_only": false }],
+                      "env_token": false, "origins": [] },
+     "token": "nuage_3f9a12c0…",
+     "env": { "NUAGE_URL": "https://mi-nuage.herokuapp.com", "NUAGE_TOKEN": "nuage_3f9a12c0…" },
+     "message": "Application `tienda` created, with its own encrypted database. Copy its token now: it is not shown again."
+   }
+   ```
+
+3. **Conectar la aplicación**: las dos líneas de `env` en su configuración (en Heroku, sus
+   Config Vars). Se conecta y crea sus tablas en su primer arranque.
+
+| Método | Ruta | Cuerpo | Respuesta |
+|---|---|---|---|
+| `GET` | `/api/apps` | | `200 {"applications": [...]}`, la primera primero, después por nombre |
+| `POST` | `/api/apps` | `{"name": "tienda", "description": "…"}` (descripción opcional) | `201` la aplicación, su `token` y `env`; `409` el nombre ya existe; `400` un nombre no válido (1 a 63 de `a-z 0-9 - _`) |
+| `GET` | `/api/apps/{nombre}` | | `200` la aplicación; `404` |
+| `POST` | `/api/apps/{nombre}/tokens` | `{"read_only": true}` (opcional, `false` por defecto) | `201 {"application", "token", "read_only", "env"}` |
+| `DELETE` | `/api/apps/{nombre}/tokens/{id}` | | `200 {"revoked": true}`; `404` no existe ese token |
+
+Un rechazo es JSON, `{"error": {"kind", "message"}}`, con un mensaje que dice qué hacer:
+`401` sin el token de gestión o con uno incorrecto, `403` cuando `NUAGE_ADMIN_TOKEN` no está
+definido, `400`, `404`, `405`, `409`. La descripción completa está en
+[`/v1/openapi.json`](crates/nuage/openapi.json).
+
+Lo que la protege:
+
+- **Un secreto propio**, ni la contraseña de la consola (una contraseña se teclea, luego se
+  adivina) ni el token de una aplicación: un token abre su base y nada más, incluido el
+  `NUAGE_TOKEN` de la primera aplicación. Se compara en tiempo constante.
+- **Un token se muestra una sola vez**, en la respuesta que lo crea: el servidor solo guarda
+  su huella SHA-256, y la lista muestra los tokens por su identificador (sus primeros
+  caracteres).
+- **Sin borrado**: borrar una aplicación borra sus datos y sus copias; eso sigue en la
+  consola, tras volver a teclear su nombre.
+- Guarde `NUAGE_ADMIN_TOKEN` con los demás secretos del servidor, nunca en una aplicación ni
+  en una página. Para cambiarlo, dele un valor nuevo: el anterior deja de servir en el
+  siguiente arranque.
 
 ## SQL
 
@@ -373,6 +445,7 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `NUAGE_ENCRYPTION_KEY` | la clave que lo cifra todo: 64 dígitos hexadecimales (`openssl rand -hex 32`, `nuage genkey`), el base64 de 32 bytes, o una frase de al menos 12 caracteres | **obligatoria**: el binario no arranca sin ella |
 | `NUAGE_TOKEN` | un token de la primera aplicación (llamada `NUAGE_NAME`); la consola crea las demás aplicaciones y sus tokens | ninguno |
 | `NUAGE_ADMIN_PASSWORD` | contraseña de la consola (y del panel) | ninguna: la consola está desactivada |
+| `NUAGE_ADMIN_TOKEN` | token de la API de gestión (`/api/apps`, `nuage apps`): crea las aplicaciones y sus tokens; 32 caracteres como mínimo (`nuage genkey`) | ninguno: la API está desactivada |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` y `/app` muestran una parte pública sin iniciar sesión | `false` |
 | `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB, o `auto` | `auto`: un octavo de la memoria, de 8 a 512 MiB |
 | `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta | |
@@ -413,6 +486,7 @@ instalador): el token viaja en una cabecera, y la cookie de la consola es `Secur
 | `POST /v1/sql` | SQL con parámetros `?`, filas como objetos JSON (sitios, cualquier lenguaje) | un token de la aplicación; un token de solo lectura solo lee |
 | `/api/health` | `{"status":"ok"}` | público |
 | `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token de una aplicación (esa aplicación) o sesión de la consola (todas) |
+| `/api/apps` | la API de gestión: las aplicaciones y sus tokens (ver [Crear una aplicación con un comando](#crear-una-aplicación-con-un-comando)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | la consola | `NUAGE_ADMIN_PASSWORD` |
 | todo lo demás | el sitio web, `/app` incluido | público |
 

@@ -12,6 +12,7 @@
     "NUAGE_ENCRYPTION_KEY": { "description": "The key everything is encrypted with (pages, log, backups). Keep a copy: without it the data and its backups cannot be read.", "generator": "secret" },
     "NUAGE_TOKEN": { "description": "Token of the first application (clients send it as a bearer token). The console at /admin makes more applications, each with its own database and tokens.", "generator": "secret" },
     "NUAGE_ADMIN_PASSWORD": { "description": "Password of the console at /admin (it also opens the live dashboard at /app)." },
+    "NUAGE_ADMIN_TOKEN": { "description": "Token of the management API (/api/apps, `nuage apps create <name>`): it creates applications and their tokens in one request.", "generator": "secret" },
     "NUAGE_NAME": { "description": "Name of the database.", "value": "nuage", "required": false },
     "NUAGE_PUBLIC_STATUS": { "description": "true: /api/status and /app show a public subset (status, uptime, services) without signing in.", "value": "false", "required": false },
     "NUAGE_BACKUP_S3_BUCKET": { "description": "Bucket for the backups. The dyno's disk is erased at each restart: the data is restored from here at boot.", "required": true },

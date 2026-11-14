@@ -167,7 +167,8 @@ One server holds several applications, each with a database of its own:
 
 - the **first application** is the server's own database (`NUAGE_NAME`, data at the root of
   `NUAGE_DATA_DIR`, token `NUAGE_TOKEN`): an existing deployment keeps its data as is;
-- the **others** are made in the console (`/admin`, **New application**): a database in
+- the **others** are made in the console (`/admin`, **New application**), or with one
+  request to the management API (`nuage apps create`, see below): a database in
   `apps/<name>/`, encrypted under keys of its own, backed up under `apps/<name>/`, and a first
   token, shown once (the server keeps only its SHA-256 digest);
 - the **token** an application sends picks its database: `NuageDb::connect(url, token)` does
@@ -177,6 +178,74 @@ One server holds several applications, each with a database of its own:
 
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` and `apps` do the
 same from Rust.
+
+### Create an application in one command
+
+The management API, `/api/apps`, makes applications and their tokens with one HTTP
+request: from a script, a CI job, a deploy step, without the console's form. It opens with
+a token of its own, `NUAGE_ADMIN_TOKEN`.
+
+1. **Turn it on** once, on the server: `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32 characters at
+   least; a shorter one stops the server at startup, with why). On Heroku: the server's app →
+   **Settings** → **Config Vars**. The startup log says `the management API (/api/apps) is on`.
+2. **Create an application**, with the `nuage` binary:
+
+   ```bash
+   export NUAGE_URL=https://my-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
+   nuage apps create shop "The shop"
+   # NUAGE_URL=https://my-nuage.herokuapp.com
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   nuage apps list
+   # nuage   1 token(s)
+   # shop    1 token(s)   The shop
+   ```
+
+   or with any HTTP client:
+
+   ```bash
+   curl https://my-nuage.herokuapp.com/api/apps \
+     -H "Authorization: Bearer $NUAGE_ADMIN_TOKEN" \
+     -d '{"name": "shop", "description": "The shop"}'
+   ```
+
+   ```json
+   {
+     "application": { "name": "shop", "description": "The shop", "first": false, "created_at": 1794690000000,
+                      "tokens": [{ "id": "3f9a12c0", "created_at": 1794690000000, "read_only": false }],
+                      "env_token": false, "origins": [] },
+     "token": "nuage_3f9a12c0…",
+     "env": { "NUAGE_URL": "https://my-nuage.herokuapp.com", "NUAGE_TOKEN": "nuage_3f9a12c0…" },
+     "message": "Application `shop` created, with its own encrypted database. Copy its token now: it is not shown again."
+   }
+   ```
+
+3. **Connect the application**: set the two lines of `env` in its configuration (on Heroku,
+   its Config Vars). It connects, and makes its tables at its first start.
+
+| Method | Path | Body | Answer |
+|---|---|---|---|
+| `GET` | `/api/apps` | | `200 {"applications": [...]}`, the first one first, then by name |
+| `POST` | `/api/apps` | `{"name": "shop", "description": "…"}` (description optional) | `201` the application, its `token` and `env`; `409` the name is taken; `400` an invalid name (1 to 63 of `a-z 0-9 - _`) |
+| `GET` | `/api/apps/{name}` | | `200` the application; `404` |
+| `POST` | `/api/apps/{name}/tokens` | `{"read_only": true}` (optional, `false` by default) | `201 {"application", "token", "read_only", "env"}` |
+| `DELETE` | `/api/apps/{name}/tokens/{id}` | | `200 {"revoked": true}`; `404` no such token |
+
+A refusal is JSON, `{"error": {"kind", "message"}}`, with a message that says what to do:
+`401` without the management token or with a wrong one, `403` when `NUAGE_ADMIN_TOKEN` is
+not set, `400`, `404`, `405`, `409`. The whole description is in
+[`/v1/openapi.json`](crates/nuage/openapi.json).
+
+What protects it:
+
+- **A secret of its own**, not the console's password (a password is typed, so guessable) and
+  not an application's token: a token opens its own database and nothing else, the first
+  application's `NUAGE_TOKEN` included. It is compared in constant time.
+- **A token is shown once**, in the answer that makes it: the server keeps only its SHA-256
+  digest, and the list shows tokens by their id (their first characters).
+- **No deletion**: deleting an application deletes its data and its backups, so it stays in
+  the console, behind its name typed again.
+- Keep `NUAGE_ADMIN_TOKEN` with the server's other secrets, never in an application or a
+  page. To change it, set a new value: the old one stops working at the next start.
 
 ## SQL
 
@@ -375,6 +444,7 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`, `nuage genkey`), base64 of 32 bytes, or a passphrase of 12 characters or more | **required**: the binary does not start without it |
 | `NUAGE_TOKEN` | a token of the first application (named `NUAGE_NAME`); the console makes the other applications and their tokens | none |
 | `NUAGE_ADMIN_PASSWORD` | password of the console (and of the dashboard) | none: the console is off |
+| `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
 | `NUAGE_CACHE_MB` | page cache of each application, in MiB, or `auto` | `auto`: an eighth of the memory, 8 to 512 MiB |
 | `NUAGE_BACKUP_DIR` | back up to this folder | |
@@ -414,6 +484,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects (websites, any language) | a token of the application; a read-only token reads only |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
+| `/api/apps` | the management API: applications and their tokens (see [Create an application in one command](#create-an-application-in-one-command)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | the console | `NUAGE_ADMIN_PASSWORD` |
 | everything else | the website, `/app` included | public |
 
