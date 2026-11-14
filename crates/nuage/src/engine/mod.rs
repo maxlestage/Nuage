@@ -3,9 +3,10 @@
 //! * **Pages**: Nuage DB's own B-trees, with copy-on-write pages, checksums
 //!   and a bounded page cache, keep the data in one file that grows with it
 //!   ([`pages`], [`store`]).
-//! * **Log**: every commit is appended to the write-ahead log and synced
-//!   before it is applied ([`wal`]); the page store is made durable at each
-//!   checkpoint, and a restart replays the log written since.
+//! * **Log**: every commit is appended to the write-ahead log, applied in
+//!   memory, then synced before it returns or is shown to a reader ([`wal`]);
+//!   commits made at the same time share one sync. The page store is made
+//!   durable at each checkpoint, and a restart replays the log written since.
 //! * **Statements**: Memoire's evaluator over the rows read from disk
 //!   ([`exec`]).
 //! * **Branches**: copy-on-write overlays of the main database.
@@ -97,7 +98,7 @@ pub struct EngineOptions {
     pub compact_every: Duration,
     /// Backups, if any.
     pub backup: Option<BackupOptions>,
-    /// `fsync` each commit. Only tests turn it off.
+    /// `fsync` the log before a commit returns. Only tests turn it off.
     pub sync: bool,
     /// Name of the database, shown by the server. Default: `nuage`.
     pub name: String,

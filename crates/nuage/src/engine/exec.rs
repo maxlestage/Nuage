@@ -200,8 +200,8 @@ pub(crate) struct Ctx<'a> {
     pub overlay: &'a mut Overlay,
     /// Operations applied after the overlay (dropped table generations).
     pub extra: &'a mut Vec<Op>,
-    /// Tables read or written, with their version when first touched.
-    pub touched: &'a mut BTreeMap<String, u64>,
+    /// Tables read or written: what a transaction's commit is checked against.
+    pub touched: &'a mut BTreeSet<String>,
     pub written: &'a mut BTreeSet<String>,
     /// Catalog entries already read, by table: a statement asks for the same
     /// ones several times. Emptied when the catalog is written.
@@ -233,9 +233,8 @@ impl Ctx<'_> {
     }
 
     fn touch(&mut self, table: &str) {
-        if !self.touched.contains_key(table) {
-            let v = self.store.version(self.branch, table);
-            self.touched.insert(table.to_owned(), v);
+        if !self.touched.contains(table) {
+            self.touched.insert(table.to_owned());
         }
     }
 

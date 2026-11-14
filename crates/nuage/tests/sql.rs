@@ -585,3 +585,37 @@ fn answers_without_the_evaluator_match_it() {
     assert_eq!(db.rows("SELECT id FROM t WHERE id = NULL", &[]), json!([]));
     assert_eq!(db.rows("SELECT n FROM named WHERE name = ''", &[]), json!([[3]]));
 }
+
+/// Writes sent at the same time each take their turn: none is refused for a
+/// conflict, and none is lost (a counter raised by every one of them ends at
+/// their number).
+#[test]
+fn writes_at_the_same_time_take_turns() {
+    let db = Db::open("turns");
+    db.run("CREATE TABLE counters (name TEXT PRIMARY KEY, n BIGINT NOT NULL); CREATE TABLE log (id SERIAL PRIMARY KEY, who INT)", &[]);
+    db.run("INSERT INTO counters (name, n) VALUES ('hits', 0)", &[]);
+    let (threads, each) = (16, 40);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let db = &db.0;
+            scope.spawn(move || {
+                for _ in 0..each {
+                    // Read, then write what was read: lost if two of them ran on the same value.
+                    db.sql(
+                        "UPDATE counters SET n = n + 1 WHERE name = 'hits'; INSERT INTO log (who) VALUES (?)",
+                        &[json!(t)],
+                    )
+                    .unwrap();
+                    // And a read alone in between: it never waits for a turn.
+                    db.sql("SELECT n FROM counters WHERE name = 'hits'", &[]).unwrap();
+                }
+            });
+        }
+    });
+    let total = threads * each;
+    assert_eq!(db.rows("SELECT n FROM counters", &[]), json!([[total]]));
+    assert_eq!(db.rows("SELECT count(*), count(DISTINCT id) FROM log", &[]), json!([[total, total]]));
+    // A dry run changes nothing, and a failing script leaves nothing behind.
+    assert!(db.0.sql("UPDATE counters SET n = 0; INSERT INTO counters (name, n) VALUES ('hits', 1)", &[]).is_err());
+    assert_eq!(db.rows("SELECT n FROM counters", &[]), json!([[total]]));
+}

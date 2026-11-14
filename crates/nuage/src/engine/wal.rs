@@ -1,7 +1,8 @@
-//! The write-ahead log: every commit is appended to the current segment and
-//! synced to disk (`fsync`) before it is applied to the page store, so a
-//! commit that returned survives a crash. Records carry a CRC-32: a record
-//! torn by a crash is detected and dropped with everything after it.
+//! The write-ahead log: every commit is appended to the current segment, and
+//! the segment is synced to disk (`fsync`) before the commit returns to its
+//! caller or is shown to readers, so a commit that returned survives a crash.
+//! Commits made at the same time share one sync. Records carry a CRC-32: a
+//! record torn by a crash is detected and dropped with everything after it.
 //!
 //! Segments are files named after their first log sequence number
 //! (`wal/00000000000000000042.log`). Encrypted, a segment starts with a
@@ -259,15 +260,15 @@ pub(crate) fn segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
-/// The segment being written.
+/// The segment being written. Appending does not sync it: whoever needs a
+/// record on disk syncs [`file`](Writer::file), and one sync covers every
+/// record appended before it (see `Store::wait_durable`).
 pub(crate) struct Writer {
     dir: PathBuf,
-    file: File,
+    file: Arc<File>,
     pub first_lsn: u64,
     /// Bytes of records in the segment (its header not counted).
     pub bytes: u64,
-    /// `fsync` after each record (off only in tests of the crash recovery).
-    sync: bool,
     key: Option<Arc<WalKey>>,
     seg: Option<SegmentKey>,
 }
@@ -277,7 +278,7 @@ impl Writer {
     /// segment is (re)started with a fresh salt: a segment the writer opens
     /// holds no valid record (they would be past the last LSN), and a new
     /// salt means a new key, so no nonce of a torn record is ever reused.
-    pub(crate) fn open(dir: &Path, first_lsn: u64, sync: bool, key: Option<Arc<WalKey>>) -> Result<Writer> {
+    pub(crate) fn open(dir: &Path, first_lsn: u64, key: Option<Arc<WalKey>>) -> Result<Writer> {
         fs::create_dir_all(dir).map_err(io)?;
         let path = dir.join(segment_name(first_lsn));
         let (file, bytes, seg) = match &key {
@@ -295,7 +296,12 @@ impl Writer {
             }
         };
         sync_dir(dir);
-        Ok(Writer { dir: dir.to_owned(), file, first_lsn, bytes, sync, key, seg })
+        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg })
+    }
+
+    /// The segment's file, to sync it.
+    pub(crate) fn file(&self) -> Arc<File> {
+        self.file.clone()
     }
 
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
@@ -310,10 +316,7 @@ impl Writer {
             None => record.payload_into(&mut bytes),
         }
         frame(&mut bytes);
-        self.file.write_all(&bytes).map_err(io)?;
-        if self.sync {
-            self.file.sync_data().map_err(io)?;
-        }
+        (&*self.file).write_all(&bytes).map_err(io)?;
         self.bytes += bytes.len() as u64;
         Ok(())
     }
@@ -321,7 +324,7 @@ impl Writer {
     /// Closes this segment and starts the next one at `next_lsn`.
     pub(crate) fn rotate(&mut self, next_lsn: u64) -> Result<()> {
         self.file.sync_all().map_err(io)?;
-        *self = Writer::open(&self.dir, next_lsn, self.sync, self.key.clone())?;
+        *self = Writer::open(&self.dir, next_lsn, self.key.clone())?;
         Ok(())
     }
 }
@@ -398,7 +401,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let enc = crate::crypto::Encryption::from_key([5; 32]);
         let (_, keys) = crate::crypto::Header::create(&enc).unwrap();
-        let mut w = Writer::open(&dir, 1, false, Some(keys.wal.clone())).unwrap();
+        let mut w = Writer::open(&dir, 1, Some(keys.wal.clone())).unwrap();
         let a = Record {
             lsn: 1,
             ops: vec![Op::Put { table: "b:main".into(), key: b"secret-key".to_vec(), value: b"secret-value".to_vec() }],

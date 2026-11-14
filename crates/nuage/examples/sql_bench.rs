@@ -117,4 +117,35 @@ fn main() {
     println!("{:44} {:>10.2?}", "point de contrôle", t.elapsed());
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+
+    // Validations avec `fsync` (le réglage par défaut) : un écrivain, puis plusieurs à la fois.
+    if filter.as_deref().is_none_or(|f| "fsync".contains(f)) {
+        let dir = std::env::temp_dir().join(format!("nuage-sql-bench-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Embedded::open(&dir).unwrap();
+        db.sql("CREATE TABLE t (id TEXT PRIMARY KEY, n BIGINT)", &[]).unwrap();
+        for writers in [1usize, 8, 32] {
+            let each = 400 / writers;
+            let t = Instant::now();
+            std::thread::scope(|scope| {
+                for w in 0..writers {
+                    let db = db.clone();
+                    scope.spawn(move || {
+                        for i in 0..each {
+                            db.sql(
+                                "INSERT INTO t (id, n) VALUES (?, ?)",
+                                &[json!(format!("{writers}-{w}-{i}")), json!(i)],
+                            )
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            let total = (writers * each) as f64;
+            let name = format!("fsync, {writers} écrivain(s)");
+            println!("{name:44} {:>10.0} validations/s", total / t.elapsed().as_secs_f64());
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

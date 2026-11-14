@@ -135,7 +135,7 @@ mod redb_file {
                 bytes += k.value().len() + v.value().len();
                 ops.push(Op::Put { table: name.clone(), key: k.value().to_vec(), value: v.value().to_vec() });
                 if bytes >= BATCH {
-                    to.apply(&ops)?;
+                    to.apply(&ops, 0)?;
                     ops.clear();
                     bytes = 0;
                     if to.dirty_bytes() >= 4 * BATCH {
@@ -143,7 +143,7 @@ mod redb_file {
                     }
                 }
             }
-            to.apply(&ops)?;
+            to.apply(&ops, 0)?;
         }
         Ok(())
     }

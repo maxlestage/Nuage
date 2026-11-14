@@ -13,14 +13,14 @@ use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
 use super::exec::TableMeta;
-use super::pages::{Node, Pages, Version};
+use super::pages::{MAX_ENTRY, Node, Pages, Version};
 use super::storage_err;
 use super::wal::{self, Op, Record};
 use crate::crypto::Keys;
@@ -62,7 +62,7 @@ pub(crate) struct BranchInfo {
 pub(crate) struct Snapshot {
     pages: Arc<Pages>,
     /// Held as long as the view is read: its pages are not reused meanwhile.
-    _version: Arc<Version>,
+    version: Arc<Version>,
     /// The branch's tree, then its ancestors', main last. `None`: not
     /// created yet (a branch that never wrote anything).
     layers: Vec<Option<Arc<Node>>>,
@@ -89,6 +89,11 @@ fn tagged(value: Option<&[u8]>) -> Vec<u8> {
 }
 
 impl Snapshot {
+    /// The last commit the view holds.
+    pub(crate) fn lsn(&self) -> u64 {
+        self.version.lsn()
+    }
+
     /// The value of `key`, looking in `overlay` first.
     pub(crate) fn get(&self, overlay: Option<&Overlay>, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(v) = overlay.and_then(|o| o.get(key)) {
@@ -263,8 +268,15 @@ pub(crate) struct Store {
     pub writer: Mutex<Writer>,
     branches: RwLock<HashMap<String, BranchInfo>>,
     generation: AtomicU64,
-    /// Version of each table of each branch, for optimistic transactions.
-    versions: Mutex<HashMap<String, HashMap<String, u64>>>,
+    /// The last commit that wrote each table of each branch, for optimistic
+    /// transactions.
+    written: Mutex<HashMap<String, Written>>,
+    /// How far the log is on disk.
+    durable: Durable,
+    /// The log segment being written, for whoever syncs it.
+    wal_file: Mutex<Arc<fs::File>>,
+    /// `fsync` the log before a commit returns (off only in tests).
+    sync: bool,
     /// The table generation the page store holds.
     saved_generation: AtomicU64,
     /// LSN of the last applied commit (what snapshots see).
@@ -274,6 +286,24 @@ pub(crate) struct Store {
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
     dirty_limit: usize,
+}
+
+/// The commits that wrote to a branch.
+#[derive(Default)]
+struct Written {
+    /// The last commit that wrote each table.
+    tables: HashMap<String, u64>,
+    /// The commit that reset or deleted the branch.
+    reset: u64,
+}
+
+/// How far the log is on disk, and whether someone is syncing it.
+struct Durable {
+    /// Every commit up to this one is on disk.
+    lsn: AtomicU64,
+    /// A sync is running: the others wait for it instead of starting one.
+    syncing: Mutex<bool>,
+    done: Condvar,
 }
 
 /// A catalog entry parsed once: its table metadata and, when a statement asked for it,
@@ -332,15 +362,20 @@ impl Store {
         let dirty_limit = (cache_bytes / 4).max(1 << 20);
         let mut last = checkpoint_lsn;
         for r in records.iter().filter(|r| r.lsn > checkpoint_lsn) {
-            pages.apply(&r.ops)?;
+            pages.apply(&r.ops, r.lsn)?;
             last = last.max(r.lsn);
         }
         let generation = u64_of(read_meta(&pages, GENERATION)?);
+        let log = wal::Writer::open(&wal_dir, last + 1, keys.map(|k| k.wal.clone()))?;
         let store = Store {
             pages: Arc::new(pages),
             dir: dir.to_owned(),
+            written: Mutex::new(HashMap::new()),
+            durable: Durable { lsn: AtomicU64::new(0), syncing: Mutex::new(false), done: Condvar::new() },
+            wal_file: Mutex::new(log.file()),
+            sync,
             writer: Mutex::new(Writer {
-                wal: wal::Writer::open(&wal_dir, last + 1, sync, keys.map(|k| k.wal.clone()))?,
+                wal: log,
                 next_lsn: last + 1,
                 checkpoint_lsn,
                 last_checkpoint: None,
@@ -348,7 +383,6 @@ impl Store {
             }),
             branches: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(generation),
-            versions: Mutex::new(HashMap::new()),
             saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
             catalog: Mutex::new(Catalog::default()),
@@ -450,17 +484,27 @@ impl Store {
             .collect()
     }
 
-    /// A read view of `branch` as of now.
+    /// A read view of `branch`: the last commit that is on disk. A reader
+    /// never sees a commit a crash could still undo.
     pub(crate) fn snapshot(&self, branch: &str) -> Result<Snapshot> {
-        if branch == MAIN {
-            let version = self.pages.version();
-            let layers = vec![version.root(MAIN_TABLE)];
-            return Ok(Snapshot { pages: self.pages.clone(), _version: version, layers });
-        }
-        let chain = self.chain(branch)?;
-        let version = self.pages.version();
-        let layers = chain.iter().map(|b| version.root(&branch_table(b))).collect();
-        Ok(Snapshot { pages: self.pages.clone(), _version: version, layers })
+        self.view(branch, self.pages.visible())
+    }
+
+    /// A read view of `branch` with every commit applied so far, on disk or
+    /// not yet: what a writer goes by. Whoever gives a caller something read
+    /// from it first waits for [`wait_durable`](Self::wait_durable) of its
+    /// [`lsn`](Snapshot::lsn).
+    pub(crate) fn snapshot_latest(&self, branch: &str) -> Result<Snapshot> {
+        self.view(branch, self.pages.version())
+    }
+
+    fn view(&self, branch: &str, version: Arc<Version>) -> Result<Snapshot> {
+        let layers = if branch == MAIN {
+            vec![version.root(MAIN_TABLE)]
+        } else {
+            self.chain(branch)?.iter().map(|b| version.root(&branch_table(b))).collect()
+        };
+        Ok(Snapshot { pages: self.pages.clone(), version, layers })
     }
 
     /// A new, never used table generation.
@@ -468,40 +512,45 @@ impl Store {
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Current version of a table of a branch (bumped by every commit to it).
-    pub(crate) fn version(&self, branch: &str, table: &str) -> u64 {
-        lock(&self.versions).get(branch).and_then(|tables| tables.get(table)).copied().unwrap_or(0)
-    }
-
-    /// Commits the changes of `branch`: `overlay` (and `extra` operations),
-    /// after checking that the tables in `expect` are still at the given
-    /// versions. `touched` names the tables whose version moves.
+    /// Commits the changes of `branch`: `overlay` (and `extra` operations).
+    /// `read`: the tables a transaction went by, in a view that held the
+    /// commits up to `since`; if another commit wrote one of them after that,
+    /// this one is refused ([`Error::Conflict`]). `touched` names the tables
+    /// it writes. Returns the commit's number: it is in the log, not yet on
+    /// disk (see [`wait_durable`](Self::wait_durable)).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit(
         &self,
         writer: &mut Writer,
         branch: &str,
         overlay: &Overlay,
         extra: Vec<Op>,
-        expect: &[(String, u64)],
+        read: &[String],
+        since: u64,
         touched: &[String],
     ) -> Result<u64> {
+        if !read.is_empty()
+            && let Some(written) = lock(&self.written).get(branch)
         {
-            let versions = lock(&self.versions);
-            let tables = versions.get(branch);
-            for (table, v) in expect {
-                if tables.and_then(|t| t.get(table)).copied().unwrap_or(0) != *v {
-                    return Err(Error::Conflict(table.clone()));
-                }
+            if written.reset > since {
+                return Err(Error::Conflict(branch.to_owned()));
+            }
+            if let Some(table) = read.iter().find(|t| written.tables.get(*t).is_some_and(|lsn| *lsn > since)) {
+                return Err(Error::Conflict(table.clone()));
             }
         }
         if overlay.is_empty() && extra.is_empty() {
-            return Ok(writer.next_lsn - 1);
+            return Ok(since);
+        }
+        // Refused before it is in the log: a record the page store cannot apply would stop every restart.
+        if overlay.iter().any(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len) >= MAX_ENTRY) {
+            return Err(Error::Validation("a row is too large for Nuage DB (1 GiB at most)".into()));
         }
         let mut ops = Vec::with_capacity(overlay.len() + extra.len());
         let children = self.children_of(branch);
         if !children.is_empty() {
             // Copy-on-write: children keep the values they were made with.
-            let before = self.snapshot(branch)?;
+            let before = self.snapshot_latest(branch)?;
             let version = self.pages.version();
             for child in &children {
                 let name = branch_table(child);
@@ -538,16 +587,16 @@ impl Store {
         let lsn = self.log_and_apply(writer, ops)?;
         self.saved_generation.store(generation, Ordering::SeqCst);
         if !touched.is_empty() {
-            let mut versions = lock(&self.versions);
-            if !versions.contains_key(branch) {
-                versions.insert(branch.to_owned(), HashMap::new());
+            let mut written = lock(&self.written);
+            if !written.contains_key(branch) {
+                written.insert(branch.to_owned(), Written::default());
             }
-            if let Some(tables) = versions.get_mut(branch) {
+            if let Some(w) = written.get_mut(branch) {
                 for t in touched {
-                    match tables.get_mut(t) {
-                        Some(v) => *v += 1,
+                    match w.tables.get_mut(t) {
+                        Some(at) => *at = lsn,
                         None => {
-                            tables.insert(t.clone(), 1);
+                            w.tables.insert(t.clone(), lsn);
                         }
                     }
                 }
@@ -556,13 +605,57 @@ impl Store {
         Ok(lsn)
     }
 
+    /// Returns once the commit `lsn` is on disk. The log is synced by one
+    /// caller at a time, and a sync covers every commit appended before it
+    /// started: commits made at the same time wait for the same one.
+    pub(crate) fn wait_durable(&self, lsn: u64) -> Result<()> {
+        if self.durable.lsn.load(Ordering::SeqCst) >= lsn {
+            return Ok(());
+        }
+        let mut syncing = lock(&self.durable.syncing);
+        loop {
+            if self.durable.lsn.load(Ordering::SeqCst) >= lsn {
+                return Ok(());
+            }
+            if *syncing {
+                syncing = self.durable.done.wait(syncing).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            *syncing = true;
+            drop(syncing);
+            // What is applied now is in the log already: this sync covers it.
+            // A segment closed meanwhile was synced when it was closed.
+            let version = self.pages.version();
+            let file = lock(&self.wal_file).clone();
+            let synced = file.sync_data();
+            syncing = lock(&self.durable.syncing);
+            *syncing = false;
+            self.durable.done.notify_all();
+            match synced {
+                Ok(()) => self.on_disk(&version),
+                Err(e) => return Err(storage_err(format!("write-ahead log: {e}"))),
+            }
+        }
+    }
+
+    /// The commits of `version` are on disk: readers see them, then their
+    /// callers are told.
+    fn on_disk(&self, version: &Arc<Version>) {
+        self.pages.show(version);
+        self.durable.lsn.fetch_max(version.lsn(), Ordering::SeqCst);
+    }
+
     fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
         let record = Record { lsn: writer.next_lsn, ops };
         writer.wal.append(&record)?;
         writer.next_lsn += 1;
         writer.commits_since_checkpoint += 1;
-        self.pages.apply(&record.ops)?;
+        self.pages.apply(&record.ops, record.lsn)?;
         self.applied_lsn.store(record.lsn, Ordering::SeqCst);
+        if !self.sync {
+            // Nothing is synced: a commit counts as on disk as soon as it is applied.
+            self.on_disk(&self.pages.version());
+        }
         if self.pages.dirty_bytes() > self.dirty_limit {
             // Much was written since the last checkpoint: the changed nodes go
             // to disk now rather than wait in memory. The log is left as it is.
@@ -574,12 +667,13 @@ impl Store {
     /// Makes everything applied so far durable in the page store.
     fn flush(&self, w: &mut Writer) -> Result<u64> {
         let lsn = w.next_lsn - 1;
-        self.pages.apply(&[Op::Put {
-            table: META.into(),
-            key: CHECKPOINT_LSN.to_vec(),
-            value: lsn.to_le_bytes().to_vec(),
-        }])?;
+        self.pages.apply(
+            &[Op::Put { table: META.into(), key: CHECKPOINT_LSN.to_vec(), value: lsn.to_le_bytes().to_vec() }],
+            lsn,
+        )?;
+        // The page store holds every commit so far: they are on disk whatever the log's state.
         self.pages.checkpoint()?;
+        self.durable.lsn.fetch_max(lsn, Ordering::SeqCst);
         w.checkpoint_lsn = lsn;
         Ok(lsn)
     }
@@ -603,6 +697,7 @@ impl Store {
         w.commits_since_checkpoint = 0;
         if w.wal.bytes > 0 {
             w.wal.rotate(w.next_lsn)?;
+            *lock(&self.wal_file) = w.wal.file();
         }
         let limit = keep_after.map_or(lsn, |k| k.min(lsn));
         let segments = wal::segments(&self.dir.join("wal"))?;
@@ -630,8 +725,10 @@ impl Store {
         let mut key = BRANCH_PREFIX.to_vec();
         key.extend_from_slice(name.as_bytes());
         let value = json!({ "parent": parent, "createdAt": info.created_at }).to_string().into_bytes();
-        self.log_and_apply(&mut w, vec![Op::Put { table: META.into(), key, value }])?;
+        let lsn = self.log_and_apply(&mut w, vec![Op::Put { table: META.into(), key, value }])?;
         self.branches.write().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned(), info.clone());
+        drop(w);
+        self.wait_durable(lsn)?;
         Ok(info)
     }
 
@@ -650,16 +747,14 @@ impl Store {
             key.extend_from_slice(name.as_bytes());
             ops.push(Op::Del { table: META.into(), key });
         }
-        self.log_and_apply(&mut w, ops)?;
+        let lsn = self.log_and_apply(&mut w, ops)?;
         if !reset {
             self.branches.write().unwrap_or_else(|e| e.into_inner()).remove(name);
         }
         // Transactions open on the branch must not commit over the change.
-        if let Some(tables) = lock(&self.versions).get_mut(name) {
-            for v in tables.values_mut() {
-                *v += 1_000_000;
-            }
-        }
+        lock(&self.written).insert(name.to_owned(), Written { tables: HashMap::new(), reset: lsn });
+        drop(w);
+        self.wait_durable(lsn)?;
         Ok(true)
     }
 
@@ -685,7 +780,9 @@ impl Store {
             Some(v) => Op::Put { table: META.into(), key: key.to_vec(), value: v.to_vec() },
             None => Op::Del { table: META.into(), key: key.to_vec() },
         };
-        self.log_and_apply(&mut w, vec![op]).map(|_| ())
+        let lsn = self.log_and_apply(&mut w, vec![op])?;
+        drop(w);
+        self.wait_durable(lsn)
     }
 
     /// Bytes stored by a branch's own tree.
