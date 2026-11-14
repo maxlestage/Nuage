@@ -40,7 +40,8 @@ pub(crate) mod value;
 #[cfg(feature = "server")]
 pub(crate) use types::Typing;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use memoire_orm::nuage::wire::SchemaCache;
 use memoire_orm::{Error, Result, Value};
@@ -51,16 +52,43 @@ pub use exec::SqlResult;
 use crate::embedded::Embedded;
 use crate::engine::Engine;
 
-/// Statements parsed, with the number of parameters they use.
+/// Statements parsed, with the number of parameters they use. A handle:
+/// cloning it shares the statements.
+#[derive(Clone)]
 pub(crate) struct Script {
-    stmts: Vec<ast::Stmt>,
+    stmts: Arc<Vec<ast::Stmt>>,
     params: usize,
 }
 
+/// Scripts already parsed, by their text. Applications send the same
+/// statements again and again with other parameters: reading the SQL each
+/// time cost more than running a short statement.
+static PARSED: Mutex<Option<HashMap<String, Script>>> = Mutex::new(None);
+/// Scripts kept; past it, the cache starts over.
+const PARSED_MAX: usize = 512;
+/// The longest text kept (a long one is a one-off: a dump, a migration).
+const PARSED_TEXT_MAX: usize = 4096;
+
 impl Script {
     pub(crate) fn parse(sql: &str) -> Result<Script> {
+        let keep = sql.len() <= PARSED_TEXT_MAX;
+        if keep
+            && let Some(script) =
+                PARSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| cache.get(sql))
+        {
+            return Ok(script.clone());
+        }
         let (stmts, params) = parse::parse(sql)?;
-        Ok(Script { stmts, params })
+        let script = Script { stmts: Arc::new(stmts), params };
+        if keep {
+            let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = cache.get_or_insert_with(HashMap::new);
+            if cache.len() >= PARSED_MAX {
+                cache.clear();
+            }
+            cache.insert(sql.to_owned(), script.clone());
+        }
+        Ok(script)
     }
 
     /// Number of statements.
@@ -83,7 +111,7 @@ impl Script {
     /// One script per statement; parameters keep their numbers.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn split(&self) -> Vec<Script> {
-        self.stmts.iter().map(|s| Script { stmts: vec![s.clone()], params: self.params }).collect()
+        self.stmts.iter().map(|s| Script { stmts: Arc::new(vec![s.clone()]), params: self.params }).collect()
     }
 
     /// `begin`, `commit` or `rollback`, when the script is that one statement.
@@ -198,7 +226,7 @@ pub(crate) fn run_values(
         'scripts: for ((script, _), params) in batch.iter().zip(all_params.iter().copied()) {
             let runner = exec::Runner::new(&tx, schemas, params);
             let mut results = Vec::with_capacity(script.stmts.len());
-            for s in &script.stmts {
+            for s in script.stmts.iter() {
                 match runner.run(s) {
                     Ok(r) => results.push(r),
                     Err(e) => {
