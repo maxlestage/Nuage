@@ -2007,6 +2007,11 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
         assert_eq!(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
+        // The log's records written by earlier versions carry Memoire's CRC-32: the same one.
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 31 % 251) as u8).collect();
+        for n in [0, 1, 7, 8, 9, 63, 64, 1000] {
+            assert_eq!(crc32(&data[..n]), memoire_orm::evaluator::crc32(&data[..n]), "{n} bytes");
+        }
     }
 
     #[test]
