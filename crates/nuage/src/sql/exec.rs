@@ -408,6 +408,20 @@ impl<'a> Runner<'a> {
                 best.unwrap_or(Value::Null)
             }
             "array_agg" => Value::Json(Json::Array(values.iter().map(v::to_json).collect())),
+            // PostgreSQL's boolean aggregates: NULL without rows, NULLs left out.
+            "bool_and" | "every" | "bool_or" => {
+                if values.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let mut all = true;
+                let mut any = false;
+                for x in &values {
+                    let b = matches!(cast(x, ColumnType::Bool)?, Value::Bool(true));
+                    all &= b;
+                    any |= b;
+                }
+                Value::Bool(if name == "bool_or" { any } else { all })
+            }
             _ => {
                 // group_concat(x [, sep]), string_agg(x, sep)
                 if values.is_empty() {
