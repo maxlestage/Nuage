@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use memoire_orm::prelude::*;
+use memoire_orm::{Query, Value};
 use nuage::{BackupOptions, DirectoryStore, Embedded, EngineOptions};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -177,6 +178,20 @@ fn crash_rounds(test: &str, key: Option<String>) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A data directory of Nuage DB 0.4 (a redb page store) needs the `import-redb` feature: without
+/// it, it is refused with a message that says so, and left as it is.
+#[cfg(not(feature = "import-redb"))]
+#[test]
+fn an_earlier_page_store_is_refused_without_the_import_feature() {
+    let dir = temp_dir("legacy-refused");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("nuage.redb"), b"redb").unwrap();
+    let err = Embedded::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("import-redb"), "{err}");
+    assert!(dir.join("nuage.redb").exists() && !dir.join("nuage.db").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn more_data_than_cache() {
     let dir = temp_dir("big");
@@ -311,6 +326,225 @@ async fn transactions_conflict_instead_of_losing_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A transaction goes by the data as it was when it began: a commit that
+/// lands before the transaction first reads the table is a conflict too.
+#[tokio::test]
+async fn a_commit_before_the_first_read_is_a_conflict() {
+    let dir = temp_dir("conflict-early");
+    let db = Embedded::open(&dir).unwrap();
+    db.create_table::<Item>().await.unwrap();
+    item(1).insert(&db).await.unwrap();
+    let tx = db.begin().await.unwrap();
+    Item::update_many().set(Item::SCORE, 50.0).filter(Item::ID.eq(1)).execute(&db).await.unwrap();
+    // The transaction still sees the row as it was, and must not write over the change.
+    let mut seen = Item::get(&tx, 1).await.unwrap();
+    assert_eq!(seen.score, 0.1);
+    seen.score += 1.0;
+    seen.update(&tx).await.unwrap();
+    assert!(tx.commit().await.unwrap_err().is_conflict());
+    assert_eq!(Item::get(&db, 1).await.unwrap().score, 50.0);
+    // A transaction that began after it commits.
+    let tx = db.begin().await.unwrap();
+    let mut seen = Item::get(&tx, 1).await.unwrap();
+    seen.score += 1.0;
+    seen.update(&tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(Item::get(&db, 1).await.unwrap().score, 51.0);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writers at the same time, the log synced (several commits share a sync):
+/// every commit that returned is read at once by its writer, and is there
+/// after a restart.
+#[test]
+fn writers_at_the_same_time_share_the_log() {
+    let dir = temp_dir("together");
+    let (threads, each) = (8i64, 40i64);
+    {
+        let db = Embedded::open(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(db.create_table::<Item>()).unwrap();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let db = db.clone();
+                scope.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    rt.block_on(async {
+                        for n in 0..each {
+                            let mut it = item(t * 1_000_000 + n);
+                            it.insert(&db).await.unwrap();
+                            // Its own commit, read back at once (a plain read sees what is on disk).
+                            let back = Item::find(&db, it.id).await.unwrap().expect("a commit that returned is read");
+                            assert_eq!(back.code, it.code);
+                            if n % 10 == 0 {
+                                // A transaction among them: retried when another commit got there first.
+                                loop {
+                                    let tx = db.begin().await.unwrap();
+                                    let mut row = Item::get(&tx, it.id).await.unwrap();
+                                    row.score += 1.0;
+                                    row.update(&tx).await.unwrap();
+                                    match tx.commit().await {
+                                        Ok(()) => break,
+                                        Err(e) if e.is_conflict() => continue,
+                                        Err(e) => panic!("{e}"),
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert_eq!(rt.block_on(Item::count(&db)).unwrap(), (threads * each) as u64);
+    }
+    let db = open_when_free(&dir, EngineOptions::default());
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(async {
+        let rows = Item::query().order_by(Item::ID.asc()).all(&db).await.unwrap();
+        assert_eq!(rows.len() as i64, threads * each);
+        let ids: std::collections::BTreeSet<i64> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), rows.len(), "every row its own id");
+        let codes: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes.len(), rows.len());
+        assert!(db.engine().check_integrity().unwrap());
+    });
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batches sent at the same time each take their turn: none is refused for a
+/// conflict, each applies whole.
+#[test]
+fn batches_at_the_same_time_take_turns() {
+    let dir = temp_dir("batches");
+    let db = Embedded::open(&dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(db.create_table::<Item>()).unwrap();
+    let (threads, each) = (8i64, 25i64);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let db = &db;
+            scope.spawn(move || {
+                for n in 0..each {
+                    let rows: Vec<Vec<Value>> = (0..2)
+                        .map(|k| {
+                            let it = item(t * 1_000_000 + n * 2 + k);
+                            vec![
+                                Value::Null,
+                                Value::Text(it.code),
+                                Value::I32(it.group_no),
+                                Value::Text(it.payload),
+                                Value::F64(it.score),
+                            ]
+                        })
+                        .collect();
+                    let statements: Vec<(bool, Query<'_>)> = rows
+                        .iter()
+                        .map(|values| (false, Query::InsertRow { table: Item::SCHEMA, values }))
+                        .chain([(true, Query::Select(&COUNT))])
+                        .collect();
+                    let results = db.batch(&statements).unwrap();
+                    assert_eq!(results.len(), 3);
+                    // A batch of reads alone, in between.
+                    assert_eq!(db.batch(&[(true, Query::Select(&COUNT))]).unwrap().len(), 1);
+                }
+            });
+        }
+    });
+    assert_eq!(rt.block_on(Item::count(&db)).unwrap() as i64, threads * each * 2);
+    // A batch that fails leaves nothing behind.
+    let taken =
+        vec![Value::Null, Value::Text("code-00000000".into()), Value::I32(1), Value::Text("p".into()), Value::F64(0.0)];
+    let fresh = vec![Value::Null, Value::Text("fresh".into()), Value::I32(1), Value::Text("p".into()), Value::F64(0.0)];
+    let failing = [
+        (false, Query::InsertRow { table: Item::SCHEMA, values: &fresh }),
+        (false, Query::InsertRow { table: Item::SCHEMA, values: &taken }),
+    ];
+    assert!(db.batch(&failing).unwrap_err().is_unique_violation());
+    assert_eq!(rt.block_on(Item::count(&db)).unwrap() as i64, threads * each * 2);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `SELECT * FROM items`, for the batches above.
+static COUNT: std::sync::LazyLock<memoire_orm::ast::SelectAst> =
+    std::sync::LazyLock::new(|| memoire_orm::ast::SelectAst::new(Item::SCHEMA));
+
+/// The child half of `crash_recovery_of_writers_at_the_same_time`: four
+/// threads write forever, each printing the code of every row whose commit
+/// returned, until the process is killed.
+fn crash_child_threads(dir: &str) -> ! {
+    let db = open_when_free(
+        dir.as_ref(),
+        EngineOptions { checkpoint_every: Duration::from_millis(50), ..EngineOptions::default() },
+    );
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(db.create_table_if_not_exists::<Item>()).unwrap();
+    let start = rt.block_on(Item::count(&db)).unwrap() as i64;
+    std::thread::scope(|scope| {
+        for t in 0..4i64 {
+            let db = db.clone();
+            scope.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    for n in 0..i64::MAX {
+                        // Codes of earlier rounds are not used again.
+                        let it = item((start + 1) * 10_000_000 + t * 1_000_000 + n);
+                        it.clone().insert(&db).await.unwrap();
+                        println!("{}", it.code);
+                    }
+                });
+            });
+        }
+    });
+    unreachable!("the writers never stop")
+}
+
+/// Killed while four threads commit: every commit that returned is there.
+#[test]
+fn crash_recovery_of_writers_at_the_same_time() {
+    if let Ok(dir) = std::env::var("NUAGE_CRASH_CHILD") {
+        crash_child_threads(&dir);
+    }
+    let dir = temp_dir("crash-together");
+    let mut acknowledged = std::collections::BTreeSet::new();
+    for round in 0..3 {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_recovery_of_writers_at_the_same_time", "--nocapture", "--test-threads=1"])
+            .env("NUAGE_CRASH_CHILD", &dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut seen = 0;
+        while let Some(Ok(line)) = lines.next() {
+            if line.starts_with("code-") {
+                acknowledged.insert(line.trim().to_owned());
+                seen += 1;
+                if seen >= 200 + round * 100 {
+                    break;
+                }
+            }
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = open_when_free(&dir, EngineOptions::default());
+            let rows = Item::query().all(&db).await.unwrap();
+            let stored: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.code.as_str()).collect();
+            let lost: Vec<&String> = acknowledged.iter().filter(|c| !stored.contains(c.as_str())).collect();
+            assert!(lost.is_empty(), "round {round}: commits that returned are gone: {lost:?}");
+            assert_eq!(Item::count(&db).await.unwrap() as usize, rows.len(), "the row counter matches the rows");
+            assert!(db.engine().check_integrity().unwrap());
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn backup_and_restore_into_an_empty_directory() {
     let dir = temp_dir("backup-src");
@@ -392,6 +626,38 @@ async fn early_stop_through_an_index_gives_the_same_rows() {
     let some = Item::query().filter(Item::GROUP_NO.eq(3)).limit(4).all(&db).await.unwrap();
     assert_eq!(some.len(), 4);
     assert!(some.iter().all(|i| i.group_no == 3));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `LIMIT` stops the reading early only when no aggregate needs every
+/// row, wherever the aggregate stands in the projection; a limit as large as
+/// can be, with an offset, is a limit all the same.
+#[tokio::test]
+async fn a_limit_does_not_cut_what_an_aggregate_counts() {
+    use memoire_orm::ast::{Projection, SelectAst};
+    use memoire_orm::{BinOp, Expr, count_all};
+    let dir = temp_dir("limit");
+    let db = Embedded::open_with(&dir, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+    db.create_table::<Item>().await.unwrap();
+    // More rows than are read at once.
+    let tx = db.begin_now().unwrap();
+    for n in 0..3000 {
+        tx.sql(
+            "INSERT INTO items (code, group_no, payload, score) VALUES (?, ?, 'p', 0.5)",
+            &[format!("c{n}").into(), (n % 100).into()],
+        )
+        .unwrap();
+    }
+    tx.commit_now().unwrap();
+    let mut counted = SelectAst::new(Item::SCHEMA);
+    counted.projection = Projection::Exprs(vec![Expr::binary(BinOp::Add, count_all(), Expr::Value(Value::I64(2)))]);
+    counted.limit = Some(1);
+    assert_eq!(db.fetch_rows(Query::Select(&counted)).unwrap(), vec![vec![Value::I64(3002)]]);
+    let mut rest = SelectAst::new(Item::SCHEMA);
+    rest.limit = Some(u64::MAX);
+    rest.offset = Some(2990);
+    assert_eq!(db.fetch_rows(Query::Select(&rest)).unwrap().len(), 10);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,7 +1,8 @@
-//! The write-ahead log: every commit is appended to the current segment and
-//! synced to disk (`fsync`) before it is applied to the page store, so a
-//! commit that returned survives a crash. Records carry a CRC-32: a record
-//! torn by a crash is detected and dropped with everything after it.
+//! The write-ahead log: every commit is appended to the current segment, and
+//! the segment is synced to disk (`fsync`) before the commit returns to its
+//! caller or is shown to readers, so a commit that returned survives a crash.
+//! Commits made at the same time share one sync. Records carry a CRC-32: a
+//! record torn by a crash is detected and dropped with everything after it.
 //!
 //! Segments are files named after their first log sequence number
 //! (`wal/00000000000000000042.log`). Encrypted, a segment starts with a
@@ -11,13 +12,13 @@
 //! once the backup, if any, has shipped them.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::pages::crc32;
 use super::storage_err;
 use memoire_orm::Result;
-use memoire_orm::evaluator::crc32;
 
 use crate::crypto::{SEGMENT_SALT, SegmentKey, WalKey, random};
 
@@ -36,6 +37,17 @@ pub(crate) enum Op {
     DelRange { table: String, start: Vec<u8>, end: Vec<u8> },
     /// Removes a whole store table (a deleted branch).
     DropTable { table: String },
+}
+
+impl Op {
+    /// The store table it changes.
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Op::Put { table, .. } | Op::Del { table, .. } | Op::DelRange { table, .. } | Op::DropTable { table } => {
+                table
+            }
+        }
+    }
 }
 
 /// One commit.
@@ -100,24 +112,31 @@ fn io(e: std::io::Error) -> memoire_orm::Error {
     storage_err(format!("write-ahead log: {e}"))
 }
 
+/// Bytes of the head of a record on disk: length, CRC-32.
+const FRAME: usize = 8;
+
 /// `length ‖ CRC-32 ‖ payload`: a CRC over what is on disk tells a torn
-/// record from a whole one.
-fn frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 8);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&crc32(payload).to_le_bytes());
-    out.extend_from_slice(payload);
-    out
+/// record from a whole one. `buf` is the payload after [`FRAME`] bytes left
+/// for its head.
+fn frame(buf: &mut [u8]) {
+    let len = (buf.len() - FRAME) as u32;
+    let crc = crc32(&buf[FRAME..]);
+    buf[..4].copy_from_slice(&len.to_le_bytes());
+    buf[4..FRAME].copy_from_slice(&crc.to_le_bytes());
 }
 
 impl Record {
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
-        frame(&self.payload())
+        let mut buf = vec![0u8; FRAME];
+        self.payload_into(&mut buf);
+        frame(&mut buf);
+        buf
     }
 
-    fn payload(&self) -> Vec<u8> {
-        let mut e = Enc(Vec::new());
+    /// Appends the record to `out`.
+    fn payload_into(&self, out: &mut Vec<u8>) {
+        let mut e = Enc(std::mem::take(out));
         e.i64(self.lsn as i64);
         e.u32(self.ops.len() as u32);
         for op in &self.ops {
@@ -145,7 +164,7 @@ impl Record {
                 }
             }
         }
-        e.0
+        *out = e.0;
     }
 
     fn decode(payload: &[u8]) -> Result<Record> {
@@ -241,17 +260,24 @@ pub(crate) fn segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
-/// The segment being written.
+/// The segment being written. Appending does not sync it: whoever needs a
+/// record on disk syncs [`file`](Writer::file), and one sync covers every
+/// record appended before it (see `Store::wait_durable`).
 pub(crate) struct Writer {
     dir: PathBuf,
-    file: File,
+    file: Arc<File>,
     pub first_lsn: u64,
     /// Bytes of records in the segment (its header not counted).
     pub bytes: u64,
-    /// `fsync` after each record (off only in tests of the crash recovery).
-    sync: bool,
     key: Option<Arc<WalKey>>,
     seg: Option<SegmentKey>,
+    /// The file holds bytes past its records (a write that failed part way)
+    /// that could not be cut yet: nothing is appended behind them.
+    torn: bool,
+    /// A record was cut from this encrypted segment: the number it had is
+    /// never sealed under this segment's key again (a nonce is used once).
+    /// The next record goes to a new segment, which has a key of its own.
+    spent: bool,
 }
 
 impl Writer {
@@ -259,7 +285,7 @@ impl Writer {
     /// segment is (re)started with a fresh salt: a segment the writer opens
     /// holds no valid record (they would be past the last LSN), and a new
     /// salt means a new key, so no nonce of a torn record is ever reused.
-    pub(crate) fn open(dir: &Path, first_lsn: u64, sync: bool, key: Option<Arc<WalKey>>) -> Result<Writer> {
+    pub(crate) fn open(dir: &Path, first_lsn: u64, key: Option<Arc<WalKey>>) -> Result<Writer> {
         fs::create_dir_all(dir).map_err(io)?;
         let path = dir.join(segment_name(first_lsn));
         let (file, bytes, seg) = match &key {
@@ -277,27 +303,70 @@ impl Writer {
             }
         };
         sync_dir(dir);
-        Ok(Writer { dir: dir.to_owned(), file, first_lsn, bytes, sync, key, seg })
+        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg, torn: false, spent: false })
     }
 
+    /// The segment's file, to sync it.
+    pub(crate) fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
+    /// Appends `record`. When the write fails, what it wrote of the record is
+    /// cut from the file: the next record follows the last whole one.
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
-        let payload = record.payload();
-        let bytes = match &self.seg {
-            Some(seg) => frame(&seg.seal(record.lsn, &payload)),
-            None => frame(&payload),
-        };
-        self.file.write_all(&bytes).map_err(io)?;
-        if self.sync {
-            self.file.sync_data().map_err(io)?;
+        if self.spent {
+            return Err(storage_err(
+                "write-ahead log: a record was cut from this segment, the next one starts another",
+            ));
+        }
+        if self.torn {
+            self.cut_to(self.bytes)?;
+        }
+        // One buffer: the head, then the record, encrypted where it is.
+        let mut bytes = vec![0u8; FRAME];
+        match &self.seg {
+            Some(seg) => {
+                bytes.extend_from_slice(&record.lsn.to_le_bytes());
+                record.payload_into(&mut bytes);
+                seg.seal_in_place(record.lsn, &mut bytes, FRAME + 8);
+            }
+            None => record.payload_into(&mut bytes),
+        }
+        frame(&mut bytes);
+        if let Err(e) = (&*self.file).write_all(&bytes) {
+            // Recovery stops at the first record that is not whole: one
+            // appended behind this one would be lost with it.
+            let _ = self.cut_to(self.bytes);
+            return Err(io(e));
         }
         self.bytes += bytes.len() as u64;
         Ok(())
     }
 
-    /// Closes this segment and starts the next one at `next_lsn`.
+    /// Cuts the segment back to its first `bytes` bytes of records: the
+    /// records appended since are not in the log any more (their commits did
+    /// not complete). Until it succeeds, nothing is appended.
+    pub(crate) fn cut_to(&mut self, bytes: u64) -> Result<()> {
+        self.bytes = bytes;
+        self.torn = true;
+        self.spent = self.seg.is_some();
+        let len = bytes + if self.seg.is_some() { HEADER_LEN as u64 } else { 0 };
+        self.file.set_len(len).map_err(io)?;
+        (&*self.file).seek(SeekFrom::Start(len)).map_err(io)?;
+        self.torn = false;
+        Ok(())
+    }
+
+    /// `true` once a record was cut from an encrypted segment: the next
+    /// record is for a new segment ([`rotate`](Self::rotate)).
+    pub(crate) fn spent(&self) -> bool {
+        self.spent
+    }
+
+    /// Leaves this segment, which its caller has synced, and starts the next
+    /// one at `next_lsn`.
     pub(crate) fn rotate(&mut self, next_lsn: u64) -> Result<()> {
-        self.file.sync_all().map_err(io)?;
-        *self = Writer::open(&self.dir, next_lsn, self.sync, self.key.clone())?;
+        *self = Writer::open(&self.dir, next_lsn, self.key.clone())?;
         Ok(())
     }
 }
@@ -374,7 +443,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let enc = crate::crypto::Encryption::from_key([5; 32]);
         let (_, keys) = crate::crypto::Header::create(&enc).unwrap();
-        let mut w = Writer::open(&dir, 1, false, Some(keys.wal.clone())).unwrap();
+        let mut w = Writer::open(&dir, 1, Some(keys.wal.clone())).unwrap();
         let a = Record {
             lsn: 1,
             ops: vec![Op::Put { table: "b:main".into(), key: b"secret-key".to_vec(), value: b"secret-value".to_vec() }],
@@ -394,5 +463,57 @@ mod tests {
         fs::write(dir.join(segment_name(1)), Record { lsn: 1, ops: vec![] }.encode()).unwrap();
         assert!(recover(&dir, Some(&keys.wal)).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record written in part (the write failed) or taken back (its commit
+    /// did not complete) is cut from the segment: the records appended after
+    /// it are read back, in clear and encrypted.
+    #[test]
+    fn a_record_that_did_not_complete_is_cut() {
+        let record = |lsn: u64, value: &[u8]| Record {
+            lsn,
+            ops: vec![Op::Put { table: "b:main".into(), key: lsn.to_be_bytes().to_vec(), value: value.to_vec() }],
+        };
+        let enc = crate::crypto::Encryption::from_key([5; 32]);
+        let (_, keys) = crate::crypto::Header::create(&enc).unwrap();
+        for key in [None, Some(keys.wal.clone())] {
+            let dir = std::env::temp_dir().join(format!("nuage-wal-cut-{}-{}", key.is_some(), std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w = Writer::open(&dir, 1, key.clone()).unwrap();
+            w.append(&record(1, b"one")).unwrap();
+            // What a write that fails half way leaves behind the last record.
+            let whole = w.bytes;
+            (&*w.file).write_all(&[0xAB; 37]).unwrap();
+            w.cut_to(whole).unwrap();
+            // Encrypted, the record cut had its number sealed under the segment's key:
+            // that number goes to another segment, under another key.
+            let next = |w: &mut Writer, lsn: u64| {
+                assert_eq!(w.spent(), key.is_some());
+                if w.spent() {
+                    assert!(w.append(&record(lsn, b"under the same key")).is_err());
+                    w.rotate(lsn).unwrap();
+                }
+            };
+            next(&mut w, 2);
+            w.append(&record(2, b"two")).unwrap();
+            // A record that is whole, taken back: the next one has its number.
+            let kept = w.bytes;
+            w.append(&record(3, &[7; 5000])).unwrap();
+            w.cut_to(kept).unwrap();
+            next(&mut w, 3);
+            w.append(&record(3, b"three")).unwrap();
+            assert!(!w.torn && !w.spent());
+            // The first record of a segment, cut: the segment starts again, with a new key.
+            w.rotate(4).unwrap();
+            w.append(&record(4, b"gone")).unwrap();
+            w.cut_to(0).unwrap();
+            next(&mut w, 4);
+            w.append(&record(4, b"four")).unwrap();
+            drop(w);
+            let read = recover(&dir, key.as_deref()).unwrap();
+            assert_eq!(read, vec![record(1, b"one"), record(2, b"two"), record(3, b"three"), record(4, b"four")]);
+            assert_eq!(segments(&dir).unwrap().len(), if key.is_some() { 4 } else { 2 });
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

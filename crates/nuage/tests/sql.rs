@@ -504,3 +504,141 @@ fn count_from_an_index_matches_the_rows() {
     tx.rollback_now().unwrap();
     check(&|sql, p| db.0.sql(sql, p).unwrap(), "après annulation");
 }
+
+/// A `SELECT` of plain columns found by a key or an index is answered from the
+/// rows read, without the evaluator. `AND 1 = 1` sends the same statement
+/// through it: both give the same rows, in the same order.
+#[test]
+fn answers_without_the_evaluator_match_it() {
+    let db = Db::open("direct");
+    db.run(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, code TEXT UNIQUE, grp INT, kind TEXT, score DOUBLE PRECISION, note TEXT);
+         CREATE INDEX t_grp_kind ON t (grp, kind);
+         CREATE INDEX t_score ON t (score);
+         CREATE TABLE named (name TEXT PRIMARY KEY, n INT)",
+        &[],
+    );
+    for i in 0..60i64 {
+        db.run(
+            "INSERT INTO t (id, code, grp, kind, score, note) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                json!(i),
+                json!(format!("c{i:02}")),
+                if i % 11 == 0 { Json::Null } else { json!(i % 4) },
+                json!(["a", "b", "c"][(i % 3) as usize]),
+                json!(i as f64 / 4.0),
+                if i % 7 == 0 { Json::Null } else { json!(format!("note {i}")) },
+            ],
+        );
+    }
+    db.run("INSERT INTO named (name, n) VALUES ('5', 1), ('abc', 2), ('', 3)", &[]);
+    let statements: &[(&str, Vec<Json>)] = &[
+        ("SELECT note FROM t WHERE id = ?", vec![json!(5)]),
+        ("SELECT * FROM t WHERE id = ?", vec![json!(5)]),
+        ("SELECT * FROM t WHERE id = ?", vec![json!(999)]),
+        ("SELECT id, note, id FROM t WHERE id = ?", vec![json!(8)]),
+        ("SELECT score, code FROM t WHERE id = ?", vec![json!(7.0)]),
+        ("SELECT id FROM t WHERE id = ?", vec![json!("5")]),
+        ("SELECT id FROM t WHERE id = ?", vec![Json::Null]),
+        ("SELECT id FROM t WHERE id = NULL", vec![]),
+        ("SELECT id, kind FROM t WHERE id IN (?, ?, ?, ?)", vec![json!(9), json!(3), json!(3), json!(1000)]),
+        ("SELECT id FROM t WHERE id IN (4, NULL, 2)", vec![]),
+        // Long lists, of numbers written both ways.
+        ("SELECT id, code FROM t WHERE id IN (40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 1000, 7)", vec![]),
+        ("SELECT id FROM t WHERE id IN (1, 2.0, 3, 4, 5, 6.0, 7, 8, 9, 10.5, 11, 12)", vec![]),
+        ("SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE score < 9)", vec![]),
+        ("SELECT id, code FROM t WHERE code = ?", vec![json!("c17")]),
+        ("SELECT id FROM t WHERE code IN ('c17', 'c03', 'nope')", vec![]),
+        ("SELECT id, note FROM t WHERE grp = ? AND kind = ?", vec![json!(2), json!("b")]),
+        ("SELECT id FROM t WHERE kind = ? AND grp = ?", vec![json!("c"), json!(1)]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ?", vec![Json::Null, json!("a")]),
+        ("SELECT id FROM t WHERE grp = 1 AND grp = 2 AND kind = 'a'", vec![]),
+        ("SELECT id FROM t WHERE grp = 1 AND kind = 'a' AND note IS NOT NULL", vec![]),
+        ("SELECT id FROM t WHERE score = ?", vec![json!(2.5)]),
+        ("SELECT id FROM t WHERE score = ?", vec![json!(3)]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? LIMIT 2", vec![json!(3), json!("a")]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? LIMIT 2 OFFSET 1", vec![json!(3), json!("a")]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? LIMIT 0", vec![json!(3), json!("a")]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? ORDER BY id DESC", vec![json!(3), json!("a")]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? ORDER BY id DESC LIMIT 2", vec![json!(3), json!("a")]),
+        ("SELECT id FROM t WHERE grp = ? AND kind = ? ORDER BY note LIMIT 3 OFFSET 1", vec![json!(1), json!("b")]),
+        ("SELECT id FROM t WHERE id = ? ORDER BY note", vec![json!(12)]),
+        ("SELECT id, score FROM t WHERE id = ? LIMIT 1", vec![json!(12)]),
+        ("SELECT id, score FROM t WHERE id = ? OFFSET 1", vec![json!(12)]),
+        ("SELECT n FROM named WHERE name = ?", vec![json!("5")]),
+        ("SELECT n FROM named WHERE name = ?", vec![json!(5)]),
+        ("SELECT n FROM named WHERE name = ?", vec![json!("")]),
+        ("SELECT upper(note) FROM t WHERE id = ?", vec![json!(5)]),
+        ("SELECT DISTINCT kind FROM t WHERE grp = ? AND kind = ?", vec![json!(2), json!("b")]),
+    ];
+    for (sql, params) in statements {
+        let direct = db.rows(sql, params);
+        // The same filter with a conjunct no index answers.
+        let through = sql.replacen(" WHERE ", " WHERE 1 = 1 AND ", 1);
+        assert_ne!(*sql, through);
+        assert_eq!(direct, db.rows(&through, params), "{sql} {params:?}");
+    }
+    // The answers themselves, for a few.
+    assert_eq!(db.rows("SELECT id, note, id FROM t WHERE id = 8", &[]), json!([[8, "note 8", 8]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE id IN (9, 3, 3, 1000)", &[]), json!([[3], [9]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE grp = 3 AND kind = 'a' LIMIT 2 OFFSET 1", &[]), json!([[15], [27]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE id = NULL", &[]), json!([]));
+    assert_eq!(db.rows("SELECT n FROM named WHERE name = ''", &[]), json!([[3]]));
+}
+
+/// Writes sent at the same time each take their turn: none is refused for a
+/// conflict, and none is lost (a counter raised by every one of them ends at
+/// their number).
+#[test]
+fn writes_at_the_same_time_take_turns() {
+    let db = Db::open("turns");
+    db.run("CREATE TABLE counters (name TEXT PRIMARY KEY, n BIGINT NOT NULL); CREATE TABLE log (id SERIAL PRIMARY KEY, who INT)", &[]);
+    db.run("INSERT INTO counters (name, n) VALUES ('hits', 0)", &[]);
+    let (threads, each) = (16, 40);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let db = &db.0;
+            scope.spawn(move || {
+                for _ in 0..each {
+                    // Read, then write what was read: lost if two of them ran on the same value.
+                    db.sql(
+                        "UPDATE counters SET n = n + 1 WHERE name = 'hits'; INSERT INTO log (who) VALUES (?)",
+                        &[json!(t)],
+                    )
+                    .unwrap();
+                    // And a read alone in between: it never waits for a turn.
+                    db.sql("SELECT n FROM counters WHERE name = 'hits'", &[]).unwrap();
+                }
+            });
+        }
+    });
+    let total = threads * each;
+    assert_eq!(db.rows("SELECT n FROM counters", &[]), json!([[total]]));
+    assert_eq!(db.rows("SELECT count(*), count(DISTINCT id) FROM log", &[]), json!([[total, total]]));
+    // A dry run changes nothing, and a failing script leaves nothing behind.
+    assert!(db.0.sql("UPDATE counters SET n = 0; INSERT INTO counters (name, n) VALUES ('hits', 1)", &[]).is_err());
+    assert_eq!(db.rows("SELECT n FROM counters", &[]), json!([[total]]));
+}
+
+/// An index that names a column twice stands for that column alone: the
+/// other conditions of a filter are still looked at, for reads, counts and
+/// writes.
+#[test]
+fn an_index_that_repeats_a_column_does_not_stand_for_the_filter() {
+    let db = Db::open("repeat");
+    db.run(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, b TEXT);
+         CREATE INDEX t_aa ON t (a, a);
+         INSERT INTO t (id, a, b) VALUES (1, 'x', 'y'), (2, 'x', 'z'), (3, 'w', 'y')",
+        &[],
+    );
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = 'x' AND b = 'y'", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = ? AND b = ?", &[json!("x"), json!("z")]), json!([[2]]));
+    assert_eq!(db.rows("SELECT count(*) FROM t WHERE a = 'x' AND b = 'y'", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT count(*) FROM t WHERE a = 'x'", &[]), json!([[2]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = 'x' ORDER BY id", &[]), json!([[1], [2]]));
+    db.run("UPDATE t SET b = b || '!' WHERE a = 'x' AND b = 'y'", &[]);
+    assert_eq!(db.rows("SELECT id, b FROM t ORDER BY id", &[]), json!([[1, "y!"], [2, "z"], [3, "y"]]));
+    assert_eq!(db.rows("DELETE FROM t WHERE a = 'x' AND b = 'y!' RETURNING id", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT id FROM t ORDER BY id", &[]), json!([[2], [3]]));
+}

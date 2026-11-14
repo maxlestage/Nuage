@@ -30,12 +30,13 @@
 //!
 //! ## How it works
 //!
-//! * **Pages**: [redb](https://docs.rs/redb), a pure-Rust B-tree store, keeps
-//!   tables and indexes in one file with a bounded page cache: the data is not
-//!   limited by memory, and primary-key and index lookups read only the rows
-//!   they need.
+//! * **Pages**: Nuage DB's own B-trees (copy-on-write pages, a checksum on
+//!   each node) keep tables and indexes in one file with a bounded page
+//!   cache: the data is not limited by memory, and primary-key and index
+//!   lookups read only the rows they need.
 //! * **Write-ahead log**: each commit is appended to the log and synced to
-//!   disk before it is applied; checkpoints make the page store durable;
+//!   disk before it returns or is shown to a reader, and commits made at the
+//!   same time share one sync; checkpoints make the page store durable;
 //!   startup replays what the last checkpoint missed. Log records and pages
 //!   carry checksums.
 //! * **Statements**: Memoire's own evaluator ([`memoire_orm::evaluator`]),

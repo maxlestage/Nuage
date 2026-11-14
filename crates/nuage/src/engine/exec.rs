@@ -11,7 +11,7 @@
 //! the tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memoire_orm::ast::{Projection, SelectAst};
 use memoire_orm::evaluator::{self, Tables};
@@ -54,6 +54,8 @@ pub(crate) struct TableMeta {
     pub indexes: Vec<IndexMeta>,
     /// The schema the table was created (or last widened) with, as JSON.
     pub schema: Json,
+    /// The type of each stored column, worked out from `schema` once.
+    kinds: OnceLock<Vec<Option<ColumnType>>>,
 }
 
 impl TableMeta {
@@ -82,12 +84,22 @@ impl TableMeta {
             pk: schema.primary_key,
             indexes,
             schema: schema_to_json(schema),
+            kinds: OnceLock::new(),
         }
     }
 
     /// The type of each stored column, from the table's schema (`None` for a
     /// column the schema does not name).
-    pub(crate) fn kinds(&self) -> Vec<Option<ColumnType>> {
+    pub(crate) fn kinds(&self) -> &[Option<ColumnType>] {
+        self.kinds.get_or_init(|| self.read_kinds())
+    }
+
+    /// The columns or the schema changed: their types are read again.
+    fn changed(&mut self) {
+        self.kinds = OnceLock::new();
+    }
+
+    fn read_kinds(&self) -> Vec<Option<ColumnType>> {
         const NAMES: [(&str, ColumnType); 14] = [
             ("bool", ColumnType::Bool),
             ("smallint", ColumnType::SmallInt),
@@ -161,6 +173,7 @@ impl TableMeta {
                 })
                 .collect::<Result<_>>()?,
             schema: j.get("schema").cloned().unwrap_or(Json::Null),
+            kinds: OnceLock::new(),
         })
     }
 
@@ -187,9 +200,12 @@ pub(crate) struct Ctx<'a> {
     pub overlay: &'a mut Overlay,
     /// Operations applied after the overlay (dropped table generations).
     pub extra: &'a mut Vec<Op>,
-    /// Tables read or written, with their version when first touched.
-    pub touched: &'a mut BTreeMap<String, u64>,
+    /// Tables read or written: what a transaction's commit is checked against.
+    pub touched: &'a mut BTreeSet<String>,
     pub written: &'a mut BTreeSet<String>,
+    /// Catalog entries already read, by table: a statement asks for the same
+    /// ones several times. Emptied when the catalog is written.
+    pub memo: &'a mut Vec<(String, Arc<Parsed>)>,
 }
 
 fn pk_enc(v: &Value) -> Vec<u8> {
@@ -210,19 +226,34 @@ impl Ctx<'_> {
     }
 
     fn put(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        if key.first() == Some(&keys::CATALOG) {
+            self.memo.clear();
+        }
         self.overlay.insert(key, value);
     }
 
     fn touch(&mut self, table: &str) {
-        if !self.touched.contains_key(table) {
-            let v = self.store.version(self.branch, table);
-            self.touched.insert(table.to_owned(), v);
+        if !self.touched.contains(table) {
+            self.touched.insert(table.to_owned());
         }
     }
 
     fn parsed(&mut self, table: &str) -> Result<Option<Arc<Parsed>>> {
+        if let Some((_, parsed)) = self.memo.iter().find(|(name, _)| name == table) {
+            return Ok(Some(parsed.clone()));
+        }
         self.touch(table);
-        self.get(&keys::catalog_key(table))?.map(|b| self.store.parsed(b)).transpose()
+        let key = keys::catalog_key(table);
+        let parsed = match self.overlay.get(&key) {
+            // An entry this transaction wrote: by its bytes.
+            Some(pending) => pending.clone().map(|b| self.store.parsed(b)).transpose()?,
+            // The stored one: read in place, and the same as last time for nearly every statement.
+            None => self.snap.with(&key, |bytes| self.store.parsed_as(table, bytes))?.transpose()?,
+        };
+        if let Some(p) = &parsed {
+            self.memo.push((table.to_owned(), p.clone()));
+        }
+        Ok(parsed)
     }
 
     /// The table's metadata (parsed once per distinct catalog entry, see [`Store::parsed`]).
@@ -277,17 +308,31 @@ impl Ctx<'_> {
         self.counter(&keys::bytes_key(meta.generation))
     }
 
-    fn decode(&self, meta: &TableMeta, map: &[Option<usize>], bytes: &[u8]) -> Result<Vec<Value>> {
-        let stored = keys::decode_row(bytes)?;
-        let _ = meta;
-        Ok(map.iter().map(|m| m.and_then(|i| stored.get(i).cloned()).unwrap_or(Value::Null)).collect())
+    /// A stored row in the order of the model's columns. `want`: the stored
+    /// columns to read (see [`wanted`]), all of them when `None`.
+    fn decode(&self, want: Option<&[bool]>, map: &[Option<usize>], bytes: &[u8]) -> Result<Vec<Value>> {
+        let mut stored = match want {
+            Some(want) => keys::decode_row_some(bytes, want)?,
+            None => keys::decode_row(bytes)?,
+        };
+        // The model's columns in the stored order (nearly always): the row as it is.
+        if stored.len() == map.len() && map.iter().enumerate().all(|(i, m)| *m == Some(i)) {
+            return Ok(stored);
+        }
+        Ok(map.iter().map(|m| m.and_then(|i| stored.get_mut(i).map(std::mem::take)).unwrap_or(Value::Null)).collect())
     }
 
-    fn rows_by_pk(&self, meta: &TableMeta, map: &[Option<usize>], pks: &[Vec<u8>]) -> Result<Vec<Vec<Value>>> {
+    fn rows_by_pk(
+        &self,
+        meta: &TableMeta,
+        map: &[Option<usize>],
+        want: Option<&[bool]>,
+        pks: &[Vec<u8>],
+    ) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::with_capacity(pks.len());
         for pk in pks {
             if let Some(b) = self.get(&row_key_raw(meta.generation, pk))? {
-                out.push(self.decode(meta, map, &b)?);
+                out.push(self.decode(want, map, &b)?);
             }
         }
         Ok(out)
@@ -298,15 +343,23 @@ impl Ctx<'_> {
         let prefix = keys::index_prefix(meta.generation, index as u16, values);
         let end = keys::prefix_end(&prefix);
         let mut out = Vec::new();
-        let mut at = prefix.clone();
-        loop {
-            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
-            out.extend(entries.into_iter().map(|(k, _)| k[prefix.len()..].to_vec()));
-            match next {
-                Some(n) => at = n,
-                None => return Ok(out),
-            }
-        }
+        self.snap.each(Some(self.overlay), &prefix, &end, |k, _| {
+            out.push(k[prefix.len()..].to_vec());
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Number of rows whose index `index` holds `values`: no key is kept.
+    fn index_count(&self, meta: &TableMeta, index: usize, values: &[&Value]) -> Result<i64> {
+        let prefix = keys::index_prefix(meta.generation, index as u16, values);
+        let end = keys::prefix_end(&prefix);
+        let mut n = 0;
+        self.snap.each(Some(self.overlay), &prefix, &end, |_, _| {
+            n += 1;
+            Ok(true)
+        })?;
+        Ok(n)
     }
 
     /// Calls `f` with each chunk of rows of the table, in primary-key order,
@@ -315,21 +368,24 @@ impl Ctx<'_> {
         &self,
         meta: &TableMeta,
         map: &[Option<usize>],
+        want: Option<&[bool]>,
         mut f: impl FnMut(Vec<Vec<Value>>) -> Result<bool>,
     ) -> Result<()> {
         let (start, end) = keys::rows_range(meta.generation);
-        let mut at = start;
-        loop {
-            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
-            let rows = entries.iter().map(|(_, v)| self.decode(meta, map, v)).collect::<Result<Vec<_>>>()?;
-            if !rows.is_empty() && !f(rows)? {
-                return Ok(());
+        let mut rows = Vec::new();
+        let mut stopped = false;
+        // Rows are decoded where they are read, a chunk at a time.
+        self.snap.each(Some(self.overlay), &start, &end, |_, v| {
+            rows.push(self.decode(want, map, v)?);
+            if rows.len() == CHUNK && !f(std::mem::take(&mut rows))? {
+                stopped = true;
             }
-            match next {
-                Some(n) => at = n,
-                None => return Ok(()),
-            }
+            Ok(!stopped)
+        })?;
+        if !stopped && !rows.is_empty() {
+            f(rows)?;
         }
+        Ok(())
     }
 }
 
@@ -448,13 +504,147 @@ static EMPTY: TableSchema = TableSchema {
         3],
 };
 
+/// A column a lookup went by (its place in the schema) and the values it may hold.
+struct Pin<'a> {
+    column: usize,
+    allowed: Vec<&'a Value>,
+    /// The allowed values by their key form, made when there are many of them.
+    by_key: std::cell::OnceCell<HashMap<Vec<u8>, &'a Value>>,
+}
+
+impl<'a> Pin<'a> {
+    fn new(column: usize, allowed: Vec<&'a Value>) -> Pin<'a> {
+        Pin { column, allowed, by_key: std::cell::OnceCell::new() }
+    }
+
+    /// `held` is exactly one of the allowed values.
+    fn holds(&self, held: &Value) -> bool {
+        // NULL equals nothing and a float may be NaN: those go to the evaluator.
+        if matches!(held, Value::Null | Value::F64(_)) {
+            return false;
+        }
+        if self.allowed.len() <= 8 {
+            return self.allowed.contains(&held);
+        }
+        let by_key = self.by_key.get_or_init(|| self.allowed.iter().map(|v| (pk_enc(v), *v)).collect());
+        by_key.get(&pk_enc(held)).is_some_and(|v| *v == held)
+    }
+}
+
+/// Keys found through an index.
+struct Pushed<'a> {
+    /// Encoded primary keys of the rows to read.
+    keys: Vec<Vec<u8>>,
+    /// When the lookup stands for the whole filter: the columns it went by.
+    /// A row that holds exactly the values it was looked up by matches,
+    /// without asking the evaluator.
+    whole: Option<Vec<Pin<'a>>>,
+}
+
+impl Pushed<'_> {
+    /// Every row holds exactly the values it was looked up by, and the lookup was the whole filter.
+    fn settles(&self, rows: &[Vec<Value>]) -> bool {
+        self.whole.as_ref().is_some_and(|pins| {
+            rows.iter().all(|row| pins.iter().all(|pin| row.get(pin.column).is_some_and(|held| pin.holds(held))))
+        })
+    }
+}
+
+/// The columns of `schema` a `SELECT` reads, by their place in the schema:
+/// the others need not be decoded. `None` when it may read any of them
+/// (every column is selected, or an expression this does not look into).
+fn columns_read(ast: &SelectAst, schema: &TableSchema) -> Option<Vec<bool>> {
+    fn mark(e: &Expr, schema: &TableSchema, mask: &mut [bool]) -> Option<()> {
+        match e {
+            Expr::Column(c) => {
+                if c.table == schema.name {
+                    *mask.get_mut(c.index)? = true;
+                }
+                Some(())
+            }
+            Expr::Value(_) => Some(()),
+            Expr::Binary { left, right, .. } => {
+                mark(left, schema, mask)?;
+                mark(right, schema, mask)
+            }
+            Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::InList { expr: x, .. } => mark(x, schema, mask),
+            Expr::Between { expr, low, high, .. } => {
+                mark(expr, schema, mask)?;
+                mark(low, schema, mask)?;
+                mark(high, schema, mask)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                mark(expr, schema, mask)?;
+                mark(pattern, schema, mask)
+            }
+            Expr::Aggregate { arg, .. } => match arg {
+                Some(a) => mark(a, schema, mask),
+                None => Some(()),
+            },
+            // A subquery (it may name this table's columns), a text search, anything else.
+            #[allow(unreachable_patterns)]
+            Expr::InSubquery { .. } | Expr::Match(_) | _ => None,
+        }
+    }
+    let mut mask = vec![false; schema.columns.len()];
+    // The primary key always: rows are told apart by it.
+    *mask.get_mut(schema.primary_key)? = true;
+    match &ast.projection {
+        Projection::Tables(tables) => {
+            if tables.iter().any(|t| t.name == schema.name) {
+                return None;
+            }
+        }
+        Projection::Exprs(list) => {
+            for e in list {
+                mark(e, schema, &mut mask)?;
+            }
+        }
+    }
+    let others = ast
+        .filter
+        .iter()
+        .chain(ast.having.iter())
+        .chain(ast.group_by.iter())
+        .chain(ast.order.iter().map(|o| &o.expr))
+        .chain(ast.joins.iter().map(|j| &j.on));
+    for e in others {
+        mark(e, schema, &mut mask)?;
+    }
+    // Every column: the plain decoding is the fastest.
+    if mask.iter().all(|m| *m) { None } else { Some(mask) }
+}
+
+/// [`columns_read`] as places in the stored row.
+fn wanted(needed: Option<&[bool]>, meta: &TableMeta, map: &[Option<usize>]) -> Option<Vec<bool>> {
+    let needed = needed?;
+    let mut want = vec![false; meta.columns.len()];
+    for (i, m) in map.iter().enumerate() {
+        if let Some(p) = m
+            && needed.get(i).copied().unwrap_or(true)
+            && let Some(slot) = want.get_mut(*p)
+        {
+            *slot = true;
+        }
+    }
+    Some(want)
+}
+
 /// Keys found through an index for the pinned conjuncts, when there is one.
-fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Expr]) -> Result<Option<Vec<Vec<u8>>>> {
+fn pushdown<'e>(
+    ctx: &Ctx<'_>,
+    meta: &TableMeta,
+    schema: &TableSchema,
+    parts: &[&'e Expr],
+) -> Result<Option<Pushed<'e>>> {
     let column = |e: &Expr| match e {
-        Expr::Column(c) if c.table == schema.name => Some(schema.columns.get(c.index)?.name),
+        Expr::Column(c) if c.table == schema.name => Some((schema.columns.get(c.index)?.name, c.index)),
         _ => None,
     };
-    let mut pins: HashMap<&str, &Value> = HashMap::new();
+    // The lookup is the whole filter when it used the only conjunct.
+    let only = parts.len() == 1;
+    let mut pins: HashMap<&str, (&'e Value, usize)> = HashMap::new();
+    let mut pinned = 0;
     for part in parts {
         match part {
             Expr::Binary { op: BinOp::Eq, left, right } => {
@@ -463,20 +653,25 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
                     (Expr::Value(v), r) => column(r).map(|c| (c, v)),
                     _ => None,
                 };
-                if let Some((c, v)) = pin {
+                if let Some(((c, at), v)) = pin {
                     if c == meta.columns[meta.pk] {
-                        return Ok(Some(vec![pk_enc(v)]));
+                        return Ok(Some(Pushed {
+                            keys: vec![pk_enc(v)],
+                            whole: only.then(|| vec![Pin::new(at, vec![v])]),
+                        }));
                     }
-                    pins.insert(c, v);
+                    pins.insert(c, (v, at));
+                    pinned += 1;
                 }
             }
             Expr::InList { expr, list, negated: false } => {
-                if let Some(c) = column(expr) {
+                if let Some((c, at)) = column(expr) {
+                    let whole = only.then(|| vec![Pin::new(at, list.iter().collect())]);
                     if c == meta.columns[meta.pk] {
                         let mut keys: Vec<Vec<u8>> = list.iter().map(pk_enc).collect();
                         keys.sort();
                         keys.dedup();
-                        return Ok(Some(keys));
+                        return Ok(Some(Pushed { keys, whole }));
                     }
                     if let Some(i) = meta.indexes.iter().position(|ix| ix.columns.len() == 1 && ix.columns[0] == c) {
                         let mut keys = Vec::new();
@@ -485,7 +680,7 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
                         }
                         keys.sort();
                         keys.dedup();
-                        return Ok(Some(keys));
+                        return Ok(Some(Pushed { keys, whole }));
                     }
                 }
             }
@@ -501,12 +696,17 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
         .max_by_key(|(_, ix)| ix.columns.len());
     match best {
         Some((i, ix)) => {
-            let values: Vec<&Value> = ix.columns.iter().map(|c| pins[c.as_str()]).collect();
+            let values: Vec<&Value> = ix.columns.iter().map(|c| pins[c.as_str()].0).collect();
             // NULL is never indexed (and never equal).
             if values.iter().any(|v| v.is_null()) {
-                return Ok(Some(Vec::new()));
+                return Ok(Some(Pushed { keys: Vec::new(), whole: None }));
             }
-            Ok(Some(ctx.index_lookup(meta, i, &values)?))
+            // The whole filter: every conjunct pins a column of its own, and the index has as
+            // many. Each row is held to every conjunct, whatever the index lists (it may name
+            // a column twice, and then stands for fewer of them).
+            let whole = (pinned == parts.len() && pins.len() == pinned && ix.columns.len() == pinned)
+                .then(|| pins.values().map(|&(v, at)| Pin::new(at, vec![v])).collect());
+            Ok(Some(Pushed { keys: ctx.index_lookup(meta, i, &values)?, whole }))
         }
         None => Ok(None),
     }
@@ -534,6 +734,8 @@ enum Stop {
 }
 
 /// Rows of `schema` matching `parts`, read through an index when possible.
+/// `needed`: the columns the statement reads (see [`columns_read`]); the
+/// others come out `NULL`.
 fn matching_rows(
     ctx: &mut Ctx<'_>,
     schema: &'static TableSchema,
@@ -541,9 +743,12 @@ fn matching_rows(
     side: &Tables,
     side_schemas: &[&'static TableSchema],
     stop: Stop,
+    needed: Option<&[bool]>,
 ) -> Result<Option<(Vec<Vec<Value>>, i64)>> {
     let Some(meta) = ctx.meta(schema.name)? else { return Ok(None) };
     let map = meta.map(schema);
+    let want = wanted(needed, &meta, &map);
+    let want = want.as_deref();
     let seq = ctx.counter(&keys::seq_key(meta.generation))?;
     let filter = and_all(parts);
     // Keeps the rows of `chunk` that match, evaluated by Memoire.
@@ -555,7 +760,8 @@ fn matching_rows(
     let mut select = SelectAst::new(schema);
     select.filter = filter.clone();
     let _ = side_schemas;
-    if let Some(mut pks) = pushdown(ctx, &meta, schema, parts)? {
+    if let Some(mut pushed) = pushdown(ctx, &meta, schema, parts)? {
+        let mut pks = std::mem::take(&mut pushed.keys);
         // The keys come in primary-key order: for `LIMIT n` with no order, or
         // ordered by the primary key, read rows in that order (or reversed)
         // and stop at the `n`th match, instead of reading every match.
@@ -572,20 +778,20 @@ fn matching_rows(
             }
             let mut out = Vec::with_capacity(n);
             for chunk in pks.chunks(n.max(16)) {
-                let rows = ctx.rows_by_pk(&meta, &map, chunk)?;
-                out.extend(if filter.is_some() { keep(rows, &select)? } else { rows });
+                let rows = ctx.rows_by_pk(&meta, &map, want, chunk)?;
+                out.extend(if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows });
                 if out.len() >= n {
                     break;
                 }
             }
             return Ok(Some((out, seq)));
         }
-        let rows = ctx.rows_by_pk(&meta, &map, &pks)?;
-        let rows = if filter.is_some() { keep(rows, &select)? } else { rows };
+        let rows = ctx.rows_by_pk(&meta, &map, want, &pks)?;
+        let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
         return Ok(Some((rows, seq)));
     }
     let mut out: Vec<Vec<Value>> = Vec::new();
-    ctx.scan_rows(&meta, &map, |chunk| {
+    ctx.scan_rows(&meta, &map, want, |chunk| {
         let matched = if filter.is_some() { keep(chunk, &select)? } else { chunk };
         out.extend(matched);
         Ok(match &stop {
@@ -609,7 +815,7 @@ fn load_all(ctx: &mut Ctx<'_>, schema: &'static TableSchema, into: &mut Tables) 
     if into.contains(schema.name) {
         return Ok(());
     }
-    if let Some((rows, seq)) = matching_rows(ctx, schema, &[], &Tables::new(), &[], Stop::Never)? {
+    if let Some((rows, seq)) = matching_rows(ctx, schema, &[], &Tables::new(), &[], Stop::Never, None)? {
         into.insert(schema, rows, seq);
     }
     Ok(())
@@ -658,8 +864,12 @@ fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
         }
     }
     let Some(meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    // An index on exactly the pinned columns: each of them, and nothing else.
     let Some(i) = meta.indexes.iter().position(|ix| {
-        ix.live() && ix.columns.len() == pins.len() && ix.columns.iter().all(|c| pins.contains_key(c.as_str()))
+        ix.live()
+            && ix.columns.len() == pins.len()
+            && pins.keys().all(|p| ix.columns.iter().any(|c| c == p))
+            && ix.columns.iter().all(|c| pins.contains_key(c.as_str()))
     }) else {
         return Ok(None);
     };
@@ -668,7 +878,50 @@ fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
     if values.iter().any(|v| v.is_null()) {
         return Ok(Some(0));
     }
-    Ok(Some(ctx.index_lookup(&meta, i, &values)?.len() as i64))
+    Ok(Some(ctx.index_count(&meta, i, &values)?))
+}
+
+/// The answer of a `SELECT` of one table from the rows that match its whole
+/// filter, when nothing is left for the evaluator to do: plain columns (or
+/// all of them), no order to apply. `Err` gives the rows back otherwise.
+fn plain_answer(ast: &SelectAst, rows: Vec<Vec<Value>>) -> std::result::Result<Vec<Vec<Value>>, Vec<Vec<Value>>> {
+    if !ast.order.is_empty() && rows.len() > 1 {
+        return Err(rows);
+    }
+    let columns: Option<Vec<usize>> = match &ast.projection {
+        Projection::Tables(tables) if tables.len() == 1 && tables[0].name == ast.from.name => None,
+        Projection::Exprs(list) => {
+            let picked: Option<Vec<usize>> = list
+                .iter()
+                .map(|e| match e {
+                    Expr::Column(c) if c.table == ast.from.name && c.index < ast.from.columns.len() => Some(c.index),
+                    _ => None,
+                })
+                .collect();
+            match picked {
+                Some(p) => Some(p),
+                None => return Err(rows),
+            }
+        }
+        _ => return Err(rows),
+    };
+    if rows.iter().any(|r| r.len() != ast.from.columns.len()) {
+        return Err(rows);
+    }
+    let skip = ast.offset.unwrap_or(0) as usize;
+    let take = ast.limit.map_or(usize::MAX, |l| l as usize);
+    let rows = rows.into_iter().skip(skip).take(take);
+    Ok(match columns {
+        None => rows.collect(),
+        Some(columns) => {
+            // A column asked once is moved out of the row; asked twice, copied.
+            let once = columns.iter().enumerate().all(|(i, c)| !columns[..i].contains(c));
+            rows.map(|mut row| {
+                columns.iter().map(|&c| if once { std::mem::take(&mut row[c]) } else { row[c].clone() }).collect()
+            })
+            .collect()
+        }
+    })
 }
 
 /// The answer to a statement that returns rows.
@@ -685,7 +938,7 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
         Query::FindByKey { table, key } => {
             let Some(meta) = ctx.meta(table.name)? else { return Err(Error::NoSuchTable(table.name.to_owned())) };
             let map = meta.map(table);
-            Ok(Fetched::Rows(ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?))
+            Ok(Fetched::Rows(ctx.rows_by_pk(&meta, &map, None, &[pk_enc(key)])?))
         }
         Query::Select(ast) => {
             if is_count_all(ast) {
@@ -708,7 +961,7 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                 && ast.group_by.is_empty()
                 && ast.having.is_none()
                 && !ast.distinct
-                && !matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(|x| matches!(x, Expr::Aggregate { .. })));
+                && !matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(Expr::has_aggregate));
             let mut tables = side.clone();
             for (i, schema) in ast.tables().enumerate() {
                 if tables.contains(schema.name) && !side_schemas.iter().any(|s| s.name == schema.name) {
@@ -734,12 +987,24 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                 let whole = own.len() == parts.len();
                 let stop = match (single && whole, ast.limit) {
                     (true, Some(limit)) => {
-                        let n = (limit + ast.offset.unwrap_or(0)) as usize;
+                        let n = limit.saturating_add(ast.offset.unwrap_or(0)) as usize;
                         if ast.order.is_empty() { Stop::First(n) } else { Stop::Best(ast.order.clone(), n) }
                     }
                     _ => Stop::Never,
                 };
-                if let Some((rows, seq)) = matching_rows(ctx, schema, &own, &side, &side_schemas, stop)? {
+                let needed = columns_read(ast, schema);
+                if let Some((rows, seq)) =
+                    matching_rows(ctx, schema, &own, &side, &side_schemas, stop, needed.as_deref())?
+                {
+                    // One table, its whole filter applied: plain columns need no evaluator.
+                    let rows = if single && whole {
+                        match plain_answer(ast, rows) {
+                            Ok(answer) => return Ok(Fetched::Rows(answer)),
+                            Err(rows) => rows,
+                        }
+                    } else {
+                        rows
+                    };
                     tables.insert(schema, rows, seq);
                 }
             }
@@ -830,18 +1095,19 @@ pub(crate) fn execute(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<ExecResult
 }
 
 fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema) -> Result<ExecResult> {
-    let Some(mut meta) = ctx.meta_mut(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    let Some(mut meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
     // A model with new columns widens the stored rows.
     let missing: Vec<String> =
         schema.columns.iter().filter(|c| meta.position(c.name).is_none()).map(|c| c.name.to_owned()).collect();
     if !missing.is_empty() {
-        meta.columns.extend(missing);
+        let mut wider = (*meta).clone();
+        wider.columns.extend(missing);
         // The new columns come from the model; the columns already there keep
         // the type the table declared (a model may name a DOUBLE as text).
         let mut widened = schema_to_json(schema);
         if let (Some(new), Some(old)) = (
             widened.get_mut("columns").and_then(Json::as_array_mut),
-            meta.schema.get("columns").and_then(Json::as_array),
+            wider.schema.get("columns").and_then(Json::as_array),
         ) {
             for c in new.iter_mut() {
                 let name = c.get("name").and_then(Json::as_str).map(str::to_owned);
@@ -852,8 +1118,10 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
                 }
             }
         }
-        meta.schema = widened;
-        ctx.put_meta(schema.name, &meta);
+        wider.schema = widened;
+        wider.changed();
+        ctx.put_meta(schema.name, &wider);
+        meta = Arc::new(wider);
     }
     let map = meta.map(schema);
     let pk = schema.primary_key;
@@ -865,9 +1133,9 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
         Query::InsertRow { .. } | Query::Insert(_) => (Vec::new(), Tables::new()),
         Query::UpsertRow { values, .. } | Query::UpdateRow { values, .. } => {
             let key = values.get(pk).ok_or_else(|| Error::Conversion(format!("`{}`: row too short", schema.name)))?;
-            (ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?, Tables::new())
+            (ctx.rows_by_pk(&meta, &map, None, &[pk_enc(key)])?, Tables::new())
         }
-        Query::DeleteByKey { key, .. } => (ctx.rows_by_pk(&meta, &map, &[pk_enc(key)])?, Tables::new()),
+        Query::DeleteByKey { key, .. } => (ctx.rows_by_pk(&meta, &map, None, &[pk_enc(key)])?, Tables::new()),
         Query::Update(u) => {
             filter_tables(u.filter.as_ref(), &mut side_schemas);
             let mut side = Tables::new();
@@ -875,8 +1143,8 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
                 load_all(ctx, s, &mut side)?;
             }
             let parts: Vec<&Expr> = u.filter.as_ref().map(conjuncts).unwrap_or_default();
-            let rows =
-                matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never)?.map_or(Vec::new(), |r| r.0);
+            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None)?
+                .map_or(Vec::new(), |r| r.0);
             (rows, side)
         }
         Query::Delete(d) => {
@@ -886,8 +1154,8 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
                 load_all(ctx, s, &mut side)?;
             }
             let parts: Vec<&Expr> = d.filter.as_ref().map(conjuncts).unwrap_or_default();
-            let rows =
-                matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never)?.map_or(Vec::new(), |r| r.0);
+            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None)?
+                .map_or(Vec::new(), |r| r.0);
             (rows, side)
         }
         _ => unreachable!("write_rows is only called for row writes"),
@@ -1148,6 +1416,7 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
             if let Some(cols) = meta.schema.get_mut("columns").and_then(Json::as_array_mut) {
                 cols.push(column.clone());
             }
+            meta.changed();
             if !fill.is_null() {
                 let width = meta.columns.len();
                 let mut bytes = ctx.table_bytes(&meta)?;
