@@ -136,11 +136,11 @@ reste à côté du nouveau sous le nom `nuage.redb.imported` : supprimez-le une 
 vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version est envoyé
 aussitôt après : la restauration suivante ne passe plus par l'import.
 
-La lecture de l'ancien fichier est la fonctionnalité Cargo `import-redb`, active par défaut
-et avec `s3` (une sauvegarde peut contenir un instantané de ces versions). Le moteur seul
-(`default-features = false`) ne contient plus redb du tout et refuse un tel répertoire avec
-un message qui le dit : une application qui l'embarque et qui a des données de ces versions
-ajoute `features = ["import-redb"]`. Une fois toutes les bases ouvertes par cette version,
+La lecture de l'ancien fichier est la fonctionnalité Cargo `import-redb`, active par défaut :
+le serveur l'a. Une application qui embarque le moteur (`default-features = false`, avec ou
+sans `s3`) ne contient plus redb du tout et refuse un tel répertoire avec un message qui le
+dit ; si elle a des données ou des sauvegardes de ces versions, elle ajoute
+`features = ["import-redb"]`. Une fois toutes les bases ouvertes par cette version,
 la fonctionnalité peut être retirée.
 
 ## Plusieurs applications

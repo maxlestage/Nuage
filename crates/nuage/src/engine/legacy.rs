@@ -6,10 +6,10 @@
 //! page file of this version, once: the old file is kept beside it as
 //! `nuage.redb.imported`, to delete when the data has been checked.
 //!
-//! Reading the old file takes the `import-redb` feature (on by default and
-//! with `s3`, off for the engine alone: `default-features = false`); without
-//! it, such a directory is refused with a message that says so. Nothing else
-//! in Nuage DB uses redb.
+//! Reading the old file takes the `import-redb` feature (on by default, off
+//! for an application that embeds the engine: `default-features = false`);
+//! without it, such a directory is refused with a message that says so.
+//! Nothing else in Nuage DB uses redb.
 
 use super::storage_err;
 use super::store::FILE;

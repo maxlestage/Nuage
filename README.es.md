@@ -135,11 +135,11 @@ nuevo como `nuage.redb.imported`: bórralo cuando hayas comprobado tus datos. Si
 seguridad configuradas, se envía enseguida una instantánea de esta versión: la restauración
 siguiente ya no pasa por la importación.
 
-La lectura del archivo antiguo es la funcionalidad Cargo `import-redb`, activa por defecto
-y con `s3` (una copia de seguridad puede contener una instantánea de esas versiones). El
-motor solo (`default-features = false`) no contiene redb en absoluto y rechaza un directorio
-así con un mensaje que lo dice: una aplicación que lo integra y tiene datos de esas versiones
-añade `features = ["import-redb"]`. Cuando todas las bases hayan sido abiertas por esta
+La lectura del archivo antiguo es la funcionalidad Cargo `import-redb`, activa por defecto:
+el servidor la tiene. Una aplicación que integra el motor (`default-features = false`, con o
+sin `s3`) no contiene redb en absoluto y rechaza un directorio así con un mensaje que lo
+dice; si tiene datos o copias de seguridad de esas versiones, añade
+`features = ["import-redb"]`. Cuando todas las bases hayan sido abiertas por esta
 versión, la funcionalidad puede quitarse.
 
 ## Varias aplicaciones
