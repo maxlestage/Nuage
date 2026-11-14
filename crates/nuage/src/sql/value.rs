@@ -537,6 +537,35 @@ fn int_arg(name: &str, v: &Value) -> Result<Option<i64>> {
 }
 
 /// The scalar functions: `name` in lower case.
+/// Functions that give a set of rows: one row per element of a JSON array.
+pub(crate) const SET_RETURNING: [&str; 4] =
+    ["jsonb_array_elements_text", "json_array_elements_text", "jsonb_array_elements", "json_array_elements"];
+
+/// The rows of a [`SET_RETURNING`] function: the elements of the JSON array
+/// `arg`, as text for the `_text` variants (like PostgreSQL), as values for the
+/// others. `NULL` gives no row.
+pub(crate) fn set_returning(name: &str, arg: &Value) -> Result<Vec<Value>> {
+    let doc = match arg {
+        Value::Null => return Ok(Vec::new()),
+        Value::Json(j) => j.clone(),
+        other => serde_json::from_str(&text_arg(other).unwrap_or_default())
+            .map_err(|_| conversion(format!("{name}(): not JSON")))?,
+    };
+    let Json::Array(items) = doc else {
+        return Err(conversion(format!("{name}(): cannot extract elements from a JSON value that is not an array")));
+    };
+    let text = name.ends_with("_text");
+    Ok(items
+        .into_iter()
+        .map(|j| match j {
+            Json::Null => Value::Null,
+            Json::String(s) if text => Value::Text(s),
+            other if text => Value::Text(other.to_string()),
+            other => json_value(&other),
+        })
+        .collect())
+}
+
 pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
     let a = &args;
     let null_in = || a.iter().any(Value::is_null);
@@ -890,6 +919,47 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             Value::Json(Json::Object(m))
         }
         "json_array" => Value::Json(Json::Array(a.iter().map(to_json).collect())),
+        // PostgreSQL's advisory locks. A transaction of Nuage DB is checked at
+        // its commit: if another commit changed a table it read since its
+        // snapshot, it fails with a conflict (`40001`). The section that the
+        // lock would serialize (read, then write) is therefore already safe,
+        // and taking the lock has nothing more to do.
+        "pg_advisory_lock" | "pg_advisory_xact_lock" | "pg_advisory_lock_shared" | "pg_advisory_xact_lock_shared" => {
+            arg_count(name, a, 1, 2)?;
+            Value::Null
+        }
+        "pg_advisory_unlock" | "pg_advisory_unlock_shared" | "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" => {
+            arg_count(name, a, 1, 2)?;
+            Value::Bool(true)
+        }
+        "pg_advisory_unlock_all" => {
+            arg_count(name, a, 0, 0)?;
+            Value::Null
+        }
+        // A stable 64-bit hash of a text (and a seed): the key of an advisory
+        // lock. Its values are not PostgreSQL's, only as stable.
+        "hashtext" | "hashtextextended" => {
+            arg_count(name, a, 1, if name == "hashtext" { 1 } else { 2 })?;
+            if null_in() {
+                return Ok(Value::Null);
+            }
+            let seed = match a.get(1) {
+                Some(Value::I64(n)) => *n as u64,
+                Some(Value::I32(n)) => *n as u64,
+                Some(other) => to_text(other).and_then(|t| t.parse::<i64>().ok()).unwrap_or(0) as u64,
+                None => 0,
+            };
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
+            for b in text_arg(&a[0]).unwrap_or_default().bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+            if name == "hashtext" { Value::I32(h as i32) } else { Value::I64(h as i64) }
+        }
+        n if SET_RETURNING.contains(&n) => {
+            return Err(syntax(format!(
+                "{n}() gives a set of rows: use it alone in a SELECT without FROM, as in `x IN (SELECT {n}(...))`"
+            )));
+        }
         "last_insert_id" | "last_insert_rowid" | "changes" => {
             return Err(syntax(format!("{name}() is not available: use RETURNING, or `last_insert_id` in the answer")));
         }
@@ -900,6 +970,16 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un paramètre JSON de `/v1/sql` arrive bit pour bit : une latitude réelle
+    /// (copiée d'une base PostgreSQL) était lue un ULP plus loin.
+    #[test]
+    fn json_doubles_exacts() {
+        for x in [44.833800000000004_f64, 0.1 + 0.2, 1e-310, f64::MAX, -2.2250738585072014e-308] {
+            let j: Json = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+            assert_eq!(from_json(&j), Value::F64(x), "{x:?}");
+        }
+    }
 
     #[test]
     fn values() {

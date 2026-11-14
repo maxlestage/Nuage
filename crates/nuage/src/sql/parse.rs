@@ -368,7 +368,38 @@ impl Parser {
             let _ = self.keyword("rows") || self.keyword("row");
             self.expect("only")?;
         }
+        self.locking_clause()?;
         Ok(Select { first, rest, order, limit, offset })
+    }
+
+    /// PostgreSQL's `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY
+    /// SHARE` (`OF t, ...`, `NOWAIT`, `SKIP LOCKED`), accepted: a transaction of
+    /// Nuage DB already fails at its commit (`40001`) if another commit changed
+    /// a table it read, so the rows it read stay as it saw them or it retries.
+    /// Outside a transaction, a statement runs alone and holds nothing after.
+    fn locking_clause(&mut self) -> Result<()> {
+        while self.peek_word(0).as_deref() == Some("for")
+            && matches!(self.peek_word(1).as_deref(), Some("update" | "share" | "no" | "key"))
+        {
+            self.at += 1;
+            if !(self.keyword("update")
+                || self.keyword("share")
+                || self.keywords(&["no", "key", "update"])
+                || self.keywords(&["key", "share"]))
+            {
+                return Err(syntax(format!("expected UPDATE or SHARE after FOR, not {}", self.describe())));
+            }
+            if self.keyword("of") {
+                loop {
+                    self.name()?;
+                    if !self.sym(",") {
+                        break;
+                    }
+                }
+            }
+            let _ = self.keyword("nowait") || self.keywords(&["skip", "locked"]);
+        }
+        Ok(())
     }
 
     fn core(&mut self) -> Result<Core> {

@@ -194,7 +194,7 @@ database/sql, JDBC, PDO, the pg gem, tokio-postgres and Npgsql: examples in
 [`clients/postgres/`](clients/postgres). Prepared statements, `$1` parameters (their types
 come from the columns they meet), text and binary values, `BEGIN` ... `COMMIT` across
 messages, savepoints, PostgreSQL's error codes (`40001` on a write conflict: run the
-transaction again). TLS with `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY` (the installer uses the
+transaction again). `SELECT ... FOR UPDATE` (`SKIP LOCKED`, `NOWAIT`, `FOR SHARE`) and the advisory locks (`pg_advisory_xact_lock`, `hashtextextended`) are accepted: a transaction already fails at its commit (`40001`) if another one changed a table it read. `x IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)` takes a list as one JSON parameter. TLS with `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY` (the installer uses the
 domain's certificate). The SQL is Nuage DB's (above); the system catalogs (`pg_catalog`) are
 not there, so tools that browse them (pgAdmin) show little, and Npgsql takes
 `Server Compatibility Mode=NoTypeLoading`. Heroku routes only HTTP: there, use `/v1/sql`.
