@@ -4,6 +4,71 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Its own page store
+
+- The tables now live in a page file written by Nuage DB itself (`nuage.db`), not in a
+  redb file: B-trees of 4 KiB pages, copy-on-write, a CRC-32 on each node checked at every
+  read, the prefix the keys of a node share stored once, a node of several pages for a key
+  or a value larger than a page.
+- A commit changes nodes in memory only (the write-ahead log makes it durable); a
+  checkpoint writes the changed nodes to free pages, then a header in the slot the previous
+  one does not use: a crash at any point leaves the previous header and all it reaches.
+  Changed nodes are also written out as soon as they outweigh a quarter of the cache.
+- A reader keeps the root it started with and sees the data as it was, without a lock or a
+  read transaction; a page is reused once no header and no reader reaches it. The list of
+  free pages is not stored: opening the file walks its branches, so a crash can neither
+  leak a page nor hand one out twice.
+- Compaction rewrites the file packed, in key order, and reads the copy back before it
+  takes the place of the file. The integrity check reads every page: checksums, order of
+  the keys, sizes, no page used twice; it no longer waits for readers.
+- Encryption is the same (XTS-AES-256, one data unit per page, headers included), and the
+  blocks of a page are now encrypted in one call to AES.
+- **Coming from 0.4**: a data directory or a backup whose pages are a redb file
+  (`nuage.redb`) is imported the first time it is opened, encrypted as it was; the old
+  file is kept as `nuage.redb.imported`, and a snapshot of this version is sent to the
+  backup. This is the `import-redb` Cargo feature (on by default), the only remaining use
+  of redb: without it (`default-features = false`) redb is not compiled at all.
+  `tests/legacy.rs` opens data directories and backups written by 0.4.0, in clear and
+  encrypted, closed normally or left by a crash.
+- Snapshots in a backup are named `snapshots/<lsn>.db`.
+
+### Faster reads and writes
+
+- A SQL text already parsed is kept (512 of them): applications send the same statements
+  with other parameters.
+- Rows found by the primary key, or by an index that carries the whole filter, no longer
+  go through the evaluator again when they hold exactly the values looked up; a `SELECT`
+  of plain columns of one table is answered from the rows read, with no table built in
+  memory (`tests/sql.rs` compares both answers on 36 kinds of statements).
+- Only the columns a `SELECT` reads are decoded: a long text or a JSON nobody asks for is
+  skipped in the stored row.
+- Scans and index lookups lend keys and values where they are instead of copying each;
+  `COUNT(*)` by an index keeps no key.
+- The catalog entry of a table is read in place and found by the table's name, once per
+  statement; a table's metadata is shared instead of copied at each write, and the types
+  of its columns are worked out once.
+- A log record is built, encrypted and framed in one buffer, with a CRC-32 computed eight
+  bytes at a time.
+
+| 5,000 rows, embedded (`examples/sql_bench.rs`) | Before | After |
+|---|---:|---:|
+| `INSERT` in a transaction (per row) | 35 µs | 16 µs |
+| `INSERT`, one commit per row | 62 µs | 15 µs |
+| `UPDATE … WHERE id = ?`, one commit each | 57 µs | 19 µs |
+| `DELETE … WHERE id = ?`, one commit each | 48 µs | 14 µs |
+| `SELECT … WHERE id = ?` (primary key) | 9.6 µs | 4.3 µs |
+| `SELECT count(*)` | 3.8 µs | 1.5 µs |
+| `SELECT count(*) WHERE indexed = ?` (1/3 of the rows) | 570 µs | 8 µs |
+| `SELECT id, date WHERE indexed = ?` (1,667 rows) | 3.4 ms | 1.5 ms |
+| `SELECT id, date` (the whole table) | 5.7 ms | 1.6 ms |
+| A filter no index answers (the whole table read) | 4.0 ms | 1.9 ms |
+| `ORDER BY … LIMIT 20` | 4.1 ms | 1.7 ms |
+| `WHERE id IN (subquery)`, 5,000 keys | 15 ms | 9.5 ms |
+| `SELECT … WHERE id IN (20 keys)` | 44 µs | 23 µs |
+
+Commits are measured without `fsync` (the log is written, not synced): with it, the disk
+sets the time of a commit.
+
 ### Faster short statements
 
 - Each table's catalog entry is parsed once and kept, keyed by its stored bytes (the same
