@@ -128,8 +128,7 @@ impl Script {
 }
 
 /// Runs `script` inside `tx`, a transaction its caller commits or rolls back
-/// (the PostgreSQL protocol's `BEGIN` ... `COMMIT`).
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+/// (the PostgreSQL protocol's `BEGIN` ... `COMMIT`, [`EmbeddedTransaction::sql`](crate::EmbeddedTransaction::sql)).
 pub(crate) fn run_in(
     tx: &crate::embedded::EmbeddedTransaction,
     schemas: &SchemaCache,

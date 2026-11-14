@@ -4,6 +4,12 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### SQL in an embedded transaction
+
+- `EmbeddedTransaction::sql(sql, params)`: SQL run inside a transaction opened with
+  `Embedded::begin_now`. It reads its own writes, others see nothing before `commit_now`,
+  and `rollback_now` (or dropping it) undoes it all: read, decide, then write, atomically.
+
 ### The embedded engine in pure Rust
 
 - New Cargo features `server` and `s3` (both on by default, with `site`): without them
