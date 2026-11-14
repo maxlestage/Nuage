@@ -32,6 +32,8 @@ pub(crate) struct Work {
     extra: Vec<Op>,
     touched: BTreeMap<String, u64>,
     written: BTreeSet<String>,
+    /// Catalog entries already read (see [`Ctx::memo`]).
+    memo: Vec<(String, std::sync::Arc<crate::engine::store::Parsed>)>,
 }
 
 impl Work {
@@ -42,6 +44,7 @@ impl Work {
             extra: Vec::new(),
             touched: BTreeMap::new(),
             written: BTreeSet::new(),
+            memo: Vec::new(),
         })
     }
 
@@ -54,6 +57,7 @@ impl Work {
             extra: &mut self.extra,
             touched: &mut self.touched,
             written: &mut self.written,
+            memo: &mut self.memo,
         }
     }
 
@@ -375,6 +379,8 @@ impl EmbeddedTransaction {
         w.extra = sp.extra.clone();
         w.touched = sp.touched.clone();
         w.written = sp.written.clone();
+        // The catalog may be among what is forgotten.
+        w.memo.clear();
         Ok(())
     }
 

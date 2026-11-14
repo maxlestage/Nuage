@@ -203,6 +203,9 @@ pub(crate) struct Ctx<'a> {
     /// Tables read or written, with their version when first touched.
     pub touched: &'a mut BTreeMap<String, u64>,
     pub written: &'a mut BTreeSet<String>,
+    /// Catalog entries already read, by table: a statement asks for the same
+    /// ones several times. Emptied when the catalog is written.
+    pub memo: &'a mut Vec<(String, Arc<Parsed>)>,
 }
 
 fn pk_enc(v: &Value) -> Vec<u8> {
@@ -223,6 +226,9 @@ impl Ctx<'_> {
     }
 
     fn put(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        if key.first() == Some(&keys::CATALOG) {
+            self.memo.clear();
+        }
         self.overlay.insert(key, value);
     }
 
@@ -234,14 +240,21 @@ impl Ctx<'_> {
     }
 
     fn parsed(&mut self, table: &str) -> Result<Option<Arc<Parsed>>> {
+        if let Some((_, parsed)) = self.memo.iter().find(|(name, _)| name == table) {
+            return Ok(Some(parsed.clone()));
+        }
         self.touch(table);
         let key = keys::catalog_key(table);
-        // An entry this transaction wrote: by its bytes.
-        if let Some(pending) = self.overlay.get(&key) {
-            return pending.clone().map(|b| self.store.parsed(b)).transpose();
+        let parsed = match self.overlay.get(&key) {
+            // An entry this transaction wrote: by its bytes.
+            Some(pending) => pending.clone().map(|b| self.store.parsed(b)).transpose()?,
+            // The stored one: read in place, and the same as last time for nearly every statement.
+            None => self.snap.with(&key, |bytes| self.store.parsed_as(table, bytes))?.transpose()?,
+        };
+        if let Some(p) = &parsed {
+            self.memo.push((table.to_owned(), p.clone()));
         }
-        // The stored one: read in place, and the same as last time for nearly every statement.
-        self.snap.with(&key, |bytes| self.store.parsed_as(table, bytes))?.transpose()
+        Ok(parsed)
     }
 
     /// The table's metadata (parsed once per distinct catalog entry, see [`Store::parsed`]).
@@ -481,13 +494,67 @@ static EMPTY: TableSchema = TableSchema {
         3],
 };
 
+/// A column a lookup went by (its place in the schema) and the values it may hold.
+struct Pin<'a> {
+    column: usize,
+    allowed: Vec<&'a Value>,
+    /// The allowed values by their key form, made when there are many of them.
+    by_key: std::cell::OnceCell<HashMap<Vec<u8>, &'a Value>>,
+}
+
+impl<'a> Pin<'a> {
+    fn new(column: usize, allowed: Vec<&'a Value>) -> Pin<'a> {
+        Pin { column, allowed, by_key: std::cell::OnceCell::new() }
+    }
+
+    /// `held` is exactly one of the allowed values.
+    fn holds(&self, held: &Value) -> bool {
+        // NULL equals nothing and a float may be NaN: those go to the evaluator.
+        if matches!(held, Value::Null | Value::F64(_)) {
+            return false;
+        }
+        if self.allowed.len() <= 8 {
+            return self.allowed.iter().any(|v| *v == held);
+        }
+        let by_key = self.by_key.get_or_init(|| self.allowed.iter().map(|v| (pk_enc(v), *v)).collect());
+        by_key.get(&pk_enc(held)).is_some_and(|v| *v == held)
+    }
+}
+
+/// Keys found through an index.
+struct Pushed<'a> {
+    /// Encoded primary keys of the rows to read.
+    keys: Vec<Vec<u8>>,
+    /// When the lookup stands for the whole filter: the columns it went by.
+    /// A row that holds exactly the values it was looked up by matches,
+    /// without asking the evaluator.
+    whole: Option<Vec<Pin<'a>>>,
+}
+
+impl Pushed<'_> {
+    /// Every row holds exactly the values it was looked up by, and the lookup was the whole filter.
+    fn settles(&self, rows: &[Vec<Value>]) -> bool {
+        self.whole.as_ref().is_some_and(|pins| {
+            rows.iter().all(|row| pins.iter().all(|pin| row.get(pin.column).is_some_and(|held| pin.holds(held))))
+        })
+    }
+}
+
 /// Keys found through an index for the pinned conjuncts, when there is one.
-fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Expr]) -> Result<Option<Vec<Vec<u8>>>> {
+fn pushdown<'e>(
+    ctx: &Ctx<'_>,
+    meta: &TableMeta,
+    schema: &TableSchema,
+    parts: &[&'e Expr],
+) -> Result<Option<Pushed<'e>>> {
     let column = |e: &Expr| match e {
-        Expr::Column(c) if c.table == schema.name => Some(schema.columns.get(c.index)?.name),
+        Expr::Column(c) if c.table == schema.name => Some((schema.columns.get(c.index)?.name, c.index)),
         _ => None,
     };
-    let mut pins: HashMap<&str, &Value> = HashMap::new();
+    // The lookup is the whole filter when it used the only conjunct.
+    let only = parts.len() == 1;
+    let mut pins: HashMap<&str, (&'e Value, usize)> = HashMap::new();
+    let mut pinned = 0;
     for part in parts {
         match part {
             Expr::Binary { op: BinOp::Eq, left, right } => {
@@ -496,20 +563,25 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
                     (Expr::Value(v), r) => column(r).map(|c| (c, v)),
                     _ => None,
                 };
-                if let Some((c, v)) = pin {
+                if let Some(((c, at), v)) = pin {
                     if c == meta.columns[meta.pk] {
-                        return Ok(Some(vec![pk_enc(v)]));
+                        return Ok(Some(Pushed {
+                            keys: vec![pk_enc(v)],
+                            whole: only.then(|| vec![Pin::new(at, vec![v])]),
+                        }));
                     }
-                    pins.insert(c, v);
+                    pins.insert(c, (v, at));
+                    pinned += 1;
                 }
             }
             Expr::InList { expr, list, negated: false } => {
-                if let Some(c) = column(expr) {
+                if let Some((c, at)) = column(expr) {
+                    let whole = only.then(|| vec![Pin::new(at, list.iter().collect())]);
                     if c == meta.columns[meta.pk] {
                         let mut keys: Vec<Vec<u8>> = list.iter().map(pk_enc).collect();
                         keys.sort();
                         keys.dedup();
-                        return Ok(Some(keys));
+                        return Ok(Some(Pushed { keys, whole }));
                     }
                     if let Some(i) = meta.indexes.iter().position(|ix| ix.columns.len() == 1 && ix.columns[0] == c) {
                         let mut keys = Vec::new();
@@ -518,7 +590,7 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
                         }
                         keys.sort();
                         keys.dedup();
-                        return Ok(Some(keys));
+                        return Ok(Some(Pushed { keys, whole }));
                     }
                 }
             }
@@ -534,12 +606,15 @@ fn pushdown(ctx: &Ctx<'_>, meta: &TableMeta, schema: &TableSchema, parts: &[&Exp
         .max_by_key(|(_, ix)| ix.columns.len());
     match best {
         Some((i, ix)) => {
-            let values: Vec<&Value> = ix.columns.iter().map(|c| pins[c.as_str()]).collect();
+            let values: Vec<&Value> = ix.columns.iter().map(|c| pins[c.as_str()].0).collect();
             // NULL is never indexed (and never equal).
             if values.iter().any(|v| v.is_null()) {
-                return Ok(Some(Vec::new()));
+                return Ok(Some(Pushed { keys: Vec::new(), whole: None }));
             }
-            Ok(Some(ctx.index_lookup(meta, i, &values)?))
+            // The whole filter: every conjunct pins a column of its own, and the index has them all.
+            let whole = (pinned == parts.len() && pins.len() == pinned && ix.columns.len() == pinned)
+                .then(|| ix.columns.iter().map(|c| Pin::new(pins[c.as_str()].1, vec![pins[c.as_str()].0])).collect());
+            Ok(Some(Pushed { keys: ctx.index_lookup(meta, i, &values)?, whole }))
         }
         None => Ok(None),
     }
@@ -588,7 +663,8 @@ fn matching_rows(
     let mut select = SelectAst::new(schema);
     select.filter = filter.clone();
     let _ = side_schemas;
-    if let Some(mut pks) = pushdown(ctx, &meta, schema, parts)? {
+    if let Some(mut pushed) = pushdown(ctx, &meta, schema, parts)? {
+        let mut pks = std::mem::take(&mut pushed.keys);
         // The keys come in primary-key order: for `LIMIT n` with no order, or
         // ordered by the primary key, read rows in that order (or reversed)
         // and stop at the `n`th match, instead of reading every match.
@@ -606,7 +682,7 @@ fn matching_rows(
             let mut out = Vec::with_capacity(n);
             for chunk in pks.chunks(n.max(16)) {
                 let rows = ctx.rows_by_pk(&meta, &map, chunk)?;
-                out.extend(if filter.is_some() { keep(rows, &select)? } else { rows });
+                out.extend(if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows });
                 if out.len() >= n {
                     break;
                 }
@@ -614,7 +690,7 @@ fn matching_rows(
             return Ok(Some((out, seq)));
         }
         let rows = ctx.rows_by_pk(&meta, &map, &pks)?;
-        let rows = if filter.is_some() { keep(rows, &select)? } else { rows };
+        let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
         return Ok(Some((rows, seq)));
     }
     let mut out: Vec<Vec<Value>> = Vec::new();
@@ -704,6 +780,49 @@ fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
     Ok(Some(ctx.index_count(&meta, i, &values)?))
 }
 
+/// The answer of a `SELECT` of one table from the rows that match its whole
+/// filter, when nothing is left for the evaluator to do: plain columns (or
+/// all of them), no order to apply. `Err` gives the rows back otherwise.
+fn plain_answer(ast: &SelectAst, rows: Vec<Vec<Value>>) -> std::result::Result<Vec<Vec<Value>>, Vec<Vec<Value>>> {
+    if !ast.order.is_empty() && rows.len() > 1 {
+        return Err(rows);
+    }
+    let columns: Option<Vec<usize>> = match &ast.projection {
+        Projection::Tables(tables) if tables.len() == 1 && tables[0].name == ast.from.name => None,
+        Projection::Exprs(list) => {
+            let picked: Option<Vec<usize>> = list
+                .iter()
+                .map(|e| match e {
+                    Expr::Column(c) if c.table == ast.from.name && c.index < ast.from.columns.len() => Some(c.index),
+                    _ => None,
+                })
+                .collect();
+            match picked {
+                Some(p) => Some(p),
+                None => return Err(rows),
+            }
+        }
+        _ => return Err(rows),
+    };
+    if rows.iter().any(|r| r.len() != ast.from.columns.len()) {
+        return Err(rows);
+    }
+    let skip = ast.offset.unwrap_or(0) as usize;
+    let take = ast.limit.map_or(usize::MAX, |l| l as usize);
+    let rows = rows.into_iter().skip(skip).take(take);
+    Ok(match columns {
+        None => rows.collect(),
+        Some(columns) => {
+            // A column asked once is moved out of the row; asked twice, copied.
+            let once = columns.iter().enumerate().all(|(i, c)| !columns[..i].contains(c));
+            rows.map(|mut row| {
+                columns.iter().map(|&c| if once { std::mem::take(&mut row[c]) } else { row[c].clone() }).collect()
+            })
+            .collect()
+        }
+    })
+}
+
 /// The answer to a statement that returns rows.
 pub(crate) enum Fetched {
     /// Rows already final.
@@ -773,6 +892,15 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                     _ => Stop::Never,
                 };
                 if let Some((rows, seq)) = matching_rows(ctx, schema, &own, &side, &side_schemas, stop)? {
+                    // One table, its whole filter applied: plain columns need no evaluator.
+                    let rows = if single && whole {
+                        match plain_answer(ast, rows) {
+                            Ok(answer) => return Ok(Fetched::Rows(answer)),
+                            Err(rows) => rows,
+                        }
+                    } else {
+                        rows
+                    };
                     tables.insert(schema, rows, seq);
                 }
             }
