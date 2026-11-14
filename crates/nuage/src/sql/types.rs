@@ -60,6 +60,7 @@ impl Infer<'_, '_> {
                     args.first().and_then(|a| self.type_of(a)).or(if *star { Some(ColumnType::BigInt) } else { None })
                 }
                 "avg" | "total" => Some(ColumnType::Double),
+                "bool_and" | "bool_or" | "every" => Some(ColumnType::Bool),
                 "lower" | "upper" | "trim" | "substr" | "substring" | "replace" | "concat" | "group_concat"
                 | "string_agg" => Some(ColumnType::Text),
                 "length" => Some(ColumnType::BigInt),
