@@ -489,7 +489,7 @@ fn crash_child_threads(dir: &str) -> ! {
             scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
-                    for n in 0.. {
+                    for n in 0..i64::MAX {
                         // Codes of earlier rounds are not used again.
                         let it = item((start + 1) * 10_000_000 + t * 1_000_000 + n);
                         it.clone().insert(&db).await.unwrap();
