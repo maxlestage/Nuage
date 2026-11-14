@@ -4,6 +4,154 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Its own page store
+
+- The tables now live in a page file written by Nuage DB itself (`nuage.db`), not in a
+  redb file: B-trees of 4 KiB pages, copy-on-write, a CRC-32 on each node checked at every
+  read, the prefix the keys of a node share stored once, a node of several pages for a key
+  or a value larger than a page.
+- A commit changes nodes in memory only (the write-ahead log makes it durable); a
+  checkpoint writes the changed nodes to free pages, then a header in the slot the previous
+  one does not use: a crash at any point leaves the previous header and all it reaches.
+  Changed nodes are also written out as soon as they outweigh a quarter of the cache.
+- A reader keeps the root it started with and sees the data as it was, without a lock or a
+  read transaction; a page is reused once no header and no reader reaches it. The list of
+  free pages is not stored: opening the file walks its branches, so a crash can neither
+  leak a page nor hand one out twice.
+- Compaction rewrites the file packed, in key order, and reads the copy back before it
+  takes the place of the file. The integrity check reads every page: checksums, order of
+  the keys, sizes, no page used twice; it no longer waits for readers.
+- Encryption is the same (XTS-AES-256, one data unit per page, headers included), and the
+  blocks of a page are now encrypted in one call to AES.
+- **Coming from 0.4**: a data directory or a backup whose pages are a redb file
+  (`nuage.redb`) is imported the first time it is opened, encrypted as it was. The new
+  file is read back and compared with the old one, entry by entry, before it takes its
+  place: a difference stops the opening and leaves the old file as it was
+  (`Engine::imported` says what was imported; the server writes it, and the tables and
+  rows of each application, in its startup log, and names an application that could not
+  be opened). The old
+  file is kept as `nuage.redb.imported`, and a snapshot of this version follows in the
+  backup (opening does not wait for it). Before that snapshot, the backup of the earlier
+  version is copied whole under `before-import/` of the backup location, where nothing
+  prunes it (a server's applications at `before-import/apps/<name>/`: `before-import`
+  taken as the backup location has the shape of the location itself, and the earlier
+  version started on it finds every application). The database as that version left it
+  can be restored from there, by that version or by this one. A backup set aside by an
+  earlier try gives way when that version has run again since. This is the `import-redb` Cargo feature (on by default: the server has it), the
+  only remaining use of redb: an application that embeds the engine (`default-features =
+  false`, with or without `s3`) compiles no redb at all, and asks for the feature if it has
+  data of those versions.
+  `tests/legacy.rs` opens data directories and backups written by 0.4.0, in clear and
+  encrypted, closed normally or left by a crash.
+- Snapshots in a backup are named `snapshots/<lsn>.db`.
+
+### Writers at the same time
+
+- The log is no longer synced under the writer lock. A commit is appended to the log and
+  applied in memory in its turn, then waits for the log to be on disk before it returns;
+  one `fsync` covers every commit appended before it started, so commits made at the same
+  time share it.
+- Nothing rests on a commit a crash could still undo: plain reads see the last commit that
+  is on disk (and never wait for one being written); a transaction that may write goes by
+  the latest commits, and each of its answers waits for them to be on disk.
+- A SQL script that writes (`POST /v1/sql`, the PostgreSQL protocol outside `BEGIN`,
+  `Embedded::sql`) takes its turn from its first statement to its commit instead of running
+  as an optimistic transaction retried on a conflict: writers on the same table used to
+  collide, wait and, with enough of them, fail with a conflict. A batch (`POST /v1/batch`,
+  `Embedded::batch`) that writes takes its turn the same way. Transactions opened by the
+  application (`BEGIN`, `db.begin()`) stay optimistic.
+- **Fixed**: a transaction could write over a commit that landed between its beginning and
+  its first read of the table (the conflict was looked for from that first read, the data
+  was as of the beginning). The conflict is now looked for from its snapshot.
+- **Fixed**: a row too large for the page store was refused after it had been written to
+  the log; it is refused before.
+- When the disk fails. A record the log could not write whole is cut from it (the records
+  appended after it used to be lost with it at the next start), and so is one that could
+  not be applied. A `fsync` of the log that fails is not tried again on the same file:
+  commits are refused until the database is opened again, since the system reports such an
+  error once and a later `fsync` that succeeds proves nothing. A commit that is in the log
+  and applied is no longer answered with an error because writing the page store early
+  (much was changed since the last checkpoint) failed. Commits missing in the middle of the
+  log are told by an event at opening. Encrypted, a record cut from the log is followed by
+  a new segment, under a new key: the number the record had is never sealed twice under
+  one key.
+- **Fixed**: a filter whose index names a column twice (`CREATE INDEX i ON t (a, a)`) left
+  a condition on another column unchecked, for reads, counts, updates and deletes; a
+  `LIMIT` cut the rows an aggregate inside an expression counts (`count(*) + 1`) on a
+  table larger than what is read at once.
+- When the server stops (`SIGTERM`), every application is checkpointed and what it wrote
+  since goes to the backup, not the server's own database alone: on a disk that does not
+  outlive the process, an application's last seconds of writes were lost at each restart.
+- With one snapshot kept (`keep_snapshots: 1`), a snapshot at the same place in the log as
+  the one before it could be pruned in its place.
+- A long log is replayed without keeping everything it changed in memory: past the same
+  limit as for commits, the page store is written on the way.
+- The page cache's clock kept a place for every page rewritten at a checkpoint while the
+  cache was not full: it grew slowly for as long as the process ran. It is now bounded by
+  the pages held.
+
+| `INSERT` with `fsync`, one commit each (`examples/sql_bench.rs`) | Before | After |
+|---|---:|---:|
+| 1 writer | 4,500 /s | 6,000 /s |
+| 8 writers | fails (conflict) | 14,000 /s |
+| 32 writers | fails (conflict) | 24,000 /s |
+
+### A lighter protocol
+
+- A statement of Memoire's client (`NuageDb`) no longer describes its tables each time: the
+  server says in `/v1/info` (`schemaRefs`) that it keeps schemas by reference, the client
+  sends each schema whole once, then a short reference. Describing and reading the schema
+  was more than half of the work of a short request, on both sides. A client or a server
+  that does not know references works as before (Memoire pinned to `8f7e0cb`).
+- A reference is the table's name and half a SHA-256 of its whole description: it names
+  one schema, and no client of the server (the holder of a read-only token of another
+  application, say) can describe another schema that answers to it.
+
+| Server and client on one machine, encrypted, `fsync` (`examples/bench.rs`) | Before | After |
+|---|---:|---:|
+| Read by id (p50) | 0.21 ms | 0.12 ms |
+| Read by a unique column (p50) | 0.27 ms | 0.19 ms |
+| A page of 20 rows through an index (p50) | 0.59 ms | 0.39 ms |
+| `POST /v1/sql`, a page of 20 rows (p50) | 0.70 ms | 0.40 ms |
+| Reads by id, 32 clients | 15,000 /s | 42,000 /s |
+
+### Faster reads and writes
+
+- A SQL text already parsed is kept (512 of them): applications send the same statements
+  with other parameters.
+- Rows found by the primary key, or by an index that carries the whole filter, no longer
+  go through the evaluator again when they hold exactly the values looked up; a `SELECT`
+  of plain columns of one table is answered from the rows read, with no table built in
+  memory (`tests/sql.rs` compares both answers on 36 kinds of statements).
+- Only the columns a `SELECT` reads are decoded: a long text or a JSON nobody asks for is
+  skipped in the stored row.
+- Scans and index lookups lend keys and values where they are instead of copying each;
+  `COUNT(*)` by an index keeps no key.
+- The catalog entry of a table is read in place and found by the table's name, once per
+  statement; a table's metadata is shared instead of copied at each write, and the types
+  of its columns are worked out once.
+- A log record is built, encrypted and framed in one buffer, with a CRC-32 computed eight
+  bytes at a time.
+
+| 5,000 rows, embedded (`examples/sql_bench.rs`) | Before | After |
+|---|---:|---:|
+| `INSERT` in a transaction (per row) | 35 µs | 16 µs |
+| `INSERT`, one commit per row | 62 µs | 15 µs |
+| `UPDATE … WHERE id = ?`, one commit each | 57 µs | 19 µs |
+| `DELETE … WHERE id = ?`, one commit each | 48 µs | 14 µs |
+| `SELECT … WHERE id = ?` (primary key) | 9.6 µs | 4.3 µs |
+| `SELECT count(*)` | 3.8 µs | 1.5 µs |
+| `SELECT count(*) WHERE indexed = ?` (1/3 of the rows) | 570 µs | 8 µs |
+| `SELECT id, date WHERE indexed = ?` (1,667 rows) | 3.4 ms | 1.5 ms |
+| `SELECT id, date` (the whole table) | 5.7 ms | 1.6 ms |
+| A filter no index answers (the whole table read) | 4.0 ms | 1.9 ms |
+| `ORDER BY … LIMIT 20` | 4.1 ms | 1.7 ms |
+| `WHERE id IN (subquery)`, 5,000 keys | 15 ms | 9.5 ms |
+| `SELECT … WHERE id IN (20 keys)` | 44 µs | 23 µs |
+
+Commits are measured without `fsync` (the log is written, not synced): with it, the disk
+sets the time of a commit.
+
 ### Faster short statements
 
 - Each table's catalog entry is parsed once and kept, keyed by its stored bytes (the same
@@ -67,6 +215,11 @@ Scans (about 1 µs per row) and subqueries are unchanged.
   (it was never equal, less nor greater).
 - A `DOUBLE` sent to `/v1/sql` arrives bit for bit (serde_json's `float_roundtrip`): a
   latitude copied from PostgreSQL was read one ULP away.
+- **Fixed**: inside `BEGIN`, a driver that prepares its statements (most do) ran an
+  `INSERT`, `UPDATE` or `DELETE ... RETURNING` once more than asked: the columns of a
+  prepared statement are found by a run with its parameters `NULL`, and in an open
+  transaction what that run wrote stayed there (`UPDATE t SET n = n + 1 RETURNING n` added
+  2). That run is now taken back.
 
 ### Dark theme
 

@@ -30,8 +30,8 @@ Nuage DB en producción, sin cambiar una línea.
 |---|---|
 | **Cifrado en reposo** | Todo lo almacenado se cifra (`NUAGE_ENCRYPTION_KEY`): las páginas con XTS-AES-256, cada registro del log con AES-256-GCM, y las copias de seguridad, que son copias de ellos. Claves derivadas por aplicación (HKDF, o Argon2id desde una frase de contraseña). |
 | **Varias aplicaciones** | Un servidor, una base por aplicación: sus tokens, sus claves, sus copias. El token que envía una aplicación elige su base. La consola y `/app` las muestran una junto a otra. |
-| **Páginas en disco** | Tablas e índices en un solo archivo B-tree con una caché de páginas acotada (`NUAGE_CACHE_MB`): los datos no están limitados por la memoria. Las búsquedas por clave primaria e índice solo leen las filas necesarias. |
-| **Registro de escritura** | Cada commit se añade al registro y se sincroniza en disco antes de aplicarse. Checkpoints, recuperación tras un fallo, CRC-32 en los registros y sumas de comprobación en las páginas. |
+| **Páginas en disco** | Tablas e índices en un solo archivo de páginas en árbol B escrito por el propio Nuage DB (copia en escritura, suma de control en cada nodo), con una caché de páginas acotada (`NUAGE_CACHE_MB`): los datos no están limitados por la memoria. Las búsquedas por clave primaria e índice solo leen las filas necesarias. |
+| **Registro de escritura** | Cada commit se añade al registro y se sincroniza en disco antes de devolverse o mostrarse a un lector; los commits hechos a la vez comparten una sincronización. Checkpoints, recuperación tras un fallo, CRC-32 en los registros y sumas de comprobación en las páginas. |
 | **Semántica de Memoire** | Las consultas pasan por el evaluador de Memoire, sobre las filas leídas del disco: Nuage DB se comporta exactamente como el motor en memoria de Memoire, con datos de cualquier tamaño. |
 | **Transacciones** | Lecturas sobre una instantánea, commits optimistas (`Error::Conflict`, reintentados por `db.transaction(...)`), transacciones interactivas por HTTP, lotes todo o nada. |
 | **Ramas** | Una copia completa de la base para una vista previa, una prueba o un experimento, creada al instante: comparte las páginas de su padre y solo guarda sus propios cambios. |
@@ -50,7 +50,7 @@ constructor de consultas, relaciones, transacciones y migraciones.
 # El motor, el modo integrado y el servidor. `default-features = false` deja fuera el sitio web.
 nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false }
 # El mismo Memoire que Nuage DB (la feature `nuage` es el cliente de un servidor).
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "fd1fdd5464547ce1f60f4a11e552c394da73cfc8", features = ["nuage"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "8f7e0cb", features = ["nuage"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -109,7 +109,7 @@ Nuage DB cifra todo lo que guarda (AES-256, HKDF-SHA256, Argon2id):
 
 | Qué | Cómo |
 |---|---|
-| páginas (`nuage.redb`: tablas, índices, ramas, lista de aplicaciones) | XTS-AES-256 (IEEE 1619), el modo del cifrado de disco: las páginas conservan su lugar y tamaño |
+| páginas (`nuage.db`: tablas, índices, ramas, lista de aplicaciones) | XTS-AES-256 (IEEE 1619), el modo del cifrado de disco: las páginas conservan su lugar y tamaño |
 | registro de escritura (`wal/*.log`) | AES-256-GCM por registro, con una clave propia de cada segmento (sal aleatoria), el LSN como nonce |
 | copias de seguridad (carpeta o S3) | copias de los archivos anteriores, cifradas igual, con la cabecera del directorio |
 
@@ -123,6 +123,36 @@ versión anterior se cifra al abrirla con una clave, y la copia en claro se sust
 **Guarda la clave**: sin ella, ni los datos ni las copias se pueden leer. El modo integrado
 también cifra, con `EngineOptions { encryption: Some(Encryption::parse(clave)?), .. }` o
 `NUAGE_ENCRYPTION_KEY` con `nuage::Db::from_env()`.
+
+### Viniendo de la versión 0.4
+
+Hasta la 0.4, las páginas eran un archivo [redb](https://docs.rs/redb), `nuage.redb`.
+Ahora son las de Nuage DB (`nuage.db`). No hay nada que hacer: un directorio de datos de una
+versión anterior, o una copia de seguridad de una de ellas restaurada en un directorio vacío,
+se importa la primera vez que esta versión lo abre, cifrado como estaba, y el registro escrito
+desde su último punto de control se vuelve a aplicar encima. Antes de ocupar su lugar, el
+archivo nuevo se vuelve a leer y se compara con el antiguo, entrada por entrada: cualquier
+diferencia detiene la apertura y deja el archivo antiguo como estaba. El servidor escribe en
+su registro de arranque lo que contiene cada aplicación (tablas, filas) y lo que se importó.
+El archivo antiguo queda junto al
+nuevo como `nuage.redb.imported`: bórralo cuando hayas comprobado tus datos. Si hay copias de
+seguridad configuradas, una instantánea de esta versión sigue en un momento: la restauración
+siguiente ya no pasa por la importación. Justo antes, la copia de seguridad de la versión
+anterior (su manifiesto, su instantánea, sus segmentos de registro y su cabecera de cifrado)
+se copia bajo `before-import/` en la ubicación de copias, donde nada la purga: la base del
+servidor en `before-import/`, cada aplicación en `before-import/apps/<nombre>/`, la forma
+de la propia ubicación de copias. Volver atrás es arrancar la versión anterior sobre un
+directorio de datos vacío con `before-import` como ubicación de copias
+(`NUAGE_BACKUP_S3_PREFIX` o `NUAGE_BACKUP_DIR` seguido de `before-import/`): ahí encuentra
+cada aplicación. Esta versión también restaura desde ahí. Bórrala cuando hayas comprobado
+tus datos.
+
+La lectura del archivo antiguo es la funcionalidad Cargo `import-redb`, activa por defecto:
+el servidor la tiene. Una aplicación que integra el motor (`default-features = false`, con o
+sin `s3`) no contiene redb en absoluto y rechaza un directorio así con un mensaje que lo
+dice; si tiene datos o copias de seguridad de esas versiones, añade
+`features = ["import-redb"]`. Cuando todas las bases hayan sido abiertas por esta
+versión, la funcionalidad puede quitarse.
 
 ## Varias aplicaciones
 

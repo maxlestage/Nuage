@@ -1,11 +1,12 @@
 //! The Nuage DB engine: tables on disk, behind a write-ahead log.
 //!
-//! * **Pages**: [redb](https://docs.rs/redb), a pure-Rust B-tree store with
-//!   copy-on-write pages, checksums and a bounded page cache, keeps the data
-//!   in one file that grows with it ([`store`]).
-//! * **Log**: every commit is appended to the write-ahead log and synced
-//!   before it is applied ([`wal`]); the page store is made durable at each
-//!   checkpoint, and a restart replays the log written since.
+//! * **Pages**: Nuage DB's own B-trees, with copy-on-write pages, checksums
+//!   and a bounded page cache, keep the data in one file that grows with it
+//!   ([`pages`], [`store`]).
+//! * **Log**: every commit is appended to the write-ahead log, applied in
+//!   memory, then synced before it returns or is shown to a reader ([`wal`]);
+//!   commits made at the same time share one sync. The page store is made
+//!   durable at each checkpoint, and a restart replays the log written since.
 //! * **Statements**: Memoire's evaluator over the rows read from disk
 //!   ([`exec`]).
 //! * **Branches**: copy-on-write overlays of the main database.
@@ -15,6 +16,8 @@
 pub mod backup;
 pub(crate) mod exec;
 pub(crate) mod keys;
+pub(crate) mod legacy;
+pub(crate) mod pages;
 pub(crate) mod store;
 pub(crate) mod wal;
 
@@ -26,11 +29,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use memoire_orm::nuage::Branch;
 use memoire_orm::{Error, Result};
-use redb::ReadableDatabase;
 
 use crate::crypto::{Encryption, Header, Keys};
 
 pub use backup::{BackupStore, DirectoryStore, PrefixedStore};
+pub use legacy::Imported;
 use store::Store;
 pub(crate) use store::{FILE, MAIN};
 
@@ -96,7 +99,7 @@ pub struct EngineOptions {
     pub compact_every: Duration,
     /// Backups, if any.
     pub backup: Option<BackupOptions>,
-    /// `fsync` each commit. Only tests turn it off.
+    /// `fsync` the log before a commit returns. Only tests turn it off.
     pub sync: bool,
     /// Name of the database, shown by the server. Default: `nuage`.
     pub name: String,
@@ -200,6 +203,8 @@ pub struct Engine {
     pub(crate) schemas: memoire_orm::nuage::wire::SchemaCache,
     /// `key` or `passphrase` when the data is encrypted.
     encryption: Option<&'static str>,
+    /// What opening brought from an earlier version's page store.
+    imported: Option<Imported>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -221,7 +226,7 @@ impl Engine {
         {
             restored = backup::restore(&dir, b.store.as_ref())?;
         }
-        let (keys, migrated) = unlock(&dir, &options)?;
+        let Unlocked { keys, migrated, imported } = unlock(&dir, &options)?;
         let encryption = options.encryption.as_ref().filter(|_| keys.is_some()).map(Encryption::kind);
         let store = Store::open(&dir, options.cache_bytes, options.sync, keys.as_ref())?;
         let backup_status = BackupStatus {
@@ -243,9 +248,25 @@ impl Engine {
             events_seq: AtomicU64::new(0),
             schemas: memoire_orm::nuage::wire::SchemaCache::default(),
             encryption,
+            imported,
         });
         if restored {
             engine.event("info", "data restored from the backup");
+        }
+        if let Some(i) = imported {
+            engine.event(
+                "info",
+                format!(
+                    "the page store of an earlier version ({}) was imported and compared with it, entry by entry: \
+                     {} entries, {} bytes; it is kept as {}",
+                    legacy::LEGACY_FILE,
+                    i.entries,
+                    i.bytes,
+                    legacy::IMPORTED
+                ),
+            );
+            // The upkeep thread sends a snapshot of this version in a moment, after it
+            // has set the earlier version's backup aside: opening does not wait for it.
         }
         if migrated {
             engine.event("warn", "the data was stored in clear: it is now encrypted");
@@ -256,6 +277,15 @@ impl Engine {
                     Err(e) => engine.event("error", format!("could not replace the backup in clear: {e}")),
                 }
             }
+        }
+        if let Some((before, after)) = engine.store.log_gap {
+            engine.event(
+                "error",
+                format!(
+                    "the log holds commit {before} then commit {after}, and none in between (a write that failed \
+                     in an earlier run?): what it holds was applied, the commits in between are lost"
+                ),
+            );
         }
         engine.event("info", format!("data is stored in {}", dir.display()));
         let weak = Arc::downgrade(&engine);
@@ -270,6 +300,13 @@ impl Engine {
     /// `None` when it is stored in clear.
     pub fn encryption(&self) -> Option<&'static str> {
         self.encryption
+    }
+
+    /// What opening this directory brought from the page store of Nuage DB
+    /// 0.4 or earlier, when it found one: the new file was read back and
+    /// compared with the old one, entry by entry, before it took its place.
+    pub fn imported(&self) -> Option<Imported> {
+        self.imported
     }
 
     /// The data directory.
@@ -323,13 +360,8 @@ impl Engine {
         let mut w = self.store.writer();
         let keep = self.options.backup.as_ref().map(|_| self.backup_status().shipped_lsn);
         self.store.checkpoint_locked(&mut w, keep)?;
-        let mut db = self.store.db.write().unwrap_or_else(|e| e.into_inner());
-        let done = match db.compact() {
-            Ok(done) => done,
-            Err(redb::CompactionError::TransactionInProgress) => false,
-            Err(e) => return Err(storage_err(format!("compaction: {e}"))),
-        };
-        drop(db);
+        let done = self.store.pages.compact()?;
+        drop(w);
         *self.last_compaction.lock().unwrap_or_else(|e| e.into_inner()) = Some((store::now_millis(), done));
         if done {
             self.event("info", "compaction done");
@@ -337,12 +369,18 @@ impl Engine {
         Ok(done)
     }
 
-    /// Checks every page checksum of the page store. Needs a moment without
-    /// reads.
+    /// Reads every page of the page store and checks it: checksums, order of
+    /// the keys, sizes, no page used twice. `false` when something is wrong
+    /// (the events say what). Commits wait while it runs; reads do not.
     pub fn check_integrity(&self) -> Result<bool> {
         let _w = self.store.writer();
-        let mut db = self.store.db.write().unwrap_or_else(|e| e.into_inner());
-        db.check_integrity().map_err(|e| storage_err(format!("integrity check: {e}")))
+        match self.store.pages.check() {
+            Ok(()) => Ok(true),
+            Err(reason) => {
+                self.event("error", format!("integrity check: {reason}"));
+                Ok(false)
+            }
+        }
     }
 
     /// Ships the sealed log segments, and takes a snapshot when one is due
@@ -356,7 +394,16 @@ impl Engine {
             status.last_snapshot_at.is_none_or(|at| store::now_millis() - at >= b.snapshot_every.as_millis() as i64);
         let result = (|| -> Result<(u64, bool)> {
             if force_snapshot || due {
-                let lsn = backup::snapshot(&self.store, b.store.as_ref(), b.keep_snapshots)?;
+                let (lsn, kept) = backup::snapshot(&self.store, b.store.as_ref(), b.keep_snapshots)?;
+                if kept {
+                    self.event(
+                        "info",
+                        format!(
+                            "the backup of the earlier version is kept at {}: delete it once the data has been checked",
+                            b.store.describe_aside(backup::BEFORE_IMPORT)
+                        ),
+                    );
+                }
                 let shipped = backup::ship_segments(&self.store, b.store.as_ref(), lsn)?;
                 Ok((shipped.max(lsn), true))
             } else {
@@ -415,31 +462,23 @@ impl Engine {
             let w = self.store.writer();
             (w.next_lsn - 1, w.checkpoint_lsn, w.last_checkpoint)
         };
-        let db = self.store.db.read().unwrap_or_else(|e| e.into_inner());
-        let cache = db.cache_stats();
-        let (hits, misses) = (cache.read_hits(), cache.read_misses());
-        let mut stats = StorageStats {
+        let pages = self.store.pages.stats();
+        let (hits, misses) = (pages.cache_hits, pages.cache_misses);
+        StorageStats {
             file_bytes,
+            stored_bytes: pages.stored_bytes,
+            fragmented_bytes: pages.free_bytes,
+            pages: pages.pages,
+            page_size: pages::PAGE as u64,
             wal_bytes,
             disk_free_bytes: disk_free(&self.store.dir),
-            cache_bytes: cache.used_bytes() as u64,
+            cache_bytes: pages.cache_bytes,
             cache_capacity_bytes: self.options.cache_bytes as u64,
             cache_hit_rate: if hits + misses == 0 { 1.0 } else { hits as f64 / (hits + misses) as f64 },
             lsn,
             checkpoint_lsn,
             last_checkpoint,
-            ..StorageStats::default()
-        };
-        if let Ok(tx) = db.begin_write() {
-            if let Ok(s) = tx.stats() {
-                stats.stored_bytes = s.stored_bytes();
-                stats.fragmented_bytes = s.fragmented_bytes();
-                stats.pages = s.allocated_pages();
-                stats.page_size = s.page_size() as u64;
-            }
-            let _ = tx.abort();
         }
-        stats
     }
 
     /// `true` when `name` is a branch (or `main`, the main database).
@@ -573,16 +612,29 @@ fn upkeep(engine: Weak<Engine>) {
 
 /// Where an encrypted copy of a page store in clear is written before it
 /// takes its place.
-const ENCRYPTING: &str = "nuage.redb.encrypting";
+const ENCRYPTING: &str = "nuage.db.encrypting";
+
+/// What [`unlock`] found.
+struct Unlocked {
+    /// The keys of the directory, when it is encrypted.
+    keys: Option<Keys>,
+    /// Data in clear was just encrypted.
+    migrated: bool,
+    /// The page store of an earlier version was just imported.
+    imported: Option<Imported>,
+}
 
 /// The keys of `dir` for `options.encryption`: opens its header, creates one
-/// for a new directory, or encrypts a directory stored in clear. Returns
-/// them, and whether data in clear was just encrypted.
-fn unlock(dir: &Path, options: &EngineOptions) -> Result<(Option<Keys>, bool)> {
+/// for a new directory, or encrypts a directory stored in clear. On the way,
+/// the page store of an earlier version is imported (see [`legacy`]).
+fn unlock(dir: &Path, options: &EngineOptions) -> Result<Unlocked> {
     let header = Header::read(dir)?;
     let tmp = dir.join(ENCRYPTING);
     match (&options.encryption, header) {
-        (None, None) => Ok((None, false)),
+        (None, None) => {
+            let imported = legacy::import(dir, None, options.cache_bytes)?;
+            Ok(Unlocked { keys: None, migrated: false, imported })
+        }
         (None, Some(_)) => Err(Error::Validation(format!(
             "the data in {} is encrypted: set NUAGE_ENCRYPTION_KEY (EngineOptions::encryption) to open it",
             dir.display()
@@ -594,18 +646,21 @@ fn unlock(dir: &Path, options: &EngineOptions) -> Result<(Option<Keys>, bool)> {
             if resumed {
                 finish_encrypting(dir)?;
             }
-            Ok((Some(keys), resumed))
+            let imported = legacy::import(dir, Some(&keys), options.cache_bytes)?;
+            Ok(Unlocked { keys: Some(keys), migrated: resumed, imported })
         }
         (Some(encryption), None) => {
             // A copy left by an encryption that did not finish: start again.
             let _ = std::fs::remove_file(&tmp);
+            let imported = legacy::import(dir, None, options.cache_bytes)?;
             if dir.join(FILE).exists() {
-                return encrypt_in_place(dir, encryption, options).map(|k| (Some(k), true));
+                let keys = encrypt_in_place(dir, encryption, options)?;
+                return Ok(Unlocked { keys: Some(keys), migrated: true, imported });
             }
             std::fs::create_dir_all(dir).map_err(|e| storage_err(format!("cannot create {}: {e}", dir.display())))?;
             let (header, keys) = Header::create(encryption)?;
             header.write(dir)?;
-            Ok((Some(keys), false))
+            Ok(Unlocked { keys: Some(keys), migrated: false, imported })
         }
     }
 }
@@ -618,17 +673,14 @@ fn encrypt_in_place(dir: &Path, encryption: &Encryption, options: &EngineOptions
     // Everything in the log in clear goes into the page store.
     drop(Store::open(dir, options.cache_bytes, true, None)?);
     let (header, keys) = Header::create(encryption)?;
-    let tmp = dir.join(ENCRYPTING);
     {
-        let clear = store::open_redb(&dir.join(FILE), options.cache_bytes, None)?;
-        let encrypted = store::open_redb(&tmp, options.cache_bytes, Some(&keys))?;
-        store::copy_tables(&clear, &encrypted)?;
+        let clear = store::open_pages(&dir.join(FILE), options.cache_bytes, None, true)?;
+        clear.copy_to(&dir.join(ENCRYPTING), Some(keys.pages.clone()))?;
     }
-    std::fs::File::open(&tmp)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| storage_err(format!("cannot sync {}: {e}", tmp.display())))?;
     header.write(dir)?;
     finish_encrypting(dir)?;
+    // What an import kept of the earlier version's file is in clear too.
+    let _ = std::fs::remove_file(dir.join(legacy::IMPORTED));
     Ok(keys)
 }
 

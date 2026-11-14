@@ -3,7 +3,7 @@
 //!
 //! | What | How |
 //! |---|---|
-//! | the page store (`nuage.redb`: tables, indexes, schemas, branches, the list of applications) | XTS-AES-256 (IEEE 1619), 4 KiB data units, under a [`StorageBackend`] of redb |
+//! | the page store (`nuage.db`: tables, indexes, schemas, branches, the list of applications) | XTS-AES-256 (IEEE 1619), one 4 KiB data unit per page |
 //! | the write-ahead log (`wal/*.log`) | AES-256-GCM per record, under a key of its own for each segment |
 //! | backups (snapshots and log segments) | copies of the files above: encrypted the same way |
 //!
@@ -17,16 +17,15 @@
 //! its own. A wrong key is reported as such at startup, before any data is
 //! read.
 //!
-//! The page store uses XTS, the mode of disk encryption: pages are rewritten
-//! in place and keep their size, so there is no room for a nonce or a tag;
-//! redb's own checksums catch damaged pages. Log records, written once, get
-//! authenticated encryption.
+//! The page store uses XTS, the mode of disk encryption: a page keeps its
+//! place and its size, so there is no room for a nonce or a tag; the checksum
+//! each page carries, inside the encryption, catches damaged pages. Log
+//! records, written once, get authenticated encryption.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::ops::Bound;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aes::Aes256;
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
@@ -35,8 +34,6 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
 use hkdf::Hkdf;
 use memoire_orm::{Error, Result};
-use redb::StorageBackend;
-use redb::backends::FileBackend;
 use serde_json::{Value as Json, json};
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -329,10 +326,57 @@ impl Xts {
         t
     }
 
-    /// Encrypts (`encrypt`) or decrypts `buf`, which sits at `offset` in the
-    /// file. Both are multiples of 16. Decrypting, a block of zeros (space
-    /// the file grew by, never written) stays zeros.
-    fn apply(&self, offset: u64, buf: &mut [u8], encrypt: bool) {
+    /// Encrypts `buf`, which sits at `offset` in the file. Both are multiples
+    /// of 16.
+    pub(crate) fn encrypt(&self, offset: u64, buf: &mut [u8]) {
+        self.run(offset, buf, true);
+    }
+
+    /// Decrypts `buf`, which sits at `offset` in the file.
+    pub(crate) fn decrypt(&self, offset: u64, buf: &mut [u8]) {
+        self.run(offset, buf, false);
+    }
+
+    /// The blocks of each data unit in one call to AES, which runs several
+    /// blocks at once where the processor can.
+    fn run(&self, offset: u64, buf: &mut [u8], encrypt: bool) {
+        debug_assert!(offset.is_multiple_of(BLOCK as u64) && buf.len().is_multiple_of(BLOCK));
+        let mut tweaks = [[0u8; BLOCK]; (UNIT as usize) / BLOCK];
+        let mut at = offset;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let n = rest.len().min((UNIT - at % UNIT) as usize);
+            let (part, tail) = rest.split_at_mut(n);
+            let blocks = part.as_chunks_mut::<BLOCK>().0;
+            let mut t = self.tweak_at(at);
+            for (block, tweak) in blocks.iter_mut().zip(tweaks.iter_mut()) {
+                *tweak = t;
+                for i in 0..BLOCK {
+                    block[i] ^= t[i];
+                }
+                double(&mut t);
+            }
+            let cast = aes::Block::cast_slice_from_core_mut(blocks);
+            if encrypt {
+                self.data.encrypt_blocks(cast);
+            } else {
+                self.data.decrypt_blocks(cast);
+            }
+            for (block, tweak) in blocks.iter_mut().zip(tweaks.iter()) {
+                for i in 0..BLOCK {
+                    block[i] ^= tweak[i];
+                }
+            }
+            at += n as u64;
+            rest = tail;
+        }
+    }
+
+    /// As the page store of versions up to 0.4 (redb) used it: encrypts
+    /// (`encrypt`) or decrypts `buf` at `offset`; decrypting, a block of zeros
+    /// (space the file grew by, never written) stays zeros.
+    #[cfg(any(feature = "import-redb", test))]
+    pub(crate) fn apply(&self, offset: u64, buf: &mut [u8], encrypt: bool) {
         debug_assert!(offset.is_multiple_of(BLOCK as u64) && buf.len().is_multiple_of(BLOCK));
         let mut at = offset;
         let mut t = self.tweak_at(at);
@@ -357,125 +401,6 @@ impl Xts {
             double(&mut t);
             at += BLOCK as u64;
         }
-    }
-}
-
-/// The page store's file, encrypted: what redb reads and writes goes
-/// through XTS. Writes that do not cover whole 16-byte blocks read, patch and
-/// rewrite the blocks at their edges.
-pub(crate) struct EncryptedFile {
-    inner: FileBackend,
-    xts: Arc<Xts>,
-    writes: Mutex<()>,
-}
-
-impl std::fmt::Debug for EncryptedFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("EncryptedFile")
-    }
-}
-
-impl EncryptedFile {
-    pub(crate) fn open(path: &Path, xts: Arc<Xts>) -> io::Result<EncryptedFile> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
-        let inner = FileBackend::new(file).map_err(io::Error::other)?;
-        Ok(EncryptedFile { inner, xts, writes: Mutex::new(()) })
-    }
-
-    /// The plaintext of the block at `at` (zeros past the end of the file).
-    fn block(&self, at: u64, len: u64) -> io::Result<[u8; BLOCK]> {
-        let mut block = [0u8; BLOCK];
-        if at < len {
-            let n = (len - at).min(BLOCK as u64) as usize;
-            self.inner.read(at, &mut block[..n])?;
-            self.xts.apply(at, &mut block, false);
-        }
-        Ok(block)
-    }
-}
-
-impl StorageBackend for EncryptedFile {
-    fn len(&self) -> io::Result<u64> {
-        self.inner.len()
-    }
-
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        let start = offset - offset % BLOCK as u64;
-        let end = (offset + out.len() as u64).div_ceil(BLOCK as u64) * BLOCK as u64;
-        let mut buf = vec![0u8; (end - start) as usize];
-        let len = self.inner.len()?;
-        if offset + out.len() as u64 > len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past the end of the page store"));
-        }
-        let have = (len.min(end) - start) as usize;
-        self.inner.read(start, &mut buf[..have])?;
-        self.xts.apply(start, &mut buf, false);
-        let skip = (offset - start) as usize;
-        out.copy_from_slice(&buf[skip..skip + out.len()]);
-        Ok(())
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        let _w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-        self.inner.set_len(len)
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        self.inner.sync_data()
-    }
-
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        let _w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-        let b = BLOCK as u64;
-        let start = offset - offset % b;
-        let end = (offset + data.len() as u64).div_ceil(b) * b;
-        let mut buf = vec![0u8; (end - start) as usize];
-        let skip = (offset - start) as usize;
-        if skip != 0 || !data.len().is_multiple_of(BLOCK) {
-            let len = self.inner.len()?;
-            let first = self.block(start, len)?;
-            buf[..BLOCK].copy_from_slice(&first);
-            if end - b != start {
-                let last = self.block(end - b, len)?;
-                let n = buf.len();
-                buf[n - BLOCK..].copy_from_slice(&last);
-            }
-        }
-        buf[skip..skip + data.len()].copy_from_slice(data);
-        self.xts.apply(start, &mut buf, true);
-        self.inner.write(start, &buf)
-    }
-
-    fn close(&self) -> io::Result<()> {
-        self.inner.close()
-    }
-
-    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> std::result::Result<bool, redb::BackendError> {
-        self.inner.try_lock_range(start, end)
-    }
-
-    fn try_lock_shared_range(
-        &self,
-        start: Bound<u64>,
-        end: Bound<u64>,
-    ) -> std::result::Result<bool, redb::BackendError> {
-        self.inner.try_lock_shared_range(start, end)
-    }
-
-    fn lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> std::result::Result<(), redb::BackendError> {
-        self.inner.lock_range(start, end)
-    }
-
-    fn lock_shared_range(&self, start: Bound<u64>, end: Bound<u64>) -> std::result::Result<(), redb::BackendError> {
-        self.inner.lock_shared_range(start, end)
-    }
-
-    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> std::result::Result<(), redb::BackendError> {
-        self.inner.unlock_range(start, end)
-    }
-
-    fn query_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> std::result::Result<bool, redb::BackendError> {
-        self.inner.query_lock_range(start, end)
     }
 }
 
@@ -513,7 +438,18 @@ fn nonce(lsn: u64) -> Nonce<aes_gcm::aead::consts::U12> {
 }
 
 impl SegmentKey {
+    /// [`seal`](Self::seal) where the record is: `buf` holds the LSN then the
+    /// record from `at` on; the record is encrypted in place and the tag appended.
+    pub(crate) fn seal_in_place(&self, lsn: u64, buf: &mut Vec<u8>, at: usize) {
+        let tag = self
+            .0
+            .encrypt_inout_detached(&nonce(lsn), &lsn.to_le_bytes(), (&mut buf[at..]).into())
+            .expect("AES-GCM seals any record");
+        buf.extend_from_slice(&tag);
+    }
+
     /// `lsn (8) ‖ AES-256-GCM(record) ‖ tag`, the LSN authenticated.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn seal(&self, lsn: u64, record: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + record.len() + TAG);
         out.extend_from_slice(&lsn.to_le_bytes());
@@ -557,32 +493,14 @@ mod tests {
         );
         xts.apply(7 * 4096, &mut unit, false);
         assert_eq!(unit, plain);
-    }
-
-    #[test]
-    fn encrypted_file_reads_back_unaligned_writes() {
-        let dir = std::env::temp_dir().join(format!("nuage-crypto-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (_, keys) = Header::create(&Encryption::from_key([7; 32])).unwrap();
-        let path = dir.join("f");
-        let f = EncryptedFile::open(&path, keys.pages.clone()).unwrap();
-        f.set_len(3 * 4096).unwrap();
-        let mut zeros = vec![1u8; 100];
-        f.read(4000, &mut zeros).unwrap();
-        assert!(zeros.iter().all(|b| *b == 0), "grown space reads as zeros");
-        f.write(4090, b"hello, nuage").unwrap();
-        f.write(5, b"x").unwrap();
-        let mut out = [0u8; 12];
-        f.read(4090, &mut out).unwrap();
-        assert_eq!(&out, b"hello, nuage");
-        let mut one = [0u8; 3];
-        f.read(4, &mut one).unwrap();
-        assert_eq!(one, [0, b'x', 0]);
-        drop(f);
-        let raw = std::fs::read(&path).unwrap();
-        assert!(!raw.windows(5).any(|w| w == b"hello"), "nothing in clear on disk");
-        let _ = std::fs::remove_dir_all(&dir);
+        // The page store's path (whole blocks at once) gives the same bytes, across units.
+        let long: Vec<u8> = (0..3 * 4096u32).map(|i| (i * 13 % 241) as u8).collect();
+        let (mut one, mut many) = (long.clone(), long.clone());
+        xts.apply(6 * 4096 + 64, &mut one, true);
+        xts.encrypt(6 * 4096 + 64, &mut many);
+        assert_eq!(one, many);
+        xts.decrypt(6 * 4096 + 64, &mut many);
+        assert_eq!(many, long);
     }
 
     #[test]
@@ -636,6 +554,11 @@ mod compatibility {
             "2a00000000000000b9677a048c6284c885ae23cb3de5be6dea77411668b12ea89c73a6fa2c20fa9e6ab63df2bdf64dd5ea"
         );
         assert_eq!(segment.open(&sealed).as_deref(), Some(&b"enregistrement du journal"[..]));
+        // Sealed where it is (what the log does): the same bytes.
+        let mut in_place = 42u64.to_le_bytes().to_vec();
+        in_place.extend_from_slice(b"enregistrement du journal");
+        segment.seal_in_place(42, &mut in_place, 8);
+        assert_eq!(in_place, sealed);
         let mut altered = sealed.clone();
         altered[12] ^= 1;
         assert!(segment.open(&altered).is_none());

@@ -1,7 +1,7 @@
 //! Nuage DB inside the application: [`Embedded`], the engine without a
 //! server, behind Memoire's backend traits.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +21,7 @@ use crate::engine::{Engine, EngineOptions, MAIN};
 pub(crate) struct Savepoint {
     overlay: Overlay,
     extra: Vec<Op>,
-    touched: BTreeMap<String, u64>,
+    touched: BTreeSet<String>,
     written: BTreeSet<String>,
 }
 
@@ -30,19 +30,40 @@ pub(crate) struct Work {
     snap: Snapshot,
     overlay: Overlay,
     extra: Vec<Op>,
-    touched: BTreeMap<String, u64>,
+    touched: BTreeSet<String>,
     written: BTreeSet<String>,
+    /// Catalog entries already read (see [`Ctx::memo`]).
+    memo: Vec<(String, std::sync::Arc<crate::engine::store::Parsed>)>,
 }
 
 impl Work {
+    /// Work that may write: it goes by every commit applied so far, on disk
+    /// or not yet. Whatever it gives its caller waits for them to be on disk
+    /// ([`Store::wait_durable`] of [`since`](Self::since), or of its own commit).
     pub(crate) fn new(store: &Store, branch: &str) -> Result<Work> {
-        Ok(Work {
-            snap: store.snapshot(branch)?,
+        Ok(Work::on(store.snapshot_latest(branch)?))
+    }
+
+    /// Work that only reads: it sees the commits that are on disk, and waits
+    /// for nothing.
+    pub(crate) fn reader(store: &Store, branch: &str) -> Result<Work> {
+        Ok(Work::on(store.snapshot(branch)?))
+    }
+
+    fn on(snap: Snapshot) -> Work {
+        Work {
+            snap,
             overlay: Overlay::new(),
             extra: Vec::new(),
-            touched: BTreeMap::new(),
+            touched: BTreeSet::new(),
             written: BTreeSet::new(),
-        })
+            memo: Vec::new(),
+        }
+    }
+
+    /// The last commit its view holds.
+    pub(crate) fn since(&self) -> u64 {
+        self.snap.lsn()
     }
 
     pub(crate) fn ctx<'a>(&'a mut self, store: &'a Store, branch: &'a str) -> Ctx<'a> {
@@ -54,18 +75,24 @@ impl Work {
             extra: &mut self.extra,
             touched: &mut self.touched,
             written: &mut self.written,
+            memo: &mut self.memo,
         }
     }
 
-    /// Commits. `check` verifies that no other commit changed the tables read
-    /// since the snapshot (transactions); single statements hold the writer
-    /// lock from their snapshot on, so they need no check.
+    /// Commits, and returns once the commit is on disk. `check` verifies
+    /// that no other commit changed the tables read since the snapshot
+    /// (transactions); single statements hold the writer lock from their
+    /// snapshot on, so they need no check.
     pub(crate) fn commit(self, store: &Store, branch: &str, check: bool) -> Result<()> {
-        let mut w = store.writer();
-        let expect: Vec<(String, u64)> = if check { self.touched.into_iter().collect() } else { Vec::new() };
+        let since = self.snap.lsn();
+        let read: Vec<String> = if check { self.touched.into_iter().collect() } else { Vec::new() };
         let written: Vec<String> = self.written.into_iter().collect();
-        store.commit(&mut w, branch, &self.overlay, self.extra, &expect, &written)?;
-        Ok(())
+        let lsn = {
+            let mut w = store.writer();
+            store.commit(&mut w, branch, &self.overlay, self.extra, &read, since, &written)?
+        };
+        // The lock is free again: the commits waiting behind this one share its sync.
+        store.wait_durable(lsn)
     }
 }
 
@@ -75,7 +102,7 @@ fn decode<O: FromRow>(rows: Vec<Vec<Value>>) -> Result<Vec<O>> {
 
 /// One statement or a batch, as the server and the embedded handle run them.
 pub(crate) fn fetch_rows(engine: &Engine, branch: &str, query: &Query<'_>) -> Result<Vec<Vec<Value>>> {
-    let mut work = Work::new(&engine.store, branch)?;
+    let mut work = Work::reader(&engine.store, branch)?;
     exec::fetch_rows(&mut work.ctx(&engine.store, branch), query)
 }
 
@@ -84,10 +111,21 @@ pub(crate) fn execute_now(engine: &Engine, branch: &str, query: &Query<'_>) -> R
     // no other commit lands before this one.
     let mut lock = engine.store.writer();
     let mut work = Work::new(&engine.store, branch)?;
-    let result = exec::execute(&mut work.ctx(&engine.store, branch), query)?;
-    let written: Vec<String> = work.written.iter().cloned().collect();
-    engine.store.commit(&mut lock, branch, &work.overlay, work.extra, &[], &written)?;
-    Ok(result)
+    let since = work.since();
+    let done = exec::execute(&mut work.ctx(&engine.store, branch), query).and_then(|result| {
+        let written: Vec<String> = work.written.iter().cloned().collect();
+        let lsn = engine.store.commit(&mut lock, branch, &work.overlay, work.extra, &[], since, &written)?;
+        Ok((result, lsn))
+    });
+    drop(lock);
+    // The answer, or the refusal, rests on what was read: on disk before it is given.
+    match done {
+        Ok((result, lsn)) => engine.store.wait_durable(lsn).map(|()| result),
+        Err(e) => {
+            engine.store.wait_durable(since)?;
+            Err(e)
+        }
+    }
 }
 
 /// A table, as the console lists it.
@@ -178,7 +216,7 @@ impl Embedded {
 
     /// The tables of the branch, with their row counts.
     pub fn tables(&self) -> Result<Vec<TableInfo>> {
-        let mut work = Work::new(&self.engine.store, &self.branch)?;
+        let mut work = Work::reader(&self.engine.store, &self.branch)?;
         let mut ctx = work.ctx(&self.engine.store, &self.branch);
         let mut out = Vec::new();
         for name in ctx.table_names()? {
@@ -199,7 +237,7 @@ impl Embedded {
     /// `None` when there is no such table: one read, whatever the number of
     /// tables.
     pub fn table_schema(&self, name: &str) -> Result<Option<Json>> {
-        let mut work = Work::new(&self.engine.store, &self.branch)?;
+        let mut work = Work::reader(&self.engine.store, &self.branch)?;
         Ok(work.ctx(&self.engine.store, &self.branch).meta(name)?.map(|m| m.schema.clone()))
     }
 
@@ -224,18 +262,37 @@ impl Embedded {
 
     /// Statements run in one transaction: all of them apply, or none. Each
     /// is `(returns_rows, statement)`; the result is the rows, or the write's
-    /// outcome.
+    /// outcome. A batch that writes takes its turn from its first statement
+    /// to its commit: no other commit lands in between, so it never conflicts.
     pub fn batch(
         &self,
         statements: &[(bool, Query<'_>)],
     ) -> Result<Vec<std::result::Result<Vec<Vec<Value>>, ExecResult>>> {
-        let tx = self.begin_now()?;
-        let mut out = Vec::with_capacity(statements.len());
-        for (rows, q) in statements {
-            out.push(if *rows { Ok(tx.fetch_rows(q)?) } else { Err(tx.execute_now(q)?) });
+        let run = |tx: &EmbeddedTransaction| {
+            let mut out = Vec::with_capacity(statements.len());
+            for (rows, q) in statements {
+                out.push(if *rows { Ok(tx.fetch_rows(q)?) } else { Err(tx.execute_now(q)?) });
+            }
+            Ok(out)
+        };
+        if statements.iter().all(|(rows, _)| *rows) {
+            // Reads alone see what is on disk and wait for nothing.
+            return run(&self.begin_read()?);
         }
-        tx.commit_now()?;
-        Ok(out)
+        let store = &self.engine.store;
+        let mut writer = store.writer();
+        let tx = self.begin_locked()?;
+        let since = tx.since()?;
+        let done = run(&tx).and_then(|out| Ok((out, tx.commit_locked(&mut writer)?)));
+        drop(writer);
+        // The writers behind share the sync of the log this waits for.
+        match done {
+            Ok((out, lsn)) => store.wait_durable(lsn).map(|()| out),
+            Err(e) => {
+                store.wait_durable(since)?;
+                Err(e)
+            }
+        }
     }
 
     /// Opens a transaction (the synchronous form of [`Database::begin`]).
@@ -244,6 +301,32 @@ impl Embedded {
             engine: self.engine.clone(),
             branch: self.branch.clone(),
             work: Mutex::new(Some(Work::new(&self.engine.store, &self.branch)?)),
+            waits: true,
+        })
+    }
+
+    /// A transaction that only reads: it sees the commits that are on disk
+    /// and never waits for one that is being written.
+    pub(crate) fn begin_read(&self) -> Result<EmbeddedTransaction> {
+        Ok(EmbeddedTransaction {
+            engine: self.engine.clone(),
+            branch: self.branch.clone(),
+            work: Mutex::new(Some(Work::reader(&self.engine.store, &self.branch)?)),
+            waits: false,
+        })
+    }
+
+    /// A transaction for a caller that holds the writer lock from here to
+    /// [`commit_locked`](EmbeddedTransaction::commit_locked): no other commit
+    /// lands meanwhile, so it cannot conflict. Its caller gives out what it
+    /// read only after [`Store::wait_durable`] of its commit (or of
+    /// [`since`](EmbeddedTransaction::since) when it does not commit).
+    pub(crate) fn begin_locked(&self) -> Result<EmbeddedTransaction> {
+        Ok(EmbeddedTransaction {
+            engine: self.engine.clone(),
+            branch: self.branch.clone(),
+            work: Mutex::new(Some(Work::new(&self.engine.store, &self.branch)?)),
+            waits: false,
         })
     }
 }
@@ -258,7 +341,7 @@ impl Executor for Embedded {
     where
         O: FromRow + Send,
     {
-        let mut work = Work::new(&self.engine.store, &self.branch)?;
+        let mut work = Work::reader(&self.engine.store, &self.branch)?;
         match exec::fetch(&mut work.ctx(&self.engine.store, &self.branch), &query)? {
             Fetched::Rows(rows) => decode(rows),
             Fetched::Tables(t) => evaluator::fetch_as(&t, query),
@@ -285,6 +368,9 @@ pub struct EmbeddedTransaction {
     engine: Arc<Engine>,
     branch: String,
     work: Mutex<Option<Work>>,
+    /// What it read is given to its caller statement by statement: each
+    /// answer waits for the commits it rests on to be on disk.
+    waits: bool,
 }
 
 impl std::fmt::Debug for EmbeddedTransaction {
@@ -297,7 +383,32 @@ impl EmbeddedTransaction {
     fn with<R>(&self, f: impl FnOnce(&mut Ctx<'_>) -> Result<R>) -> Result<R> {
         let mut guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
         let work = guard.as_mut().ok_or(Error::TransactionFinished)?;
-        f(&mut work.ctx(&self.engine.store, &self.branch))
+        let since = work.since();
+        let done = f(&mut work.ctx(&self.engine.store, &self.branch));
+        drop(guard);
+        if self.waits {
+            // What the transaction read may hold a commit still on its way to
+            // the disk: its caller gets nothing that a crash could undo. Once
+            // it is there (nearly always already), this costs one comparison.
+            self.engine.store.wait_durable(since)?;
+        }
+        done
+    }
+
+    /// The last commit its view holds.
+    pub(crate) fn since(&self) -> Result<u64> {
+        let guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(Work::since).ok_or(Error::TransactionFinished)
+    }
+
+    /// Commits a transaction opened with [`Embedded::begin_locked`], whose
+    /// caller holds the writer lock (`writer`). Returns the commit's number:
+    /// the caller waits for it to be on disk once the lock is free.
+    pub(crate) fn commit_locked(&self, writer: &mut crate::engine::store::Writer) -> Result<u64> {
+        let work = self.work.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or(Error::TransactionFinished)?;
+        let since = work.since();
+        let written: Vec<String> = work.written.into_iter().collect();
+        self.engine.store.commit(writer, &self.branch, &work.overlay, work.extra, &[], since, &written)
     }
 
     /// Rows of a statement, undecoded.
@@ -375,6 +486,8 @@ impl EmbeddedTransaction {
         w.extra = sp.extra.clone();
         w.touched = sp.touched.clone();
         w.written = sp.written.clone();
+        // The catalog may be among what is forgotten.
+        w.memo.clear();
         Ok(())
     }
 

@@ -86,6 +86,66 @@ fn main() {
         &format!("SELECT id, resume FROM main WHERE id IN ({})", vec!["?"; 20].join(", ")),
         &(100..120).map(|i| json!(format!("m{i:06}"))).collect::<Vec<_>>(),
     );
+    // Écritures, une validation par instruction (journal écrit, sans `fsync`).
+    let mut next = n;
+    let mut write = |name: &str, reps: u32, sql: &str, params: &mut dyn FnMut(usize) -> Vec<Json>| {
+        if filter.as_deref().is_some_and(|f| !name.contains(f)) {
+            return;
+        }
+        let t = Instant::now();
+        for _ in 0..reps {
+            db.sql(sql, &params(next)).unwrap();
+            next += 1;
+        }
+        let per: Duration = t.elapsed() / reps;
+        println!("{name:44} {per:>10.2?}");
+    };
+    write(
+        "insertion (une validation par ligne)",
+        2000,
+        "INSERT INTO main (id, espace, joue_le, resume) VALUES (?, ?, ?, ?)",
+        &mut |i| vec![json!(format!("m{i:06}")), json!(i % 3), json!(i * 1000), json!(resume)],
+    );
+    write("mise à jour par clé", 2000, "UPDATE main SET joue_le = ? WHERE id = ?", &mut |i| {
+        vec![json!(i), json!(format!("m{:06}", i * 7 % n))]
+    });
+    write("suppression par clé", 2000, "DELETE FROM joueur WHERE cle = ?", &mut |i| {
+        vec![json!(format!("m{:06}/v", i * 3 % n))]
+    });
+    let t = Instant::now();
+    db.engine().checkpoint().unwrap();
+    println!("{:44} {:>10.2?}", "point de contrôle", t.elapsed());
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+
+    // Validations avec `fsync` (le réglage par défaut) : un écrivain, puis plusieurs à la fois.
+    if filter.as_deref().is_none_or(|f| "fsync".contains(f)) {
+        let dir = std::env::temp_dir().join(format!("nuage-sql-bench-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Embedded::open(&dir).unwrap();
+        db.sql("CREATE TABLE t (id TEXT PRIMARY KEY, n BIGINT)", &[]).unwrap();
+        for writers in [1usize, 8, 32] {
+            let each = 400 / writers;
+            let t = Instant::now();
+            std::thread::scope(|scope| {
+                for w in 0..writers {
+                    let db = db.clone();
+                    scope.spawn(move || {
+                        for i in 0..each {
+                            db.sql(
+                                "INSERT INTO t (id, n) VALUES (?, ?)",
+                                &[json!(format!("{writers}-{w}-{i}")), json!(i)],
+                            )
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            let total = (writers * each) as f64;
+            let name = format!("fsync, {writers} écrivain(s)");
+            println!("{name:44} {:>10.0} validations/s", total / t.elapsed().as_secs_f64());
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

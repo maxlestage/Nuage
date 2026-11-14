@@ -750,7 +750,7 @@ impl<'a> Runner<'a> {
             None => 0,
         };
         let mut out = if sel.rest.is_empty() {
-            let hint = limit.map(|l| l + offset);
+            let hint = limit.map(|l| l.saturating_add(offset));
             self.core(&sel.first, &sel.order, hint, outer, used)?
         } else {
             let mut acc = self.core(&sel.first, &[], None, outer, used)?;

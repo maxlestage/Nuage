@@ -219,6 +219,47 @@ pub(crate) fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
     (0..n).map(|_| decode_value(&mut rest)).collect()
 }
 
+/// Moves `input` past one value written by Memoire's `encode_value`, without
+/// making it: nothing is allocated for a text or a JSON nobody reads.
+fn skip_value(input: &mut &[u8]) -> Result<()> {
+    let fixed = |n: usize| Some(1 + n);
+    let len = match input.first() {
+        Some(0) => fixed(0),
+        Some(1) => fixed(1),
+        Some(2 | 10) => fixed(4),
+        Some(3 | 4 | 11) => fixed(8),
+        Some(7) => fixed(16),
+        Some(8 | 9) => fixed(12),
+        // Text, bytes, JSON: a length on four bytes, then the content.
+        Some(5 | 6 | 12) => input.get(1..5).and_then(|n| Some(5 + u32::from_le_bytes(n.try_into().ok()?) as usize)),
+        _ => None,
+    };
+    match len.and_then(|n| input.get(n..)) {
+        Some(rest) => {
+            *input = rest;
+            Ok(())
+        }
+        // A kind this does not know, or a row cut short: decoding says what is wrong.
+        None => decode_value(input).map(|_| ()),
+    }
+}
+
+/// [`decode_row`] for the stored columns `want` marks: the others are left
+/// `NULL`, unread.
+pub(crate) fn decode_row_some(bytes: &[u8], want: &[bool]) -> Result<Vec<Value>> {
+    let (n, mut rest) = bytes.split_at_checked(4).ok_or_else(|| super::storage_err("truncated row"))?;
+    let n = u32::from_le_bytes(n.try_into().unwrap_or_default()) as usize;
+    (0..n)
+        .map(|i| {
+            if want.get(i).copied().unwrap_or(false) {
+                decode_value(&mut rest)
+            } else {
+                skip_value(&mut rest).map(|()| Value::Null)
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn encode_i64(v: i64) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
@@ -255,5 +296,45 @@ mod tests {
     fn rows_round_trip() {
         let row = vec![Value::I64(1), Value::Text("é".into()), Value::Null, Value::Bytes(vec![0, 1])];
         assert_eq!(decode_row(&encode_row(&row)).unwrap(), row);
+    }
+
+    /// Any subset of the columns of a row with every kind of value: the ones
+    /// asked for come out as they went in, the others are skipped whole.
+    #[test]
+    fn columns_not_asked_for_are_skipped() {
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 123).unwrap();
+        let row = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::I32(-7),
+            Value::I64(1 << 40),
+            Value::F64(2.5),
+            Value::Text("été".into()),
+            Value::Text(String::new()),
+            Value::Bytes(vec![0, 255, 3]),
+            Value::Uuid(uuid::Uuid::from_bytes([9; 16])),
+            Value::Timestamp(at.naive_utc()),
+            Value::TimestampTz(at),
+            Value::Date(at.date_naive()),
+            Value::Time(at.time()),
+            Value::Json(serde_json::json!({ "a": [1, "x", null] })),
+            Value::I64(42),
+        ];
+        let bytes = encode_row(&row);
+        for mask in 0u32..(1 << row.len()) {
+            // Every 37th subset, and the ones with a single column or all but one.
+            let ones = mask.count_ones() as usize;
+            if mask % 37 != 0 && ones != 1 && ones != row.len() - 1 {
+                continue;
+            }
+            let want: Vec<bool> = (0..row.len()).map(|i| mask & (1 << i) != 0).collect();
+            let expected: Vec<Value> =
+                row.iter().zip(&want).map(|(v, w)| if *w { v.clone() } else { Value::Null }).collect();
+            assert_eq!(decode_row_some(&bytes, &want).unwrap(), expected, "{want:?}");
+        }
+        // A shorter mask leaves the rest unread; a row cut short is an error either way.
+        assert_eq!(decode_row_some(&bytes, &[false, true]).unwrap()[1], Value::Bool(true));
+        assert!(decode_row_some(&bytes[..bytes.len() - 3], &[]).is_err());
+        assert!(decode_row_some(&bytes[..40], &[]).is_err());
     }
 }

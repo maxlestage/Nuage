@@ -946,6 +946,13 @@ impl Session {
         }
         let nulls = vec![Value::Null; script.params()];
         let dry = match &self.tx {
+            // In the transaction the client has open: what the run writes
+            // there is taken back before anything else happens.
+            Some(tx) if script.writes() => tx.savepoint().and_then(|before| {
+                let dry = crate::sql::run_in(tx, &self.state.schemas, script, &nulls);
+                tx.rollback_to(&before)?;
+                dry
+            }),
             Some(tx) => crate::sql::run_in(tx, &self.state.schemas, script, &nulls),
             None => {
                 crate::sql::run_values(&self.app.engine, &self.branch, &self.state.schemas, &[(script, &nulls)], false)

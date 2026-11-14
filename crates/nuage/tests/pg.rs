@@ -152,3 +152,38 @@ async fn drivers_connect_query_and_commit() {
     assert_eq!(db.query("SELECT * FROM items", &[]).await.unwrap().len(), 2, "main is untouched");
     assert!(connect(addr, "t0ken", "no-such-branch").await.is_err());
 }
+
+/// A driver that prepares a statement asks for its columns before it runs
+/// it: inside `BEGIN`, asking writes nothing.
+#[tokio::test]
+async fn describing_a_statement_in_a_transaction_changes_nothing() {
+    let (_server, addr) = start("describe").await;
+    let db = connect(addr, "t0ken", "nuage").await.unwrap();
+    db.batch_execute(
+        "CREATE TABLE counters (id SERIAL PRIMARY KEY, name TEXT, n BIGINT NOT NULL DEFAULT 0);
+         INSERT INTO counters (name, n) VALUES ('a', 10), ('b', 20)",
+    )
+    .await
+    .unwrap();
+
+    db.batch_execute("BEGIN").await.unwrap();
+    // No parameter: the statement would run as it is.
+    let n: i64 = db.query_one("UPDATE counters SET n = n + 1 WHERE name = 'a' RETURNING n", &[]).await.unwrap().get(0);
+    assert_eq!(n, 11, "run once");
+    // Its parameters NULL, the row is one the table accepts.
+    let id: i64 = db.query_one("INSERT INTO counters (name) VALUES ($1) RETURNING id", &[&"c"]).await.unwrap().get(0);
+    assert_eq!(id, 3);
+    // Prepared and never run.
+    db.prepare("DELETE FROM counters RETURNING id").await.unwrap();
+    let rows = db.query("SELECT name, n FROM counters ORDER BY id", &[]).await.unwrap();
+    let seen: Vec<(Option<String>, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(seen, [(Some("a".into()), 11), (Some("b".into()), 20), (Some("c".into()), 0)]);
+    db.batch_execute("COMMIT").await.unwrap();
+
+    let rows = db.query("SELECT name, n FROM counters ORDER BY id", &[]).await.unwrap();
+    let seen: Vec<(Option<String>, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(seen, [(Some("a".into()), 11), (Some("b".into()), 20), (Some("c".into()), 0)]);
+    // Outside a transaction too.
+    let n: i64 = db.query_one("UPDATE counters SET n = n + 1 WHERE name = 'b' RETURNING n", &[]).await.unwrap().get(0);
+    assert_eq!(n, 21);
+}

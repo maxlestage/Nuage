@@ -40,7 +40,8 @@ pub(crate) mod value;
 #[cfg(feature = "server")]
 pub(crate) use types::Typing;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use memoire_orm::nuage::wire::SchemaCache;
 use memoire_orm::{Error, Result, Value};
@@ -51,16 +52,43 @@ pub use exec::SqlResult;
 use crate::embedded::Embedded;
 use crate::engine::Engine;
 
-/// Statements parsed, with the number of parameters they use.
+/// Statements parsed, with the number of parameters they use. A handle:
+/// cloning it shares the statements.
+#[derive(Clone)]
 pub(crate) struct Script {
-    stmts: Vec<ast::Stmt>,
+    stmts: Arc<Vec<ast::Stmt>>,
     params: usize,
 }
 
+/// Scripts already parsed, by their text. Applications send the same
+/// statements again and again with other parameters: reading the SQL each
+/// time cost more than running a short statement.
+static PARSED: Mutex<Option<HashMap<String, Script>>> = Mutex::new(None);
+/// Scripts kept; past it, the cache starts over.
+const PARSED_MAX: usize = 512;
+/// The longest text kept (a long one is a one-off: a dump, a migration).
+const PARSED_TEXT_MAX: usize = 4096;
+
 impl Script {
     pub(crate) fn parse(sql: &str) -> Result<Script> {
+        let keep = sql.len() <= PARSED_TEXT_MAX;
+        if keep
+            && let Some(script) =
+                PARSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| cache.get(sql))
+        {
+            return Ok(script.clone());
+        }
         let (stmts, params) = parse::parse(sql)?;
-        Ok(Script { stmts, params })
+        let script = Script { stmts: Arc::new(stmts), params };
+        if keep {
+            let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = cache.get_or_insert_with(HashMap::new);
+            if cache.len() >= PARSED_MAX {
+                cache.clear();
+            }
+            cache.insert(sql.to_owned(), script.clone());
+        }
+        Ok(script)
     }
 
     /// Number of statements.
@@ -83,7 +111,7 @@ impl Script {
     /// One script per statement; parameters keep their numbers.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn split(&self) -> Vec<Script> {
-        self.stmts.iter().map(|s| Script { stmts: vec![s.clone()], params: self.params }).collect()
+        self.stmts.iter().map(|s| Script { stmts: Arc::new(vec![s.clone()]), params: self.params }).collect()
     }
 
     /// `begin`, `commit` or `rollback`, when the script is that one statement.
@@ -162,8 +190,8 @@ fn check_params(script: &Script, given: usize) -> Result<()> {
 }
 
 /// Runs scripts (each one statement or several, separated by `;`, with its
-/// parameters) on `branch` of `engine`, all in one transaction, retried on a
-/// write conflict. `commit: false` rolls it back: a dry run, what would change.
+/// parameters) on `branch` of `engine`, all in one transaction. `commit:
+/// false` rolls it back: a dry run, what would change.
 pub(crate) fn run(
     engine: &Arc<Engine>,
     branch: &str,
@@ -187,43 +215,38 @@ pub(crate) fn run_values(
     for (script, params) in batch {
         check_params(script, params.len())?;
     }
-    let all_params: Vec<&[Value]> = batch.iter().map(|(_, p)| *p).collect();
     let writes = batch.iter().any(|(s, _)| s.writes());
     let db = Embedded::from_engine(engine.clone()).on_branch(branch)?;
-    let mut attempt = 0;
-    loop {
-        let tx = db.begin_now()?;
+    let run_all = |tx: &crate::embedded::EmbeddedTransaction| -> Result<Vec<Vec<SqlResult>>> {
         let mut out = Vec::with_capacity(batch.len());
-        let mut failed = None;
-        'scripts: for ((script, _), params) in batch.iter().zip(all_params.iter().copied()) {
-            let runner = exec::Runner::new(&tx, schemas, params);
-            let mut results = Vec::with_capacity(script.stmts.len());
-            for s in &script.stmts {
-                match runner.run(s) {
-                    Ok(r) => results.push(r),
-                    Err(e) => {
-                        failed = Some(e);
-                        break 'scripts;
-                    }
-                }
-            }
-            out.push(results);
+        for (script, params) in batch {
+            let runner = exec::Runner::new(tx, schemas, params);
+            out.push(script.stmts.iter().map(|s| runner.run(s)).collect::<Result<Vec<_>>>()?);
         }
-        if let Some(e) = failed {
-            let _ = tx.rollback_now();
-            return Err(e);
-        }
-        if !commit || !writes {
-            let _ = tx.rollback_now();
-            return Ok(out);
-        }
-        match tx.commit_now() {
-            Ok(()) => return Ok(out),
-            Err(Error::Conflict(_)) if attempt < 8 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1 << attempt.min(5)));
-            }
-            Err(e) => return Err(e),
+        Ok(out)
+    };
+    if !writes {
+        // Reads alone see what is on disk and wait for nothing.
+        return run_all(&db.begin_read()?);
+    }
+    // Writes take their turn from the first statement to the commit: nothing
+    // lands in between, so there is no conflict to retry, however many
+    // writers there are. The turn ends before the log is synced: the writers
+    // behind share that sync.
+    let mut writer = engine.store.writer();
+    let tx = db.begin_locked()?;
+    let since = tx.since()?;
+    let done = run_all(&tx).and_then(|out| {
+        let lsn = if commit { tx.commit_locked(&mut writer)? } else { since };
+        Ok((out, lsn))
+    });
+    drop(writer);
+    match done {
+        Ok((out, lsn)) => engine.store.wait_durable(lsn).map(|()| out),
+        Err(e) => {
+            // The refusal rests on what was read too.
+            engine.store.wait_durable(since)?;
+            Err(e)
         }
     }
 }

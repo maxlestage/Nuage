@@ -162,6 +162,8 @@ async fn main() -> memoire_orm::Result<()> {
                 req = req.header("accept-encoding", "gzip");
             }
             let req = req.body(http_body_util::Full::new(hyper::body::Bytes::from(body))).unwrap();
+            // The connection takes the next request once it is done with the last answer.
+            sender.ready().await.map_err(|e| Error::Pool(e.to_string()))?;
             let t = Instant::now();
             let res = sender.send_request(req).await.map_err(|e| Error::Pool(e.to_string()))?;
             assert_eq!(res.status(), 200);
