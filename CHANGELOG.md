@@ -61,6 +61,19 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   was as of the beginning). The conflict is now looked for from its snapshot.
 - **Fixed**: a row too large for the page store was refused after it had been written to
   the log; it is refused before.
+- When the disk fails. A record the log could not write whole is cut from it (the records
+  appended after it used to be lost with it at the next start), and so is one that could
+  not be applied. A `fsync` of the log that fails is not tried again on the same file:
+  commits are refused until the database is opened again, since the system reports such an
+  error once and a later `fsync` that succeeds proves nothing. A commit that is in the log
+  and applied is no longer answered with an error because writing the page store early
+  (much was changed since the last checkpoint) failed. Commits missing in the middle of the
+  log are told by an event at opening.
+- A long log is replayed without keeping everything it changed in memory: past the same
+  limit as for commits, the page store is written on the way.
+- The page cache's clock kept a place for every page rewritten at a checkpoint while the
+  cache was not full: it grew slowly for as long as the process ran. It is now bounded by
+  the pages held.
 
 | `INSERT` with `fsync`, one commit each (`examples/sql_bench.rs`) | Before | After |
 |---|---:|---:|

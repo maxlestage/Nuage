@@ -12,7 +12,7 @@
 //! once the backup, if any, has shipped them.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -271,6 +271,9 @@ pub(crate) struct Writer {
     pub bytes: u64,
     key: Option<Arc<WalKey>>,
     seg: Option<SegmentKey>,
+    /// The file holds bytes past its records (a write that failed part way)
+    /// that could not be cut yet: nothing is appended behind them.
+    torn: bool,
 }
 
 impl Writer {
@@ -296,7 +299,7 @@ impl Writer {
             }
         };
         sync_dir(dir);
-        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg })
+        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg, torn: false })
     }
 
     /// The segment's file, to sync it.
@@ -304,7 +307,12 @@ impl Writer {
         self.file.clone()
     }
 
+    /// Appends `record`. When the write fails, what it wrote of the record is
+    /// cut from the file: the next record follows the last whole one.
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
+        if self.torn {
+            self.cut_to(self.bytes)?;
+        }
         // One buffer: the head, then the record, encrypted where it is.
         let mut bytes = vec![0u8; FRAME];
         match &self.seg {
@@ -316,8 +324,26 @@ impl Writer {
             None => record.payload_into(&mut bytes),
         }
         frame(&mut bytes);
-        (&*self.file).write_all(&bytes).map_err(io)?;
+        if let Err(e) = (&*self.file).write_all(&bytes) {
+            // Recovery stops at the first record that is not whole: one
+            // appended behind this one would be lost with it.
+            let _ = self.cut_to(self.bytes);
+            return Err(io(e));
+        }
         self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Cuts the segment back to its first `bytes` bytes of records: the
+    /// records appended since are not in the log any more (their commits did
+    /// not complete). Until it succeeds, nothing is appended.
+    pub(crate) fn cut_to(&mut self, bytes: u64) -> Result<()> {
+        self.bytes = bytes;
+        self.torn = true;
+        let len = bytes + if self.seg.is_some() { HEADER_LEN as u64 } else { 0 };
+        self.file.set_len(len).map_err(io)?;
+        (&*self.file).seek(SeekFrom::Start(len)).map_err(io)?;
+        self.torn = false;
         Ok(())
     }
 
@@ -421,5 +447,39 @@ mod tests {
         fs::write(dir.join(segment_name(1)), Record { lsn: 1, ops: vec![] }.encode()).unwrap();
         assert!(recover(&dir, Some(&keys.wal)).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record written in part (the write failed) or taken back (its commit
+    /// did not complete) is cut from the segment: the records appended after
+    /// it are read back, in clear and encrypted.
+    #[test]
+    fn a_record_that_did_not_complete_is_cut() {
+        let record = |lsn: u64, value: &[u8]| Record {
+            lsn,
+            ops: vec![Op::Put { table: "b:main".into(), key: lsn.to_be_bytes().to_vec(), value: value.to_vec() }],
+        };
+        let enc = crate::crypto::Encryption::from_key([5; 32]);
+        let (_, keys) = crate::crypto::Header::create(&enc).unwrap();
+        for key in [None, Some(keys.wal.clone())] {
+            let dir = std::env::temp_dir().join(format!("nuage-wal-cut-{}-{}", key.is_some(), std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w = Writer::open(&dir, 1, key.clone()).unwrap();
+            w.append(&record(1, b"one")).unwrap();
+            // What a write that fails half way leaves behind the last record.
+            let whole = w.bytes;
+            (&*w.file).write_all(&[0xAB; 37]).unwrap();
+            w.cut_to(whole).unwrap();
+            w.append(&record(2, b"two")).unwrap();
+            // A record that is whole, taken back: the next one has its number.
+            let kept = w.bytes;
+            w.append(&record(3, &[7; 5000])).unwrap();
+            w.cut_to(kept).unwrap();
+            w.append(&record(3, b"three")).unwrap();
+            assert!(!w.torn);
+            drop(w);
+            let read = recover(&dir, key.as_deref()).unwrap();
+            assert_eq!(read, vec![record(1, b"one"), record(2, b"two"), record(3, b"three")]);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
