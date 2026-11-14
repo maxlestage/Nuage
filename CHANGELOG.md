@@ -4,6 +4,27 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Faster short statements
+
+- Each table's catalog entry is parsed once and kept, keyed by its stored bytes (the same
+  bytes always describe the same table, on every branch and in every transaction), with
+  its `'static` schema. Every statement used to parse the catalog JSON of its tables, then
+  serialize it again to look the schema up: most of the cost of a short statement.
+- `COUNT(*)` whose filter is equalities pinning exactly the columns of an index is counted
+  from the index, without reading the rows.
+- `examples/sql_bench.rs`: embedded SQL timings (`cargo run --release -p nuage
+  --no-default-features --example sql_bench -- 5000`).
+
+| 5,000 rows, embedded | Before | After |
+|---|---:|---:|
+| `INSERT` in a transaction (per row) | 73 µs | 32 µs |
+| `SELECT … WHERE id = ?` (primary key) | 37 µs | 8.5 µs |
+| `SELECT count(*)` | 29.6 µs | 3.6 µs |
+| `SELECT count(*) WHERE indexed = ?` (1/3 of the rows) | 2.73 ms | 0.43 ms |
+| `SELECT … WHERE id IN (20 keys)` | 69 µs | 42 µs |
+
+Scans (about 1 µs per row) and subqueries are unchanged.
+
 ### SQL in an embedded transaction
 
 - `EmbeddedTransaction::sql(sql, params)`: SQL run inside a transaction opened with

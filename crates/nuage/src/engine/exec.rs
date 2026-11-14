@@ -11,15 +11,16 @@
 //! the tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use memoire_orm::ast::{Projection, SelectAst};
 use memoire_orm::evaluator::{self, Tables};
-use memoire_orm::nuage::wire::schema_to_json;
+use memoire_orm::nuage::wire::{SchemaCache, schema_to_json};
 use memoire_orm::{AggFunc, BinOp, ColumnType, Error, ExecResult, Expr, JoinKind, Query, Result, TableSchema, Value};
 use serde_json::{Value as Json, json};
 
 use super::keys::{self, push_value};
-use super::store::{Overlay, Snapshot, Store};
+use super::store::{Overlay, Parsed, Snapshot, Store};
 use super::wal::Op;
 
 /// Rows read per step of a table scan.
@@ -219,9 +220,29 @@ impl Ctx<'_> {
         }
     }
 
-    pub(crate) fn meta(&mut self, table: &str) -> Result<Option<TableMeta>> {
+    fn parsed(&mut self, table: &str) -> Result<Option<Arc<Parsed>>> {
         self.touch(table);
-        self.get(&keys::catalog_key(table))?.map(|b| TableMeta::from_json(&b)).transpose()
+        self.get(&keys::catalog_key(table))?.map(|b| self.store.parsed(b)).transpose()
+    }
+
+    /// The table's metadata (parsed once per distinct catalog entry, see [`Store::parsed`]).
+    pub(crate) fn meta(&mut self, table: &str) -> Result<Option<Arc<TableMeta>>> {
+        Ok(self.parsed(table)?.map(|p| p.meta.clone()))
+    }
+
+    /// The table's metadata, to change it.
+    fn meta_mut(&mut self, table: &str) -> Result<Option<TableMeta>> {
+        Ok(self.meta(table)?.map(|m| (*m).clone()))
+    }
+
+    /// The table's `'static` schema, made once per distinct catalog entry.
+    pub(crate) fn table_schema(&mut self, table: &str, schemas: &SchemaCache) -> Result<Option<&'static TableSchema>> {
+        let Some(p) = self.parsed(table)? else { return Ok(None) };
+        if let Some(s) = p.schema.get() {
+            return Ok(Some(s));
+        }
+        let s = schemas.schema(&p.meta.schema)?;
+        Ok(Some(p.schema.get_or_init(|| s)))
     }
 
     fn put_meta(&mut self, table: &str, meta: &TableMeta) {
@@ -606,6 +627,50 @@ fn is_count_all(ast: &SelectAst) -> bool {
             if matches!(e.as_slice(), [Expr::Aggregate { func: AggFunc::Count, arg: None, distinct: false }]))
 }
 
+/// `COUNT(*)` of one table whose filter is equalities that pin exactly the
+/// columns of one of its indexes (`WHERE a = 1 AND b = 'x'` with an index on
+/// `(a, b)`): the number of index entries is the answer, no row is read.
+/// `None` when the statement is not of that form.
+fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
+    let Some(filter) = &ast.filter else { return Ok(None) };
+    let counts_all = ast.joins.is_empty()
+        && ast.group_by.is_empty()
+        && ast.having.is_none()
+        && ast.limit.is_none()
+        && ast.offset.unwrap_or(0) == 0
+        && !ast.distinct
+        && matches!(&ast.projection, Projection::Exprs(e)
+            if matches!(e.as_slice(), [Expr::Aggregate { func: AggFunc::Count, arg: None, distinct: false }]));
+    if !counts_all {
+        return Ok(None);
+    }
+    let schema = ast.from;
+    let mut pins: HashMap<&str, &Value> = HashMap::new();
+    for part in conjuncts(filter) {
+        let Expr::Binary { op: BinOp::Eq, left, right } = part else { return Ok(None) };
+        let (column, value) = match (&**left, &**right) {
+            (Expr::Column(c), Expr::Value(v)) | (Expr::Value(v), Expr::Column(c)) if c.table == schema.name => (c, v),
+            _ => return Ok(None),
+        };
+        let Some(col) = schema.columns.get(column.index) else { return Ok(None) };
+        if pins.insert(col.name, value).is_some_and(|old| old != value) {
+            return Ok(None);
+        }
+    }
+    let Some(meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    let Some(i) = meta.indexes.iter().position(|ix| {
+        ix.live() && ix.columns.len() == pins.len() && ix.columns.iter().all(|c| pins.contains_key(c.as_str()))
+    }) else {
+        return Ok(None);
+    };
+    let values: Vec<&Value> = meta.indexes[i].columns.iter().map(|c| pins[c.as_str()]).collect();
+    // NULL is never indexed (and never equal).
+    if values.iter().any(|v| v.is_null()) {
+        return Ok(Some(0));
+    }
+    Ok(Some(ctx.index_lookup(&meta, i, &values)?.len() as i64))
+}
+
 /// The answer to a statement that returns rows.
 pub(crate) enum Fetched {
     /// Rows already final.
@@ -628,6 +693,9 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                     return Err(Error::NoSuchTable(ast.from.name.to_owned()));
                 };
                 return Ok(Fetched::Rows(vec![vec![Value::I64(ctx.row_count(&meta)?)]]));
+            }
+            if let Some(n) = count_by_index(ctx, ast)? {
+                return Ok(Fetched::Rows(vec![vec![Value::I64(n)]]));
             }
             let mut side_schemas = Vec::new();
             subquery_tables(ast, &mut side_schemas);
@@ -762,7 +830,7 @@ pub(crate) fn execute(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<ExecResult
 }
 
 fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema) -> Result<ExecResult> {
-    let Some(mut meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    let Some(mut meta) = ctx.meta_mut(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
     // A model with new columns widens the stored rows.
     let missing: Vec<String> =
         schema.columns.iter().filter(|c| meta.position(c.name).is_none()).map(|c| c.name.to_owned()).collect();
@@ -1012,7 +1080,7 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
                     Err(Error::Validation(format!("there is already an index named `{name}`")))
                 };
             }
-            let Some(mut meta) = ctx.meta(table)? else { return Err(Error::NoSuchTable(table.clone())) };
+            let Some(mut meta) = ctx.meta_mut(table)? else { return Err(Error::NoSuchTable(table.clone())) };
             for c in columns {
                 if meta.position(c).is_none() {
                     return Err(Error::Validation(format!("`{table}` has no column `{c}`")));
@@ -1050,7 +1118,7 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
                     Err(Error::Validation(format!("there is no index named `{name}`")))
                 };
             };
-            let Some(mut meta) = ctx.meta(&table)? else { return Err(Error::NoSuchTable(table)) };
+            let Some(mut meta) = ctx.meta_mut(&table)? else { return Err(Error::NoSuchTable(table)) };
             let start = keys::index_prefix(meta.generation, i as u16, &[]);
             let end = keys::prefix_end(&start);
             let mut at = start.clone();
@@ -1071,7 +1139,7 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
             Ok(())
         }
         Alter::AddColumn { table, column, fill } => {
-            let Some(mut meta) = ctx.meta(table)? else { return Err(Error::NoSuchTable(table.clone())) };
+            let Some(mut meta) = ctx.meta_mut(table)? else { return Err(Error::NoSuchTable(table.clone())) };
             let name = column.get("name").and_then(Json::as_str).unwrap_or_default().to_owned();
             if meta.position(&name).is_some() {
                 return Err(Error::Validation(format!("`{table}` already has a column `{name}`")));

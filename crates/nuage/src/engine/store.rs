@@ -12,13 +12,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use memoire_orm::{Error, Result};
 use redb::{Durability, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::{Value as Json, json};
 
+use super::exec::TableMeta;
 use super::storage_err;
 use super::wal::{self, Op, Record};
 use crate::crypto::{EncryptedFile, Keys};
@@ -177,7 +178,19 @@ pub(crate) struct Store {
     versions: Mutex<HashMap<(String, String), u64>>,
     /// LSN of the last applied commit (what snapshots see).
     applied_lsn: AtomicU64,
+    /// Catalog entries already parsed, by their stored bytes (see [`Store::parsed`]).
+    catalog: Mutex<HashMap<Vec<u8>, Arc<Parsed>>>,
 }
+
+/// A catalog entry parsed once: its table metadata and, when a statement asked for it,
+/// its `'static` schema.
+pub(crate) struct Parsed {
+    pub meta: Arc<TableMeta>,
+    pub schema: OnceLock<&'static memoire_orm::TableSchema>,
+}
+
+/// Distinct catalog entries kept parsed; past it, the cache starts over.
+const CATALOG_CACHE: usize = 1024;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -310,6 +323,7 @@ impl Store {
             generation: AtomicU64::new(generation),
             versions: Mutex::new(HashMap::new()),
             applied_lsn: AtomicU64::new(last),
+            catalog: Mutex::new(HashMap::new()),
         };
         store.load_branches()?;
         store.checkpoint(None)?;
@@ -346,6 +360,23 @@ impl Store {
             self.branches.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
         list.sort_by(|a, b| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
         list
+    }
+
+    /// The catalog entry stored as `bytes`, parsed. Every statement reads the catalog
+    /// entries of its tables: parsing their JSON each time cost most of a short statement.
+    /// The same bytes always describe the same table, on every branch and in every
+    /// transaction (a change to a table writes new bytes), so keying by them is exact.
+    pub(crate) fn parsed(&self, bytes: Vec<u8>) -> Result<Arc<Parsed>> {
+        if let Some(p) = lock(&self.catalog).get(&bytes) {
+            return Ok(p.clone());
+        }
+        let parsed = Arc::new(Parsed { meta: Arc::new(TableMeta::from_json(&bytes)?), schema: OnceLock::new() });
+        let mut cache = lock(&self.catalog);
+        if cache.len() >= CATALOG_CACHE {
+            cache.clear();
+        }
+        cache.insert(bytes, parsed.clone());
+        Ok(parsed)
     }
 
     pub(crate) fn has_branch(&self, name: &str) -> bool {
