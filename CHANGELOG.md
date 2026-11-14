@@ -72,7 +72,9 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   error once and a later `fsync` that succeeds proves nothing. A commit that is in the log
   and applied is no longer answered with an error because writing the page store early
   (much was changed since the last checkpoint) failed. Commits missing in the middle of the
-  log are told by an event at opening.
+  log are told by an event at opening. Encrypted, a record cut from the log is followed by
+  a new segment, under a new key: the number the record had is never sealed twice under
+  one key.
 - **Fixed**: a filter whose index names a column twice (`CREATE INDEX i ON t (a, a)`) left
   a condition on another column unchecked, for reads, counts, updates and deletes; a
   `LIMIT` cut the rows an aggregate inside an expression counts (`count(*) + 1`) on a
@@ -100,7 +102,10 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   server says in `/v1/info` (`schemaRefs`) that it keeps schemas by reference, the client
   sends each schema whole once, then a short reference. Describing and reading the schema
   was more than half of the work of a short request, on both sides. A client or a server
-  that does not know references works as before (Memoire pinned to `a7419cb`).
+  that does not know references works as before (Memoire pinned to `8f7e0cb`).
+- A reference is the table's name and half a SHA-256 of its whole description: it names
+  one schema, and no client of the server (the holder of a read-only token of another
+  application, say) can describe another schema that answers to it.
 
 | Server and client on one machine, encrypted, `fsync` (`examples/bench.rs`) | Before | After |
 |---|---:|---:|
