@@ -102,6 +102,9 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Timestamp(x), TimestampTz(y)) => Some(x.cmp(&y.naive_utc())),
         (TimestampTz(x), Timestamp(y)) => Some(x.naive_utc().cmp(y)),
         (Date(x), Date(y)) => Some(x.cmp(y)),
+        // A date against a timestamp: the date at midnight, as in PostgreSQL.
+        (Date(x), Timestamp(_) | TimestampTz(_)) => compare(&Timestamp(x.and_hms_opt(0, 0, 0)?), b),
+        (Timestamp(_) | TimestampTz(_), Date(y)) => compare(a, &Timestamp(y.and_hms_opt(0, 0, 0)?)),
         (Time(x), Time(y)) => Some(x.cmp(y)),
         (Json(x), Json(y)) => Some(if x == y { Ordering::Equal } else { x.to_string().cmp(&y.to_string()) }),
         // Text against a typed value: the text read as that type (`'2026-11-13'`).
@@ -537,6 +540,64 @@ fn int_arg(name: &str, v: &Value) -> Result<Option<i64>> {
 }
 
 /// The scalar functions: `name` in lower case.
+/// An `INTERVAL '...'` as calendar months and microseconds: `1 year 2 months`,
+/// `3 days`, `-1 hour`, `90 minutes`, `1 week`, `2 h 30 min`, `1.5 seconds`.
+pub(crate) fn interval_months_and_micros(text: &str) -> Result<(i32, i64)> {
+    let bad = || {
+        syntax(format!(
+            "INTERVAL '{text}': write it as `<number> <unit>` (years, months, weeks, days, hours, minutes, seconds)"
+        ))
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() || !words.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    let (mut months, mut micros) = (0i64, 0f64);
+    for pair in words.chunks(2) {
+        let n: f64 = pair[0].parse().map_err(|_| bad())?;
+        let unit = pair[1].to_ascii_lowercase();
+        let unit = unit.trim_end_matches('s');
+        match unit {
+            "year" | "yr" | "y" => months += (n * 12.0) as i64,
+            "mon" | "month" => months += n as i64,
+            "week" | "w" => micros += n * 7.0 * 86_400e6,
+            "day" | "d" => micros += n * 86_400e6,
+            "hour" | "hr" | "h" => micros += n * 3_600e6,
+            "minute" | "min" | "m" => micros += n * 60e6,
+            "second" | "sec" => micros += n * 1e6,
+            "millisecond" | "msec" | "ms" => micros += n * 1e3,
+            "microsecond" | "u" | "usec" => micros += n,
+            _ => return Err(bad()),
+        }
+    }
+    Ok((i32::try_from(months).map_err(|_| bad())?, micros.round() as i64))
+}
+
+/// `x + INTERVAL '...'` (`sign` 1) or `x - INTERVAL '...'` (`sign` -1): months
+/// first, on the calendar (31 January + 1 month = 28 or 29 February), then
+/// the rest. A date gives a timestamp, as in PostgreSQL.
+fn shift(x: &Value, text: &str, sign: i64) -> Result<Value> {
+    use chrono::{Duration, Months, NaiveDateTime};
+    let (months, micros) = interval_months_and_micros(text)?;
+    let months = i64::from(months) * sign;
+    let step = |t: NaiveDateTime| -> Result<NaiveDateTime> {
+        let m = Months::new(months.unsigned_abs() as u32);
+        let t = if months >= 0 { t.checked_add_months(m) } else { t.checked_sub_months(m) };
+        t.and_then(|t| t.checked_add_signed(Duration::microseconds(micros * sign)))
+            .ok_or_else(|| conversion(format!("date out of range after INTERVAL '{text}'")))
+    };
+    Ok(match x {
+        Value::Null => Value::Null,
+        Value::TimestampTz(t) => Value::TimestampTz(step(t.naive_utc())?.and_utc()),
+        Value::Timestamp(t) => Value::Timestamp(step(*t)?),
+        Value::Date(d) => Value::Timestamp(step(d.and_hms_opt(0, 0, 0).expect("midnight"))?),
+        other => match cast(other, ColumnType::Timestamp)? {
+            Value::Timestamp(t) => Value::Timestamp(step(t)?),
+            _ => return Err(conversion("INTERVAL: not a date")),
+        },
+    })
+}
+
 /// Functions that give a set of rows: one row per element of a JSON array.
 pub(crate) const SET_RETURNING: [&str; 4] =
     ["jsonb_array_elements_text", "json_array_elements_text", "jsonb_array_elements", "json_array_elements"];
@@ -919,6 +980,15 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             Value::Json(Json::Object(m))
         }
         "json_array" => Value::Json(Json::Array(a.iter().map(to_json).collect())),
+        "_interval" => {
+            arg_count(name, a, 1, 1)?;
+            Value::Text(text_arg(&a[0]).unwrap_or_default())
+        }
+        "_shift" => {
+            arg_count(name, a, 3, 3)?;
+            let sign = if matches!(a[2], Value::I64(-1)) { -1 } else { 1 };
+            shift(&a[0], &text_arg(&a[1]).unwrap_or_default(), sign)?
+        }
         // PostgreSQL's advisory locks. A transaction of Nuage DB is checked at
         // its commit: if another commit changed a table it read since its
         // snapshot, it fails with a conflict (`40001`). The section that the
@@ -989,6 +1059,11 @@ mod tests {
             Some(Ordering::Equal)
         );
         assert_eq!(compare(&Value::Null, &Value::I64(1)), None);
+        let day = |s: &str| Value::Date(s.parse().unwrap());
+        let at = |s: &str| Value::Timestamp(chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap());
+        assert_eq!(compare(&at("2026-02-28 00:00:00"), &day("2026-03-01")), Some(Ordering::Less));
+        assert_eq!(compare(&day("2026-03-01"), &at("2026-03-01 00:00:00")), Some(Ordering::Equal));
+        assert_eq!(compare(&day("2026-03-01"), &at("2026-03-01 09:00:00")), Some(Ordering::Less));
         assert_eq!(arith(Op::Div, &Value::I64(7), &Value::I64(2)).unwrap(), Value::I64(3));
         assert_eq!(arith(Op::Mod, &Value::I64(7), &Value::I64(2)).unwrap(), Value::I64(1));
         assert!(arith(Op::Div, &Value::I64(1), &Value::I64(0)).is_err());

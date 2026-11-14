@@ -63,8 +63,20 @@ pub(crate) enum Expr {
 }
 
 /// Aggregate functions (with one argument, or `count(*)`).
-pub(crate) const AGGREGATES: [&str; 9] =
-    ["count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg"];
+pub(crate) const AGGREGATES: [&str; 12] = [
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "total",
+    "group_concat",
+    "string_agg",
+    "array_agg",
+    "bool_and",
+    "bool_or",
+    "every",
+];
 
 impl Expr {
     pub(crate) fn is_aggregate(&self) -> bool {
