@@ -202,6 +202,29 @@ fn main() -> ExitCode {
             }
             None => None,
         };
+        // The engines' warnings and errors (a backup or a checkpoint that failed...) go to the
+        // log too, not only to the dashboard: `heroku logs` and the services' log files show them.
+        let server = std::sync::Arc::new(server);
+        let watched = server.clone();
+        let events = tokio::spawn(async move {
+            let mut seen: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            loop {
+                for app in watched.apps() {
+                    let Some(engine) = watched.app_engine(&app.name) else { continue };
+                    let last = seen.entry(app.name.clone()).or_insert(started);
+                    for event in engine.events().0 {
+                        if event.at > *last && matches!(event.level, "warn" | "error") {
+                            log(&format!("{} ({}): {}", event.level, app.name, event.message));
+                        }
+                        *last = (*last).max(event.at);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
         let keep_awake = config.keep_awake.map(|k| {
             let hours = k.hours.map_or("always".to_owned(), |(a, b)| format!("from {a}:00 to {b}:00 UTC"));
             log(&format!("keep-awake: {} every {} min, {hours}", k.url, k.every.as_secs() / 60));
@@ -212,6 +235,7 @@ fn main() -> ExitCode {
             task.abort();
         }
         log("stopping: last checkpoint and backup");
+        events.abort();
         running.shutdown().await;
         if let Some(pg) = pg {
             pg.shutdown().await;

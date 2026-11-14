@@ -342,7 +342,8 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
         // No commit may land while the file is copied.
         let mut w = store.writer();
         let lsn = store.checkpoint_locked(&mut w, Some(0))?;
-        fs::copy(store.dir.join(FILE), &local).map_err(io)?;
+        // Through the store's own handle: Windows lets no other handle read the locked file.
+        store.pages.copy_file_to(&local)?;
         lsn
     };
     let name = format!("snapshots/{lsn:020}.db");
