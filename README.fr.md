@@ -139,11 +139,13 @@ L'ancien fichier reste à côté du nouveau sous le nom `nuage.redb.imported` : 
 vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version suit dans
 l'instant : la restauration suivante ne passe plus par l'import. Juste avant, la sauvegarde
 de l'ancienne version (son manifeste, son instantané, ses segments de journal et son en-tête
-de chiffrement) est copiée sous `before-import/` dans l'emplacement de sauvegarde de chaque
-base, où rien ne la purge. Revenir en arrière, c'est restaurer depuis là : un répertoire de
-données vide, et `before-import` (de la base, `apps/<nom>/before-import` pour une
-application) pris comme emplacement de sauvegarde. Supprimez-la une fois vos données
-vérifiées.
+de chiffrement) est copiée sous `before-import/` dans l'emplacement de sauvegarde, où rien
+ne la purge : la base du serveur dans `before-import/`, chaque application dans
+`before-import/apps/<nom>/`, la forme de l'emplacement de sauvegarde lui-même. Revenir en
+arrière, c'est démarrer l'ancienne version sur un répertoire de données vide avec
+`before-import` comme emplacement de sauvegarde (`NUAGE_BACKUP_S3_PREFIX` ou
+`NUAGE_BACKUP_DIR` suivi de `before-import/`) : elle y trouve chaque application. Cette
+version restaure aussi depuis là. Supprimez-la une fois vos données vérifiées.
 
 La lecture de l'ancien fichier est la fonctionnalité Cargo `import-redb`, active par défaut :
 le serveur l'a. Une application qui embarque le moteur (`default-features = false`, avec ou

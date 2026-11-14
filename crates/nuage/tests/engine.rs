@@ -629,3 +629,35 @@ async fn early_stop_through_an_index_gives_the_same_rows() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `LIMIT` stops the reading early only when no aggregate needs every
+/// row, wherever the aggregate stands in the projection; a limit as large as
+/// can be, with an offset, is a limit all the same.
+#[tokio::test]
+async fn a_limit_does_not_cut_what_an_aggregate_counts() {
+    use memoire_orm::ast::{Projection, SelectAst};
+    use memoire_orm::{BinOp, Expr, count_all};
+    let dir = temp_dir("limit");
+    let db = Embedded::open_with(&dir, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+    db.create_table::<Item>().await.unwrap();
+    // More rows than are read at once.
+    let tx = db.begin_now().unwrap();
+    for n in 0..3000 {
+        tx.sql(
+            "INSERT INTO items (code, group_no, payload, score) VALUES (?, ?, 'p', 0.5)",
+            &[format!("c{n}").into(), (n % 100).into()],
+        )
+        .unwrap();
+    }
+    tx.commit_now().unwrap();
+    let mut counted = SelectAst::new(Item::SCHEMA);
+    counted.projection = Projection::Exprs(vec![Expr::binary(BinOp::Add, count_all(), Expr::Value(Value::I64(2)))]);
+    counted.limit = Some(1);
+    assert_eq!(db.fetch_rows(Query::Select(&counted)).unwrap(), vec![vec![Value::I64(3002)]]);
+    let mut rest = SelectAst::new(Item::SCHEMA);
+    rest.limit = Some(u64::MAX);
+    rest.offset = Some(2990);
+    assert_eq!(db.fetch_rows(Query::Select(&rest)).unwrap().len(), 10);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

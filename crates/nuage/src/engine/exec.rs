@@ -701,9 +701,11 @@ fn pushdown<'e>(
             if values.iter().any(|v| v.is_null()) {
                 return Ok(Some(Pushed { keys: Vec::new(), whole: None }));
             }
-            // The whole filter: every conjunct pins a column of its own, and the index has them all.
+            // The whole filter: every conjunct pins a column of its own, and the index has as
+            // many. Each row is held to every conjunct, whatever the index lists (it may name
+            // a column twice, and then stands for fewer of them).
             let whole = (pinned == parts.len() && pins.len() == pinned && ix.columns.len() == pinned)
-                .then(|| ix.columns.iter().map(|c| Pin::new(pins[c.as_str()].1, vec![pins[c.as_str()].0])).collect());
+                .then(|| pins.values().map(|&(v, at)| Pin::new(at, vec![v])).collect());
             Ok(Some(Pushed { keys: ctx.index_lookup(meta, i, &values)?, whole }))
         }
         None => Ok(None),
@@ -862,8 +864,12 @@ fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
         }
     }
     let Some(meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    // An index on exactly the pinned columns: each of them, and nothing else.
     let Some(i) = meta.indexes.iter().position(|ix| {
-        ix.live() && ix.columns.len() == pins.len() && ix.columns.iter().all(|c| pins.contains_key(c.as_str()))
+        ix.live()
+            && ix.columns.len() == pins.len()
+            && pins.keys().all(|p| ix.columns.iter().any(|c| c == p))
+            && ix.columns.iter().all(|c| pins.contains_key(c.as_str()))
     }) else {
         return Ok(None);
     };
@@ -955,7 +961,7 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                 && ast.group_by.is_empty()
                 && ast.having.is_none()
                 && !ast.distinct
-                && !matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(|x| matches!(x, Expr::Aggregate { .. })));
+                && !matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(Expr::has_aggregate));
             let mut tables = side.clone();
             for (i, schema) in ast.tables().enumerate() {
                 if tables.contains(schema.name) && !side_schemas.iter().any(|s| s.name == schema.name) {
@@ -981,7 +987,7 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                 let whole = own.len() == parts.len();
                 let stop = match (single && whole, ast.limit) {
                     (true, Some(limit)) => {
-                        let n = (limit + ast.offset.unwrap_or(0)) as usize;
+                        let n = limit.saturating_add(ast.offset.unwrap_or(0)) as usize;
                         if ast.order.is_empty() { Stop::First(n) } else { Stop::Best(ast.order.clone(), n) }
                     }
                     _ => Stop::Never,

@@ -619,3 +619,26 @@ fn writes_at_the_same_time_take_turns() {
     assert!(db.0.sql("UPDATE counters SET n = 0; INSERT INTO counters (name, n) VALUES ('hits', 1)", &[]).is_err());
     assert_eq!(db.rows("SELECT n FROM counters", &[]), json!([[total]]));
 }
+
+/// An index that names a column twice stands for that column alone: the
+/// other conditions of a filter are still looked at, for reads, counts and
+/// writes.
+#[test]
+fn an_index_that_repeats_a_column_does_not_stand_for_the_filter() {
+    let db = Db::open("repeat");
+    db.run(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, b TEXT);
+         CREATE INDEX t_aa ON t (a, a);
+         INSERT INTO t (id, a, b) VALUES (1, 'x', 'y'), (2, 'x', 'z'), (3, 'w', 'y')",
+        &[],
+    );
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = 'x' AND b = 'y'", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = ? AND b = ?", &[json!("x"), json!("z")]), json!([[2]]));
+    assert_eq!(db.rows("SELECT count(*) FROM t WHERE a = 'x' AND b = 'y'", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT count(*) FROM t WHERE a = 'x'", &[]), json!([[2]]));
+    assert_eq!(db.rows("SELECT id FROM t WHERE a = 'x' ORDER BY id", &[]), json!([[1], [2]]));
+    db.run("UPDATE t SET b = b || '!' WHERE a = 'x' AND b = 'y'", &[]);
+    assert_eq!(db.rows("SELECT id, b FROM t ORDER BY id", &[]), json!([[1, "y!"], [2, "z"], [3, "y"]]));
+    assert_eq!(db.rows("DELETE FROM t WHERE a = 'x' AND b = 'y!' RETURNING id", &[]), json!([[1]]));
+    assert_eq!(db.rows("SELECT id FROM t ORDER BY id", &[]), json!([[2], [3]]));
+}
