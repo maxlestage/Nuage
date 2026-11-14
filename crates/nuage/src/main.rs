@@ -45,11 +45,32 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("apps") {
         return apps(std::env::args().skip(2).collect());
     }
+    if matches!(std::env::args().nth(1).as_deref(), Some("help" | "--help" | "-h")) {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("version" | "--version" | "-V")) {
         println!("nuage {}", nuage::VERSION);
         return ExitCode::SUCCESS;
     }
-    let config = match nuage::config::from_env() {
+    // `nuage --env-file <file>` (or NUAGE_ENV_FILE): the settings in a file, as the
+    // services of the installers start it on macOS and Windows.
+    let args: Vec<String> = std::env::args().collect();
+    let env_file = match args.iter().position(|a| a == "--env-file") {
+        Some(i) => match args.get(i + 1) {
+            Some(path) => Some(path.clone()),
+            None => {
+                eprintln!("usage: nuage --env-file <file>");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => std::env::var("NUAGE_ENV_FILE").ok().filter(|v| !v.trim().is_empty()),
+    };
+    let config = match &env_file {
+        Some(path) => nuage::config::from_env_file(std::path::Path::new(path.trim())),
+        None => nuage::config::from_env(),
+    };
+    let config = match config {
         Ok(c) => c,
         Err(e) => {
             eprintln!("nuage: configuration error: {e}");
@@ -86,9 +107,22 @@ fn main() -> ExitCode {
         if let Some(kind) = engine.encryption() {
             log(&format!("everything is encrypted ({}), with the {kind} of NUAGE_ENCRYPTION_KEY", nuage::crypto::SCHEME));
         }
+        if let Some(path) = &env_file {
+            log(&format!("settings read from {path}"));
+        }
         match &backup {
             Some(target) => {
                 log(&format!("backups go to {target}; an empty data directory is restored from there at startup"));
+                if let Some(folder) = &config.backup_dir
+                    && nuage::config::same_disk(&config.data_dir, folder) == Some(true)
+                {
+                    log(&format!(
+                        "warning: the backups ({}) are on the same disk as the data: if this disk fails, both are lost. \
+                         Put NUAGE_BACKUP_DIR on another disk (and plug it in: an external disk that is not plugged in \
+                         leaves its folder on this disk), or back up to S3 (NUAGE_BACKUP_S3_*)",
+                        folder.display()
+                    ));
+                }
                 if engine.backup_status().restored {
                     log("the data directory was empty: restored from the backup");
                 }
@@ -261,3 +295,14 @@ fn apps(args: Vec<String>) -> ExitCode {
         }
     }
 }
+
+const HELP: &str = "Nuage DB: a database server, configured by environment variables (see the README).
+
+usage: nuage                              start the server
+       nuage --env-file <file>            start it with the settings of <file> (KEY=value lines;
+                                          the environment wins), as NUAGE_ENV_FILE does
+       nuage genkey                       a new key (NUAGE_ENCRYPTION_KEY, NUAGE_ADMIN_TOKEN)
+       nuage check [url] [token]          does a connection work? (NUAGE_URL, NUAGE_TOKEN)
+       nuage apps create <name> [desc]    a new application on a server (NUAGE_URL, NUAGE_ADMIN_TOKEN)
+       nuage apps list                    the applications of a server
+       nuage version                      the version";

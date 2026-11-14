@@ -15,7 +15,8 @@
 //! | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
 //! | `NUAGE_CACHE_MB` | page cache of each application's database, in MiB, or `auto` | `auto`: an eighth of the memory (8 to 512 MiB) |
-//! | `NUAGE_BACKUP_DIR` | back up to this directory | |
+//! | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); a variable of the environment wins over the file | none |
+//! | `NUAGE_BACKUP_DIR` | back up to this directory (another disk: a backup on the data's disk dies with it) | |
 //! | `NUAGE_BACKUP_S3_BUCKET` | back up to this S3 bucket | |
 //! | `NUAGE_BACKUP_S3_ENDPOINT` | S3 endpoint URL | `https://s3.<region>.amazonaws.com` |
 //! | `NUAGE_BACKUP_S3_REGION` | S3 region | `us-east-1` |
@@ -61,6 +62,8 @@ pub struct Config {
     pub server: ServerOptions,
     /// Requests to its own address, so the host does not put it to sleep.
     pub keep_awake: Option<crate::keepawake::KeepAwake>,
+    /// The backup folder (`NUAGE_BACKUP_DIR`), if the backups go to one.
+    pub backup_dir: Option<PathBuf>,
 }
 
 /// The data directory and the engine settings, through `var`: `NUAGE_DATA_DIR`,
@@ -175,6 +178,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         None => None,
     };
     Ok(Config {
+        backup_dir: get("NUAGE_BACKUP_DIR").map(PathBuf::from),
         keep_awake,
         port,
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
@@ -191,6 +195,83 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
 #[cfg(feature = "server")]
 pub fn from_env() -> Result<Config> {
     from_vars(|k| std::env::var(k).ok())
+}
+
+/// [`from_vars`] with the process environment, then the settings file
+/// `path`: a variable of the environment wins over the file. What
+/// `nuage --env-file <file>` and `NUAGE_ENV_FILE` read: the services that the
+/// installers set up on macOS and Windows start the server so.
+#[cfg(feature = "server")]
+pub fn from_env_file(path: &std::path::Path) -> Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::Validation(format!("cannot read the settings file {}: {e}", path.display())))?;
+    let file: std::collections::HashMap<String, String> =
+        parse_env_file(&text).map_err(|e| Error::Validation(format!("{}: {e}", path.display())))?.into_iter().collect();
+    from_vars(|k| std::env::var(k).ok().or_else(|| file.get(k).cloned()))
+}
+
+/// The variables of a settings file: `KEY=value` lines, `#` comments and blank
+/// lines, an optional `export ` before the key, and the value as it is or
+/// between `"` or `'` (what systemd's `EnvironmentFile`, Docker's `--env-file`
+/// and a shell's `.` read alike). Later lines win.
+pub fn parse_env_file(text: &str) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut vars = Vec::new();
+    // A byte order mark, as Windows editors and PowerShell 5 write one.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {}: `KEY=value` expected", i + 1));
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("line {}: `{key}` is not a variable name", i + 1));
+        }
+        let value = value.trim();
+        let value = [('"', '"'), ('\'', '\'')]
+            .iter()
+            .find_map(|&(a, b)| value.strip_prefix(a)?.strip_suffix(b))
+            .filter(|_| value.len() >= 2)
+            .unwrap_or(value);
+        vars.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(vars)
+}
+
+/// Are `a` and `b` on the same disk? Each is taken at its closest existing
+/// folder. `None` when it cannot tell. A backup on the disk of the data dies
+/// with it, and an external disk not plugged in leaves its mount point on the
+/// computer's own disk: the server says so at startup.
+pub fn same_disk(a: &std::path::Path, b: &std::path::Path) -> Option<bool> {
+    fn existing(p: &std::path::Path) -> Option<PathBuf> {
+        let p = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().ok()?.join(p) };
+        p.ancestors().find(|a| a.exists()).map(std::path::Path::to_path_buf)
+    }
+    let (a, b) = (existing(a)?, existing(b)?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(a).ok()?.dev() == std::fs::metadata(b).ok()?.dev())
+    }
+    #[cfg(windows)]
+    {
+        let root = |p: PathBuf| -> Option<String> {
+            match std::fs::canonicalize(p).ok()?.components().next()? {
+                std::path::Component::Prefix(prefix) => Some(prefix.as_os_str().to_string_lossy().to_uppercase()),
+                _ => None,
+            }
+        };
+        Some(root(a)? == root(b)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        None
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -225,6 +306,50 @@ mod tests {
         assert_eq!(key.engine.encryption.unwrap().kind(), "key");
         assert!(from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "short".to_owned())).is_err());
         assert!(from_vars(|k| (k == "NUAGE_BACKUP_S3_BUCKET").then(|| "b".to_owned())).is_err(), "credentials needed");
+    }
+
+    #[test]
+    fn settings_files() {
+        let vars = parse_env_file(
+            "# Nuage DB\n\nPORT=9090\nexport NUAGE_NAME = maison \nNUAGE_ADMIN_PASSWORD=\"deux mots\"\n\
+             NUAGE_BACKUP_DIR='/Volumes/Sauvegarde/nuage'\nNUAGE_TOKEN=a=b\nPORT=9091\nEMPTY=\nQUOTE=\"\n",
+        )
+        .unwrap();
+        let get = |k: &str| vars.iter().rev().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("PORT"), Some("9091"), "the last line wins");
+        assert_eq!(get("NUAGE_NAME"), Some("maison"));
+        assert_eq!(get("NUAGE_ADMIN_PASSWORD"), Some("deux mots"));
+        assert_eq!(get("NUAGE_BACKUP_DIR"), Some("/Volumes/Sauvegarde/nuage"));
+        assert_eq!(get("NUAGE_TOKEN"), Some("a=b"));
+        assert_eq!((get("EMPTY"), get("QUOTE")), (Some(""), Some("\"")));
+        assert!(parse_env_file("PORT 9090").unwrap_err().contains("line 1"));
+        let windows =
+            parse_env_file("\u{feff}# Nuage DB\r\nPORT=9090\r\nNUAGE_BACKUP_DIR=E:\\Sauvegarde\\nuage\r\n").unwrap();
+        assert_eq!(
+            windows,
+            [("PORT".into(), "9090".into()), ("NUAGE_BACKUP_DIR".into(), "E:\\Sauvegarde\\nuage".into())]
+        );
+        assert!(parse_env_file("ok=1\nBAD-KEY=1").unwrap_err().contains("line 2"));
+
+        let dir = std::env::temp_dir().join(format!("nuage-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nuage.env");
+        std::fs::write(&file, "PORT=7070\nNUAGE_BACKUP_DIR=/tmp/sauvegarde\nNUAGE_PUBLIC_STATUS=true\n").unwrap();
+        let c = from_env_file(&file).unwrap();
+        assert_eq!((c.port, c.server.public_status), (7070, true));
+        assert_eq!(c.backup_dir, Some(PathBuf::from("/tmp/sauvegarde")));
+        assert!(from_env_file(&dir.join("absent.env")).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(&file, "PORT=x").unwrap();
+        assert!(from_env_file(&file).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn same_disk_or_not() {
+        let tmp = std::env::temp_dir();
+        assert_eq!(same_disk(&tmp, &tmp.join("not/yet/made")), Some(true), "a folder to come is where its parent is");
+        #[cfg(target_os = "linux")]
+        assert_eq!(same_disk(&tmp, std::path::Path::new("/proc")), Some(false), "/proc is a disk of its own");
     }
 
     #[test]

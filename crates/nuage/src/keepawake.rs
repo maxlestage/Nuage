@@ -210,7 +210,8 @@ pub async fn list_apps(url: &str, admin_token: &str) -> std::result::Result<Stri
     Ok(apps
         .iter()
         .map(|a| {
-            let tokens = a["tokens"].as_array().map_or(0, Vec::len);
+            // The first application also opens with NUAGE_TOKEN, which is not in its list.
+            let tokens = a["tokens"].as_array().map_or(0, Vec::len) + usize::from(a["env_token"] == true);
             let description = a["description"].as_str().unwrap_or_default();
             let mut line = format!("{}\t{tokens} token(s)", a["name"].as_str().unwrap_or_default());
             if !description.is_empty() {

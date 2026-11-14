@@ -1376,6 +1376,7 @@ async fn management_api() {
     assert!(NuageDb::connect(&running.url(), &blog_token).await.is_ok());
     let listed = nuage::keepawake::list_apps(&running.url(), &admin).await.unwrap();
     assert!(listed.contains("blog\t1 token(s)\tLe blog"), "{listed}");
+    assert!(listed.starts_with("nuage\t1 token(s)"), "NUAGE_TOKEN counts: {listed}");
     let refused = nuage::keepawake::create_app(&running.url(), "wrong", "x", "").await.unwrap_err();
     assert!(refused.contains("NUAGE_ADMIN_TOKEN"), "{refused}");
     let twice = nuage::keepawake::create_app(&running.url(), &admin, "blog", "").await.unwrap_err();
