@@ -873,10 +873,10 @@ impl<'a> Runner<'a> {
         let mut sources: Vec<Option<Vec<Vec<Value>>>> = Vec::new();
         let refs: Vec<(&TableRef, Option<&Join>)> =
             core.from.iter().map(|f| (f, None)).chain(core.joins.iter().map(|j| (&j.table, Some(j)))).collect();
-        if refs.is_empty() {
-            if let Some(rows) = self.set_returning_core(core, &scope, outer, used)? {
-                return Ok(rows);
-            }
+        if refs.is_empty()
+            && let Some(rows) = self.set_returning_core(core, &scope, outer, used)?
+        {
+            return Ok(rows);
         }
         for (t, _) in &refs {
             match &t.source {
