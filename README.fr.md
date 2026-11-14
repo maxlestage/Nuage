@@ -357,6 +357,7 @@ sauvegardes.
 | **Linux** (Debian, Ubuntu, Fedora, Rocky, Alpine, Raspberry Pi OS..., x86_64 ou ARM64, dès 512 Mio) | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | systemd `nuage` |
 | **macOS** (Apple silicon ou Intel), dans le Terminal | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | launchd, sous votre utilisateur |
 | **Windows** 10, 11, Server, dans PowerShell **en administrateur** | `irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 \| iex` | tâche planifiée `Nuage DB`, en SYSTEM |
+| **cargo**, partout où tourne Rust | `cargo install --locked --git https://github.com/maxlestage/Nuage nuage` (voir [Avec cargo](#avec-cargo)) | aucun : donnez-le à l'installateur |
 | **Docker**, partout | `docker compose up -d` dans ce dépôt (réglages dans `.env`) | le conteneur |
 
 Chacune installe le binaire `nuage` (compilé en statique : aucune dépendance), crée le
@@ -396,6 +397,38 @@ SYSTEM, lisible des seuls administrateurs, avec une règle de pare-feu pour le r
   [page des versions](https://github.com/maxlestage/Nuage/releases) ; `nuage --env-file nuage.env`
   démarre le serveur avec les réglages d'un fichier (lignes `CLÉ=valeur` ; l'environnement
   l'emporte).
+
+### Avec cargo
+
+Avec Rust installé ([rustup.rs](https://rustup.rs)), sur Linux, macOS ou Windows :
+
+```bash
+cargo install --locked --git https://github.com/maxlestage/Nuage nuage
+nuage --version
+```
+
+Le binaire `nuage` arrive dans `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` sur Windows), avec
+le site et le tableau de bord en direct. Un serveur plus léger, sans eux (`/` est alors une
+petite page d'accueil ; la console, l'API et tout le reste demeurent) :
+`cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
+Une version précise : `--tag v0.4.2`. Mise à jour : la même commande, avec `--force`.
+
+`cargo install` ne pose que le binaire : ni service, ni réglages, ni sauvegardes. Donnez-le à
+l'installateur, qui fait le reste (réglages, sauvegardes, service lancé avec l'ordinateur) :
+
+```bash
+# Linux, macOS : `command -v nuage` le trouve avant sudo, dont le PATH n'a pas ~/.cargo/bin
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo NUAGE_BINARY="$(command -v nuage)" bash
+```
+
+```powershell
+# Windows, PowerShell en administrateur
+$env:NUAGE_BINARY = (Get-Command nuage).Source; irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 | iex
+```
+
+Ou lancez-le vous-même, avec un fichier de réglages : `nuage genkey` crée la clé,
+`nuage --env-file nuage.env` démarre le serveur (voir [`nuage.env.example`](nuage.env.example)).
+Sur Linux et macOS, `NUAGE_FROM_SOURCE=1` fait compiler l'installateur lui-même avec cargo.
 
 ### Sauvegardes : vous choisissez où
 

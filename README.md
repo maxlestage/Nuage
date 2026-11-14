@@ -353,6 +353,7 @@ with the computer, and asks where the backups go.
 | **Linux** (Debian, Ubuntu, Fedora, Rocky, Alpine, Raspberry Pi OS..., x86_64 or ARM64, from 512 MiB) | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | systemd `nuage` |
 | **macOS** (Apple silicon or Intel), in Terminal | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | launchd, as your user |
 | **Windows** 10, 11, Server, in PowerShell **as administrator** | `irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 \| iex` | scheduled task `Nuage DB`, as SYSTEM |
+| **cargo**, anywhere Rust runs | `cargo install --locked --git https://github.com/maxlestage/Nuage nuage` (see [With cargo](#with-cargo)) | none: hand it to the installer |
 | **Docker**, anywhere | `docker compose up -d` in this repository (settings in `.env`) | the container |
 
 Each one installs the `nuage` binary (a static build: no dependency), generates the settings
@@ -389,6 +390,38 @@ administrators only, with a firewall rule for the local network.
 - **By hand**: binaries for Linux, macOS and Windows are on the
   [releases page](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
   starts the server with the settings of a file (`KEY=value` lines; the environment wins).
+
+### With cargo
+
+With Rust installed ([rustup.rs](https://rustup.rs)), on Linux, macOS or Windows:
+
+```bash
+cargo install --locked --git https://github.com/maxlestage/Nuage nuage
+nuage --version
+```
+
+The `nuage` binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows), with the
+website and the live dashboard. A lighter server, without them (`/` is then a small home page;
+the console, the API and everything else stay):
+`cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
+A release: `--tag v0.4.2`. Upgrade: the same command, with `--force`.
+
+`cargo install` only puts the binary there: no service, no settings, no backups. Hand it to
+the installer, which does the rest (settings, backups, service started with the computer):
+
+```bash
+# Linux, macOS: `command -v nuage` finds it before sudo, whose PATH has no ~/.cargo/bin
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo NUAGE_BINARY="$(command -v nuage)" bash
+```
+
+```powershell
+# Windows, PowerShell as administrator
+$env:NUAGE_BINARY = (Get-Command nuage).Source; irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 | iex
+```
+
+Or start it yourself, with a settings file: `nuage genkey` makes the key,
+`nuage --env-file nuage.env` starts the server (see [`nuage.env.example`](nuage.env.example)).
+On Linux and macOS, `NUAGE_FROM_SOURCE=1` makes the installer itself build with cargo.
 
 ### Backups: you choose where
 
