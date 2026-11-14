@@ -304,7 +304,21 @@ for ($i = 0; $i -lt 30; $i++) {
         break
     } catch { Start-Sleep -Seconds 1 }
 }
-if (-not $running) { Die "the server does not answer: Get-Content -Tail 50 '$Log'" }
+if (-not $running) {
+    # Say why, here: what the task did, and what the server wrote.
+    $info = Get-ScheduledTaskInfo -TaskName $Task -ErrorAction SilentlyContinue
+    $state = (Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue).State
+    Warn ("the scheduled task '{0}': state {1}, last result 0x{2:X}, last run {3}" -f $Task, $state, $info.LastTaskResult, $info.LastRunTime)
+    $process = Get-Process -Name nuage -ErrorAction SilentlyContinue
+    Warn ("nuage.exe is {0}" -f $(if ($process) { "running (pid $($process.Id -join ', '))" } else { 'not running' }))
+    if (Test-Path $Log) {
+        Warn "the end of $Log :"
+        Get-Content -Tail 40 $Log | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Warn "$Log was not written: the task did not start the server"
+    }
+    Die "the server does not answer on port $Port (see above)"
+}
 
 $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress
