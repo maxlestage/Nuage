@@ -94,8 +94,30 @@
   color-scheme: dark;
 }
 
+/* Light: chosen (data-theme, from the theme buttons), or the device's when none is. */
+:root[data-theme="light"] {
+  --bg: #f5f7fc;
+  --bg-elev: #ffffff;
+  --surface: rgba(30, 41, 80, 0.035);
+  --surface-2: rgba(30, 41, 80, 0.07);
+  --border: rgba(30, 41, 80, 0.11);
+  --border-strong: rgba(30, 41, 80, 0.2);
+  --text: #0f1426;
+  --text-muted: #46506e;
+  --text-dim: #5f6987;
+  --accent: #0369a1;
+  --ok: #047857;
+  --warn: #b45309;
+  --err: #b91c1c;
+  --grad-text: linear-gradient(90deg, #0284c7, #4f46e5, #9333ea);
+  --shadow: 0 24px 60px -30px rgba(30, 40, 90, 0.3);
+  --glow-a: rgba(14, 165, 233, 0.14);
+  --glow-b: rgba(124, 58, 237, 0.1);
+  color-scheme: light;
+}
+
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     --bg: #f5f7fc;
     --bg-elev: #ffffff;
     --surface: rgba(30, 41, 80, 0.035);
@@ -384,6 +406,41 @@ h3 {
 }
 
 .lang-btn.active {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* Theme: light, dark, as the device. The one in use stands out. */
+.theme-switch {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.theme-btn {
+  min-width: 34px;
+  min-height: 32px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font: 600 0.95rem/1 var(--font-sans);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.theme-btn:hover {
+  color: var(--text);
+}
+
+:root:not([data-theme]) .theme-btn[data-set-theme="auto"],
+:root[data-theme="light"] .theme-btn[data-set-theme="light"],
+:root[data-theme="dark"] .theme-btn[data-set-theme="dark"] {
   background: var(--surface-2);
   color: var(--text);
 }

@@ -103,6 +103,36 @@ pub fn lang_switch(route: Route) -> Element {
     ))
 }
 
+/// Light, dark, or as the device: stored in the browser (no cookie), applied before the
+/// first paint by [`THEME_SCRIPT`].
+pub fn theme_switch(lang: Lang) -> Element {
+    let (group, light, dark, auto) = match lang {
+        Lang::Fr => ("Thème", "Clair", "Sombre", "Comme l'appareil"),
+        Lang::Es => ("Tema", "Claro", "Oscuro", "Como el dispositivo"),
+        _ => ("Theme", "Light", "Dark", "As the device"),
+    };
+    let button = |code: &'static str, glyph: &'static str, label: &'static str| {
+        el("button")
+            .class("theme-btn")
+            .attr("type", "button")
+            .attr("data-set-theme", code)
+            .attr("title", label)
+            .attr("aria-label", label)
+            .text(glyph)
+    };
+    div()
+        .class("theme-switch")
+        .attr("role", "group")
+        .attr("aria-label", group)
+        .child(button("light", "☀", light))
+        .child(button("dark", "☾", dark))
+        .child(button("auto", "A", auto))
+}
+
+/// Applies the theme stored in the browser before the page paints, and handles the
+/// theme buttons (the Content-Security-Policy allows it by its hash).
+pub const THEME_SCRIPT: &str = r#"(function(){var d=document.documentElement,k="nuage-theme";try{var t=localStorage.getItem(k);if(t==="light"||t==="dark")d.setAttribute("data-theme",t)}catch(e){}document.addEventListener("click",function(e){var b=e.target.closest&&e.target.closest("[data-set-theme]");if(!b)return;var t=b.getAttribute("data-set-theme");try{t==="auto"?localStorage.removeItem(k):localStorage.setItem(k,t)}catch(x){}t==="auto"?d.removeAttribute("data-theme"):d.setAttribute("data-theme",t)})})();"#;
+
 /// Eyebrow, title and subtitle of a section.
 pub fn section_head(eyebrow: &str, title: &str, subtitle: Option<&str>, id: &str) -> Element {
     div()
@@ -161,6 +191,7 @@ fn navbar(route: Route) -> Element {
             .child(
                 div()
                     .class("nav-actions")
+                    .child(theme_switch(lang))
                     .child(lang_switch(route))
                     .child(a().class("btn btn-ghost btn-sm").href("/admin").text(tx.nav_console))
                     .child(
@@ -191,6 +222,7 @@ fn navbar(route: Route) -> Element {
                                     .child(a().class("menu-link").href("/admin").text(tx.nav_console)),
                             )
                             .child(lang_switch(route))
+                            .child(theme_switch(lang))
                             .child(
                                 a().class("btn btn-primary")
                                     .href(doc_href(lang, "quick-start"))
@@ -407,6 +439,7 @@ pub fn base_document(site: &Site, body: Node, lang: Lang) -> Document {
             ),
             author = AUTHOR
         ))
+        .head(format!("<script>{THEME_SCRIPT}</script>"))
         .head(pwa::head_tags(lang))
         .service_worker("/sw.js");
     if assets.has_bundle() {

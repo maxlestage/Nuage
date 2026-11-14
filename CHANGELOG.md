@@ -2,6 +2,16 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Dark theme
+
+- The console has a real dark theme (deep night blue, sky-blue accents, Nuage DB's
+  gradient), and a **Light · Dark · Auto** switch next to the languages: the choice is kept (a
+  cookie), and Auto follows the device. Before, the dark colours only came with a dark device.
+- The website has the same switch (☀ ☾ A): the choice stays in the browser (no cookie), and a
+  small script applies it before the page paints.
+
 ## 0.4.0 (2026-11-13)
 
 ### Does my connection work?
