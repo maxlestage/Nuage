@@ -51,6 +51,36 @@ pub trait BackupStore: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
     /// Removes an object (no error when it does not exist).
     fn delete(&self, name: &str) -> Result<()>;
+
+    /// Stores the object `name` of what is set aside under `dir`
+    /// (`before-import/`): by default the object `dir` + `name`. A store that
+    /// is one part of a larger one ([`PrefixedStore`]) sets aside under `dir`
+    /// of the whole, at its own place there: `dir`, taken as a backup
+    /// location, then has the shape of the location itself, each
+    /// application's backup where a server looks for it.
+    fn put_aside(&self, dir: &str, name: &str, data: &[u8]) -> Result<()> {
+        self.put(&format!("{dir}{name}"), data)
+    }
+    /// Reads an object set aside under `dir` (see [`put_aside`](Self::put_aside)).
+    fn get_aside(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get(&format!("{dir}{name}"))
+    }
+    /// Names (without `dir`) of the objects set aside under `dir` that start with `prefix`.
+    fn list_aside(&self, dir: &str, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list(&format!("{dir}{prefix}"))?
+            .into_iter()
+            .filter_map(|n| n.strip_prefix(dir).map(str::to_owned))
+            .collect())
+    }
+    /// Removes an object set aside under `dir`.
+    fn delete_aside(&self, dir: &str, name: &str) -> Result<()> {
+        self.delete(&format!("{dir}{name}"))
+    }
+    /// Where what is set aside under `dir` is, as [`describe`](Self::describe) tells a place.
+    fn describe_aside(&self, dir: &str) -> String {
+        format!("{}/{}", self.describe().trim_end_matches('/'), dir.trim_end_matches('/'))
+    }
 }
 
 /// Backups in a directory (another disk, a mounted network volume...).
@@ -183,19 +213,48 @@ impl BackupStore for PrefixedStore {
     fn delete(&self, name: &str) -> Result<()> {
         self.inner.delete(&format!("{}{name}", self.prefix))
     }
+
+    // Aside under `dir` of the whole store, at this part's place there.
+    fn put_aside(&self, dir: &str, name: &str, data: &[u8]) -> Result<()> {
+        self.inner.put_aside(dir, &format!("{}{name}", self.prefix), data)
+    }
+
+    fn get_aside(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_aside(dir, &format!("{}{name}", self.prefix))
+    }
+
+    fn list_aside(&self, dir: &str, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list_aside(dir, &format!("{}{prefix}", self.prefix))?
+            .into_iter()
+            .filter_map(|n| n.strip_prefix(&self.prefix).map(str::to_owned))
+            .collect())
+    }
+
+    fn delete_aside(&self, dir: &str, name: &str) -> Result<()> {
+        self.inner.delete_aside(dir, &format!("{}{name}", self.prefix))
+    }
+
+    fn describe_aside(&self, dir: &str) -> String {
+        format!("{}/{}", self.inner.describe_aside(dir), self.prefix.trim_end_matches('/'))
+    }
 }
 
 /// Removes every object of a backup (a deleted application's).
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
-    for base in ["", BEFORE_IMPORT] {
-        for prefix in ["snapshots/", "wal/"] {
-            for name in backup.list(&format!("{base}{prefix}"))? {
-                backup.delete(&name)?;
-            }
+    for prefix in ["snapshots/", "wal/"] {
+        for name in backup.list(prefix)? {
+            backup.delete(&name)?;
         }
-        backup.delete(&format!("{base}{}", crate::crypto::HEADER_FILE))?;
-        backup.delete(&format!("{base}{MANIFEST}"))?;
+        for name in backup.list_aside(BEFORE_IMPORT, prefix)? {
+            backup.delete_aside(BEFORE_IMPORT, &name)?;
+        }
+    }
+    for name in [crate::crypto::HEADER_FILE, MANIFEST] {
+        backup.delete(name)?;
+        backup.delete_aside(BEFORE_IMPORT, name)?;
     }
     Ok(())
 }
@@ -212,10 +271,13 @@ pub(crate) const BEFORE_IMPORT: &str = "before-import/";
 /// `before-import/`, where nothing prunes them. Whatever happens to the data
 /// from then on, the database as that version left it can be restored (by
 /// that version, or by this one) from `before-import/` taken as the backup
-/// location. To delete once the data has been checked.
+/// location: a server's applications are set aside under it where a server
+/// looks for them (`before-import/apps/<name>/`, see
+/// [`BackupStore::put_aside`]). To delete once the data has been checked.
 ///
 /// Returns `true` when it copied something: `false` when the backup is of
-/// this version, or was set aside before. `encrypted`: the data directory is
+/// this version, or this very backup was set aside before (one set aside
+/// earlier, of an older state, gives way). `encrypted`: the data directory is
 /// encrypted; a backup in clear of a directory encrypted since is not kept.
 pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bool> {
     let Some(manifest) = backup.get(MANIFEST)? else { return Ok(false) };
@@ -225,28 +287,29 @@ pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bo
     if !name.ends_with(".redb") || was_encrypted != encrypted {
         return Ok(false);
     }
-    let aside = |object: &str| format!("{BEFORE_IMPORT}{object}");
+    let aside = |object: &str, data: &[u8]| backup.put_aside(BEFORE_IMPORT, object, data);
     // The manifest goes last: it is there only when everything it needs is.
-    if backup.get(&aside(MANIFEST))?.is_some() {
+    // Another one is of a backup set aside earlier: this one takes its place.
+    if backup.get_aside(BEFORE_IMPORT, MANIFEST)?.as_deref() == Some(manifest.as_slice()) {
         return Ok(false);
     }
     let lsn = j.get("lsn").and_then(Json::as_u64).unwrap_or(0);
     let snapshot = backup.get(name)?.ok_or_else(|| storage_err(format!("backup snapshot `{name}` is missing")))?;
-    backup.put(&aside(name), &snapshot)?;
+    aside(name, &snapshot)?;
     drop(snapshot);
     for segment in backup.list("wal/")? {
         // The segments a restore of that snapshot reads (see `restore`).
         if segment_lsn(segment.trim_start_matches("wal/")).is_some_and(|first| first > lsn)
             && let Some(bytes) = backup.get(&segment)?
         {
-            backup.put(&aside(&segment), &bytes)?;
+            aside(&segment, &bytes)?;
         }
     }
     if was_encrypted {
         let header = backup.get(HEADER_FILE)?.ok_or_else(|| storage_err(format!("the backup has no {HEADER_FILE}")))?;
-        backup.put(&aside(HEADER_FILE), &header)?;
+        aside(HEADER_FILE, &header)?;
     }
-    backup.put(&aside(MANIFEST), &manifest)?;
+    aside(MANIFEST, &manifest)?;
     Ok(true)
 }
 
@@ -294,7 +357,9 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
     let manifest = json!({ "snapshot": name, "lsn": lsn, "at": now_millis(), "encrypted": header.is_some() });
     backup.put(MANIFEST, manifest.to_string().as_bytes())?;
     let mut snapshots = backup.list("snapshots/")?;
-    snapshots.sort();
+    // Oldest first; at the same place in the log, the one of an earlier
+    // version (`.redb`) before the one just written.
+    snapshots.sort_by_key(|n| (snapshot_lsn(n), n.ends_with(".db")));
     if snapshots.len() > keep.max(1) {
         let cut = snapshots.len() - keep.max(1);
         for old in &snapshots[..cut] {
@@ -383,4 +448,57 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
     fs::rename(&tmp, dir.join(file)).map_err(io)?;
     wal::sync_dir(dir);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The backup of an earlier version is set aside once; when that version
+    /// has run again since and gone further, its new backup takes the place of
+    /// the one set aside before.
+    #[test]
+    fn a_backup_set_aside_earlier_gives_way_to_a_later_one() {
+        let dir = std::env::temp_dir().join(format!("nuage-backup-aside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = DirectoryStore::new(&dir);
+        let old = |lsn: u64| {
+            let name = format!("snapshots/{lsn:020}.redb");
+            store.put(&name, format!("pages at {lsn}").as_bytes()).unwrap();
+            let manifest = json!({ "snapshot": name, "lsn": lsn, "at": 1, "encrypted": false }).to_string();
+            store.put(MANIFEST, manifest.as_bytes()).unwrap();
+            manifest.into_bytes()
+        };
+        let aside = |name: &str| store.get_aside(BEFORE_IMPORT, name).unwrap();
+        let first = old(5);
+        store.put(&format!("wal/{}", segment_name(3)), b"before the snapshot").unwrap();
+        store.put(&format!("wal/{}", segment_name(6)), b"after the snapshot").unwrap();
+        assert!(keep_aside(&store, false).unwrap());
+        assert_eq!(aside(MANIFEST), Some(first));
+        assert_eq!(aside("snapshots/00000000000000000005.redb"), Some(b"pages at 5".to_vec()));
+        assert_eq!(aside(&format!("wal/{}", segment_name(6))), Some(b"after the snapshot".to_vec()));
+        assert_eq!(aside(&format!("wal/{}", segment_name(3))), None, "a restore does not read it");
+        assert!(!keep_aside(&store, false).unwrap(), "the same backup: nothing to do");
+        // The earlier version ran again from there, and wrote more.
+        let second = old(9);
+        assert!(keep_aside(&store, false).unwrap());
+        assert_eq!(aside(MANIFEST), Some(second));
+        assert_eq!(aside("snapshots/00000000000000000009.redb"), Some(b"pages at 9".to_vec()));
+        // A backup of this version, or one in clear of data encrypted since: nothing to set aside.
+        assert!(!keep_aside(&store, true).unwrap());
+        let ours = json!({ "snapshot": "snapshots/00000000000000000012.db", "lsn": 12, "encrypted": false });
+        store.put(MANIFEST, ours.to_string().as_bytes()).unwrap();
+        assert!(!keep_aside(&store, false).unwrap());
+        // A part of the store sets aside under `before-import/` of the whole, at its own place.
+        let whole: Arc<dyn BackupStore> = Arc::new(store.clone());
+        let part = PrefixedStore::new(whole, "apps/shop/");
+        part.put_aside(BEFORE_IMPORT, MANIFEST, b"m").unwrap();
+        assert_eq!(store.get("before-import/apps/shop/manifest.json").unwrap(), Some(b"m".to_vec()));
+        assert_eq!(part.list_aside(BEFORE_IMPORT, "").unwrap(), [MANIFEST]);
+        assert!(part.describe_aside(BEFORE_IMPORT).ends_with("before-import/apps/shop"));
+        delete_all(&part).unwrap();
+        assert_eq!(store.get("before-import/apps/shop/manifest.json").unwrap(), None);
+        assert_eq!(aside(MANIFEST).map(|m| m.len() > 10), Some(true), "the others' stay");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

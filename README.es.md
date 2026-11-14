@@ -139,10 +139,13 @@ nuevo como `nuage.redb.imported`: bórralo cuando hayas comprobado tus datos. Si
 seguridad configuradas, una instantánea de esta versión sigue en un momento: la restauración
 siguiente ya no pasa por la importación. Justo antes, la copia de seguridad de la versión
 anterior (su manifiesto, su instantánea, sus segmentos de registro y su cabecera de cifrado)
-se copia bajo `before-import/` en la ubicación de copias de cada base, donde nada la purga.
-Volver atrás es restaurar desde ahí: un directorio de datos vacío, y `before-import` (de la
-base, `apps/<nombre>/before-import` para una aplicación) tomado como ubicación de copias.
-Bórrala cuando hayas comprobado tus datos.
+se copia bajo `before-import/` en la ubicación de copias, donde nada la purga: la base del
+servidor en `before-import/`, cada aplicación en `before-import/apps/<nombre>/`, la forma
+de la propia ubicación de copias. Volver atrás es arrancar la versión anterior sobre un
+directorio de datos vacío con `before-import` como ubicación de copias
+(`NUAGE_BACKUP_S3_PREFIX` o `NUAGE_BACKUP_DIR` seguido de `before-import/`): ahí encuentra
+cada aplicación. Esta versión también restaura desde ahí. Bórrala cuando hayas comprobado
+tus datos.
 
 La lectura del archivo antiguo es la funcionalidad Cargo `import-redb`, activa por defecto:
 el servidor la tiene. Una aplicación que integra el motor (`default-features = false`, con o

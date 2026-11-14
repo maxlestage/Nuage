@@ -32,8 +32,12 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   be opened). The old
   file is kept as `nuage.redb.imported`, and a snapshot of this version follows in the
   backup (opening does not wait for it). Before that snapshot, the backup of the earlier
-  version is copied whole under `before-import/`, where nothing prunes it: the database as
-  that version left it can be restored from there, by that version or by this one. This is the `import-redb` Cargo feature (on by default: the server has it), the
+  version is copied whole under `before-import/` of the backup location, where nothing
+  prunes it (a server's applications at `before-import/apps/<name>/`: `before-import`
+  taken as the backup location has the shape of the location itself, and the earlier
+  version started on it finds every application). The database as that version left it
+  can be restored from there, by that version or by this one. A backup set aside by an
+  earlier try gives way when that version has run again since. This is the `import-redb` Cargo feature (on by default: the server has it), the
   only remaining use of redb: an application that embeds the engine (`default-features =
   false`, with or without `s3`) compiles no redb at all, and asks for the feature if it has
   data of those versions.
@@ -69,6 +73,15 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   and applied is no longer answered with an error because writing the page store early
   (much was changed since the last checkpoint) failed. Commits missing in the middle of the
   log are told by an event at opening.
+- **Fixed**: a filter whose index names a column twice (`CREATE INDEX i ON t (a, a)`) left
+  a condition on another column unchecked, for reads, counts, updates and deletes; a
+  `LIMIT` cut the rows an aggregate inside an expression counts (`count(*) + 1`) on a
+  table larger than what is read at once.
+- When the server stops (`SIGTERM`), every application is checkpointed and what it wrote
+  since goes to the backup, not the server's own database alone: on a disk that does not
+  outlive the process, an application's last seconds of writes were lost at each restart.
+- With one snapshot kept (`keep_snapshots: 1`), a snapshot at the same place in the log as
+  the one before it could be pruned in its place.
 - A long log is replayed without keeping everything it changed in memory: past the same
   limit as for commits, the page store is written on the way.
 - The page cache's clock kept a place for every page rewritten at a checkpoint while the

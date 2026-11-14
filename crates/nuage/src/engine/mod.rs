@@ -399,9 +399,8 @@ impl Engine {
                     self.event(
                         "info",
                         format!(
-                            "the backup of the earlier version is kept under {} in {}: delete it once the data has been checked",
-                            backup::BEFORE_IMPORT,
-                            b.store.describe()
+                            "the backup of the earlier version is kept at {}: delete it once the data has been checked",
+                            b.store.describe_aside(backup::BEFORE_IMPORT)
                         ),
                     );
                 }

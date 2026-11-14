@@ -279,3 +279,86 @@ fn a_backup_of_the_earlier_version() {
 fn an_encrypted_backup_of_the_earlier_version() {
     restore_backup("encrypted-backup", key());
 }
+
+/// The backup of a server's application (under `apps/<name>/` of the backup
+/// location) is set aside where a server whose backup location is
+/// `before-import` looks for it: going back finds every application.
+#[test]
+fn the_backup_of_an_application_is_set_aside_where_a_server_looks_for_it() {
+    use nuage::{BackupStore, PrefixedStore};
+    let tmp = |what: &str| std::env::temp_dir().join(format!("nuage-legacy-app-{what}-{}", std::process::id()));
+    let (root, dir, back) = (tmp("location"), tmp("data"), tmp("back"));
+    for d in [&root, &dir, &back] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    let original = files(&fixture("clear-backup"));
+    copy_dir(&fixture("clear-backup"), &root.join("apps/shop"));
+    // What a server gives the engine of its application `shop`.
+    let of_shop = |location: &Path| -> EngineOptions {
+        let store: Arc<dyn BackupStore> =
+            Arc::new(PrefixedStore::new(Arc::new(DirectoryStore::new(location)), "apps/shop/"));
+        EngineOptions { backup: Some(BackupOptions::new(store)), ..options(None) }
+    };
+    {
+        let db = Embedded::open_with(&dir, of_shop(&root)).unwrap();
+        assert!(db.engine().backup_status().restored);
+        check(&db, false);
+        db.engine().backup_now(true).unwrap();
+        let (events, _) = db.engine().events();
+        let told = events.iter().any(|e| e.message.contains("before-import/apps/shop"));
+        assert!(told, "the event says where: {events:?}");
+    }
+    assert_eq!(files(&root.join("before-import/apps/shop")), original, "byte for byte, at the application's place");
+    assert!(!root.join("apps/shop/before-import").exists());
+    {
+        // The same server, its backup location now `before-import`.
+        let db = Embedded::open_with(&back, of_shop(&root.join("before-import"))).unwrap();
+        assert!(db.engine().backup_status().restored, "the application is found there");
+        check(&db, false);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    for d in [&root, &dir, &back] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// An idle database of the earlier version, and one snapshot kept: the
+/// first snapshot of this version, at the same place in the log as the old
+/// one, is the one that stays.
+#[test]
+fn the_first_snapshot_after_an_import_is_the_one_kept() {
+    let tmp = |what: &str| std::env::temp_dir().join(format!("nuage-legacy-idle-{what}-{}", std::process::id()));
+    let (backup, dir, again) = (tmp("backup"), tmp("data"), tmp("again"));
+    for d in [&backup, &dir, &again] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    copy_dir(&fixture("clear-backup"), &backup);
+    // Nothing was written after its snapshot.
+    std::fs::remove_dir_all(backup.join("wal")).unwrap();
+    let with = || {
+        let store = Arc::new(DirectoryStore::new(&backup));
+        EngineOptions {
+            backup: Some(BackupOptions { keep_snapshots: 1, ..BackupOptions::new(store) }),
+            ..options(None)
+        }
+    };
+    let rows = {
+        let db = Embedded::open_with(&dir, with()).unwrap();
+        db.engine().backup_now(true).unwrap();
+        one(&db, "SELECT count(*) FROM notes")
+    };
+    let manifest: Json = serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    let snapshot = manifest["snapshot"].as_str().unwrap();
+    assert_eq!(snapshot, "snapshots/00000000000000000410.db", "at the place of the old one in the log");
+    let left: Vec<String> = files(&backup).into_keys().filter(|k| k.starts_with("snapshots/")).collect();
+    assert_eq!(left, [snapshot], "the old snapshot went, not the one the manifest names");
+    {
+        let db = Embedded::open_with(&again, with()).unwrap();
+        assert!(db.engine().backup_status().restored);
+        assert_eq!(one(&db, "SELECT count(*) FROM notes"), rows);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    for d in [&backup, &dir, &again] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

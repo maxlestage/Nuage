@@ -174,12 +174,20 @@ fn main() -> ExitCode {
         if let Some(pg) = pg {
             pg.shutdown().await;
         }
+        // Every application, the server's own last (it holds the list of the others):
+        // what was written since the last checkpoint goes to the backup before the disk is gone.
+        let mut engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
+        engines.reverse();
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = engine.checkpoint();
-            if engine.options().backup.is_some() {
-                let _ = engine.backup_now(false);
+            for engine in engines {
+                let _ = engine.checkpoint();
+                if engine.options().backup.is_some()
+                    && let Err(e) = engine.backup_now(false)
+                {
+                    eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
+                }
+                let _ = engine.close();
             }
-            let _ = engine.close();
         })
         .await;
         ExitCode::SUCCESS
