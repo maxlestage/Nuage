@@ -286,7 +286,12 @@ fn redirect(status: StatusCode, location: &str, varies: bool) -> Response<Vec<u8
 
 /// A redirect to a page in the visitor's language (it depends on the visitor).
 fn redirect_to_lang(headers: &HeaderMap, page: Page, query: Option<&str>) -> Response<Vec<u8>> {
-    let query = query.map(|q| format!("?{q}")).unwrap_or_default();
+    // `lang=auto` tells the page it was not chosen: a language kept in the browser (the
+    // EN/FR/ES buttons, no cookie) takes over there.
+    let query = match query.filter(|q| !q.is_empty()) {
+        Some(q) => format!("?{q}&lang=auto"),
+        None => "?lang=auto".to_owned(),
+    };
     redirect(StatusCode::FOUND, &format!("{}{query}", href(pick_lang(headers), page)), true)
 }
 

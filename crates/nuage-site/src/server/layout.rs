@@ -86,10 +86,27 @@ pub fn logo(lang: Lang) -> Element {
         .child(span().class("logo-text").text("Nuage").child(span().class("logo-accent").text(" DB")))
 }
 
-/// FR / EN / ES: links to the same page in each language.
+/// EN / FR / ES: links to the same page in each language, kept in the browser (no
+/// cookie); Auto: the browser's language again.
 pub fn lang_switch(route: Route) -> Element {
-    div().class("lang-switch").attr("role", "group").attr("aria-label", t(route.lang).language).children(Lang::ALL.map(
-        |l| {
+    let auto_label = match route.lang {
+        Lang::Fr => "Comme l'appareil",
+        Lang::Es => "Como el dispositivo",
+        _ => "As the device",
+    };
+    // The same page without its language: the server picks the browser's.
+    let bare = if route.page == Page::NotFound {
+        "/".to_owned()
+    } else {
+        let path = route.path();
+        let rest = path.strip_prefix(&format!("/{}", route.lang.code())).unwrap_or("/");
+        if rest.is_empty() { "/".to_owned() } else { rest.to_owned() }
+    };
+    div()
+        .class("lang-switch")
+        .attr("role", "group")
+        .attr("aria-label", t(route.lang).language)
+        .children(Lang::ALL.map(|l| {
             let target = if route.page == Page::NotFound { Route::new(l, Page::Home) } else { route.with_lang(l) };
             let link = a()
                 .class("lang-btn")
@@ -99,8 +116,14 @@ pub fn lang_switch(route: Route) -> Element {
                 .attr("title", l.native_name())
                 .text(l.short());
             if l == route.lang { link.class("active").attr("aria-current", "true") } else { link }
-        },
-    ))
+        }))
+        .child(
+            a().class("lang-btn lang-auto")
+                .href(bare)
+                .attr("title", auto_label)
+                .attr("aria-label", auto_label)
+                .text("Auto"),
+        )
 }
 
 /// Light, dark, or as the device: stored in the browser (no cookie), applied before the
@@ -131,7 +154,7 @@ pub fn theme_switch(lang: Lang) -> Element {
 
 /// Applies the theme stored in the browser before the page paints, and handles the
 /// theme buttons (the Content-Security-Policy allows it by its hash).
-pub const THEME_SCRIPT: &str = r#"(function(){var d=document.documentElement,k="nuage-theme";try{var t=localStorage.getItem(k);if(t==="light"||t==="dark")d.setAttribute("data-theme",t)}catch(e){}document.addEventListener("click",function(e){var b=e.target.closest&&e.target.closest("[data-set-theme]");if(!b)return;var t=b.getAttribute("data-set-theme");try{t==="auto"?localStorage.removeItem(k):localStorage.setItem(k,t)}catch(x){}t==="auto"?d.removeAttribute("data-theme"):d.setAttribute("data-theme",t)})})();"#;
+pub const THEME_SCRIPT: &str = r#"(function(){var d=document.documentElement,k="nuage-theme",L="nuage-lang",s=null;try{var t=localStorage.getItem(k);if(t==="light"||t==="dark")d.setAttribute("data-theme",t);s=localStorage.getItem(L)}catch(e){}var q=location.search,m=/([?&])lang=auto(&|$)/;if(m.test(q)){var p=location.pathname,r=q.replace(m,function(_,a,b){return b?a:""}).replace(/[?&]$/,"");if(s&&s!==d.lang&&/^\/(en|fr|es)(\/|$)/.test(p)){location.replace(p.replace(/^\/(en|fr|es)/,"/"+s)+r+location.hash);return}history.replaceState(null,"",p+r+location.hash)}if(!s)d.setAttribute("data-lang-choice","auto");document.addEventListener("click",function(e){var c=e.target.closest;if(!c)return;var b=e.target.closest("[data-set-theme]");if(b){var t=b.getAttribute("data-set-theme");try{t==="auto"?localStorage.removeItem(k):localStorage.setItem(k,t)}catch(x){}t==="auto"?d.removeAttribute("data-theme"):d.setAttribute("data-theme",t);return}var a=e.target.closest(".lang-btn");if(a){try{var g=a.getAttribute("hreflang");g?localStorage.setItem(L,g):localStorage.removeItem(L)}catch(x){}}})})();"#;
 
 /// Eyebrow, title and subtitle of a section.
 pub fn section_head(eyebrow: &str, title: &str, subtitle: Option<&str>, id: &str) -> Element {

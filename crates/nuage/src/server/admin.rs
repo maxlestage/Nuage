@@ -138,8 +138,11 @@ body::before{content:"";display:block;height:3px;background:var(--brand)}
 a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 header{display:flex;flex-wrap:wrap;gap:.5rem 1rem;align-items:center;padding:.75rem 1rem;border-bottom:1px solid var(--line);background:var(--card)}
 header strong{background:var(--brand);-webkit-background-clip:text;background-clip:text;color:transparent}
-.prefs{display:flex;flex-wrap:wrap;gap:.2rem .9rem;color:var(--muted);font-size:.88rem}.prefs a{color:var(--muted);text-decoration:none}.prefs a:hover{color:var(--fg)}
-.themes a{padding:0 .1rem}:root:not([data-theme]) .th-auto,:root[data-theme=light] .th-light,:root[data-theme=dark] .th-dark{color:var(--fg);font-weight:700}
+.prefs{display:flex;flex-wrap:wrap;gap:.4rem .6rem;align-items:center}
+.seg{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:9px;background:var(--bg2)}
+.seg a{min-width:2rem;text-align:center;padding:.18rem .5rem;border-radius:7px;color:var(--muted);text-decoration:none;font:600 .78rem/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}.seg a:hover{color:var(--fg)}
+:root:not([data-theme]) .th-auto,:root[data-theme=light] .th-light,:root[data-theme=dark] .th-dark,:root:not([data-lang-choice]) .lg-cur,:root[data-lang-choice=auto] .lg-auto{background:var(--card2);color:var(--fg);box-shadow:0 0 0 1px var(--line2)}
+:root[data-lang-choice=auto] .lg-cur{color:var(--fg)}.themes a{font:600 .95rem/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header strong{font-size:1.05rem}nav{display:flex;flex-wrap:wrap;gap:.25rem .75rem}nav a{color:var(--fg);text-decoration:none;padding:.2rem 0}nav a:hover{color:var(--accent)}
 main{max-width:1100px;margin:0 auto;padding:1rem}h1{font-size:1.35rem;margin:.25rem 0 1rem}h2{font-size:1.1rem;margin:1.5rem 0 .5rem}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.75rem 1rem;box-shadow:var(--shadow)}
@@ -163,33 +166,45 @@ tbody tr:hover{background:var(--card2)}
 details.lang{border-bottom:1px solid var(--line)}details.lang summary{cursor:pointer;padding:.45rem 0;font-weight:600}
 "#;
 
+/// English, French, Spanish, or as the device (the browser's language): the one in use
+/// stands out (from the page's `data-lang-choice`, which [`prefs`] sets).
 fn lang_switch(l: Lang, here: &str) -> String {
-    let mut out = String::from(r#"<span class="langs">"#);
+    let mut out = format!(r#"<span class="seg langs" role="group" aria-label="{}">"#, t(l, "Language"));
     for other in Lang::ALL {
-        let sep = if other == Lang::En { "" } else { " · " };
-        if other == l {
-            let _ = write!(out, r#"{sep}<b aria-current="true">{}</b>"#, other.code().to_uppercase());
-        } else {
-            let _ = write!(
-                out,
-                r#"{sep}<a href="{}?lang={code}" hreflang="{code}" lang="{code}">{}</a>"#,
-                esc(here),
-                other.code().to_uppercase(),
-                code = other.code()
-            );
-        }
+        let current = if other == l { r#" lg-cur" aria-current="true"# } else { "\"" };
+        let _ = write!(
+            out,
+            r#"<a class="lg-{code}{current} href="{}?lang={code}" hreflang="{code}" lang="{code}" title="{name}">{}</a>"#,
+            esc(here),
+            other.code().to_uppercase(),
+            code = other.code(),
+            name = match other {
+                Lang::En => "English",
+                Lang::Fr => "Français",
+                Lang::Es => "Español",
+            }
+        );
     }
-    out.push_str("</span>");
+    let _ = write!(
+        out,
+        r#"<a class="lg-auto" href="{}?lang=auto" title="{}">Auto</a></span>"#,
+        esc(here),
+        t(l, "As the device")
+    );
     out
 }
 
-/// Light, dark, or as the device: the one in use is bold (from the page's
-/// `data-theme`, which [`themed`] sets from the cookie).
+/// Light, dark, or as the device: the one in use stands out (from the page's
+/// `data-theme`, which [`prefs`] sets from the cookie).
 fn theme_switch(l: Lang, here: &str) -> String {
-    let mut out = String::from(r#"<span class="themes">"#);
-    for (i, (code, label)) in [("light", "Light"), ("dark", "Dark"), ("auto", "Auto")].into_iter().enumerate() {
-        let sep = if i == 0 { "" } else { " · " };
-        let _ = write!(out, r#"{sep}<a class="th-{code}" href="{}?theme={code}">{}</a>"#, esc(here), t(l, label));
+    let mut out = format!(r#"<span class="seg themes" role="group" aria-label="{}">"#, t(l, "Theme"));
+    for (code, glyph, label) in [("light", "☀", "Light"), ("dark", "☾", "Dark"), ("auto", "A", "As the device")] {
+        let _ = write!(
+            out,
+            r#"<a class="th-{code}" href="{}?theme={code}" title="{label}" aria-label="{label}">{glyph}</a>"#,
+            esc(here),
+            label = t(l, label)
+        );
     }
     out.push_str("</span>");
     out
@@ -204,9 +219,19 @@ pub(crate) fn theme_of(headers: &HeaderMap) -> Option<&'static str> {
     }
 }
 
-/// A console page in the chosen theme: `<html data-theme="dark">`.
-pub(crate) async fn themed(headers: &HeaderMap, res: Response<HttpBody>) -> Response<HttpBody> {
-    let Some(theme) = theme_of(headers) else { return res };
+/// A console page with the visitor's choices on `<html>`: `data-theme="dark"` (a theme
+/// chosen), `data-lang-choice="auto"` (the language follows the browser).
+pub(crate) async fn prefs(headers: &HeaderMap, res: Response<HttpBody>) -> Response<HttpBody> {
+    let mut attrs = String::new();
+    if let Some(theme) = theme_of(headers) {
+        attrs.push_str(&format!(r#"data-theme="{theme}" "#));
+    }
+    if cookie(headers, LANG_COOKIE).and_then(Lang::from_code).is_none() {
+        attrs.push_str(r#"data-lang-choice="auto" "#);
+    }
+    if attrs.is_empty() {
+        return res;
+    }
     let is_html = res
         .headers()
         .get(header::CONTENT_TYPE)
@@ -220,8 +245,7 @@ pub(crate) async fn themed(headers: &HeaderMap, res: Response<HttpBody>) -> Resp
         Ok(b) => b.to_bytes(),
         Err(never) => match never {},
     };
-    let page =
-        String::from_utf8_lossy(&bytes).replacen("<html lang=", &format!(r#"<html data-theme="{theme}" lang="#), 1);
+    let page = String::from_utf8_lossy(&bytes).replacen("<html lang=", &format!("<html {attrs}lang="), 1);
     Response::from_parts(parts, full(page))
 }
 
@@ -486,7 +510,7 @@ fn login_page(l: Lang, secure: bool, message: Option<&str>, status: u16, next: O
 pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
     let headers = req.headers().clone();
     let res = route_inner(state, req, peer).await;
-    themed(&headers, res).await
+    prefs(&headers, res).await
 }
 
 async fn route_inner(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
@@ -496,6 +520,13 @@ async fn route_inner(state: &Arc<State>, req: Request<Incoming>, peer: SocketAdd
         let mut res = redirect(safe_next(&back).unwrap_or("/admin"));
         let (value, age) = if choice == "auto" { ("", 0) } else { (choice.as_str(), 365 * 24 * 3600) };
         set_cookie(&mut res, secure_context(req.headers()), THEME_COOKIE, value, age);
+        return res;
+    }
+    // `?lang=auto`: the browser's language again.
+    if query_param(&req, "lang").as_deref() == Some("auto") {
+        let back = req.uri().path().to_owned();
+        let mut res = redirect(safe_next(&back).unwrap_or("/admin"));
+        set_cookie(&mut res, secure_context(req.headers()), LANG_COOKIE, "", 0);
         return res;
     }
     // `?lang=fr`: the console in that language from now on (a cookie).

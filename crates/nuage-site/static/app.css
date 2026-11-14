@@ -410,6 +410,22 @@ h3 {
   color: var(--text);
 }
 
+/* As the browser: Auto stands out, and the language it gave stays marked. */
+.lang-auto {
+  font-family: var(--font-sans);
+}
+
+:root[data-lang-choice="auto"] .lang-auto {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+:root[data-lang-choice="auto"] .lang-btn.active {
+  background: transparent;
+  box-shadow: inset 0 -2px 0 var(--accent);
+  border-radius: 8px 8px 4px 4px;
+}
+
 /* Theme: light, dark, as the device. The one in use stands out. */
 .theme-switch {
   display: inline-flex;

@@ -230,6 +230,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Light", "Clair", "Claro"),
     ("Dark", "Sombre", "Oscuro"),
     ("Auto", "Auto", "Auto"),
+    ("Language", "Langue", "Idioma"),
+    ("Theme", "Thème", "Tema"),
+    ("As the device", "Comme l'appareil", "Como el dispositivo"),
     ("Connected: last connection {}.", "Connectée : dernière connexion {}.", "Conectada: última conexión {}."),
     ("Waiting for a first connection.", "En attente d'une première connexion.", "Esperando una primera conexión."),
     (
