@@ -26,19 +26,17 @@ server = [
     "s3", "memoire-orm/nuage", "tokio/net", "tokio/signal", "dep:flate2",
     "hyper/server", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
 ]
-## Backups to S3-compatible storage (a small HTTP/1.1 client over rustls). It turns
-## `import-redb` on: a backup may hold a snapshot of a version up to 0.4, which a new, empty
-## disk restores.
+## Backups to S3-compatible storage (a small HTTP/1.1 client over rustls).
 s3 = [
-    "import-redb",
     "dep:tokio", "tokio/net", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:http-body-util",
     "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
 ]
 ## Reads the page store of Nuage DB up to 0.4 (a redb file, `nuage.redb`) once, to bring
 ## a data directory or a backup of those versions to this one. Nothing else uses redb:
-## the feature (and `s3` turning it on) can go once every database has been opened by this
-## version. An application that embeds the engine alone (`default-features = false`) and
-## has data directories of those versions asks for it: `features = ["import-redb"]`.
+## the feature can go once every database has been opened by this version. An application
+## that embeds the engine (`default-features = false`, with or without `s3`) has no redb;
+## if it has data directories or backups of those versions, it asks for the feature:
+## `features = ["import-redb"]`.
 import-redb = ["dep:redb"]
 ## Without `s3`, `server`, `site` and `import-redb` (`default-features = false`), Nuage DB is its embedded
 ## engine alone (`nuage::Embedded`, backups to a folder): pure Rust, no network stack, no
