@@ -441,3 +441,66 @@ fn sql_in_a_transaction() {
     }
     assert_eq!(count(db.0.sql("SELECT count(*) FROM notes", &[]).unwrap()), 2);
 }
+
+/// `COUNT(*)` answered from an index (equalities that pin exactly its columns)
+/// gives the same count as the rows themselves: integers, text, NULL, a
+/// literal of another type, a two-column index, and the uncommitted writes of
+/// a transaction.
+#[test]
+fn count_from_an_index_matches_the_rows() {
+    let db = Db::open("count-index");
+    db.0.sql(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT, a INTEGER, b TEXT);
+         CREATE INDEX t_n ON t (n);
+         CREATE INDEX t_s ON t (s);
+         CREATE INDEX t_ab ON t (a, b)",
+        &[],
+    )
+    .unwrap();
+    for i in 0..300i64 {
+        let n = if i % 11 == 0 { Json::Null } else { json!(i % 7) };
+        let s = if i % 13 == 0 { Json::Null } else { json!(format!("v{}", i % 5)) };
+        db.0.sql(
+            "INSERT INTO t (id, n, s, a, b) VALUES (?, ?, ?, ?, ?)",
+            &[json!(i), n, s, json!(i % 3), json!(format!("b{}", i % 4))],
+        )
+        .unwrap();
+    }
+    db.0.sql("UPDATE t SET n = 99 WHERE id < 20; DELETE FROM t WHERE id % 17 = 0", &[]).unwrap();
+    let filters: Vec<(&str, Vec<Json>)> = vec![
+        ("n = ?", vec![json!(3)]),
+        ("n = ?", vec![json!(99)]),
+        ("n = ?", vec![json!(1234)]),
+        ("n = ?", vec![Json::Null]),
+        ("n = ?", vec![json!("3")]),
+        ("n = ?", vec![json!(3.0)]),
+        ("? = n", vec![json!(4)]),
+        ("s = ?", vec![json!("v2")]),
+        ("s = ?", vec![json!("V2")]),
+        ("a = ? AND b = ?", vec![json!(1), json!("b2")]),
+        ("b = ? AND a = ?", vec![json!("b3"), json!(0)]),
+        ("a = ?", vec![json!(2)]),
+        ("n = ? AND n = ?", vec![json!(3), json!(3)]),
+        ("n = ? AND n = ?", vec![json!(3), json!(4)]),
+        ("n = ? AND s = ?", vec![json!(3), json!("v3")]),
+    ];
+    let check = |run: &dyn Fn(&str, &[Json]) -> Vec<SqlResult>, when: &str| {
+        for (filter, params) in &filters {
+            let count = run(&format!("SELECT count(*) FROM t WHERE {filter}"), params)[0].rows[0][0].as_i64().unwrap();
+            let rows = run(&format!("SELECT id FROM t WHERE {filter}"), params)[0].rows.len() as i64;
+            assert_eq!(count, rows, "{when} : {filter} {params:?}");
+        }
+    };
+    check(&|sql, p| db.0.sql(sql, p).unwrap(), "base");
+    // In a transaction: its own writes count, and nothing else sees them.
+    let tx = db.0.begin_now().unwrap();
+    tx.sql(
+        "INSERT INTO t (id, n, s, a, b) VALUES (1000, 3, 'v2', 1, 'b2'); \
+         UPDATE t SET n = 4, s = 'v2' WHERE id = 30; DELETE FROM t WHERE n = 5",
+        &[],
+    )
+    .unwrap();
+    check(&|sql, p| tx.sql(sql, p).unwrap(), "transaction");
+    tx.rollback_now().unwrap();
+    check(&|sql, p| db.0.sql(sql, p).unwrap(), "après annulation");
+}

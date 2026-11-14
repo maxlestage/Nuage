@@ -200,7 +200,7 @@ impl Embedded {
     /// tables.
     pub fn table_schema(&self, name: &str) -> Result<Option<Json>> {
         let mut work = Work::new(&self.engine.store, &self.branch)?;
-        Ok(work.ctx(&self.engine.store, &self.branch).meta(name)?.map(|m| m.schema))
+        Ok(work.ctx(&self.engine.store, &self.branch).meta(name)?.map(|m| m.schema.clone()))
     }
 
     /// Runs SQL (see [`crate::sql`]): one statement or several separated by
@@ -334,10 +334,13 @@ impl EmbeddedTransaction {
         crate::sql::run_in(self, &self.engine.schemas, &script, &values)
     }
 
-    /// The schema of one table as this transaction sees it (its own
-    /// `CREATE TABLE` included), `None` when there is none.
-    pub(crate) fn table_schema(&self, name: &str) -> Result<Option<Json>> {
-        self.with(|ctx| Ok(ctx.meta(name)?.map(|m| m.schema)))
+    /// The table's `'static` schema as this transaction sees it.
+    pub(crate) fn static_schema(
+        &self,
+        name: &str,
+        schemas: &memoire_orm::nuage::wire::SchemaCache,
+    ) -> Result<Option<&'static memoire_orm::TableSchema>> {
+        self.with(|ctx| ctx.table_schema(name, schemas))
     }
 
     /// The tables as this transaction sees them.

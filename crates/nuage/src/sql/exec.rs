@@ -194,17 +194,14 @@ impl<'a> Runner<'a> {
 
     /// The schema of a table (its name in any case).
     pub(crate) fn schema(&self, name: &str) -> Result<&'static TableSchema> {
-        let json = match self.tx.table_schema(name)? {
-            Some(j) => j,
-            None => {
-                let real = self.tx.table_names()?.into_iter().find(|t| t.eq_ignore_ascii_case(name));
-                match real {
-                    Some(r) => self.tx.table_schema(&r)?.ok_or_else(|| Error::NoSuchTable(name.to_owned()))?,
-                    None => return Err(Error::NoSuchTable(name.to_owned())),
-                }
-            }
-        };
-        self.schemas.schema(&json)
+        if let Some(s) = self.tx.static_schema(name, self.schemas)? {
+            return Ok(s);
+        }
+        let real = self.tx.table_names()?.into_iter().find(|t| t.eq_ignore_ascii_case(name));
+        match real {
+            Some(r) => self.tx.static_schema(&r, self.schemas)?.ok_or_else(|| Error::NoSuchTable(name.to_owned())),
+            None => Err(Error::NoSuchTable(name.to_owned())),
+        }
     }
 
     fn param(&self, i: usize) -> Result<Value> {
