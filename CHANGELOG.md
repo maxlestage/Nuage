@@ -197,6 +197,11 @@ Scans (about 1 µs per row) and subqueries are unchanged.
   (it was never equal, less nor greater).
 - A `DOUBLE` sent to `/v1/sql` arrives bit for bit (serde_json's `float_roundtrip`): a
   latitude copied from PostgreSQL was read one ULP away.
+- **Fixed**: inside `BEGIN`, a driver that prepares its statements (most do) ran an
+  `INSERT`, `UPDATE` or `DELETE ... RETURNING` once more than asked: the columns of a
+  prepared statement are found by a run with its parameters `NULL`, and in an open
+  transaction what that run wrote stayed there (`UPDATE t SET n = n + 1 RETURNING n` added
+  2). That run is now taken back.
 
 ### Dark theme
 
