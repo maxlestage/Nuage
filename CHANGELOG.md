@@ -42,8 +42,12 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - It opens with `NUAGE_ADMIN_TOKEN`, a secret of its own (32 characters at least, `nuage
   genkey`; a shorter one stops the server at startup), compared in constant time. An
   application's token, `NUAGE_TOKEN` included, never opens it. Without it, the API is off.
-- `nuage apps create <name> [description]` and `nuage apps list`, with `NUAGE_URL` and
-  `NUAGE_ADMIN_TOKEN`: the same from a terminal.
+- `nuage apps create <name> [description]` and `nuage apps list`: the same from a terminal.
+  On the server's computer they need nothing else (`sudo nuage apps create shop`): the token
+  and the port come from the installer's settings file, and the address shown is its
+  `SITE_URL` when it has one; from anywhere else, `NUAGE_URL` and `NUAGE_ADMIN_TOKEN`.
+- A name already taken answers `409` with `kind: unique_violation`, which Memoire's
+  `NuageAdmin` reads as `Error::UniqueViolation`.
 - In `/v1/openapi.json`, the READMEs, `nuage.env.example` and `app.json`.
 
 ### The dashboard's cards open

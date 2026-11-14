@@ -186,9 +186,20 @@ request: from a script, a CI job, a deploy step, without the console's form. It 
 a token of its own, `NUAGE_ADMIN_TOKEN`.
 
 1. **Turn it on** once, on the server: `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32 characters at
-   least; a shorter one stops the server at startup, with why). On Heroku: the server's app →
-   **Settings** → **Config Vars**. The startup log says `the management API (/api/apps) is on`.
-2. **Create an application**, with the `nuage` binary:
+   least; a shorter one stops the server at startup, with why). The installers set one
+   already. On Heroku: the server's app → **Settings** → **Config Vars**. The startup log says
+   `the management API (/api/apps) is on`.
+2. **Create an application**. On the server's computer, nothing else is needed: `nuage`
+   reads the token and the port in the installer's settings file (hence `sudo`; on Windows,
+   a PowerShell as administrator), and shows `SITE_URL` as the address when the file has it:
+
+   ```bash
+   sudo nuage apps create shop "The shop"
+   # NUAGE_URL=http://127.0.0.1:8080
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   ```
+
+   From anywhere else, give it the server and its management token:
 
    ```bash
    export NUAGE_URL=https://my-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
@@ -221,6 +232,11 @@ a token of its own, `NUAGE_ADMIN_TOKEN`.
 
 3. **Connect the application**: set the two lines of `env` in its configuration (on Heroku,
    its Config Vars). It connects, and makes its tables at its first start.
+
+From Rust, `memoire_orm::NuageAdmin` (Memoire's `nuage` feature) does the same:
+`NuageAdmin::new(url, admin_token)?.create_app("shop", "The shop").await?` gives the token and
+`env()`, the two lines. In a [Paquets](https://github.com/maxlestage/Paquets) project,
+`paquets nuage create shop` makes the application and writes the two lines in `.env`.
 
 | Method | Path | Body | Answer |
 |---|---|---|---|

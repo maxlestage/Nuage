@@ -180,10 +180,20 @@ depuis un script, une CI, une étape de déploiement, sans le formulaire de la c
 s'ouvre avec un jeton à elle, `NUAGE_ADMIN_TOKEN`.
 
 1. **L'activer**, une fois, sur le serveur : `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32
-   caractères au moins ; plus court, le serveur refuse de démarrer et dit pourquoi). Sur
-   Heroku : l'app du serveur → **Settings** → **Config Vars**. Le journal de démarrage dit
-   `the management API (/api/apps) is on`.
-2. **Créer une application**, avec le binaire `nuage` :
+   caractères au moins ; plus court, le serveur refuse de démarrer et dit pourquoi). Les
+   installateurs en mettent déjà un. Sur Heroku : l'app du serveur → **Settings** → **Config
+   Vars**. Le journal de démarrage dit `the management API (/api/apps) is on`.
+2. **Créer une application**. Sur l'ordinateur du serveur, rien d'autre : `nuage` lit le
+   jeton et le port dans le fichier de réglages de l'installateur (d'où `sudo` ; sur Windows,
+   un PowerShell en administrateur), et montre `SITE_URL` comme adresse quand le fichier l'a :
+
+   ```bash
+   sudo nuage apps create boutique "La boutique"
+   # NUAGE_URL=http://127.0.0.1:8080
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   ```
+
+   D'ailleurs, donnez-lui le serveur et son jeton de gestion :
 
    ```bash
    export NUAGE_URL=https://mon-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
@@ -216,6 +226,11 @@ s'ouvre avec un jeton à elle, `NUAGE_ADMIN_TOKEN`.
 
 3. **Brancher l'application** : les deux lignes de `env` dans sa configuration (sur Heroku,
    ses Config Vars). Elle se connecte et crée ses tables à son premier démarrage.
+
+Depuis Rust, `memoire_orm::NuageAdmin` (la fonction `nuage` de Memoire) fait de même :
+`NuageAdmin::new(url, jeton_de_gestion)?.create_app("boutique", "La boutique").await?` donne le
+jeton et `env()`, les deux lignes. Dans un projet [Paquets](https://github.com/maxlestage/Paquets),
+`paquets nuage create boutique` crée l'application et écrit les deux lignes dans `.env`.
 
 | Méthode | Chemin | Corps | Réponse |
 |---|---|---|---|

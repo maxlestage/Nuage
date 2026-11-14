@@ -179,10 +179,21 @@ desde un script, una CI, un paso de despliegue, sin el formulario de la consola.
 un token propio, `NUAGE_ADMIN_TOKEN`.
 
 1. **Activarla**, una vez, en el servidor: `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32
-   caracteres como mínimo; más corto, el servidor no arranca y dice por qué). En Heroku: la
-   app del servidor → **Settings** → **Config Vars**. El registro de arranque dice
-   `the management API (/api/apps) is on`.
-2. **Crear una aplicación**, con el binario `nuage`:
+   caracteres como mínimo; más corto, el servidor no arranca y dice por qué). Los
+   instaladores ya ponen uno. En Heroku: la app del servidor → **Settings** → **Config Vars**.
+   El registro de arranque dice `the management API (/api/apps) is on`.
+2. **Crear una aplicación**. En el ordenador del servidor no hace falta nada más: `nuage`
+   lee el token y el puerto en el fichero de ajustes del instalador (de ahí `sudo`; en
+   Windows, un PowerShell como administrador), y muestra `SITE_URL` como dirección cuando el
+   fichero la tiene:
+
+   ```bash
+   sudo nuage apps create tienda "La tienda"
+   # NUAGE_URL=http://127.0.0.1:8080
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   ```
+
+   Desde cualquier otro sitio, dele el servidor y su token de gestión:
 
    ```bash
    export NUAGE_URL=https://mi-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
@@ -215,6 +226,11 @@ un token propio, `NUAGE_ADMIN_TOKEN`.
 
 3. **Conectar la aplicación**: las dos líneas de `env` en su configuración (en Heroku, sus
    Config Vars). Se conecta y crea sus tablas en su primer arranque.
+
+Desde Rust, `memoire_orm::NuageAdmin` (la función `nuage` de Memoire) hace lo mismo:
+`NuageAdmin::new(url, token_de_gestion)?.create_app("tienda", "La tienda").await?` da el token
+y `env()`, las dos líneas. En un proyecto [Paquets](https://github.com/maxlestage/Paquets),
+`paquets nuage create tienda` crea la aplicación y escribe las dos líneas en `.env`.
 
 | Método | Ruta | Cuerpo | Respuesta |
 |---|---|---|---|
