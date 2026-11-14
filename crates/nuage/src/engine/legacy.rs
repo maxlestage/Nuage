@@ -3,8 +3,11 @@
 //! Their page store was a [redb](https://docs.rs/redb) file, `nuage.redb`;
 //! the log and the backups are the same as today. Opening such a directory
 //! (or restoring such a backup) copies every table of the old file into a
-//! page file of this version, once: the old file is kept beside it as
-//! `nuage.redb.imported`, to delete when the data has been checked.
+//! page file of this version, once. The new file is then read back from the
+//! disk and compared with the old one, entry by entry, before it takes its
+//! place: a difference stops the opening and leaves the old file as it was.
+//! The old file is kept beside the new one as `nuage.redb.imported`, to
+//! delete when the data has been checked.
 //!
 //! Reading the old file takes the `import-redb` feature (on by default, off
 //! for an application that embeds the engine: `default-features = false`);
@@ -19,14 +22,24 @@ pub(crate) const LEGACY_FILE: &str = "nuage.redb";
 /// What it is renamed to once imported.
 pub(crate) const IMPORTED: &str = "nuage.redb.imported";
 
+/// What an import brought to this version: every entry of it was read back
+/// from the new file and compared with the old one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Imported {
+    /// Entries: rows, index entries, the catalog's, of every branch.
+    pub entries: u64,
+    /// Bytes of their keys and values.
+    pub bytes: u64,
+}
+
 /// Imports the page store of an earlier version found in `dir`, if any.
-/// Returns `true` when it did.
+/// Returns what it imported when it did.
 #[cfg(not(feature = "import-redb"))]
 pub(crate) fn import(
     dir: &std::path::Path,
     _keys: Option<&crate::crypto::Keys>,
     _cache_bytes: usize,
-) -> memoire_orm::Result<bool> {
+) -> memoire_orm::Result<Option<Imported>> {
     if dir.join(LEGACY_FILE).exists() && !dir.join(FILE).exists() {
         return Err(storage_err(format!(
             "{} was written by Nuage DB 0.4 or earlier ({LEGACY_FILE}): open it once with a build that has the \
@@ -34,7 +47,7 @@ pub(crate) fn import(
             dir.display()
         )));
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[cfg(feature = "import-redb")]
@@ -52,7 +65,7 @@ mod redb_file {
     use redb::backends::FileBackend;
     use redb::{ReadableDatabase, ReadableTable, StorageBackend, TableDefinition, TableHandle};
 
-    use super::{FILE, IMPORTED, LEGACY_FILE, storage_err};
+    use super::{FILE, IMPORTED, Imported, LEGACY_FILE, storage_err};
     use crate::crypto::{Keys, Xts};
     use crate::engine::pages::Pages;
     use crate::engine::wal::{self, Op};
@@ -70,7 +83,7 @@ mod redb_file {
         storage_err(format!("importing {LEGACY_FILE}: {e}"))
     }
 
-    pub(crate) fn import(dir: &Path, keys: Option<&Keys>, cache_bytes: usize) -> Result<bool> {
+    pub(crate) fn import(dir: &Path, keys: Option<&Keys>, cache_bytes: usize) -> Result<Option<Imported>> {
         let old = dir.join(LEGACY_FILE);
         let encrypting = dir.join(OLD_ENCRYPTING);
         if encrypting.exists() {
@@ -87,24 +100,51 @@ mod redb_file {
             }
         }
         if !old.exists() {
-            return Ok(false);
+            return Ok(None);
         }
         let new = dir.join(FILE);
-        if !new.exists() {
-            let tmp = dir.join(IMPORTING);
-            let _ = std::fs::remove_file(&tmp);
-            {
-                let db = open(&old, cache_bytes, keys)?;
-                let pages = Pages::open(&tmp, cache_bytes, keys.map(|k| k.pages.clone()), true)?;
-                copy(&db, &pages)?;
-                pages.checkpoint()?;
+        let xts = || keys.map(|k| k.pages.clone());
+        let imported = {
+            let db = open(&old, cache_bytes, keys)?;
+            if new.exists() {
+                // An import that stopped between its two renames: the new file
+                // is in place, and nothing was written to it since.
+                same(&db, &Pages::open(&new, cache_bytes, xts(), true)?).map_err(|e| {
+                    bad(format!(
+                        "{} holds both {FILE} and {LEGACY_FILE}, and they differ ({e}): move away the one that is \
+                         not the data",
+                        dir.display()
+                    ))
+                })?
+            } else {
+                let tmp = dir.join(IMPORTING);
+                let _ = std::fs::remove_file(&tmp);
+                {
+                    let pages = Pages::open(&tmp, cache_bytes, xts(), true)?;
+                    copy(&db, &pages)?;
+                    pages.checkpoint()?;
+                }
+                // Read back from the disk before it is trusted: the old file
+                // stays the data until every entry was found in the new one.
+                let checked = Pages::open(&tmp, cache_bytes, xts(), true).and_then(|pages| {
+                    pages.check().map_err(bad)?;
+                    same(&db, &pages).map_err(|e| bad(format!("the copy differs from {LEGACY_FILE}: {e}")))
+                });
+                let imported = match checked {
+                    Ok(imported) => imported,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                };
+                std::fs::rename(&tmp, &new).map_err(bad)?;
+                wal::sync_dir(dir);
+                imported
             }
-            std::fs::rename(&tmp, &new).map_err(bad)?;
-            wal::sync_dir(dir);
-        }
+        };
         std::fs::rename(&old, dir.join(IMPORTED)).map_err(bad)?;
         wal::sync_dir(dir);
-        Ok(true)
+        Ok(Some(imported))
     }
 
     fn open(path: &Path, cache_bytes: usize, keys: Option<&Keys>) -> Result<redb::Database> {
@@ -146,6 +186,60 @@ mod redb_file {
             to.apply(&ops, 0)?;
         }
         Ok(())
+    }
+
+    /// Compares the page file with the old store, entry by entry, both in key
+    /// order: the same tables, the same keys, the same values, nothing more.
+    /// Says what differs when something does.
+    fn same(from: &redb::Database, to: &Pages) -> std::result::Result<Imported, String> {
+        let version = to.version();
+        let r = from.begin_read().map_err(|e| e.to_string())?;
+        let mut imported = Imported::default();
+        let mut names = std::collections::BTreeSet::new();
+        for handle in r.list_tables().map_err(|e| e.to_string())? {
+            let name = handle.name().to_owned();
+            let table = r.open_table(TableDefinition::<&[u8], &[u8]>::new(&name)).map_err(|e| e.to_string())?;
+            let mut old = table.iter().map_err(|e| e.to_string())?;
+            let (mut entries, mut bytes) = (0u64, 0u64);
+            let mut wrong = None;
+            if let Some(root) = version.root(&name) {
+                to.walk_all(&root, &mut |k, v| {
+                    wrong = match old.next() {
+                        Some(Ok((ok, ov))) if ok.value() == k && ov.value() == v => None,
+                        Some(Ok((ok, _))) if ok.value() == k => {
+                            Some(format!("entry {} has another value", entries + 1))
+                        }
+                        Some(Ok(_)) => Some(format!("entry {} has another key", entries + 1)),
+                        Some(Err(e)) => Some(e.to_string()),
+                        None => Some(format!("it has more than the {entries} entries of the old one")),
+                    };
+                    entries += 1;
+                    bytes += (k.len() + v.len()) as u64;
+                    wrong.is_none()
+                })
+                .map_err(|e| format!("table `{name}`: {e}"))?;
+            }
+            if wrong.is_none() {
+                wrong = match old.next() {
+                    Some(Ok(_)) => Some(format!("it has only {entries} of the entries of the old one")),
+                    Some(Err(e)) => Some(e.to_string()),
+                    None => None,
+                };
+            }
+            if let Some(wrong) = wrong {
+                return Err(format!("table `{name}`: {wrong}"));
+            }
+            if bytes != version.bytes(&name) {
+                return Err(format!("table `{name}`: holds {bytes} bytes, {} recorded", version.bytes(&name)));
+            }
+            imported.entries += entries;
+            imported.bytes += bytes;
+            names.insert(name);
+        }
+        match version.names().into_iter().find(|n| !names.contains(n)) {
+            Some(extra) => Err(format!("table `{extra}` is not in the old one")),
+            None => Ok(imported),
+        }
     }
 
     /// The old page store's file, encrypted: what redb reads and writes goes
@@ -299,6 +393,100 @@ mod redb_file {
             drop(f);
             let raw = std::fs::read(&path).unwrap();
             assert!(!raw.windows(5).any(|w| w == b"hello"), "nothing in clear on disk");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn temp(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("nuage-legacy-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn put(table: &str, key: &[u8], value: &[u8]) -> Op {
+            Op::Put { table: table.to_owned(), key: key.to_vec(), value: value.to_vec() }
+        }
+
+        /// The copy is compared with the old store: a missing entry, one too
+        /// many, another key, another value or another table is noticed.
+        #[test]
+        fn a_copy_that_differs_is_noticed() {
+            let dir = temp("same");
+            let db = redb::Database::create(dir.join("old.redb")).unwrap();
+            let w = db.begin_write().unwrap();
+            let mut ops = Vec::new();
+            for name in ["meta", "b:main"] {
+                let mut t = w.open_table(TableDefinition::<&[u8], &[u8]>::new(name)).unwrap();
+                for i in 0..2000u32 {
+                    let (k, v) = (i.to_be_bytes(), vec![i as u8; (i % 300) as usize]);
+                    t.insert(&k[..], &v[..]).unwrap();
+                    ops.push(put(name, &k, &v));
+                }
+            }
+            // A table with nothing in it: no tree stands for it.
+            w.open_table(TableDefinition::<&[u8], &[u8]>::new("empty")).unwrap();
+            w.commit().unwrap();
+            let n = std::cell::Cell::new(0);
+            let copy = |extra: &[Op]| {
+                n.set(n.get() + 1);
+                let pages = Pages::open(&dir.join(format!("{}.db", n.get())), 1 << 20, None, false).unwrap();
+                pages.apply(&ops, 0).unwrap();
+                pages.apply(extra, 0).unwrap();
+                pages.checkpoint().unwrap();
+                same(&db, &pages)
+            };
+            let whole = copy(&[]).unwrap();
+            assert_eq!(whole.entries, 4000);
+            assert_eq!(whole.bytes, 2 * (0..2000u64).map(|i| 4 + i % 300).sum::<u64>());
+            let key = |i: u32| i.to_be_bytes();
+            let missing = copy(&[Op::Del { table: "b:main".into(), key: key(1999).to_vec() }]).unwrap_err();
+            assert!(missing.contains("`b:main`") && missing.contains("only 1999"), "{missing}");
+            let hole = copy(&[Op::Del { table: "meta".into(), key: key(7).to_vec() }]).unwrap_err();
+            assert!(hole.contains("`meta`") && hole.contains("entry 8 has another key"), "{hole}");
+            let more = copy(&[put("meta", &key(5000), b"x")]).unwrap_err();
+            assert!(more.contains("more than the 2000 entries"), "{more}");
+            let value = copy(&[put("b:main", &key(40), b"other")]).unwrap_err();
+            assert!(value.contains("entry 41 has another value"), "{value}");
+            let table = copy(&[put("b:other", b"k", b"v")]).unwrap_err();
+            assert!(table.contains("`b:other` is not in the old one"), "{table}");
+            let filled = copy(&[put("empty", b"k", b"v")]).unwrap_err();
+            assert!(filled.contains("`empty`") && filled.contains("more than the 0 entries"), "{filled}");
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An import that stopped once the new file was in place, before the
+        /// old one was set aside, goes on; two files that differ are refused.
+        #[test]
+        fn an_import_that_stopped_between_its_two_renames() {
+            let dir = temp("resumed");
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redb-0.4/clear-closed");
+            std::fs::copy(fixture.join(LEGACY_FILE), dir.join(LEGACY_FILE)).unwrap();
+            let first = import(&dir, None, 1 << 20).unwrap().expect("imported");
+            assert!(first.entries > 352 && first.bytes > 20_000, "{first:?}");
+            assert!(dir.join(FILE).exists() && dir.join(IMPORTED).exists() && !dir.join(LEGACY_FILE).exists());
+            assert!(!dir.join(IMPORTING).exists());
+            assert_eq!(import(&dir, None, 1 << 20).unwrap(), None, "nothing left to import");
+
+            std::fs::rename(dir.join(IMPORTED), dir.join(LEGACY_FILE)).unwrap();
+            assert_eq!(import(&dir, None, 1 << 20).unwrap(), Some(first), "the same data, compared again");
+            assert!(dir.join(IMPORTED).exists() && !dir.join(LEGACY_FILE).exists());
+
+            // Another file in the place of the new one: refused, both stay.
+            {
+                let pages = Pages::open(&dir.join(FILE), 1 << 20, None, false).unwrap();
+                pages.apply(&[put("meta", b"added", b"later")], 0).unwrap();
+                pages.checkpoint().unwrap();
+            }
+            std::fs::rename(dir.join(IMPORTED), dir.join(LEGACY_FILE)).unwrap();
+            let other = std::fs::read(dir.join(FILE)).unwrap();
+            let e = import(&dir, None, 1 << 20).unwrap_err().to_string();
+            assert!(e.contains("they differ") && e.contains("`meta`"), "{e}");
+            assert!(dir.join(LEGACY_FILE).exists() && !dir.join(IMPORTED).exists());
+            assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), other);
+            // The old file is still the data it was.
+            std::fs::remove_file(dir.join(FILE)).unwrap();
+            assert_eq!(import(&dir, None, 1 << 20).unwrap(), Some(first));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

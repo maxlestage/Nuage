@@ -831,6 +831,14 @@ impl Version {
     pub(crate) fn bytes(&self, tree: &str) -> u64 {
         self.trees.get(tree).map_or(0, |t| t.bytes)
     }
+
+    /// The names of the store tables, sorted.
+    #[cfg(feature = "import-redb")]
+    pub(crate) fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.trees.keys().map(|n| n.to_string()).collect();
+        names.sort();
+        names
+    }
 }
 
 impl Drop for Version {
@@ -1311,6 +1319,30 @@ impl Pages {
                     let more = match &b.children[i].ptr {
                         Ptr::Mem(n) => self.walk(n, start, end, f)?,
                         Ptr::Disk(e) => self.walk(&*self.load(*e)?, start, end, f)?,
+                    };
+                    if !more {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Calls `f` with every entry under `node`, in key order, until it
+    /// returns `false`. Returns `false` when `f` stopped the walk.
+    #[cfg(feature = "import-redb")]
+    pub(crate) fn walk_all<F>(&self, node: &Node, f: &mut F) -> Result<bool>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        match node {
+            Node::Leaf(c) => Ok((0..c.len()).all(|i| f(c.key(i), c.val(i)))),
+            Node::Branch(b) => {
+                for child in &b.children {
+                    let more = match &child.ptr {
+                        Ptr::Mem(n) => self.walk_all(n, f)?,
+                        Ptr::Disk(e) => self.walk_all(&*self.load(*e)?, f)?,
                     };
                     if !more {
                         return Ok(false);

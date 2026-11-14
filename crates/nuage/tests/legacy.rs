@@ -97,7 +97,9 @@ fn open_directory(name: &str, encryption: Option<Encryption>) {
         let db = Embedded::open_with(&dir, options(encryption.clone())).unwrap();
         check(&db, true);
         let (events, _) = db.engine().events();
-        assert!(events.iter().any(|e| e.message.contains("was imported")), "{events:?}");
+        assert!(events.iter().any(|e| e.message.contains("was imported and compared")), "{events:?}");
+        let imported = db.engine().imported().expect("imported");
+        assert!(imported.entries > 352 && imported.bytes > 20_000, "{imported:?}");
         db.sql("INSERT INTO notes (label, grp, body) VALUES ('written-by-this-version', 5, 'n')", &[]).unwrap();
         assert_eq!(db.engine().encryption().is_some(), encryption.is_some());
     }
@@ -107,6 +109,7 @@ fn open_directory(name: &str, encryption: Option<Encryption>) {
     let db = open_when_free(&dir, options(encryption));
     let (events, _) = db.engine().events();
     assert!(!events.iter().any(|e| e.message.contains("was imported")), "{events:?}");
+    assert_eq!(db.engine().imported(), None);
     assert_eq!(one(&db, "SELECT count(*) FROM notes"), "353");
     assert_eq!(one(&db, "SELECT max(id) FROM notes"), "404");
     drop(db);
