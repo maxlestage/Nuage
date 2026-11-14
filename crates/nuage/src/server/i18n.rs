@@ -227,6 +227,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("SQL over HTTP", "SQL en HTTP", "SQL por HTTP"),
     ("PostgreSQL", "PostgreSQL", "PostgreSQL"),
     ("Refresh", "Actualiser", "Actualizar"),
+    ("Light", "Clair", "Claro"),
+    ("Dark", "Sombre", "Oscuro"),
+    ("Auto", "Auto", "Auto"),
     ("Connected: last connection {}.", "Connectée : dernière connexion {}.", "Conectada: última conexión {}."),
     ("Waiting for a first connection.", "En attente d'une première connexion.", "Esperando una primera conexión."),
     (

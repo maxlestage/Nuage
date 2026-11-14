@@ -35,6 +35,8 @@ const SESSION_COOKIE: &str = "nuage_session";
 const LOGIN_COOKIE: &str = "nuage_login";
 /// The console's language (`fr`, `en`, `es`), chosen with `?lang=`.
 pub(crate) const LANG_COOKIE: &str = "nuage_lang";
+/// The console's theme: `light`, `dark` (unset: as the device).
+pub(crate) const THEME_COOKIE: &str = "nuage_theme";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILURES_PER_ADDRESS: usize = 5;
@@ -128,21 +130,29 @@ pub(crate) fn esc(s: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root{--bg:#f7f8fb;--fg:#17202a;--muted:#5d6b7a;--card:#fff;--line:#dfe4ea;--accent:#2563eb;--bad:#b42318;--ok:#067647}
-@media (prefers-color-scheme:dark){:root{--bg:#0f141a;--fg:#e6edf3;--muted:#9aa7b4;--card:#161d25;--line:#2a3441;--accent:#6ea8fe;--bad:#ff8a80;--ok:#5fd38d}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+:root{--bg:#f5f7fc;--bg2:#eef1f8;--fg:#0f1426;--muted:#4d5876;--card:#fff;--card2:#f8f9fd;--line:#dde2ee;--line2:#c9d0e2;--accent:#0369a1;--btn:#0b6fb8;--on-btn:#fff;--bad:#b91c1c;--ok:#047857;--warn:#b45309;--code:#f2f5fb;--focus:rgba(3,105,161,.35);--shadow:0 1px 2px rgba(15,20,38,.05);--brand:linear-gradient(90deg,#0284c7,#4f46e5,#9333ea);color-scheme:light}
+:root[data-theme=dark]{--bg:#060913;--bg2:#0a0f1e;--fg:#e9edf8;--muted:#9aa4c2;--card:#0e1427;--card2:#121a31;--line:#1d2742;--line2:#2b3858;--accent:#7dd3fc;--btn:#38bdf8;--on-btn:#04121f;--bad:#f87171;--ok:#34d399;--warn:#fbbf24;--code:#0a1020;--focus:rgba(125,211,252,.4);--shadow:0 1px 0 rgba(255,255,255,.03) inset,0 12px 32px -18px rgba(0,0,0,.8);--brand:linear-gradient(90deg,#38bdf8,#6366f1,#a855f7);color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#060913;--bg2:#0a0f1e;--fg:#e9edf8;--muted:#9aa4c2;--card:#0e1427;--card2:#121a31;--line:#1d2742;--line2:#2b3858;--accent:#7dd3fc;--btn:#38bdf8;--on-btn:#04121f;--bad:#f87171;--ok:#34d399;--warn:#fbbf24;--code:#0a1020;--focus:rgba(125,211,252,.4);--shadow:0 1px 0 rgba(255,255,255,.03) inset,0 12px 32px -18px rgba(0,0,0,.8);--brand:linear-gradient(90deg,#38bdf8,#6366f1,#a855f7);color-scheme:dark}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+body::before{content:"";display:block;height:3px;background:var(--brand)}
+a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 header{display:flex;flex-wrap:wrap;gap:.5rem 1rem;align-items:center;padding:.75rem 1rem;border-bottom:1px solid var(--line);background:var(--card)}
+header strong{background:var(--brand);-webkit-background-clip:text;background-clip:text;color:transparent}
+.prefs{display:flex;flex-wrap:wrap;gap:.2rem .9rem;color:var(--muted);font-size:.88rem}.prefs a{color:var(--muted);text-decoration:none}.prefs a:hover{color:var(--fg)}
+.themes a{padding:0 .1rem}:root:not([data-theme]) .th-auto,:root[data-theme=light] .th-light,:root[data-theme=dark] .th-dark{color:var(--fg);font-weight:700}
 header strong{font-size:1.05rem}nav{display:flex;flex-wrap:wrap;gap:.25rem .75rem}nav a{color:var(--fg);text-decoration:none;padding:.2rem 0}nav a:hover{color:var(--accent)}
 main{max-width:1100px;margin:0 auto;padding:1rem}h1{font-size:1.35rem;margin:.25rem 0 1rem}h2{font-size:1.1rem;margin:1.5rem 0 .5rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.75rem 1rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.75rem 1rem;box-shadow:var(--shadow)}
 .card small{display:block;color:var(--muted)}.card b{font-size:1.15rem}.scroll{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.45rem .7rem;border-bottom:1px solid var(--line);white-space:nowrap;max-width:28rem;overflow:hidden;text-overflow:ellipsis}th{color:var(--muted);font-weight:600}
-form{margin:0}input,textarea,select{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem;width:100%}
-textarea{min-height:7rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}button{font:inherit;border:0;border-radius:8px;padding:.5rem .9rem;background:var(--accent);color:#fff;cursor:pointer}
-button.danger{background:var(--bad)}button.plain{background:transparent;color:var(--accent);padding:0}.row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end}.row>*{flex:1 1 12rem}.row>button{flex:0 0 auto}
+form{margin:0}input,textarea,select{font:inherit;color:var(--fg);background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:.5rem .6rem;width:100%}input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--focus)}
+textarea{min-height:7rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:.5rem .9rem;background:var(--btn);color:var(--on-btn);cursor:pointer}button:hover{filter:brightness(1.08)}
+button.danger{background:var(--bad);color:#fff}button.plain{background:transparent;color:var(--accent);padding:0}.row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end}.row>*{flex:1 1 12rem}.row>button{flex:0 0 auto}
 .msg{padding:.6rem .8rem;border-radius:8px;border:1px solid var(--line);background:var(--card);margin:.75rem 0}.bad{color:var(--bad)}.ok{color:var(--ok)}.muted{color:var(--muted)}
 .login{max-width:22rem;margin:12vh auto}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;overflow-x:auto;margin:.5rem 0}
+pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;overflow-x:auto;margin:.5rem 0}
+.msg.ok{border-color:color-mix(in srgb,var(--ok) 45%,var(--line));background:color-mix(in srgb,var(--ok) 9%,var(--card))}.msg.bad{border-color:color-mix(in srgb,var(--bad) 45%,var(--line));background:color-mix(in srgb,var(--bad) 9%,var(--card))}
+tbody tr:hover{background:var(--card2)}
 .pill{display:inline-block;font-size:.78rem;line-height:1.4;padding:.05rem .5rem;border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}.pill.ok{color:var(--ok);border-color:currentColor}.pill.bad{color:var(--bad);border-color:currentColor}
 .row-title{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .6rem}.row-title h1{margin:0}.apphead{margin-bottom:1rem}
 .tabs{display:flex;flex-wrap:wrap;gap:.25rem;border-bottom:1px solid var(--line);margin-top:.75rem}.tabs a{padding:.4rem .7rem;color:var(--muted);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}.tabs a:hover{color:var(--fg)}.tabs a[aria-current]{color:var(--accent);border-color:var(--accent)}
@@ -173,23 +183,71 @@ fn lang_switch(l: Lang, here: &str) -> String {
     out
 }
 
+/// Light, dark, or as the device: the one in use is bold (from the page's
+/// `data-theme`, which [`themed`] sets from the cookie).
+fn theme_switch(l: Lang, here: &str) -> String {
+    let mut out = String::from(r#"<span class="themes">"#);
+    for (i, (code, label)) in [("light", "Light"), ("dark", "Dark"), ("auto", "Auto")].into_iter().enumerate() {
+        let sep = if i == 0 { "" } else { " · " };
+        let _ = write!(out, r#"{sep}<a class="th-{code}" href="{}?theme={code}">{}</a>"#, esc(here), t(l, label));
+    }
+    out.push_str("</span>");
+    out
+}
+
+/// The theme chosen with `?theme=` (a cookie): `None` follows the device.
+pub(crate) fn theme_of(headers: &HeaderMap) -> Option<&'static str> {
+    match cookie(headers, THEME_COOKIE) {
+        Some("light") => Some("light"),
+        Some("dark") => Some("dark"),
+        _ => None,
+    }
+}
+
+/// A console page in the chosen theme: `<html data-theme="dark">`.
+pub(crate) async fn themed(headers: &HeaderMap, res: Response<HttpBody>) -> Response<HttpBody> {
+    let Some(theme) = theme_of(headers) else { return res };
+    let is_html = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"));
+    if !is_html {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let bytes = match http_body_util::BodyExt::collect(body).await {
+        Ok(b) => b.to_bytes(),
+        Err(never) => match never {},
+    };
+    let page =
+        String::from_utf8_lossy(&bytes).replacen("<html lang=", &format!(r#"<html data-theme="{theme}" lang="#), 1);
+    Response::from_parts(parts, full(page))
+}
+
 fn page(l: Lang, here: &str, title: &str, csrf: Option<&str>, body: &str) -> String {
     let nav = match csrf {
         Some(csrf) => format!(
-            r#"<nav><a href="/admin">{apps}</a><a href="/admin/server">{server}</a></nav>{langs}
+            r#"<nav><a href="/admin">{apps}</a><a href="/admin/server">{server}</a></nav><span class="prefs">{langs}{themes}</span>
 <form method="post" action="/admin/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{c}"><button class="plain">{out}</button></form>"#,
             apps = t(l, "Applications"),
             server = t(l, "Server"),
             langs = lang_switch(l, here),
+            themes = theme_switch(l, here),
             c = esc(csrf),
             out = t(l, "Log out")
         ),
-        None => format!(r#"<span style="margin-left:auto">{}</span>"#, lang_switch(l, here)),
+        None => format!(
+            r#"<span class="prefs" style="margin-left:auto">{}{}</span>"#,
+            lang_switch(l, here),
+            theme_switch(l, here)
+        ),
     };
     format!(
-        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex"><meta name="color-scheme" content="light dark"><title>{} · Nuage DB</title><style>{STYLE}</style></head>
-<body><header><strong>Nuage DB</strong>{nav}</header><main>{body}</main></body></html>"#,
+        r##"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#0e1427" media="(prefers-color-scheme: dark)"><title>{} · Nuage DB</title><style>{STYLE}</style></head>
+<body><header><strong>Nuage DB</strong>{nav}</header><main>{body}</main></body></html>"##,
         esc(title),
         lang = l.code()
     )
@@ -426,6 +484,20 @@ fn login_page(l: Lang, secure: bool, message: Option<&str>, status: u16, next: O
 }
 
 pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
+    let headers = req.headers().clone();
+    let res = route_inner(state, req, peer).await;
+    themed(&headers, res).await
+}
+
+async fn route_inner(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
+    // `?theme=dark`: the console in that theme from now on (a cookie); `auto` follows the device.
+    if let Some(choice) = query_param(&req, "theme").filter(|t| matches!(t.as_str(), "light" | "dark" | "auto")) {
+        let back = req.uri().path().to_owned();
+        let mut res = redirect(safe_next(&back).unwrap_or("/admin"));
+        let (value, age) = if choice == "auto" { ("", 0) } else { (choice.as_str(), 365 * 24 * 3600) };
+        set_cookie(&mut res, secure_context(req.headers()), THEME_COOKIE, value, age);
+        return res;
+    }
     // `?lang=fr`: the console in that language from now on (a cookie).
     if let Some(choice) = query_param(&req, "lang").as_deref().and_then(Lang::from_code) {
         let back = req.uri().path().to_owned();

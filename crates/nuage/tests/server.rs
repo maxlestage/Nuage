@@ -350,6 +350,20 @@ async fn console() {
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
     assert!(app.body.contains("NUAGE_PG_PORT=5432"), "PostgreSQL is off here: the console says how to turn it on");
     assert!(app.body.contains("✓ Connected: last connection"), "the console shows the last connection");
+    // The theme: light, dark or as the device, kept in a cookie.
+    assert!(
+        app.body.contains(r#"class="th-dark""#) && !app.body.contains("<html data-theme="),
+        "as the device by default"
+    );
+    let chosen = c.request("GET", "/admin/apps/nuage?theme=dark", &[]).await;
+    assert_eq!(chosen.status, 303);
+    let dark = c.request("GET", "/admin/apps/nuage", &[]).await;
+    assert!(dark.body.contains(r#"<html data-theme="dark" lang="#), "the dark theme is kept");
+    c.request("GET", "/admin/apps/nuage?theme=auto", &[]).await;
+    assert!(
+        !c.request("GET", "/admin/apps/nuage", &[]).await.body.contains("<html data-theme="),
+        "back to the device's"
+    );
     for language in [
         "JavaScript",
         "Python",
