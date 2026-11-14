@@ -4,6 +4,7 @@ use memoire_orm::{ColumnType, Result, Value};
 
 use super::ast::*;
 use super::lex::{Tok, syntax, tokenize};
+use super::value;
 
 /// Words that end an expression or a list: never taken as an alias.
 const RESERVED: [&str; 46] = [
@@ -1068,7 +1069,26 @@ impl Parser {
             } else {
                 return Ok(e);
             };
-            e = Expr::Bin(op, Box::new(e), Box::new(self.term()?));
+            let right = self.term()?;
+            e = match (op, e, right) {
+                // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`, `INTERVAL '...' + x`.
+                (op, x, Expr::Func { name, mut args, .. }) if name == "_interval" => {
+                    let sign = if op == Op::Sub { -1 } else { 1 };
+                    Expr::Func {
+                        name: "_shift".into(),
+                        args: vec![x, args.remove(0), Expr::Lit(Value::I64(sign))],
+                        distinct: false,
+                        star: false,
+                    }
+                }
+                (Op::Add, Expr::Func { name, mut args, .. }, x) if name == "_interval" => Expr::Func {
+                    name: "_shift".into(),
+                    args: vec![x, args.remove(0), Expr::Lit(Value::I64(1))],
+                    distinct: false,
+                    star: false,
+                },
+                (op, l, r) => Expr::Bin(op, Box::new(l), Box::new(r)),
+            };
         }
     }
 
@@ -1172,6 +1192,28 @@ impl Parser {
                         let name = if lw == "localtimestamp" { "current_timestamp".into() } else { lw };
                         return Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: false });
                     }
+                    // Typed literals: `DATE '2026-01-31'`, `TIMESTAMP '...'`, `TIMESTAMPTZ '...'`.
+                    "date" | "timestamp" | "timestamptz" | "time"
+                        if matches!(self.toks.get(self.at + 1), Some(Tok::Str(_))) =>
+                    {
+                        let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
+                        self.at += 2;
+                        let (kind, _) = type_of(&lw).expect("a type");
+                        return Ok(Expr::Cast(Box::new(Expr::Lit(Value::Text(text))), column_type(kind)));
+                    }
+                    // `INTERVAL '1 day'`: a span to add to or take from a date
+                    // (`now() - INTERVAL '2 hours'`).
+                    "interval" if matches!(self.toks.get(self.at + 1), Some(Tok::Str(_))) => {
+                        let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
+                        self.at += 2;
+                        value::interval_months_and_micros(&text)?;
+                        return Ok(Expr::Func {
+                            name: "_interval".into(),
+                            args: vec![Expr::Lit(Value::Text(text))],
+                            distinct: false,
+                            star: false,
+                        });
+                    }
                     "exists" => {
                         self.at += 1;
                         self.expect_sym("(")?;
@@ -1228,6 +1270,19 @@ impl Parser {
         if self.sym("*") {
             self.expect_sym(")")?;
             return Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: true });
+        }
+        // `extract(epoch FROM x)`: the standard form of extract('epoch', x).
+        if name == "extract" && matches!(self.peek_word(1).as_deref(), Some("from")) {
+            let field = self.name()?;
+            self.expect("from")?;
+            let x = self.expr()?;
+            self.expect_sym(")")?;
+            return Ok(Expr::Func {
+                name,
+                args: vec![Expr::Lit(Value::Text(field.to_ascii_lowercase())), x],
+                distinct: false,
+                star: false,
+            });
         }
         let distinct = self.keyword("distinct");
         let mut args = Vec::new();

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use memoire_orm::ast::{Projection, SelectAst};
 use memoire_orm::evaluator::{self, Tables};
 use memoire_orm::nuage::wire::schema_to_json;
-use memoire_orm::{AggFunc, BinOp, Error, ExecResult, Expr, JoinKind, Query, Result, TableSchema, Value};
+use memoire_orm::{AggFunc, BinOp, ColumnType, Error, ExecResult, Expr, JoinKind, Query, Result, TableSchema, Value};
 use serde_json::{Value as Json, json};
 
 use super::keys::{self, push_value};
@@ -82,6 +82,42 @@ impl TableMeta {
             indexes,
             schema: schema_to_json(schema),
         }
+    }
+
+    /// The type of each stored column, from the table's schema (`None` for a
+    /// column the schema does not name).
+    pub(crate) fn kinds(&self) -> Vec<Option<ColumnType>> {
+        const NAMES: [(&str, ColumnType); 14] = [
+            ("bool", ColumnType::Bool),
+            ("smallint", ColumnType::SmallInt),
+            ("int", ColumnType::Int),
+            ("bigint", ColumnType::BigInt),
+            ("real", ColumnType::Real),
+            ("double", ColumnType::Double),
+            ("text", ColumnType::Text),
+            ("bytes", ColumnType::Bytes),
+            ("uuid", ColumnType::Uuid),
+            ("timestamp", ColumnType::Timestamp),
+            ("timestamptz", ColumnType::TimestampTz),
+            ("date", ColumnType::Date),
+            ("time", ColumnType::Time),
+            ("json", ColumnType::Json),
+        ];
+        let declared: Vec<(&str, &str)> = self
+            .schema
+            .get("columns")
+            .and_then(Json::as_array)
+            .map(|cols| {
+                cols.iter().filter_map(|c| Some((c.get("name")?.as_str()?, c.get("kind")?.as_str()?))).collect()
+            })
+            .unwrap_or_default();
+        self.columns
+            .iter()
+            .map(|name| {
+                let kind = declared.iter().find(|(n, _)| n == name)?.1;
+                NAMES.iter().find(|(n, _)| *n == kind).map(|(_, k)| *k)
+            })
+            .collect()
     }
 
     fn to_json(&self) -> Vec<u8> {
@@ -732,7 +768,23 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
         schema.columns.iter().filter(|c| meta.position(c.name).is_none()).map(|c| c.name.to_owned()).collect();
     if !missing.is_empty() {
         meta.columns.extend(missing);
-        meta.schema = schema_to_json(schema);
+        // The new columns come from the model; the columns already there keep
+        // the type the table declared (a model may name a DOUBLE as text).
+        let mut widened = schema_to_json(schema);
+        if let (Some(new), Some(old)) = (
+            widened.get_mut("columns").and_then(Json::as_array_mut),
+            meta.schema.get("columns").and_then(Json::as_array),
+        ) {
+            for c in new.iter_mut() {
+                let name = c.get("name").and_then(Json::as_str).map(str::to_owned);
+                if let Some(before) = old.iter().find(|o| o.get("name").and_then(Json::as_str) == name.as_deref())
+                    && let (Some(slot), Some(kind)) = (c.get_mut("kind"), before.get("kind"))
+                {
+                    *slot = kind.clone();
+                }
+            }
+        }
+        meta.schema = widened;
         ctx.put_meta(schema.name, &meta);
     }
     let map = meta.map(schema);
@@ -862,15 +914,45 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
 
 /// A row in storage order; stored columns the model does not know keep
 /// their old value.
+///
+/// A text written to a column of numbers or dates is stored as the column's
+/// type, as PostgreSQL does (`'48.86'` into a `DOUBLE PRECISION`): a model
+/// that writes decimals as exact text (a `NUMERIC` in PostgreSQL) would
+/// otherwise leave text among the numbers, and every comparison on the
+/// column (`latitude BETWEEN ...`) would fail. A text that does not convert
+/// is kept as it is.
 fn to_stored(meta: &TableMeta, map: &[Option<usize>], row: &[Value], old: Option<&Vec<Value>>) -> Vec<Value> {
     let mut stored = old.cloned().unwrap_or_default();
     stored.resize(meta.columns.len(), Value::Null);
+    let kinds = meta.kinds();
     for (i, m) in map.iter().enumerate() {
         if let Some(p) = m {
-            stored[*p] = row[i].clone();
+            stored[*p] = match (&row[i], kinds.get(*p).copied().flatten()) {
+                (Value::Text(_), Some(kind)) if converts_text(kind) => {
+                    crate::sql::value::cast(&row[i], kind).unwrap_or_else(|_| row[i].clone())
+                }
+                _ => row[i].clone(),
+            };
         }
     }
     stored
+}
+
+/// Column types a text is converted to when it is written.
+fn converts_text(kind: ColumnType) -> bool {
+    matches!(
+        kind,
+        ColumnType::SmallInt
+            | ColumnType::Int
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Bool
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Date
+            | ColumnType::Time
+    )
 }
 
 // ---------------------------------------------------------------------------
