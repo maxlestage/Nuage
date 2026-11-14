@@ -278,6 +278,15 @@ impl Engine {
                 }
             }
         }
+        if let Some((before, after)) = engine.store.log_gap {
+            engine.event(
+                "error",
+                format!(
+                    "the log holds commit {before} then commit {after}, and none in between (a write that failed \
+                     in an earlier run?): what it holds was applied, the commits in between are lost"
+                ),
+            );
+        }
         engine.event("info", format!("data is stored in {}", dir.display()));
         let weak = Arc::downgrade(&engine);
         std::thread::Builder::new()

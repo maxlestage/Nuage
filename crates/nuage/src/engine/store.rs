@@ -286,6 +286,9 @@ pub(crate) struct Store {
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
     dirty_limit: usize,
+    /// Commits the log read at opening does not hold, between two it does:
+    /// the last one before the gap and the first one after it.
+    pub log_gap: Option<(u64, u64)>,
 }
 
 /// The commits that wrote to a branch.
@@ -304,6 +307,13 @@ struct Durable {
     /// A sync is running: the others wait for it instead of starting one.
     syncing: Mutex<bool>,
     done: Condvar,
+    /// A sync of the log failed, and why. The system reports such an error
+    /// once and may have dropped what it could not write: a later sync that
+    /// succeeds proves nothing, so no commit is accepted until a restart.
+    failed: OnceLock<String>,
+    /// The next sync fails (tests).
+    #[cfg(test)]
+    fail_next: std::sync::atomic::AtomicBool,
 }
 
 /// A catalog entry parsed once: its table metadata and, when a statement asked for it,
@@ -342,6 +352,15 @@ fn read_meta(pages: &Pages, key: &[u8]) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Writes the page store to disk as holding every commit up to `lsn`.
+fn save(pages: &Pages, lsn: u64) -> Result<()> {
+    pages.apply(
+        &[Op::Put { table: META.into(), key: CHECKPOINT_LSN.to_vec(), value: lsn.to_le_bytes().to_vec() }],
+        lsn,
+    )?;
+    pages.checkpoint()
+}
+
 fn u64_of(bytes: Option<Vec<u8>>) -> u64 {
     bytes.and_then(|b| b.try_into().ok()).map_or(0, u64::from_le_bytes)
 }
@@ -361,9 +380,18 @@ impl Store {
         let records = wal::recover(&wal_dir, keys.map(|k| k.wal.as_ref()))?;
         let dirty_limit = (cache_bytes / 4).max(1 << 20);
         let mut last = checkpoint_lsn;
+        let mut log_gap = None;
         for r in records.iter().filter(|r| r.lsn > checkpoint_lsn) {
+            if r.lsn > last + 1 && log_gap.is_none() {
+                log_gap = Some((last, r.lsn));
+            }
             pages.apply(&r.ops, r.lsn)?;
             last = last.max(r.lsn);
+            if pages.dirty_bytes() > dirty_limit {
+                // A long log: what it changed goes to disk on the way rather
+                // than wait in memory for the end. A crash resumes from here.
+                save(&pages, last)?;
+            }
         }
         let generation = u64_of(read_meta(&pages, GENERATION)?);
         let log = wal::Writer::open(&wal_dir, last + 1, keys.map(|k| k.wal.clone()))?;
@@ -371,7 +399,14 @@ impl Store {
             pages: Arc::new(pages),
             dir: dir.to_owned(),
             written: Mutex::new(HashMap::new()),
-            durable: Durable { lsn: AtomicU64::new(0), syncing: Mutex::new(false), done: Condvar::new() },
+            durable: Durable {
+                lsn: AtomicU64::new(0),
+                syncing: Mutex::new(false),
+                done: Condvar::new(),
+                failed: OnceLock::new(),
+                #[cfg(test)]
+                fail_next: std::sync::atomic::AtomicBool::new(false),
+            },
             wal_file: Mutex::new(log.file()),
             sync,
             writer: Mutex::new(Writer {
@@ -387,6 +422,7 @@ impl Store {
             applied_lsn: AtomicU64::new(last),
             catalog: Mutex::new(Catalog::default()),
             dirty_limit,
+            log_gap,
         };
         store.load_branches()?;
         store.checkpoint(None)?;
@@ -617,6 +653,7 @@ impl Store {
             if self.durable.lsn.load(Ordering::SeqCst) >= lsn {
                 return Ok(());
             }
+            self.log_is_sound()?;
             if *syncing {
                 syncing = self.durable.done.wait(syncing).unwrap_or_else(|e| e.into_inner());
                 continue;
@@ -627,14 +664,34 @@ impl Store {
             // A segment closed meanwhile was synced when it was closed.
             let version = self.pages.version();
             let file = lock(&self.wal_file).clone();
+            #[cfg(test)]
+            let synced = match self.durable.fail_next.swap(false, Ordering::SeqCst) {
+                true => Err(std::io::Error::other("no sync (test)")),
+                false => file.sync_data(),
+            };
+            #[cfg(not(test))]
             let synced = file.sync_data();
+            if let Err(e) = &synced {
+                let _ = self.durable.failed.set(e.to_string());
+            }
             syncing = lock(&self.durable.syncing);
             *syncing = false;
             self.durable.done.notify_all();
-            match synced {
-                Ok(()) => self.on_disk(&version),
-                Err(e) => return Err(storage_err(format!("write-ahead log: {e}"))),
+            if synced.is_ok() {
+                self.on_disk(&version);
             }
+        }
+    }
+
+    /// An error once a sync of the log has failed: the commits it covered
+    /// may not be on disk, and no later sync can tell.
+    fn log_is_sound(&self) -> Result<()> {
+        match self.durable.failed.get() {
+            Some(e) => Err(storage_err(format!(
+                "write-ahead log: it could not be made durable ({e}): no commit is accepted until the database \
+                 is opened again"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -646,11 +703,17 @@ impl Store {
     }
 
     fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
+        self.log_is_sound()?;
         let record = Record { lsn: writer.next_lsn, ops };
+        let logged = writer.wal.bytes;
         writer.wal.append(&record)?;
+        if let Err(e) = self.pages.apply(&record.ops, record.lsn) {
+            // Not applied: it must not come back when the log is replayed either.
+            let _ = writer.wal.cut_to(logged);
+            return Err(e);
+        }
         writer.next_lsn += 1;
         writer.commits_since_checkpoint += 1;
-        self.pages.apply(&record.ops, record.lsn)?;
         self.applied_lsn.store(record.lsn, Ordering::SeqCst);
         if !self.sync {
             // Nothing is synced: a commit counts as on disk as soon as it is applied.
@@ -659,7 +722,9 @@ impl Store {
         if self.pages.dirty_bytes() > self.dirty_limit {
             // Much was written since the last checkpoint: the changed nodes go
             // to disk now rather than wait in memory. The log is left as it is.
-            self.flush(writer)?;
+            // The commit is made whether this succeeds or not: a page store
+            // that cannot be written is the next checkpoint's to report.
+            let _ = self.flush(writer);
         }
         Ok(record.lsn)
     }
@@ -667,12 +732,8 @@ impl Store {
     /// Makes everything applied so far durable in the page store.
     fn flush(&self, w: &mut Writer) -> Result<u64> {
         let lsn = w.next_lsn - 1;
-        self.pages.apply(
-            &[Op::Put { table: META.into(), key: CHECKPOINT_LSN.to_vec(), value: lsn.to_le_bytes().to_vec() }],
-            lsn,
-        )?;
         // The page store holds every commit so far: they are on disk whatever the log's state.
-        self.pages.checkpoint()?;
+        save(&self.pages, lsn)?;
         self.durable.lsn.fetch_max(lsn, Ordering::SeqCst);
         w.checkpoint_lsn = lsn;
         Ok(lsn)
@@ -792,5 +853,154 @@ impl Store {
 
     pub(crate) fn applied_lsn(&self) -> u64 {
         self.applied_lsn.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::{Embedded, EngineOptions};
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nuage-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn count(db: &Embedded) -> String {
+        format!("{:?}", db.sql("SELECT count(*) FROM t", &[]).unwrap()[0].rows[0][0])
+    }
+
+    /// A sync of the log that fails is not tried again on the same file: the
+    /// commit is refused, and so is every one after it, until the database is
+    /// opened again. What was durable before stays.
+    #[test]
+    fn a_failed_sync_of_the_log_stops_the_commits() {
+        let dir = temp("sync");
+        {
+            let db = Embedded::open(&dir).unwrap();
+            db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+            db.sql("INSERT INTO t (id, v) VALUES (1, 'kept')", &[]).unwrap();
+            let store = &db.engine().store;
+            store.durable.fail_next.store(true, Ordering::SeqCst);
+            let e = db.sql("INSERT INTO t (id, v) VALUES (2, 'not synced')", &[]).unwrap_err().to_string();
+            assert!(e.contains("write-ahead log"), "{e}");
+            // The next sync would succeed: it is not trusted.
+            assert!(!store.durable.fail_next.load(Ordering::SeqCst));
+            let e = db.sql("INSERT INTO t (id, v) VALUES (3, 'refused')", &[]).unwrap_err().to_string();
+            assert!(e.contains("no commit is accepted until the database is opened again"), "{e}");
+            let e = db.engine().create_branch("b", None).unwrap_err().to_string();
+            assert!(e.contains("no commit is accepted"), "{e}");
+            // Readers were never shown the commit whose sync failed.
+            assert_eq!(count(&db), "I64(1)");
+        }
+        let db = open_again(&dir, EngineOptions::default());
+        db.sql("INSERT INTO t (id, v) VALUES (4, 'after')", &[]).unwrap();
+        assert_eq!(db.sql("SELECT count(*) FROM t WHERE id IN (1, 4)", &[]).unwrap()[0].rows[0][0].to_string(), "2");
+        assert!(db.sql("SELECT count(*) FROM t WHERE id = 3", &[]).unwrap()[0].rows[0][0].to_string() == "0");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The log of `dir` gets one more segment: a record per `(lsn, bytes)`,
+    /// each a metadata entry `replayed/<lsn>` of that many bytes.
+    fn append_log(dir: &std::path::Path, records: &[(u64, usize)]) {
+        let mut log = super::wal::Writer::open(&dir.join("wal"), records[0].0, None).unwrap();
+        for (lsn, bytes) in records {
+            let key = format!("replayed/{lsn:06}").into_bytes();
+            let op = super::Op::Put { table: super::META.into(), key, value: vec![*lsn as u8; *bytes] };
+            log.append(&super::Record { lsn: *lsn, ops: vec![op] }).unwrap();
+        }
+        log.file().sync_all().unwrap();
+    }
+
+    /// Opens `dir` once the handle dropped just before has let go of it.
+    fn open_again(dir: &std::path::Path, options: EngineOptions) -> Embedded {
+        (0..400)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Embedded::open_with(dir, options.clone()).ok()
+            })
+            .expect("opens again")
+    }
+
+    /// A log much longer than what the page store keeps in memory is
+    /// replayed whole: its changes go to disk on the way.
+    #[test]
+    fn a_long_log_is_replayed() {
+        let dir = temp("replay");
+        let options = EngineOptions { cache_bytes: 1 << 20, sync: false, ..EngineOptions::default() };
+        let last = {
+            let db = Embedded::open_with(&dir, options.clone()).unwrap();
+            db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+            db.engine().checkpoint().unwrap()
+        };
+        // 12 MiB of commits the page store does not hold, for a limit of 1 MiB.
+        let records: Vec<(u64, usize)> = (1..=192).map(|i| (last + i, 64 << 10)).collect();
+        append_log(&dir, &records);
+        let db = open_again(&dir, options);
+        let store = &db.engine().store;
+        assert_eq!(store.log_gap, None);
+        let entries = store.meta_entries(b"replayed/").unwrap();
+        assert_eq!(entries.len(), 192);
+        assert!(entries.iter().zip(&records).all(|((_, v), (lsn, n))| v.len() == *n && v[0] == *lsn as u8));
+        assert_eq!(store.applied_lsn(), last + 192);
+        assert_eq!(count(&db), "I64(0)");
+        assert!(db.engine().check_integrity().unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Commits missing in the middle of the log are told: what the log holds
+    /// is applied, and an event says which ones are not there.
+    #[test]
+    fn a_gap_in_the_log_is_told() {
+        let dir = temp("gap");
+        let last = {
+            let db = Embedded::open(&dir).unwrap();
+            db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+            db.engine().checkpoint().unwrap()
+        };
+        append_log(&dir, &[(last + 1, 10), (last + 2, 10), (last + 5, 10), (last + 6, 10)]);
+        let db = open_again(&dir, EngineOptions::default());
+        assert_eq!(db.engine().store.log_gap, Some((last + 2, last + 5)));
+        assert_eq!(db.engine().store.meta_entries(b"replayed/").unwrap().len(), 4);
+        let (events, _) = db.engine().events();
+        let told = events.iter().find(|e| e.level == "error").map(|e| e.message.clone()).unwrap_or_default();
+        assert!(told.contains(&format!("commit {} then commit {}", last + 2, last + 5)), "{events:?}");
+        drop(db);
+        // The next opening starts from a checkpoint: nothing to tell any more.
+        let db = open_again(&dir, EngineOptions::default());
+        assert_eq!(db.engine().store.log_gap, None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the limit of changed nodes kept in memory, a commit writes them
+    /// to the page store. When that fails, the commit is made all the same:
+    /// it is in the log and applied.
+    #[test]
+    fn a_commit_is_made_when_the_page_store_cannot_be_written() {
+        let dir = temp("flush");
+        let options = EngineOptions { cache_bytes: 1 << 20, sync: false, ..EngineOptions::default() };
+        let db = Embedded::open_with(&dir, options).unwrap();
+        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+        let store = &db.engine().store;
+        store.pages.fail_checkpoints.store(true, Ordering::Relaxed);
+        let body = "x".repeat(64 << 10);
+        for id in 0..40 {
+            db.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), body.clone().into()]).unwrap();
+        }
+        assert!(store.pages.dirty_bytes() > store.dirty_limit, "past the limit: every commit tried to flush");
+        assert_eq!(count(&db), "I64(40)");
+        assert!(db.engine().checkpoint().is_err());
+        store.pages.fail_checkpoints.store(false, Ordering::Relaxed);
+        db.engine().checkpoint().unwrap();
+        assert_eq!(store.pages.dirty_bytes(), 0);
+        assert_eq!(count(&db), "I64(40)");
+        assert!(db.engine().check_integrity().unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

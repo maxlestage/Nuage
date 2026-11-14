@@ -26,7 +26,7 @@
 //! * **Encryption.** With a key, every page (headers included) is encrypted
 //!   with XTS-AES-256, one data unit per page (see [`crate::crypto`]).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
@@ -878,6 +878,10 @@ impl Hasher for PageHasher {
     }
 }
 
+/// Places of the clock's ring that may stand for no page held before it is
+/// made anew (beyond as many as the pages held).
+const RING_SLACK: usize = 64;
+
 struct Cached {
     node: Arc<Node>,
     bytes: usize,
@@ -949,6 +953,14 @@ impl Cache {
             freed += old.bytes;
         } else {
             shard.ring.push_back(page);
+            // A page taken out (rewritten at a checkpoint) keeps its place in
+            // the ring, and takes another when it comes back: once such
+            // places outnumber the pages held, the ring is made anew.
+            if shard.ring.len() > 2 * shard.map.len() + RING_SLACK {
+                let Shard { map, ring, .. } = &mut *shard;
+                let mut seen = HashSet::with_capacity(map.len());
+                ring.retain(|p| map.contains_key(p) && seen.insert(*p));
+            }
         }
         shard.bytes += bytes;
         shard.bytes -= freed;
@@ -1094,6 +1106,9 @@ pub(crate) struct Pages {
     state: Mutex<State>,
     /// Bytes of the nodes changed since the last checkpoint, about.
     dirty: AtomicUsize,
+    /// Checkpoints fail (tests of a disk that cannot be written).
+    #[cfg(test)]
+    pub(crate) fail_checkpoints: std::sync::atomic::AtomicBool,
 }
 
 /// What a file holds: its header, its trees and the pages they use.
@@ -1238,6 +1253,8 @@ impl Pages {
             live,
             state: Mutex::new(state),
             dirty: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_checkpoints: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1414,6 +1431,10 @@ impl Pages {
     /// Makes every commit so far durable: writes the changed nodes to free
     /// pages, then the header that points to them.
     pub(crate) fn checkpoint(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_checkpoints.load(Ordering::Relaxed) {
+            return Err(err("no checkpoint (test)"));
+        }
         let mut st = lock(&self.state);
         self.reclaim(&mut st);
         if !st.changed && st.counter > 0 {
@@ -2104,6 +2125,41 @@ mod tests {
         for n in [0, 1, 7, 8, 9, 63, 64, 1000] {
             assert_eq!(crc32(&data[..n]), memoire_orm::evaluator::crc32(&data[..n]), "{n} bytes");
         }
+    }
+
+    /// Nodes rewritten checkpoint after checkpoint leave and come back to
+    /// the cache: the clock's ring does not grow with them.
+    #[test]
+    fn the_cache_ring_stays_as_small_as_the_cache() {
+        let cache = Cache::new(64 << 20);
+        let node = Arc::new(Node::Leaf(Cells::default()));
+        for round in 0..2000u64 {
+            for page in 0..200u64 {
+                cache.remove(page);
+                cache.insert(page, node.clone());
+            }
+            if round % 500 == 0 {
+                cache.insert(1_000_000 + round, node.clone());
+            }
+        }
+        let (mut held, mut ring) = (0, 0);
+        for shard in &cache.shards {
+            let shard = lock(shard);
+            assert!(shard.ring.len() <= 2 * shard.map.len() + RING_SLACK + 1, "{} places", shard.ring.len());
+            assert!(shard.map.keys().all(|p| shard.ring.contains(p)), "every page held has its place");
+            held += shard.map.len();
+            ring += shard.ring.len();
+        }
+        assert_eq!(held, 204);
+        assert!(ring < 204 * 2 + SHARDS * (RING_SLACK + 1), "{ring} places for {held} pages");
+        // The clock still makes room: a cache too small for all of them keeps the last ones in.
+        let small = Cache::new(SHARDS * 4 * node.mem());
+        for page in 0..10_000u64 {
+            small.remove(page / 2);
+            small.insert(page, node.clone());
+        }
+        assert!(small.used.load(Ordering::Relaxed) <= SHARDS * 4 * node.mem());
+        assert!(small.peek(9_999).is_some());
     }
 
     #[test]
