@@ -47,12 +47,24 @@ constructor de consultas, relaciones, transacciones y migraciones.
 
 ```toml
 [dependencies]
-# El motor, el modo integrado y el servidor. `default-features = false` deja fuera el sitio web.
-nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false }
+# El motor, el modo integrado y el servidor, sin el sitio web.
+nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false, features = ["server"] }
 # El mismo Memoire que Nuage DB (la feature `nuage` es el cliente de un servidor).
 memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "8f7e0cb", features = ["nuage"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+| Feature de Cargo | Lo que añade | Por defecto |
+|---|---|---|
+| *(ninguna)* | el motor integrado (`nuage::Embedded`), SQL, cifrado, copias en una carpeta: **Rust puro**, sin pila de red, ni C ni ensamblador (RustCrypto) | siempre |
+| `s3` | copias en un almacenamiento compatible con S3 (HTTP/1.1 sobre rustls) | sí |
+| `server` | el servidor (`/v1`, protocolo PostgreSQL, consola, estado en vivo), `nuage::Db::Remote` y el binario `nuage`; incluye `s3` | sí |
+| `site` | el sitio web y el panel `/app`, servidos por el binario; incluye `server` | sí |
+| `import-redb` | lee una vez el almacén de páginas de Nuage DB hasta la 0.4 (`nuage.redb`), para llevar una carpeta de datos o una copia de esas versiones a esta (ver [Viniendo de la versión 0.4](#viniendo-de-la-versión-04)); el único uso de redb | sí |
+
+`default-features = false` es el motor integrado solo; añade `features = ["s3"]` para las
+copias en S3 (la configuración de una base integrada con ellas:
+`nuage::config::engine_from_vars`).
 
 ### Integrada: un directorio en disco
 
