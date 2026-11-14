@@ -379,4 +379,29 @@ fn postgres_idioms() {
         db.rows("SELECT hashtextextended('a', 0) = hashtextextended('a', 0), hashtextextended('a', 0) = hashtextextended('a', 1)", &[]),
         json!([[true, false]])
     );
+
+    // Dates : INTERVAL, extract(... FROM ...), littéraux typés, agrégats booléens.
+    assert_eq!(db.rows("SELECT (DATE '2026-01-31' + INTERVAL '1 month')::date", &[]), json!([["2026-02-28"]]));
+    assert_eq!(
+        db.rows("SELECT (TIMESTAMP '2026-03-01 10:00:00' - INTERVAL '1 day 2 hours')::text", &[]),
+        json!([["2026-02-28 08:00:00"]])
+    );
+    assert_eq!(db.rows("SELECT INTERVAL '2 years' + DATE '2024-02-29' < DATE '2026-03-01'", &[]), json!([[true]]));
+    assert_eq!(
+        db.rows("SELECT now() - INTERVAL '1 hour' < now(), now() + INTERVAL '90 minutes' > now()", &[]),
+        json!([[true, true]])
+    );
+    assert_eq!(
+        db.rows(
+            "SELECT extract(epoch FROM TIMESTAMP '2026-01-01 00:00:00'), extract(year FROM DATE '2026-05-04')",
+            &[]
+        ),
+        json!([[1767225600, 2026]])
+    );
+    assert!(db.err("SELECT now() - INTERVAL 'bientôt'").contains("INTERVAL"));
+    assert_eq!(
+        db.rows("SELECT bool_and(age > 16), bool_or(age > 50), every(age > 40) FROM users", &[]),
+        json!([[true, true, false]])
+    );
+    assert_eq!(db.rows("SELECT bool_and(age > 0) FROM users WHERE id > 100", &[]), json!([[null]]));
 }

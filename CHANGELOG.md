@@ -30,6 +30,14 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - `jsonb_array_elements_text` (and `json_`, and the non-`_text` forms) in a SELECT without
   FROM: `x NOT IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)` passes a list as one
   JSON parameter.
+- A text written by a model into a column of numbers or dates is stored as the column's
+  type, as in PostgreSQL (`'48.86'` into a `DOUBLE PRECISION`). Before, a model that writes
+  decimals as exact text left text among the numbers, and from that one row on every
+  comparison on the column failed (`cannot compare text with f64`).
+- `INTERVAL '1 day 2 hours'`, added to or taken from a date or a timestamp (years and months
+  on the calendar); `extract(epoch FROM x)`; typed literals `DATE '...'`, `TIMESTAMP '...'`;
+  `bool_and`, `bool_or`, `every`. A date compared with a timestamp is the date at midnight
+  (it was never equal, less nor greater).
 - A `DOUBLE` sent to `/v1/sql` arrives bit for bit (serde_json's `float_roundtrip`): a
   latitude copied from PostgreSQL was read one ULP away.
 
