@@ -666,7 +666,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "memoire-orm"
 version = "0.2.1"
-source = "git+https://github.com/maxlestage/Memoire?rev=a7419cb#a7419cbde36f8e2f26a2073a5fd1fae23298ce48"
+source = "git+https://github.com/maxlestage/Memoire?rev=8f7e0cb#8f7e0cb11e4e24786cf52f50250a0d19fc38aa17"
 dependencies = [
  "chrono",
  "foldhash",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "memoire-orm-derive"
 version = "0.2.1"
-source = "git+https://github.com/maxlestage/Memoire?rev=a7419cb#a7419cbde36f8e2f26a2073a5fd1fae23298ce48"
+source = "git+https://github.com/maxlestage/Memoire?rev=8f7e0cb#8f7e0cb11e4e24786cf52f50250a0d19fc38aa17"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -702,8 +702,26 @@ impl Store {
         self.durable.lsn.fetch_max(version.lsn(), Ordering::SeqCst);
     }
 
+    /// Leaves the log segment being written and starts the next one. The
+    /// segment left is synced first, and a sync that fails is final (see
+    /// [`Durable::failed`]): what was appended to it may not be on disk.
+    fn next_segment(&self, w: &mut Writer) -> Result<()> {
+        if let Err(e) = w.wal.file().sync_all() {
+            let _ = self.durable.failed.set(e.to_string());
+            return self.log_is_sound();
+        }
+        w.wal.rotate(w.next_lsn)?;
+        *lock(&self.wal_file) = w.wal.file();
+        Ok(())
+    }
+
     fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
         self.log_is_sound()?;
+        if writer.wal.spent() {
+            // A record was cut from this segment: its number is not sealed
+            // twice under one key.
+            self.next_segment(writer)?;
+        }
         let record = Record { lsn: writer.next_lsn, ops };
         let logged = writer.wal.bytes;
         writer.wal.append(&record)?;
@@ -756,9 +774,8 @@ impl Store {
         let lsn = self.flush(w)?;
         w.last_checkpoint = Some(SystemTime::now());
         w.commits_since_checkpoint = 0;
-        if w.wal.bytes > 0 {
-            w.wal.rotate(w.next_lsn)?;
-            *lock(&self.wal_file) = w.wal.file();
+        if w.wal.bytes > 0 || w.wal.spent() {
+            self.next_segment(w)?;
         }
         let limit = keep_after.map_or(lsn, |k| k.min(lsn));
         let segments = wal::segments(&self.dir.join("wal"))?;
@@ -975,6 +992,45 @@ mod tests {
         assert_eq!(db.engine().store.log_gap, None);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record cut from an encrypted log (its commit could not be applied)
+    /// moves the log to another segment, under another key: the number the
+    /// record had is sealed once per key. Both segments are replayed.
+    #[test]
+    fn a_record_cut_from_an_encrypted_log_starts_another_segment() {
+        let (dir, copy) = (temp("rekey"), temp("rekey-copy"));
+        let options =
+            EngineOptions { encryption: Some(crate::Encryption::from_key([9; 32])), ..EngineOptions::default() };
+        let db = Embedded::open_with(&dir, options.clone()).unwrap();
+        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+        db.engine().checkpoint().unwrap();
+        db.sql("INSERT INTO t (id, v) VALUES (1, 'before')", &[]).unwrap();
+        let segments = || super::wal::segments(&dir.join("wal")).unwrap().len();
+        let before = segments();
+        {
+            // What a commit that was logged and could not be applied leaves.
+            let mut w = db.engine().store.writer();
+            let whole = w.wal.bytes;
+            w.wal.cut_to(whole).unwrap();
+            assert!(w.wal.spent());
+        }
+        db.sql("INSERT INTO t (id, v) VALUES (2, 'after')", &[]).unwrap();
+        assert_eq!(segments(), before + 1);
+        assert!(!db.engine().store.writer().wal.spent());
+        // As a crash would leave it: the page store of the last checkpoint, and the log.
+        std::fs::create_dir_all(copy.join("wal")).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap().chain(std::fs::read_dir(dir.join("wal")).unwrap()).flatten() {
+            if entry.path().is_file() {
+                std::fs::copy(entry.path(), copy.join(entry.path().strip_prefix(&dir).unwrap())).unwrap();
+            }
+        }
+        let again = Embedded::open_with(&copy, options).unwrap();
+        assert_eq!(again.engine().store.log_gap, None);
+        assert_eq!(count(&again), "I64(2)");
+        drop((db, again));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy);
     }
 
     /// Past the limit of changed nodes kept in memory, a commit writes them

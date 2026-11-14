@@ -274,6 +274,10 @@ pub(crate) struct Writer {
     /// The file holds bytes past its records (a write that failed part way)
     /// that could not be cut yet: nothing is appended behind them.
     torn: bool,
+    /// A record was cut from this encrypted segment: the number it had is
+    /// never sealed under this segment's key again (a nonce is used once).
+    /// The next record goes to a new segment, which has a key of its own.
+    spent: bool,
 }
 
 impl Writer {
@@ -299,7 +303,7 @@ impl Writer {
             }
         };
         sync_dir(dir);
-        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg, torn: false })
+        Ok(Writer { dir: dir.to_owned(), file: Arc::new(file), first_lsn, bytes, key, seg, torn: false, spent: false })
     }
 
     /// The segment's file, to sync it.
@@ -310,6 +314,11 @@ impl Writer {
     /// Appends `record`. When the write fails, what it wrote of the record is
     /// cut from the file: the next record follows the last whole one.
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
+        if self.spent {
+            return Err(storage_err(
+                "write-ahead log: a record was cut from this segment, the next one starts another",
+            ));
+        }
         if self.torn {
             self.cut_to(self.bytes)?;
         }
@@ -340,6 +349,7 @@ impl Writer {
     pub(crate) fn cut_to(&mut self, bytes: u64) -> Result<()> {
         self.bytes = bytes;
         self.torn = true;
+        self.spent = self.seg.is_some();
         let len = bytes + if self.seg.is_some() { HEADER_LEN as u64 } else { 0 };
         self.file.set_len(len).map_err(io)?;
         (&*self.file).seek(SeekFrom::Start(len)).map_err(io)?;
@@ -347,9 +357,15 @@ impl Writer {
         Ok(())
     }
 
-    /// Closes this segment and starts the next one at `next_lsn`.
+    /// `true` once a record was cut from an encrypted segment: the next
+    /// record is for a new segment ([`rotate`](Self::rotate)).
+    pub(crate) fn spent(&self) -> bool {
+        self.spent
+    }
+
+    /// Leaves this segment, which its caller has synced, and starts the next
+    /// one at `next_lsn`.
     pub(crate) fn rotate(&mut self, next_lsn: u64) -> Result<()> {
-        self.file.sync_all().map_err(io)?;
         *self = Writer::open(&self.dir, next_lsn, self.key.clone())?;
         Ok(())
     }
@@ -469,16 +485,34 @@ mod tests {
             let whole = w.bytes;
             (&*w.file).write_all(&[0xAB; 37]).unwrap();
             w.cut_to(whole).unwrap();
+            // Encrypted, the record cut had its number sealed under the segment's key:
+            // that number goes to another segment, under another key.
+            let next = |w: &mut Writer, lsn: u64| {
+                assert_eq!(w.spent(), key.is_some());
+                if w.spent() {
+                    assert!(w.append(&record(lsn, b"under the same key")).is_err());
+                    w.rotate(lsn).unwrap();
+                }
+            };
+            next(&mut w, 2);
             w.append(&record(2, b"two")).unwrap();
             // A record that is whole, taken back: the next one has its number.
             let kept = w.bytes;
             w.append(&record(3, &[7; 5000])).unwrap();
             w.cut_to(kept).unwrap();
+            next(&mut w, 3);
             w.append(&record(3, b"three")).unwrap();
-            assert!(!w.torn);
+            assert!(!w.torn && !w.spent());
+            // The first record of a segment, cut: the segment starts again, with a new key.
+            w.rotate(4).unwrap();
+            w.append(&record(4, b"gone")).unwrap();
+            w.cut_to(0).unwrap();
+            next(&mut w, 4);
+            w.append(&record(4, b"four")).unwrap();
             drop(w);
             let read = recover(&dir, key.as_deref()).unwrap();
-            assert_eq!(read, vec![record(1, b"one"), record(2, b"two"), record(3, b"three")]);
+            assert_eq!(read, vec![record(1, b"one"), record(2, b"two"), record(3, b"three"), record(4, b"four")]);
+            assert_eq!(segments(&dir).unwrap().len(), if key.is_some() { 4 } else { 2 });
             let _ = fs::remove_dir_all(&dir);
         }
     }
