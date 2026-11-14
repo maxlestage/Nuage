@@ -213,10 +213,21 @@ pub(crate) fn encode_row(row: &[Value]) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
-    let (n, mut rest) = bytes.split_at_checked(4).ok_or_else(|| super::storage_err("truncated row"))?;
+/// The number of values a stored row says it has, and its values. The vector
+/// of the row is sized once: each value takes at least a byte, so a count
+/// larger than what follows (a damaged row) reserves no more than that.
+fn row_header(bytes: &[u8]) -> Result<(usize, &[u8], Vec<Value>)> {
+    let (n, rest) = bytes.split_at_checked(4).ok_or_else(|| super::storage_err("truncated row"))?;
     let n = u32::from_le_bytes(n.try_into().unwrap_or_default()) as usize;
-    (0..n).map(|_| decode_value(&mut rest)).collect()
+    Ok((n, rest, Vec::with_capacity(n.min(rest.len()))))
+}
+
+pub(crate) fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
+    let (n, mut rest, mut row) = row_header(bytes)?;
+    for _ in 0..n {
+        row.push(decode_value(&mut rest)?);
+    }
+    Ok(row)
 }
 
 /// Moves `input` past one value written by Memoire's `encode_value`, without
@@ -247,17 +258,16 @@ fn skip_value(input: &mut &[u8]) -> Result<()> {
 /// [`decode_row`] for the stored columns `want` marks: the others are left
 /// `NULL`, unread.
 pub(crate) fn decode_row_some(bytes: &[u8], want: &[bool]) -> Result<Vec<Value>> {
-    let (n, mut rest) = bytes.split_at_checked(4).ok_or_else(|| super::storage_err("truncated row"))?;
-    let n = u32::from_le_bytes(n.try_into().unwrap_or_default()) as usize;
-    (0..n)
-        .map(|i| {
-            if want.get(i).copied().unwrap_or(false) {
-                decode_value(&mut rest)
-            } else {
-                skip_value(&mut rest).map(|()| Value::Null)
-            }
-        })
-        .collect()
+    let (n, mut rest, mut row) = row_header(bytes)?;
+    for i in 0..n {
+        if want.get(i).copied().unwrap_or(false) {
+            row.push(decode_value(&mut rest)?);
+        } else {
+            skip_value(&mut rest)?;
+            row.push(Value::Null);
+        }
+    }
+    Ok(row)
 }
 
 pub(crate) fn encode_i64(v: i64) -> Vec<u8> {

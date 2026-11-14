@@ -570,6 +570,12 @@ fn answers_without_the_evaluator_match_it() {
         ("SELECT n FROM named WHERE name = ?", vec![json!("")]),
         ("SELECT upper(note) FROM t WHERE id = ?", vec![json!(5)]),
         ("SELECT DISTINCT kind FROM t WHERE grp = ? AND kind = ?", vec![json!(2), json!("b")]),
+        // Half the columns or more, in the table's order (each row keeps its vector), or not.
+        ("SELECT id, code, grp FROM t WHERE grp = ? AND kind = ?", vec![json!(1), json!("b")]),
+        ("SELECT code, kind, score, note FROM t WHERE id IN (3, 9, 27, 1000)", vec![]),
+        ("SELECT id, grp, kind, note, score FROM t WHERE code = ?", vec![json!("c21")]),
+        ("SELECT note, score, kind FROM t WHERE grp = ? AND kind = ?", vec![json!(2), json!("c")]),
+        ("SELECT id, note, note, kind FROM t WHERE id IN (5, 14)", vec![]),
     ];
     for (sql, params) in statements {
         let direct = db.rows(sql, params);
@@ -578,6 +584,23 @@ fn answers_without_the_evaluator_match_it() {
         assert_ne!(*sql, through);
         assert_eq!(direct, db.rows(&through, params), "{sql} {params:?}");
     }
+    // Whole tables, plain columns: read without the evaluator, then through it.
+    for (direct, through) in [
+        ("SELECT id, code, grp FROM t", "SELECT id, code, grp FROM t WHERE 1 = 1"),
+        ("SELECT code, grp, kind, note FROM t", "SELECT code, grp, kind, note FROM t WHERE 1 = 1"),
+        ("SELECT * FROM t", "SELECT * FROM t WHERE 1 = 1"),
+        ("SELECT note, id FROM t", "SELECT note, id FROM t WHERE 1 = 1"),
+        (
+            "SELECT id, code, grp, kind FROM t LIMIT 5 OFFSET 2",
+            "SELECT id, code, grp, kind FROM t WHERE 1 = 1 LIMIT 5 OFFSET 2",
+        ),
+    ] {
+        assert_eq!(db.rows(direct, &[]), db.rows(through, &[]), "{direct}");
+    }
+    assert_eq!(
+        db.rows("SELECT id, code, note FROM t WHERE id IN (8, 14)", &[]),
+        json!([[8, "c08", "note 8"], [14, "c14", null]])
+    );
     // The answers themselves, for a few.
     assert_eq!(db.rows("SELECT id, note, id FROM t WHERE id = 8", &[]), json!([[8, "note 8", 8]]));
     assert_eq!(db.rows("SELECT id FROM t WHERE id IN (9, 3, 3, 1000)", &[]), json!([[3], [9]]));

@@ -209,7 +209,7 @@ every PostgreSQL driver connects too: see below.
 
 **Does my connection work?** `GET /v1/ping` answers which application the token opens:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` gives
-`Connected to Nuage DB 0.4.0: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.1: application blog, read and write, branch main, 3 table(s).`,
 and without a token, or with one that opens nothing, it says what is wrong. From any machine:
 `nuage check <url> <token>`. A PostgreSQL connection gets the same line as a notice (psql
 prints it), and each application's page in the console shows its last connection (when, how,
