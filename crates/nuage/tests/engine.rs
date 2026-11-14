@@ -177,6 +177,20 @@ fn crash_rounds(test: &str, key: Option<String>) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A data directory of Nuage DB 0.4 (a redb page store) needs the `import-redb` feature: without
+/// it, it is refused with a message that says so, and left as it is.
+#[cfg(not(feature = "import-redb"))]
+#[test]
+fn an_earlier_page_store_is_refused_without_the_import_feature() {
+    let dir = temp_dir("legacy-refused");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("nuage.redb"), b"redb").unwrap();
+    let err = Embedded::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("import-redb"), "{err}");
+    assert!(dir.join("nuage.redb").exists() && !dir.join("nuage.db").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn more_data_than_cache() {
     let dir = temp_dir("big");

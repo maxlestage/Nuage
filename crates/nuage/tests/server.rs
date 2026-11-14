@@ -779,7 +779,7 @@ async fn applications() {
     assert_eq!(User::count(&shop).await.unwrap(), 5);
     assert_eq!(User::count(&blog).await.unwrap(), 1);
     assert!(User::count(&first).await.is_err(), "the first application has no `users`");
-    assert!(dir.join("apps/shop/nuage.redb").exists() && dir.join("apps/shop/encryption.json").exists());
+    assert!(dir.join("apps/shop/nuage.db").exists() && dir.join("apps/shop/encryption.json").exists());
     server.app_engine("shop").unwrap().checkpoint().unwrap();
     assert_eq!(files_with(&dir, NEEDLE), 0, "every application is encrypted");
 

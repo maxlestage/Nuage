@@ -1,6 +1,6 @@
 [package]
 name = "nuage"
-description = "Nuage DB: Memoire's own database, in pure Rust. Tables on disk behind a write-ahead log, copy-on-write branches, backups to a directory or S3, an HTTP server and a management console. Embedded or as a server."
+description = "Nuage DB: Memoire's own database, in pure Rust. Tables on disk in its own B-tree pages behind a write-ahead log, copy-on-write branches, backups to a directory or S3, an HTTP server and a management console. Embedded or as a server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ categories = ["database-implementations", "database", "web-programming::http-ser
 exclude = ["tests"]
 
 [features]
-default = ["chrono", "uuid", "json", "site"]
+default = ["chrono", "uuid", "json", "site", "import-redb"]
 ## The website of Nuage DB (crates/nuage-site: pages, the live dashboard at `/app`, PWA),
 ## served by the `nuage` binary next to the database: `nuage::site()`. Without it, `/`
 ## is a small home page.
@@ -31,7 +31,11 @@ s3 = [
     "dep:tokio", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:http-body-util",
     "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
 ]
-## Without `s3`, `server` and `site` (`default-features = false`), Nuage DB is its embedded
+## Reads the page store of Nuage DB up to 0.4 (a redb file, `nuage.redb`) once, to bring
+## a data directory or a backup of those versions to this one. Nothing else uses redb:
+## drop the feature once every database has been opened by this version.
+import-redb = ["dep:redb"]
+## Without `s3`, `server`, `site` and `import-redb` (`default-features = false`), Nuage DB is its embedded
 ## engine alone (`nuage::Embedded`, backups to a folder): pure Rust, no network stack, no
 ## C or assembly (cryptography from RustCrypto).
 ## Nuage DB always stores dates, UUIDs and JSON (memoire-orm's `chrono`, `uuid` and
@@ -44,7 +48,8 @@ json = []
 [dependencies]
 memoire-orm = { workspace = true }
 nuage-site = { workspace = true, optional = true }
-redb = "4"
+# Only to read the page store of versions up to 0.4 (feature `import-redb`).
+redb = { version = "4", optional = true }
 # `float_roundtrip` : sans elle, le parseur rapide de serde_json peut décaler un
 # nombre d'un ULP (44.833800000000004 lu 44.8338) : un DOUBLE envoyé à /v1/sql
 # doit arriver bit pour bit, comme par le protocole PostgreSQL.

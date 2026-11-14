@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `manifest.json` | latest snapshot and its LSN |
 //! | `encryption.json` | the header of an encrypted database (salt, check value: no key) |
-//! | `snapshots/<lsn>.redb` | page store files |
+//! | `snapshots/<lsn>.db` | page store files (`.redb`: written by a version up to 0.4, see [`super::legacy`]) |
 //! | `wal/<first lsn>.log` | log segments |
 
 use std::fs;
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
+use super::legacy::LEGACY_FILE;
 use super::storage_err;
 use super::store::{FILE, Store, now_millis};
 use super::wal::{self, segment_lsn, segment_name};
@@ -225,7 +226,7 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
         fs::copy(store.dir.join(FILE), &local).map_err(io)?;
         lsn
     };
-    let name = format!("snapshots/{lsn:020}.redb");
+    let name = format!("snapshots/{lsn:020}.db");
     let uploaded = backup.put_file(&name, &local);
     let _ = fs::remove_file(&local);
     uploaded?;
@@ -244,8 +245,7 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
             backup.delete(old)?;
         }
         // Segments that end before the oldest kept snapshot are useless.
-        let oldest: u64 =
-            snapshots[cut].trim_start_matches("snapshots/").trim_end_matches(".redb").parse().unwrap_or(0);
+        let oldest = snapshot_lsn(&snapshots[cut]);
         let mut segs: Vec<(u64, String)> = backup
             .list("wal/")?
             .into_iter()
@@ -261,6 +261,13 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
         }
     }
     Ok(lsn)
+}
+
+/// The LSN in the name of a snapshot (`snapshots/<lsn>.db`, or `.redb` for one
+/// of a version up to 0.4).
+fn snapshot_lsn(name: &str) -> u64 {
+    let name = name.trim_start_matches("snapshots/");
+    name.split_once('.').map_or(name, |(lsn, _)| lsn).parse().unwrap_or(0)
 }
 
 /// After a database in clear was encrypted and a snapshot of it taken:
@@ -286,7 +293,7 @@ pub(crate) fn purge_older(backup: &dyn BackupStore) -> Result<()> {
 
 /// `true` when `dir` holds no database.
 pub(crate) fn is_empty(dir: &Path) -> bool {
-    !dir.join(FILE).exists()
+    !dir.join(FILE).exists() && !dir.join(LEGACY_FILE).exists()
 }
 
 /// Restores the latest backup into `dir`. Returns `false` when there is
@@ -303,7 +310,9 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
         let header = backup.get(HEADER_FILE)?.ok_or_else(|| storage_err(format!("the backup has no {HEADER_FILE}")))?;
         fs::write(dir.join(HEADER_FILE), header).map_err(io)?;
     }
-    let tmp = dir.join("nuage.redb.partial");
+    // A snapshot of a version up to 0.4 is its page store: opening imports it.
+    let file = if name.ends_with(".redb") { LEGACY_FILE } else { FILE };
+    let tmp = dir.join("nuage.db.partial");
     fs::write(&tmp, data).map_err(io)?;
     for seg in backup.list("wal/")? {
         let Some(first) = segment_lsn(seg.trim_start_matches("wal/")) else { continue };
@@ -315,7 +324,7 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
             fs::write(dir.join("wal").join(segment_name(first)), bytes).map_err(io)?;
         }
     }
-    fs::rename(&tmp, dir.join(FILE)).map_err(io)?;
+    fs::rename(&tmp, dir.join(file)).map_err(io)?;
     wal::sync_dir(dir);
     Ok(true)
 }
