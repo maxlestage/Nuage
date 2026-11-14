@@ -18,6 +18,7 @@
 //! ```
 
 pub mod dashboard;
+pub mod details;
 pub mod i18n;
 pub mod icons;
 pub mod routes;

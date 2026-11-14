@@ -223,6 +223,15 @@ impl Sim {
                 secret: Some("key".into()),
             }),
             applications: Some(3),
+            memory: Some(nuage_site::status::Memory {
+                total_bytes: Some(1 << 30),
+                available_bytes: Some(700 << 20),
+                process_bytes: Some(24 << 20),
+                swap_total_bytes: Some(1 << 30),
+                swap_free_bytes: Some(1 << 30),
+                cache_per_app_bytes: Some(128 << 20),
+            }),
+            postgresql: Some(nuage_site::status::Postgres { port: 5432, tls: true }),
             databases: Some(vec![
                 Database {
                     name: "nuage".into(),
