@@ -641,7 +641,7 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
         }
         if path == "/" {
             let res = admin::home_page(state, req.headers());
-            return admin::themed(req.headers(), res).await;
+            return admin::prefs(req.headers(), res).await;
         }
     }
     json_response(404, &json!({ "error": { "kind": "not_found", "message": format!("no such page: {path}") } }))

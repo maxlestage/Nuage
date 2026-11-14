@@ -12,6 +12,14 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - The website has the same switch (☀ ☾ A): the choice stays in the browser (no cookie), and a
   small script applies it before the page paints.
 
+### Languages, in the same spirit
+
+- English, French, Spanish **or Auto** (the browser's language), as a switch like the theme's,
+  in the console and on the website; the choice is kept (the console's cookie, the browser's
+  storage on the website, which sets no cookie). On the website, `/` and the pages without a
+  language still go to the browser's language, unless a language was chosen: the redirect says
+  `lang=auto`, and the page moves to the kept one.
+
 ## 0.4.0 (2026-11-13)
 
 ### Does my connection work?

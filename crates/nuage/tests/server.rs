@@ -350,6 +350,14 @@ async fn console() {
     assert!(app.body.contains("Size on disk") && app.body.contains("NUAGE_URL="), "{}", app.body);
     assert!(app.body.contains("NUAGE_PG_PORT=5432"), "PostgreSQL is off here: the console says how to turn it on");
     assert!(app.body.contains("✓ Connected: last connection"), "the console shows the last connection");
+    // The language: EN, FR, ES or as the browser, like the theme.
+    assert!(app.body.contains(r#"class="lg-auto""#) && app.body.contains(r#"class="lg-fr""#));
+    c.request("GET", "/admin/apps/nuage?lang=fr", &[]).await;
+    let fr = c.request("GET", "/admin/apps/nuage", &[]).await;
+    assert!(fr.body.contains(r#"lang="fr""#) && !fr.body.contains(r#"data-lang-choice="auto" lang"#), "French, chosen");
+    c.request("GET", "/admin/apps/nuage?lang=auto", &[]).await;
+    let auto = c.request("GET", "/admin/apps/nuage", &[]).await;
+    assert!(auto.body.contains(r#"data-lang-choice="auto""#), "as the browser again");
     // The theme: light, dark or as the device, kept in a cookie.
     assert!(
         app.body.contains(r#"class="th-dark""#) && !app.body.contains("<html data-theme="),
@@ -358,7 +366,7 @@ async fn console() {
     let chosen = c.request("GET", "/admin/apps/nuage?theme=dark", &[]).await;
     assert_eq!(chosen.status, 303);
     let dark = c.request("GET", "/admin/apps/nuage", &[]).await;
-    assert!(dark.body.contains(r#"<html data-theme="dark" lang="#), "the dark theme is kept");
+    assert!(dark.body.contains(r#"<html data-theme="dark" "#), "the dark theme is kept");
     c.request("GET", "/admin/apps/nuage?theme=auto", &[]).await;
     assert!(
         !c.request("GET", "/admin/apps/nuage", &[]).await.body.contains("<html data-theme="),
@@ -1115,7 +1123,11 @@ async fn console_in_three_languages() {
 
     // The browser's language, before any choice.
     let page = http(addr, "GET", "/admin/login", &[("accept-language", "es-ES,es;q=0.9,en;q=0.5")], "").await;
-    assert!(page.body.contains(r#"<html lang="es">"#) && page.body.contains("Contraseña"), "{}", page.body);
+    assert!(
+        page.body.contains(r#"<html data-lang-choice="auto" lang="es">"#) && page.body.contains("Contraseña"),
+        "{}",
+        page.body
+    );
 
     for (code, words) in [
         ("fr", ["Applications", "Nouvelle application", "Jetons", "Réglages", "Sites web"]),

@@ -72,7 +72,7 @@ mod tests {
     fn pages_and_files() {
         let home = get("/", None).expect("the home page is the site's");
         assert!(matches!(home.status, 301..=308), "{}", home.status);
-        assert_eq!(header(&home, "location"), Some("/fr/"));
+        assert_eq!(header(&home, "location"), Some("/fr/?lang=auto"));
         let page = get("/fr/app/", None).unwrap();
         assert_eq!(page.status, 200);
         assert!(page.content_type.starts_with("text/html"), "{}", page.content_type);

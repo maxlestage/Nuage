@@ -73,11 +73,12 @@ fn every_route_answers() {
 fn root_and_app_lead_to_the_visitor_language() {
     let response = request(Method::GET, "/", &[("accept-language", "de-DE,es;q=0.8,en;q=0.5")]).unwrap();
     assert_eq!(response.status(), StatusCode::FOUND);
-    assert_eq!(header(&response, "location"), "/es/");
+    // `lang=auto`: the page was not chosen, a language kept in the browser takes over.
+    assert_eq!(header(&response, "location"), "/es/?lang=auto");
     let app = request(Method::GET, "/app", &[("accept-language", "fr-FR")]).unwrap();
-    assert_eq!(header(&app, "location"), "/fr/app/");
-    assert_eq!(header(&get("/app/"), "location"), "/en/app/");
-    assert_eq!(header(&get("/docs"), "location"), "/en/docs/");
+    assert_eq!(header(&app, "location"), "/fr/app/?lang=auto");
+    assert_eq!(header(&get("/app/"), "location"), "/en/app/?lang=auto");
+    assert_eq!(header(&get("/docs?x=1"), "location"), "/en/docs/?x=1&lang=auto");
 }
 
 #[test]
@@ -268,7 +269,13 @@ fn no_link_is_broken() {
             if !checked.insert(link.clone()) && fragment.is_none() {
                 continue;
             }
-            let response = get(&target);
+            let mut response = get(&target);
+            // The language switch's Auto: the page without its language, which leads to
+            // the browser's.
+            if response.status() == StatusCode::FOUND && header(&response, "location").ends_with("lang=auto") {
+                let next = header(&response, "location").to_owned();
+                response = get(&next);
+            }
             assert_eq!(response.status(), StatusCode::OK, "{path}: broken link {link}");
             if let Some(fragment) = fragment.filter(|f| !f.is_empty()) {
                 let page = String::from_utf8(response.into_body()).unwrap();
