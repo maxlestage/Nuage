@@ -310,6 +310,30 @@ impl EmbeddedTransaction {
         self.with(|ctx| exec::execute(ctx, query))
     }
 
+    /// Runs SQL (see [`crate::sql`]) in the transaction: one statement or
+    /// several separated by `;`, `?` parameters from `params`, one result per
+    /// statement. Later statements, and later calls, see what earlier ones
+    /// wrote; nothing is visible outside before [`commit_now`](Self::commit_now),
+    /// and [`rollback_now`](Self::rollback_now) (or dropping the transaction)
+    /// undoes it all. A failing statement leaves the transaction open with
+    /// the statements before it applied: roll back to discard them.
+    ///
+    /// ```no_run
+    /// # fn demo(db: &nuage::Embedded) -> memoire_orm::Result<()> {
+    /// let tx = db.begin_now()?;
+    /// let seen = tx.sql("SELECT count(*) FROM notes WHERE text = ?", &["hello".into()])?;
+    /// if seen[0].rows[0][0].as_i64() == Some(0) {
+    ///     tx.sql("INSERT INTO notes (text) VALUES (?)", &["hello".into()])?;
+    /// }
+    /// tx.commit_now()?;
+    /// # Ok(()) }
+    /// ```
+    pub fn sql(&self, sql: &str, params: &[Json]) -> Result<Vec<crate::sql::SqlResult>> {
+        let script = crate::sql::Script::parse(sql)?;
+        let values: Vec<Value> = params.iter().map(crate::sql::value::from_json).collect();
+        crate::sql::run_in(self, &self.engine.schemas, &script, &values)
+    }
+
     /// The schema of one table as this transaction sees it (its own
     /// `CREATE TABLE` included), `None` when there is none.
     pub(crate) fn table_schema(&self, name: &str) -> Result<Option<Json>> {

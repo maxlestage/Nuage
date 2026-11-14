@@ -405,3 +405,39 @@ fn postgres_idioms() {
     );
     assert_eq!(db.rows("SELECT bool_and(age > 0) FROM users WHERE id > 100", &[]), json!([[null]]));
 }
+
+/// `EmbeddedTransaction::sql`: a transaction sees its own writes, others see
+/// nothing before the commit, and a rollback undoes everything.
+#[test]
+fn sql_in_a_transaction() {
+    let db = Db::open("transaction");
+    db.0.sql("CREATE TABLE notes (id TEXT PRIMARY KEY, n BIGINT NOT NULL)", &[]).unwrap();
+    let count = |rows: Vec<SqlResult>| rows[0].rows[0][0].as_i64().unwrap();
+
+    let tx = db.0.begin_now().unwrap();
+    tx.sql(
+        "INSERT INTO notes (id, n) VALUES (?, ?); INSERT INTO notes (id, n) VALUES (?, ?)",
+        &[json!("a"), json!(1), json!("b"), json!(2)],
+    )
+    .unwrap();
+    assert_eq!(count(tx.sql("SELECT count(*) FROM notes", &[]).unwrap()), 2);
+    assert_eq!(count(db.0.sql("SELECT count(*) FROM notes", &[]).unwrap()), 0, "not committed yet");
+    tx.sql("UPDATE notes SET n = n + 10 WHERE id = ?", &[json!("a")]).unwrap();
+    tx.commit_now().unwrap();
+    assert_eq!(count(db.0.sql("SELECT sum(n) FROM notes", &[]).unwrap()), 13);
+
+    let tx = db.0.begin_now().unwrap();
+    tx.sql("DELETE FROM notes", &[]).unwrap();
+    assert_eq!(count(tx.sql("SELECT count(*) FROM notes", &[]).unwrap()), 0);
+    // A failing statement: the caller rolls back.
+    assert!(tx.sql("INSERT INTO notes (id, n) VALUES (?, ?)", &[json!("c")]).is_err());
+    tx.rollback_now().unwrap();
+    assert_eq!(count(db.0.sql("SELECT count(*) FROM notes", &[]).unwrap()), 2);
+
+    // Dropped without a commit: nothing written.
+    {
+        let tx = db.0.begin_now().unwrap();
+        tx.sql("INSERT INTO notes (id, n) VALUES ('d', 4)", &[]).unwrap();
+    }
+    assert_eq!(count(db.0.sql("SELECT count(*) FROM notes", &[]).unwrap()), 2);
+}
