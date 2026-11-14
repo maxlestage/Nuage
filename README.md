@@ -29,7 +29,7 @@ server in production, without changing a line.
 |---|---|
 | **Encrypted at rest** | Everything stored is encrypted (`NUAGE_ENCRYPTION_KEY`): the pages with XTS-AES-256, each log record with AES-256-GCM, and the backups, which are copies of them. Keys derived per application (HKDF, or Argon2id from a passphrase). |
 | **Several applications** | One server, one database per application: its own tokens, its own keys, its own backups. The token an application sends picks its database. The console and `/app` show them side by side. |
-| **Pages on disk** | Tables and indexes in one B-tree file with a bounded page cache (`NUAGE_CACHE_MB`): the data is not limited by memory. Primary-key and index lookups read only the rows they need. |
+| **Pages on disk** | Tables and indexes in one file of B-tree pages written by Nuage DB itself (copy-on-write, a checksum on each node), with a bounded page cache (`NUAGE_CACHE_MB`): the data is not limited by memory. Primary-key and index lookups read only the rows they need. |
 | **Write-ahead log** | Each commit is appended to the log and synced to disk before it is applied. Checkpoints, crash recovery, CRC-32 on log records and checksums on pages. |
 | **Memoire semantics** | Statements run on Memoire's own evaluator over the rows read from disk: Nuage DB behaves exactly like Memoire's in-memory engine, on data of any size. |
 | **Transactions** | Snapshot reads, optimistic commits (`Error::Conflict`, retried by `db.transaction(...)`), interactive transactions over HTTP, all-or-nothing batches. |
@@ -59,6 +59,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 | `s3` | backups to S3-compatible storage (HTTP/1.1 over rustls) | yes |
 | `server` | the server (`/v1`, PostgreSQL protocol, console, live status), `nuage::Db::Remote` and the `nuage` binary; implies `s3` | yes |
 | `site` | the website and the `/app` dashboard, served by the binary; implies `server` | yes |
+| `import-redb` | reads the page store of Nuage DB up to 0.4 (`nuage.redb`) once, to bring a data directory or a backup of those versions to this one (see [Coming from 0.4](#coming-from-04)); the only use of redb | yes |
 
 `default-features = false` is the embedded engine alone; add `features = ["s3"]` for
 S3 backups (the configuration of an embedded database with them:
@@ -119,7 +120,7 @@ Nuage DB encrypts everything it stores (AES-256, HKDF-SHA256, Argon2id):
 
 | What | How |
 |---|---|
-| pages (`nuage.redb`: tables, indexes, branches, the list of applications) | XTS-AES-256 (IEEE 1619), the mode of disk encryption: pages keep their place and size |
+| pages (`nuage.db`: tables, indexes, branches, the list of applications) | XTS-AES-256 (IEEE 1619), the mode of disk encryption: pages keep their place and size |
 | write-ahead log (`wal/*.log`) | AES-256-GCM per record, under a key of its own for each segment (random salt), the LSN as nonce |
 | backups (folder or S3) | copies of the files above, encrypted the same way, with the directory's header |
 
@@ -133,6 +134,20 @@ opened with a key, and the backup in clear is replaced. **Keep the key**: withou
 the data nor the backups can be read. The embedded mode encrypts too, with
 `EngineOptions { encryption: Some(Encryption::parse(key)?), .. }` or `NUAGE_ENCRYPTION_KEY`
 with `nuage::Db::from_env()`.
+
+### Coming from 0.4
+
+Up to 0.4 the pages were a [redb](https://docs.rs/redb) file, `nuage.redb`. Since then they
+are Nuage DB's own (`nuage.db`). Nothing to do: a data directory of an earlier version, or a
+backup of one restored into an empty directory, is imported the first time this version opens
+it, encrypted as it was, and the log written since its last checkpoint is replayed over it.
+The old file stays beside the new one as `nuage.redb.imported`: delete it once you have
+checked your data. When backups are configured, a snapshot of this version is sent right
+after, so the next restore no longer goes through the import.
+
+Reading the old file is the `import-redb` Cargo feature, on by default. A build without it
+(`default-features = false`) contains no redb at all and refuses such a directory with a
+message that says so. Once every database has been opened by this version, the feature can go.
 
 ## Several applications
 

@@ -38,7 +38,7 @@ NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=... NUAGE_ADMIN_PASSWOR
   them; keys derived per data directory (HKDF, Argon2id for a passphrase).
 - **Applications**: one server, one database per application, with its own tokens, keys and
   backups; the token an application sends picks its database.
-- **Engine**: redb B-tree pages with a bounded cache, a write-ahead log synced on each
+- **Engine**: its own B-tree pages (copy-on-write, checksums) with a bounded cache, a write-ahead log synced on each
   commit, checkpoints, crash recovery, checksums; Memoire's evaluator over the rows read
   from disk.
 - **Branches**: instant, they share their parent's pages and store only their own changes.

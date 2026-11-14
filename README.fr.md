@@ -30,7 +30,7 @@ ligne.
 |---|---|
 | **Chiffré au repos** | Tout ce qui est stocké est chiffré (`NUAGE_ENCRYPTION_KEY`) : les pages en XTS-AES-256, chaque enregistrement du journal en AES-256-GCM, et les sauvegardes, qui en sont des copies. Clés dérivées par application (HKDF, ou Argon2id depuis une phrase de passe). |
 | **Plusieurs applications** | Un serveur, une base par application : ses jetons, ses clés, ses sauvegardes. Le jeton qu'envoie une application choisit sa base. La console et `/app` les montrent côte à côte. |
-| **Pages sur disque** | Tables et index dans un seul fichier B-tree, avec un cache de pages borné (`NUAGE_CACHE_MB`) : les données ne sont pas limitées par la mémoire. Les recherches par clé primaire et par index ne lisent que les lignes utiles. |
+| **Pages sur disque** | Tables et index dans un seul fichier de pages en arbre B écrit par Nuage DB lui-même (copie sur écriture, somme de contrôle sur chaque nœud), avec un cache de pages borné (`NUAGE_CACHE_MB`) : les données ne sont pas limitées par la mémoire. Les recherches par clé primaire et par index ne lisent que les lignes utiles. |
 | **Journal d'écriture** | Chaque commit est ajouté au journal et synchronisé sur disque avant d'être appliqué. Checkpoints, reprise après crash, CRC-32 sur les enregistrements du journal et sommes de contrôle sur les pages. |
 | **Sémantique de Memoire** | Les requêtes passent par l'évaluateur de Memoire, sur les lignes lues sur disque : Nuage DB se comporte exactement comme le moteur en mémoire de Memoire, quelle que soit la taille des données. |
 | **Transactions** | Lectures sur instantané, commits optimistes (`Error::Conflict`, rejoués par `db.transaction(...)`), transactions interactives en HTTP, lots tout-ou-rien. |
@@ -109,7 +109,7 @@ Nuage DB chiffre tout ce qu'il stocke (AES-256, HKDF-SHA256, Argon2id) :
 
 | Quoi | Comment |
 |---|---|
-| pages (`nuage.redb` : tables, index, branches, liste des applications) | XTS-AES-256 (IEEE 1619), le mode du chiffrement de disque : les pages gardent leur place et leur taille |
+| pages (`nuage.db` : tables, index, branches, liste des applications) | XTS-AES-256 (IEEE 1619), le mode du chiffrement de disque : les pages gardent leur place et leur taille |
 | journal d'écriture (`wal/*.log`) | AES-256-GCM par enregistrement, sous une clé propre à chaque segment (sel aléatoire), le LSN comme nonce |
 | sauvegardes (dossier ou S3) | copies des fichiers ci-dessus, chiffrées de même, avec l'en-tête du répertoire |
 
@@ -124,6 +124,22 @@ remplacée. **Gardez la clé** : sans elle, ni les données ni les sauvegardes n
 Le mode intégré chiffre aussi, avec
 `EngineOptions { encryption: Some(Encryption::parse(clé)?), .. }` ou `NUAGE_ENCRYPTION_KEY`
 avec `nuage::Db::from_env()`.
+
+### En venant de la version 0.4
+
+Jusqu'à la 0.4, les pages étaient un fichier [redb](https://docs.rs/redb), `nuage.redb`.
+Ce sont maintenant celles de Nuage DB (`nuage.db`). Rien à faire : un répertoire de données
+d'une version antérieure, ou une sauvegarde d'une telle version restaurée dans un répertoire
+vide, est importé à la première ouverture par cette version, chiffré comme il l'était, et le
+journal écrit depuis son dernier point de contrôle est rejoué par-dessus. L'ancien fichier
+reste à côté du nouveau sous le nom `nuage.redb.imported` : supprimez-le une fois vos données
+vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version est envoyé
+aussitôt après : la restauration suivante ne passe plus par l'import.
+
+La lecture de l'ancien fichier est la fonctionnalité Cargo `import-redb`, active par défaut.
+Une compilation sans elle (`default-features = false`) ne contient plus redb du tout et
+refuse un tel répertoire avec un message qui le dit. Une fois toutes les bases ouvertes par
+cette version, la fonctionnalité peut être retirée.
 
 ## Plusieurs applications
 
