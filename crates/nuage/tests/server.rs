@@ -13,9 +13,9 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::HeaderMap;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use memoire_orm::Query;
 use memoire_orm::nuage::NuageError;
 use memoire_orm::prelude::*;
+use memoire_orm::{Query, Value};
 use nuage::{Engine, EngineOptions, Server, ServerOptions, SiteResponse};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -85,7 +85,48 @@ async fn client_and_server_end_to_end() {
         "{err:?}"
     );
     assert!(matches!(db.create_table::<User>().await.unwrap_err(), Error::TableExists(_)));
-    assert!(matches!(db.raw::<i64>("SELECT 1", &[]).await.unwrap_err(), Error::Unsupported(_)));
+    // Raw SQL (`db.raw`, `db.raw_execute`): the SQL layer runs it, as `/v1/sql`
+    // does, with PostgreSQL's `$1` parameters.
+    let n: Vec<i64> =
+        db.raw("SELECT count(*) FROM users WHERE email = $1", &[Value::Text("a@x.dev".into())]).await.unwrap();
+    assert_eq!(n, vec![1]);
+    let names: Vec<String> = db
+        .raw(
+            "SELECT name FROM users WHERE id NOT IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)",
+            &[Value::Text("[]".into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(names, vec!["A".to_owned()]);
+    assert_eq!(
+        db.raw_execute(
+            "UPDATE users SET name = $1 WHERE email = $2",
+            &[Value::Text("A2".into()), Value::Text("a@x.dev".into())]
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(db.raw::<i64>("SELECT nope FROM nowhere", &[]).await.is_err());
+    // Inside a transaction: its writes, seen by it alone until the commit.
+    let tx = db.begin().await.unwrap();
+    let locked: Vec<i64> =
+        tx.raw("SELECT id FROM users WHERE email = $1 FOR UPDATE", &[Value::Text("a@x.dev".into())]).await.unwrap();
+    assert_eq!(locked.len(), 1);
+    assert_eq!(
+        tx.raw_execute("UPDATE users SET name = 'A3' WHERE id = $1", &[memoire_orm::Value::I64(locked[0])])
+            .await
+            .unwrap(),
+        1
+    );
+    let seen: Vec<String> = tx.raw("SELECT name FROM users", &[]).await.unwrap();
+    assert_eq!(seen, vec!["A3".to_owned()]);
+    let outside: Vec<String> = db.raw("SELECT name FROM users", &[]).await.unwrap();
+    assert_eq!(outside, vec!["A2".to_owned()]);
+    tx.rollback().await.unwrap();
+    let after: Vec<String> = db.raw("SELECT name FROM users", &[]).await.unwrap();
+    assert_eq!(after, vec!["A2".to_owned()]);
+    db.raw_execute("UPDATE users SET name = 'A' WHERE email = 'a@x.dev'", &[]).await.unwrap();
 
     // Batches: all or nothing.
     let b = user("b@x.dev", "B", None, 0.0);
@@ -989,6 +1030,9 @@ async fn websites() {
     }
     let reader = NuageDb::connect(&running.url(), &read).await.unwrap();
     assert!(reader.branches().await.is_ok(), "reads work with the client too");
+    let n: Vec<i64> = reader.raw("SELECT count(*) FROM posts", &[]).await.unwrap();
+    assert_eq!(n, vec![200], "raw reads too");
+    assert!(reader.raw::<i64>("DELETE FROM posts RETURNING id", &[]).await.is_err(), "not raw writes");
     let count = http(
         addr,
         "POST",
