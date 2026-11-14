@@ -190,8 +190,8 @@ fn check_params(script: &Script, given: usize) -> Result<()> {
 }
 
 /// Runs scripts (each one statement or several, separated by `;`, with its
-/// parameters) on `branch` of `engine`, all in one transaction, retried on a
-/// write conflict. `commit: false` rolls it back: a dry run, what would change.
+/// parameters) on `branch` of `engine`, all in one transaction. `commit:
+/// false` rolls it back: a dry run, what would change.
 pub(crate) fn run(
     engine: &Arc<Engine>,
     branch: &str,
@@ -215,43 +215,38 @@ pub(crate) fn run_values(
     for (script, params) in batch {
         check_params(script, params.len())?;
     }
-    let all_params: Vec<&[Value]> = batch.iter().map(|(_, p)| *p).collect();
     let writes = batch.iter().any(|(s, _)| s.writes());
     let db = Embedded::from_engine(engine.clone()).on_branch(branch)?;
-    let mut attempt = 0;
-    loop {
-        let tx = db.begin_now()?;
+    let run_all = |tx: &crate::embedded::EmbeddedTransaction| -> Result<Vec<Vec<SqlResult>>> {
         let mut out = Vec::with_capacity(batch.len());
-        let mut failed = None;
-        'scripts: for ((script, _), params) in batch.iter().zip(all_params.iter().copied()) {
-            let runner = exec::Runner::new(&tx, schemas, params);
-            let mut results = Vec::with_capacity(script.stmts.len());
-            for s in script.stmts.iter() {
-                match runner.run(s) {
-                    Ok(r) => results.push(r),
-                    Err(e) => {
-                        failed = Some(e);
-                        break 'scripts;
-                    }
-                }
-            }
-            out.push(results);
+        for (script, params) in batch {
+            let runner = exec::Runner::new(tx, schemas, params);
+            out.push(script.stmts.iter().map(|s| runner.run(s)).collect::<Result<Vec<_>>>()?);
         }
-        if let Some(e) = failed {
-            let _ = tx.rollback_now();
-            return Err(e);
-        }
-        if !commit || !writes {
-            let _ = tx.rollback_now();
-            return Ok(out);
-        }
-        match tx.commit_now() {
-            Ok(()) => return Ok(out),
-            Err(Error::Conflict(_)) if attempt < 8 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1 << attempt.min(5)));
-            }
-            Err(e) => return Err(e),
+        Ok(out)
+    };
+    if !writes {
+        // Reads alone see what is on disk and wait for nothing.
+        return run_all(&db.begin_read()?);
+    }
+    // Writes take their turn from the first statement to the commit: nothing
+    // lands in between, so there is no conflict to retry, however many
+    // writers there are. The turn ends before the log is synced: the writers
+    // behind share that sync.
+    let mut writer = engine.store.writer();
+    let tx = db.begin_locked()?;
+    let since = tx.since()?;
+    let done = run_all(&tx).and_then(|out| {
+        let lsn = if commit { tx.commit_locked(&mut writer)? } else { since };
+        Ok((out, lsn))
+    });
+    drop(writer);
+    match done {
+        Ok((out, lsn)) => engine.store.wait_durable(lsn).map(|()| out),
+        Err(e) => {
+            // The refusal rests on what was read too.
+            engine.store.wait_durable(since)?;
+            Err(e)
         }
     }
 }

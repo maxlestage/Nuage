@@ -33,6 +33,32 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   encrypted, closed normally or left by a crash.
 - Snapshots in a backup are named `snapshots/<lsn>.db`.
 
+### Writers at the same time
+
+- The log is no longer synced under the writer lock. A commit is appended to the log and
+  applied in memory in its turn, then waits for the log to be on disk before it returns;
+  one `fsync` covers every commit appended before it started, so commits made at the same
+  time share it.
+- Nothing rests on a commit a crash could still undo: plain reads see the last commit that
+  is on disk (and never wait for one being written); a transaction that may write goes by
+  the latest commits, and each of its answers waits for them to be on disk.
+- A SQL script that writes (`POST /v1/sql`, the PostgreSQL protocol outside `BEGIN`,
+  `Embedded::sql`) takes its turn from its first statement to its commit instead of running
+  as an optimistic transaction retried on a conflict: writers on the same table used to
+  collide, wait and, with enough of them, fail with a conflict. Transactions opened by the
+  application (`BEGIN`, `db.begin()`) stay optimistic.
+- **Fixed**: a transaction could write over a commit that landed between its beginning and
+  its first read of the table (the conflict was looked for from that first read, the data
+  was as of the beginning). The conflict is now looked for from its snapshot.
+- **Fixed**: a row too large for the page store was refused after it had been written to
+  the log; it is refused before.
+
+| `INSERT` with `fsync`, one commit each (`examples/sql_bench.rs`) | Before | After |
+|---|---:|---:|
+| 1 writer | 4,500 /s | 6,000 /s |
+| 8 writers | fails (conflict) | 14,000 /s |
+| 32 writers | fails (conflict) | 24,000 /s |
+
 ### Faster reads and writes
 
 - A SQL text already parsed is kept (512 of them): applications send the same statements

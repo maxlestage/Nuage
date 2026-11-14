@@ -53,7 +53,7 @@ const KIND_BRANCH: u8 = 2;
 const KIND_DIRECTORY: u8 = 3;
 const KIND_HEADER: u8 = 4;
 /// The longest key and value together.
-const MAX_ENTRY: usize = 1 << 30;
+pub(crate) const MAX_ENTRY: usize = 1 << 30;
 
 fn err(message: impl std::fmt::Display) -> Error {
     storage_err(format!("page store: {message}"))
@@ -805,14 +805,21 @@ impl Live {
 /// The trees as of one commit: what a reader sees, however long it reads.
 pub(crate) struct Version {
     seq: u64,
+    /// What the caller numbered the commit (its place in the log).
+    lsn: u64,
     trees: Trees,
     live: Arc<Live>,
 }
 
 impl Version {
-    fn new(seq: u64, trees: Trees, live: &Arc<Live>) -> Arc<Version> {
+    fn new(seq: u64, lsn: u64, trees: Trees, live: &Arc<Live>) -> Arc<Version> {
         *lock(&live.0).entry(seq).or_insert(0) += 1;
-        Arc::new(Version { seq, trees, live: live.clone() })
+        Arc::new(Version { seq, lsn, trees, live: live.clone() })
+    }
+
+    /// The number given to the last commit it holds (see [`Pages::apply`]).
+    pub(crate) fn lsn(&self) -> u64 {
+        self.lsn
     }
 
     /// The root of a store table, `None` when there is no such table.
@@ -1070,7 +1077,11 @@ pub(crate) struct Pages {
     /// `fsync` at each checkpoint (off only in tests).
     sync: bool,
     cache: Cache,
+    /// The trees as of the last commit.
     current: RwLock<Arc<Version>>,
+    /// The trees readers are given: the last commit known to be on disk (in
+    /// the log, or by a checkpoint). Never ahead of `current`.
+    visible: RwLock<Arc<Version>>,
     live: Arc<Live>,
     state: Mutex<State>,
     /// Bytes of the nodes changed since the last checkpoint, about.
@@ -1208,12 +1219,14 @@ impl Pages {
         let loaded = load(&disk)?;
         let live = Arc::new(Live::default());
         let state = State::of(&loaded);
+        let version = Version::new(0, 0, loaded.trees, &live);
         Ok(Pages {
             path: path.to_owned(),
             disk: RwLock::new(disk),
             sync,
             cache: Cache::new(cache_bytes),
-            current: RwLock::new(Version::new(0, loaded.trees, &live)),
+            current: RwLock::new(version.clone()),
+            visible: RwLock::new(version),
             live,
             state: Mutex::new(state),
             dirty: AtomicUsize::new(0),
@@ -1227,6 +1240,23 @@ impl Pages {
     /// The trees as of the last commit.
     pub(crate) fn version(&self) -> Arc<Version> {
         self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The trees as of the last commit known to be on disk: what a reader may
+    /// be shown.
+    pub(crate) fn visible(&self) -> Arc<Version> {
+        self.visible.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `version` (given by [`version`](Self::version)) is on disk: readers
+    /// may see it. An older one than they already see changes nothing.
+    pub(crate) fn show(&self, version: &Arc<Version>) {
+        let mut visible = self.visible.write().unwrap_or_else(|e| e.into_inner());
+        if version.seq > visible.seq {
+            let old = std::mem::replace(&mut *visible, version.clone());
+            drop(visible);
+            drop(old);
+        }
     }
 
     fn publish(&self, version: Arc<Version>) {
@@ -1291,10 +1321,11 @@ impl Pages {
         }
     }
 
-    /// Applies `ops` as one commit, in memory: readers that start after it
-    /// see all of them, the others none. Durable at the next checkpoint (the
-    /// write-ahead log covers the time in between).
-    pub(crate) fn apply(&self, ops: &[Op]) -> Result<()> {
+    /// Applies `ops` as one commit, in memory, numbered `lsn`: the next
+    /// [`version`](Self::version) holds all of them or none. Readers see it
+    /// once it is [shown](Self::show) or a checkpoint ran. Durable at the next
+    /// checkpoint (the write-ahead log covers the time in between).
+    pub(crate) fn apply(&self, ops: &[Op], lsn: u64) -> Result<()> {
         let mut st = lock(&self.state);
         let cur = self.version();
         let mut tx = Txn { pages: self, trees: cur.trees.clone(), freed: Vec::new(), dirty: 0 };
@@ -1303,7 +1334,7 @@ impl Pages {
         st.pending.extend(tx.freed.into_iter().map(|e| (seq, e)));
         st.changed = true;
         self.dirty.fetch_add(tx.dirty, Ordering::Relaxed);
-        self.publish(Version::new(seq, tx.trees, &self.live));
+        self.publish(Version::new(seq, lsn, tx.trees, &self.live));
         Ok(())
     }
 
@@ -1402,7 +1433,11 @@ impl Pages {
         st.durable_seq = cur.seq;
         st.changed = false;
         self.dirty.store(0, Ordering::Relaxed);
-        self.publish(Version::new(cur.seq, trees, &self.live));
+        // The same commits, their nodes on disk: what everyone reads from now on.
+        let written = Version::new(cur.seq, cur.lsn, trees, &self.live);
+        let shown = std::mem::replace(&mut *self.visible.write().unwrap_or_else(|e| e.into_inner()), written.clone());
+        self.publish(written);
+        drop(shown);
         drop(cur);
         self.reclaim(&mut st);
         let before = st.end;
@@ -1430,7 +1465,10 @@ impl Pages {
         self.checkpoint()?;
         let mut st = lock(&self.state);
         let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
-        if Arc::strong_count(&current) != 1 || self.live.count() != 1 || st.changed {
+        // Only the two handles of this store on one version: no reader.
+        let mut visible = self.visible.write().unwrap_or_else(|e| e.into_inner());
+        if !Arc::ptr_eq(&current, &visible) || Arc::strong_count(&current) != 2 || self.live.count() != 1 || st.changed
+        {
             return Ok(false);
         }
         if st.free_pages == 0 && st.pending.is_empty() {
@@ -1458,7 +1496,9 @@ impl Pages {
         let seq = current.seq;
         *st = State::of(&loaded);
         st.durable_seq = seq;
-        *current = Version::new(seq, loaded.trees, &self.live);
+        let packed = Version::new(seq, current.lsn, loaded.trees, &self.live);
+        *visible = packed.clone();
+        *current = packed;
         Ok(true)
     }
 
@@ -2107,7 +2147,7 @@ mod tests {
             let before = pages.version();
             levels = levels.max(before.root(T).map_or(0, |r| r.level()));
             let seen_before = if whole { all(&pages, T) } else { Vec::new() };
-            pages.apply(&ops).unwrap();
+            pages.apply(&ops, 0).unwrap();
             let expected: Vec<_> =
                 if whole { model.iter().map(|(k, v)| (k.clone(), v.clone())).collect() } else { Vec::new() };
             if whole {
@@ -2184,7 +2224,7 @@ mod tests {
         for chunk in 0..20u32 {
             let ops: Vec<Op> =
                 (0..1_000u32).map(|i| put(format!("row{:08}", chunk * 1_000 + i).as_bytes(), &value)).collect();
-            pages.apply(&ops).unwrap();
+            pages.apply(&ops, 0).unwrap();
         }
         pages.checkpoint().unwrap();
         let stats = pages.stats();
@@ -2197,14 +2237,14 @@ mod tests {
             let ops: Vec<Op> = (0..500u32)
                 .map(|i| put(format!("row{:08}", (round * 37 + i * 40) % 20_000).as_bytes(), &[round as u8; 100]))
                 .collect();
-            pages.apply(&ops).unwrap();
+            pages.apply(&ops, 0).unwrap();
             pages.checkpoint().unwrap();
         }
         let grown = std::fs::metadata(&path).unwrap().len();
         assert!(grown < file * 2, "{file} bytes grew to {grown}");
         pages.check().unwrap();
         // Dropping the table frees it all, and the file shrinks at the next checkpoint.
-        pages.apply(&[Op::DropTable { table: T.into() }, put(b"left", b"1")]).unwrap();
+        pages.apply(&[Op::DropTable { table: T.into() }, put(b"left", b"1")], 0).unwrap();
         pages.checkpoint().unwrap();
         pages.checkpoint().unwrap();
         assert_eq!(all(&pages, T), vec![(b"left".to_vec(), b"1".to_vec())]);
@@ -2219,14 +2259,14 @@ mod tests {
         let path = temp("reader");
         let pages = Pages::open(&path, 64 << 10, None, false).unwrap();
         let ops: Vec<Op> = (0..5_000u32).map(|i| put(format!("k{i:06}").as_bytes(), &[1; 50])).collect();
-        pages.apply(&ops).unwrap();
+        pages.apply(&ops, 0).unwrap();
         pages.checkpoint().unwrap();
         let old = pages.version();
         // Every row rewritten, several checkpoints: the pages the reader may
         // still read are not handed out.
         for round in 2..6u8 {
             let ops: Vec<Op> = (0..5_000u32).map(|i| put(format!("k{i:06}").as_bytes(), &[round; 50])).collect();
-            pages.apply(&ops).unwrap();
+            pages.apply(&ops, 0).unwrap();
             pages.checkpoint().unwrap();
             assert!(!pages.compact().unwrap(), "a reader is at work");
         }
@@ -2252,7 +2292,7 @@ mod tests {
         let path = temp("damage");
         let pages = Pages::open(&path, 1 << 20, None, true).unwrap();
         let ops: Vec<Op> = (0..2_000u32).map(|i| put(format!("k{i:06}").as_bytes(), &[3; 80])).collect();
-        pages.apply(&ops).unwrap();
+        pages.apply(&ops, 0).unwrap();
         pages.checkpoint().unwrap();
         let again = Pages::open(&path, 1 << 20, None, true).err().unwrap().to_string();
         assert!(again.contains("already open"), "{again}");
@@ -2278,8 +2318,8 @@ mod tests {
         let path = temp("copy");
         let pages = Pages::open(&path, 1 << 20, None, false).unwrap();
         let ops: Vec<Op> = (0..3_000u32).map(|i| put(format!("k{i:06}").as_bytes(), b"SECRET-VALUE")).collect();
-        pages.apply(&ops).unwrap();
-        pages.apply(&[Op::Put { table: "meta".into(), key: b"a".to_vec(), value: b"b".to_vec() }]).unwrap();
+        pages.apply(&ops, 0).unwrap();
+        pages.apply(&[Op::Put { table: "meta".into(), key: b"a".to_vec(), value: b"b".to_vec() }], 0).unwrap();
         pages.checkpoint().unwrap();
         let copy = path.with_extension("copy");
         let (_, keys) = KeyHeader::create(&Encryption::from_key([3; 32])).unwrap();
