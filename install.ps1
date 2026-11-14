@@ -1,4 +1,4 @@
-# Nuage DB — installs a server on Windows 10, 11 or Server (x64; ARM64 runs it too), in one
+# Nuage DB - installs a server on Windows 10, 11 or Server (x64; ARM64 runs it too), in one
 # command, from a PowerShell opened as administrator:
 #
 #   irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 | iex
@@ -49,7 +49,7 @@ function Die($m) { Write-Host "error: $m" -ForegroundColor Red; throw $m }
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $admin) { Die 'run it from a PowerShell opened as administrator (right click → Run as administrator)' }
+if (-not $admin) { Die 'run it from a PowerShell opened as administrator (right click, then Run as administrator)' }
 
 $Action = if ($args.Count -gt 0) { $args[0] } elseif ($env:NUAGE_ACTION) { $env:NUAGE_ACTION } else { 'install' }
 

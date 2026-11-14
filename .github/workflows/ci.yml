@@ -159,6 +159,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the server
         run: cargo build --locked -p nuage --bin nuage
+      # Windows PowerShell 5.1 reads a file without a byte order mark as Windows-1252: a
+      # character outside ASCII ("→" holds the byte of "’") can end a string early.
+      - name: The PowerShell scripts are ASCII
+        if: runner.os == 'Linux'
+        run: "! grep -nP '[^\\x00-\\x7F]' install.ps1 .github/install-test.ps1"
       # install.sh as a systemd service, backups to a folder of their own.
       - name: install.sh (Linux)
         if: runner.os == 'Linux'

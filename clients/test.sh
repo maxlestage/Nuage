@@ -15,7 +15,7 @@ export NUAGE_URL=http://127.0.0.1:$port NUAGE_TOKEN=test-token-$RANDOM
 PORT=$port NUAGE_DATA_DIR=$dir/data NUAGE_TOKEN=$NUAGE_TOKEN NUAGE_ENCRYPTION_KEY=$("$bin" genkey) \
 	"$bin" >"$dir/server.log" 2>&1 &
 server=$!
-trap 'kill $server 2>/dev/null; rm -rf "$dir"' EXIT
+trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$dir"' EXIT
 up=""
 for _ in $(seq 1 100); do
 	if curl -fs "$NUAGE_URL/api/health" >/dev/null 2>&1; then
