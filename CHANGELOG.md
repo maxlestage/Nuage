@@ -26,8 +26,9 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - **Coming from 0.4**: a data directory or a backup whose pages are a redb file
   (`nuage.redb`) is imported the first time it is opened, encrypted as it was; the old
   file is kept as `nuage.redb.imported`, and a snapshot of this version is sent to the
-  backup. This is the `import-redb` Cargo feature (on by default), the only remaining use
-  of redb: without it (`default-features = false`) redb is not compiled at all.
+  backup. This is the `import-redb` Cargo feature (on by default, and with `s3`), the only
+  remaining use of redb: the engine alone (`default-features = false`) compiles no redb at
+  all, and an application that embeds it with data of those versions asks for the feature.
   `tests/legacy.rs` opens data directories and backups written by 0.4.0, in clear and
   encrypted, closed normally or left by a crash.
 - Snapshots in a backup are named `snapshots/<lsn>.db`.

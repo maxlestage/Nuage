@@ -59,7 +59,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 | `s3` | backups to S3-compatible storage (HTTP/1.1 over rustls) | yes |
 | `server` | the server (`/v1`, PostgreSQL protocol, console, live status), `nuage::Db::Remote` and the `nuage` binary; implies `s3` | yes |
 | `site` | the website and the `/app` dashboard, served by the binary; implies `server` | yes |
-| `import-redb` | reads the page store of Nuage DB up to 0.4 (`nuage.redb`) once, to bring a data directory or a backup of those versions to this one (see [Coming from 0.4](#coming-from-04)); the only use of redb | yes |
+| `import-redb` | reads the page store of Nuage DB up to 0.4 (`nuage.redb`) once, to bring a data directory or a backup of those versions to this one (see [Coming from 0.4](#coming-from-04)); the only use of redb | yes, and with `s3` |
 
 `default-features = false` is the embedded engine alone; add `features = ["s3"]` for
 S3 backups (the configuration of an embedded database with them:
@@ -145,9 +145,11 @@ The old file stays beside the new one as `nuage.redb.imported`: delete it once y
 checked your data. When backups are configured, a snapshot of this version is sent right
 after, so the next restore no longer goes through the import.
 
-Reading the old file is the `import-redb` Cargo feature, on by default. A build without it
-(`default-features = false`) contains no redb at all and refuses such a directory with a
-message that says so. Once every database has been opened by this version, the feature can go.
+Reading the old file is the `import-redb` Cargo feature, on by default and with `s3` (a
+backup may hold a snapshot of those versions). The engine alone (`default-features = false`)
+contains no redb at all and refuses such a directory with a message that says so: an
+application that embeds it and has data of those versions adds `features = ["import-redb"]`.
+Once every database has been opened by this version, the feature can go.
 
 ## Several applications
 

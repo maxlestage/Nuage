@@ -6,9 +6,10 @@
 //! page file of this version, once: the old file is kept beside it as
 //! `nuage.redb.imported`, to delete when the data has been checked.
 //!
-//! Reading the old file takes the `import-redb` feature (on by default, off
-//! with `default-features = false`); without it, such a directory is refused
-//! with a message that says so. Nothing else in Nuage DB uses redb.
+//! Reading the old file takes the `import-redb` feature (on by default and
+//! with `s3`, off for the engine alone: `default-features = false`); without
+//! it, such a directory is refused with a message that says so. Nothing else
+//! in Nuage DB uses redb.
 
 use super::storage_err;
 use super::store::FILE;
@@ -29,7 +30,7 @@ pub(crate) fn import(
     if dir.join(LEGACY_FILE).exists() && !dir.join(FILE).exists() {
         return Err(storage_err(format!(
             "{} was written by Nuage DB 0.4 or earlier ({LEGACY_FILE}): open it once with a build that has the \
-             `import-redb` feature (the default features have it) to bring it to this version",
+             `import-redb` Cargo feature of `nuage` (the default features have it) to bring it to this version",
             dir.display()
         )));
     }
