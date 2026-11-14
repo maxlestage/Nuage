@@ -145,3 +145,34 @@ jobs:
         run: cargo build --locked -p nuage --bin nuage
       - name: Run each driver against it
         run: clients/postgres/test.sh target/debug/nuage
+
+  install:
+    name: Installers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the server
+        run: cargo build --locked -p nuage --bin nuage
+      # install.sh as a systemd service, backups to a folder of their own.
+      - name: install.sh (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /srv/backup-disk
+          .github/install-test.sh target/debug/nuage /srv/backup-disk/nuage
+      # install.sh as a launchd daemon, run as the runner's user.
+      - name: install.sh (macOS)
+        if: runner.os == 'macOS'
+        run: .github/install-test.sh target/debug/nuage "$RUNNER_TEMP/nuage-backup"
+      # install.ps1 as a scheduled task, backups on the runner's second drive.
+      - name: install.ps1 (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $drive = if (Test-Path 'D:\') { 'D:' } else { $env:RUNNER_TEMP }
+          .github\install-test.ps1 target\debug\nuage.exe "$drive\nuage-backup"
