@@ -342,36 +342,87 @@ it. What a visitor feels is mostly the network: pick the host's region closest t
 dyno that never sleeps (Heroku **Basic**, not Eco, whose first request after a pause takes
 seconds).
 
-## Install on a server
+## Install on any computer
 
-On any Linux server (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 or ARM64, from 512 MiB
-of memory), one command:
+Nuage DB runs on any computer: a Linux server, a Raspberry Pi, a Mac, a Windows PC, next to
+(or instead of) a server on a host like Heroku. One command installs it as a service started
+with the computer, and asks where the backups go.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
-```
+| | One command | Service |
+|---|---|---|
+| **Linux** (Debian, Ubuntu, Fedora, Rocky, Alpine, Raspberry Pi OS..., x86_64 or ARM64, from 512 MiB) | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | systemd `nuage` |
+| **macOS** (Apple silicon or Intel), in Terminal | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | launchd, as your user |
+| **Windows** 10, 11, Server, in PowerShell **as administrator** | `irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 \| iex` | scheduled task `Nuage DB`, as SYSTEM |
+| **Docker**, anywhere | `docker compose up -d` in this repository (settings in `.env`) | the container |
 
-It installs the `nuage` binary (a static build: no dependency), **creates swap** when the
-server has none (the size of the memory, 1 to 4 GiB; `vm.swappiness=10`, so the memory goes
-to the database), a `nuage` user, the data in `/var/lib/nuage`, the settings in
-`/etc/nuage/nuage.env` with a generated key, token and console password, and a systemd
-service started at boot. It prints the address, the token and the password once: **copy
-`/etc/nuage/nuage.env` somewhere safe**, nobody can read the data without its key.
+Each one installs the `nuage` binary (a static build: no dependency), generates the settings
+file with a key, a token, a console password and a management token, makes the data folder,
+sets up the backups, starts the service and checks that it answers. It prints the address,
+the token and the password once: **copy the settings file somewhere safe, away from this
+computer**: nobody can read the data, nor its backups, without its key.
 
-- **HTTPS**: point a domain name to the server, then
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| settings | `/etc/nuage/nuage.env` | `/usr/local/etc/nuage/nuage.env` | `C:\ProgramData\Nuage\nuage.env` |
+| data | `/var/lib/nuage` | `/usr/local/var/nuage` | `C:\ProgramData\Nuage\data` |
+| logs | `journalctl -u nuage -f` | `tail -f /usr/local/var/log/nuage.log` | `Get-Content -Wait C:\ProgramData\Nuage\nuage.log` |
+
+On Linux it also **creates swap** when the server has none (the size of the memory, 1 to 4
+GiB; `vm.swappiness=10`, so the memory goes to the database) and a `nuage` system user. On
+macOS the service runs as the person who ran `sudo`; on Windows, as SYSTEM, readable by
+administrators only, with a firewall rule for the local network.
+
+- **HTTPS** (Linux): point a domain name to the server, then
   `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, with a free
   certificate; Nuage DB then listens on `127.0.0.1` only). Without HTTPS the console works,
   but warns that the password travels in clear.
-- **Upgrade**: run the command again; data, key and settings stay.
-- **Options**: `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0`: no swap), `NUAGE_VERSION=v0.3.0`,
-  `NUAGE_FROM_SOURCE=1` (build with cargo).
-- **Remove**: `... | sudo bash -s uninstall` (keeps the data), `... | sudo bash -s purge`.
+- **Upgrade**: run the command again; data, key, settings and backups stay.
+- **Options**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: off), `NUAGE_SWAP_MB` (`0`: no swap),
+  `NUAGE_VERSION=v0.4.2`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
+  cargo). On Windows, set them first: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
+- **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
+  `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
+  `$env:NUAGE_ACTION = 'uninstall'` (or `'purge'`), then the same command.
 - **Memory**: each application's page cache is `NUAGE_CACHE_MB=auto`, an eighth of the
   memory (8 to 512 MiB); the rest stays on disk. The console's *Server* page shows the memory
   Nuage DB uses, the free memory and the swap.
+- **By hand**: binaries for Linux, macOS and Windows are on the
+  [releases page](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
+  starts the server with the settings of a file (`KEY=value` lines; the environment wins).
 
-Binaries for Linux, macOS and Windows are on the
-[releases page](https://github.com/maxlestage/Nuage/releases).
+### Backups: you choose where
+
+The data folder is only one copy. With a backup, Nuage DB sends a **snapshot** of each
+database (every hour, `NUAGE_BACKUP_SNAPSHOT_MINUTES`) and the **write-ahead log** since then
+(at every checkpoint, every 30 seconds), all encrypted with the key; and when it starts with
+an **empty data folder** (a new disk, a new computer), it **restores itself** from the backup
+before it serves. The installer asks where they go; or say it in the command:
+
+| Where | Command (Linux, macOS) | Windows |
+|---|---|---|
+| a folder on **another disk**: an external disk, a NAS | `curl ... \| sudo NUAGE_BACKUP_DIR=/Volumes/MyDisk/nuage bash` | `$env:NUAGE_BACKUP_DIR = 'E:\Nuage'; irm ... \| iex` |
+| **S3-compatible storage**: AWS S3, Cloudflare R2, Scaleway, Backblaze B2, MinIO | `NUAGE_BACKUP_S3_BUCKET=… NUAGE_BACKUP_S3_REGION=… NUAGE_BACKUP_S3_ENDPOINT=… NUAGE_BACKUP_S3_ACCESS_KEY_ID=… NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…` | the same, with `$env:` |
+| none (not recommended) | `NUAGE_BACKUP=none` | `$env:NUAGE_BACKUP = 'none'` |
+
+- **Another disk, or off-site.** A backup on the disk of the data dies with it: the installer
+  and the server warn when the backup folder is on the same disk. A copy at home does not
+  survive a fire or a theft: S3-compatible storage does (R2 and B2 cost little for this
+  size). The settings file's key must be kept away from the backups' bucket too.
+- **An external disk that is not plugged in**: the installer makes only the last folder of
+  `NUAGE_BACKUP_DIR` (`/Volumes/MyDisk` must exist), and the server warns at startup when the
+  folder turns out to be on the computer's own disk. On macOS, if the backups to an external
+  disk fail (in the log), add `/usr/local/bin/nuage` in System Settings → Privacy & Security
+  → Full Disk Access. On Windows, a NAS share (`\\nas\backup\nuage`) must let the computer's
+  account (`COMPUTER$`) write.
+- **Change** where they go: run the installer again with the new option; it replaces the old
+  one in the settings file and restarts the service. Without an option, it keeps them.
+- **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors.
+- **Restore** on a new computer: install, put the old settings file's
+  `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
+  and restart the service: it restores the last snapshot and replays the log after it.
+- **One writer per backup**: two servers must never back up to the same folder or bucket
+  prefix (each would overwrite the other's). A computer next to a Heroku server uses a
+  folder, bucket or `NUAGE_BACKUP_S3_PREFIX` of its own.
 
 ## Quick start
 
@@ -447,7 +498,8 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
 | `NUAGE_CACHE_MB` | page cache of each application, in MiB, or `auto` | `auto`: an eighth of the memory, 8 to 512 MiB |
-| `NUAGE_BACKUP_DIR` | back up to this folder | |
+| `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); the environment wins over the file | none |
+| `NUAGE_BACKUP_DIR` | back up to this folder, on another disk (the server warns when it is on the data's disk) | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint of S3-compatible storage | `https://s3.<region>.amazonaws.com` |
 | `NUAGE_BACKUP_S3_REGION` | region | `us-east-1` |

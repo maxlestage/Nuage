@@ -4,6 +4,32 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Install on any computer, backups where you choose
+
+- `install.sh` installs on **macOS** too (Apple silicon, Intel): a launchd daemon started with
+  the Mac and run as the person who ran `sudo`, the settings in
+  `/usr/local/etc/nuage/nuage.env`, the data in `/usr/local/var/nuage`, the log in
+  `/usr/local/var/log/nuage.log`.
+- `install.ps1` installs on **Windows** 10, 11 and Server, from an administrator PowerShell
+  (`irm …/install.ps1 | iex`): `nuage.exe` in `C:\Program Files\Nuage`, the data and the
+  settings in `C:\ProgramData\Nuage`, readable by administrators only, a scheduled task that
+  starts it with Windows and restarts it, a firewall rule for the local network.
+- **The backups are chosen at install**: a folder on another disk (`NUAGE_BACKUP_DIR`), S3-
+  compatible storage (`NUAGE_BACKUP_S3_*`) or none (`NUAGE_BACKUP=none`), given in the command
+  or asked in the terminal; written in the settings file, kept on upgrades, changed by running
+  the installer again with another option. The installer makes only the last folder (an
+  external disk that is not plugged in is not replaced by a folder on the computer's own disk)
+  and warns when the folder is on the data's disk. `uninstall` and `purge` never delete the
+  backups.
+- The installers generate `NUAGE_ADMIN_TOKEN` and print the `nuage apps create` line.
+- `nuage --env-file <file>` (or `NUAGE_ENV_FILE`): the settings from a file of `KEY=value`
+  lines (comments, `export`, quotes, Windows line ends and byte order mark accepted); the
+  environment wins over the file. The macOS and Windows services start the server so.
+- At startup the server warns when `NUAGE_BACKUP_DIR` is on the same disk as the data.
+- `nuage --help` lists the commands.
+- CI: the installers run end to end on Linux, macOS and Windows (service, health, first backup
+  in the folder, `nuage apps create`, upgrade, uninstall, purge).
+
 ### Create an application in one command
 
 - `/api/apps`, the management API: `POST /api/apps {"name", "description"}` creates an

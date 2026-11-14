@@ -341,38 +341,91 @@ comprimen con gzip para los clientes que lo aceptan. Lo que nota un visitante es
 la red: elige la región del proveedor más cercana a él, y un dyno que nunca se duerme
 (Heroku **Basic**, no Eco, cuya primera petición tras una pausa tarda varios segundos).
 
-## Instalar en un servidor
+## Instalar en cualquier ordenador
 
-En cualquier servidor Linux (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 o ARM64, desde
-512 MiB de memoria), un comando:
+Nuage DB funciona en cualquier ordenador: un servidor Linux, una Raspberry Pi, un Mac, un PC
+con Windows, junto a (o en lugar de) un servidor en un proveedor como Heroku. Un comando lo
+instala como un servicio que arranca con el ordenador, y pregunta adónde van las copias de
+seguridad.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
-```
+| | Un comando | Servicio |
+|---|---|---|
+| **Linux** (Debian, Ubuntu, Fedora, Rocky, Alpine, Raspberry Pi OS..., x86_64 o ARM64, desde 512 MiB) | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | systemd `nuage` |
+| **macOS** (Apple silicon o Intel), en Terminal | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | launchd, con su usuario |
+| **Windows** 10, 11, Server, en PowerShell **como administrador** | `irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 \| iex` | tarea programada `Nuage DB`, como SYSTEM |
+| **Docker**, en cualquier sitio | `docker compose up -d` en este repositorio (ajustes en `.env`) | el contenedor |
 
-Instala el binario `nuage` (compilado estático: sin dependencias), **crea swap** si el
-servidor no tiene (el tamaño de la memoria, de 1 a 4 GiB; `vm.swappiness=10`, para que la
-memoria sea para la base), un usuario `nuage`, los datos en `/var/lib/nuage`, los ajustes en
-`/etc/nuage/nuage.env` con una clave, un token y una contraseña de consola generados, y un
-servicio systemd que arranca con el sistema. Muestra una vez la dirección, el token y la
-contraseña: **copia `/etc/nuage/nuage.env` en un lugar seguro**, nadie puede leer los datos
-sin su clave.
+Cada uno instala el binario `nuage` (compilado estático: sin dependencias), genera el fichero
+de ajustes con una clave, un token, una contraseña de consola y un token de gestión, crea la
+carpeta de datos, configura las copias, arranca el servicio y comprueba que responde. Muestra
+una vez la dirección, el token y la contraseña: **copie el fichero de ajustes en un lugar
+seguro, lejos de este ordenador**: nadie puede leer los datos, ni sus copias, sin su clave.
 
-- **HTTPS**: apunta un nombre de dominio al servidor y ejecuta
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| ajustes | `/etc/nuage/nuage.env` | `/usr/local/etc/nuage/nuage.env` | `C:\ProgramData\Nuage\nuage.env` |
+| datos | `/var/lib/nuage` | `/usr/local/var/nuage` | `C:\ProgramData\Nuage\data` |
+| registro | `journalctl -u nuage -f` | `tail -f /usr/local/var/log/nuage.log` | `Get-Content -Wait C:\ProgramData\Nuage\nuage.log` |
+
+En Linux también **crea swap** si el servidor no tiene (el tamaño de la memoria, de 1 a 4
+GiB; `vm.swappiness=10`, para que la memoria vaya a la base) y un usuario de sistema `nuage`.
+En macOS el servicio se ejecuta con la persona que lanzó `sudo`; en Windows, como SYSTEM,
+legible solo por los administradores, con una regla de cortafuegos para la red local.
+
+- **HTTPS** (Linux): apunte un nombre de dominio al servidor y luego
   `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, con un
   certificado gratuito; Nuage DB escucha entonces solo en `127.0.0.1`). Sin HTTPS la consola
-  funciona, pero avisa de que la contraseña viaja sin cifrar.
-- **Actualizar**: vuelve a ejecutar el comando; datos, clave y ajustes se conservan.
-- **Opciones**: `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0`: sin swap), `NUAGE_VERSION=v0.3.0`,
-  `NUAGE_FROM_SOURCE=1` (compilar con cargo).
-- **Desinstalar**: `... | sudo bash -s uninstall` (conserva los datos),
-  `... | sudo bash -s purge`.
+  funciona, pero avisa de que la contraseña viaja en claro.
+- **Actualizar**: vuelva a ejecutar el comando; datos, clave, ajustes y copias se conservan.
+- **Opciones**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: desactivado), `NUAGE_SWAP_MB` (`0`: sin
+  swap), `NUAGE_VERSION=v0.4.2`, `NUAGE_BINARY=/ruta/a/nuage`, `NUAGE_FROM_SOURCE=1`
+  (compilar con cargo). En Windows, defínalas antes: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
+- **Desinstalar**: `... | sudo bash -s uninstall` conserva los datos, los ajustes y las
+  copias; `... | sudo bash -s purge` borra los datos y los ajustes, nunca las copias. En
+  Windows: `$env:NUAGE_ACTION = 'uninstall'` (o `'purge'`) y después el mismo comando.
 - **Memoria**: la caché de páginas de cada aplicación es `NUAGE_CACHE_MB=auto`, un octavo de
-  la memoria (de 8 a 512 MiB); el resto queda en disco. La página *Servidor* de la consola
-  muestra la memoria que usa Nuage DB, la memoria libre y el swap.
+  la memoria (8 a 512 MiB); el resto queda en disco. La página *Servidor* de la consola muestra
+  la memoria que usa Nuage DB, la memoria libre y el swap.
+- **A mano**: hay binarios para Linux, macOS y Windows en la
+  [página de versiones](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
+  arranca el servidor con los ajustes de un fichero (líneas `CLAVE=valor`; el entorno gana).
 
-Hay binarios para Linux, macOS y Windows en la
-[página de versiones](https://github.com/maxlestage/Nuage/releases).
+### Copias de seguridad: usted elige dónde
+
+La carpeta de datos es solo una copia. Con una copia de seguridad, Nuage DB envía una
+**instantánea** de cada base (cada hora, `NUAGE_BACKUP_SNAPSHOT_MINUTES`) y el **registro de
+escritura** desde entonces (en cada checkpoint, cada 30 segundos), todo cifrado con la clave;
+y cuando arranca con una **carpeta de datos vacía** (un disco nuevo, un ordenador nuevo), **se
+restaura solo** desde la copia antes de servir. El instalador pregunta adónde van; o dígalo en
+el comando:
+
+| Dónde | Comando (Linux, macOS) | Windows |
+|---|---|---|
+| una carpeta en **otro disco**: un disco externo, un NAS | `curl ... \| sudo NUAGE_BACKUP_DIR=/Volumes/MiDisco/nuage bash` | `$env:NUAGE_BACKUP_DIR = 'E:\Nuage'; irm ... \| iex` |
+| un **almacenamiento compatible con S3**: AWS S3, Cloudflare R2, Scaleway, Backblaze B2, MinIO | `NUAGE_BACKUP_S3_BUCKET=… NUAGE_BACKUP_S3_REGION=… NUAGE_BACKUP_S3_ENDPOINT=… NUAGE_BACKUP_S3_ACCESS_KEY_ID=… NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…` | las mismas, con `$env:` |
+| ninguna (no recomendado) | `NUAGE_BACKUP=none` | `$env:NUAGE_BACKUP = 'none'` |
+
+- **Otro disco, o fuera de casa.** Una copia en el disco de los datos muere con él: el
+  instalador y el servidor avisan cuando la carpeta de copias está en el mismo disco. Una
+  copia en casa no sobrevive a un incendio ni a un robo; un almacenamiento compatible con S3,
+  sí (R2 y B2 cuestan poco para este tamaño). Guarde también la clave del fichero de ajustes
+  lejos del bucket de las copias.
+- **Un disco externo desconectado**: el instalador solo crea la última carpeta de
+  `NUAGE_BACKUP_DIR` (`/Volumes/MiDisco` debe existir), y el servidor avisa al arrancar cuando
+  la carpeta resulta estar en el disco del ordenador. En macOS, si las copias a un disco
+  externo fallan (en el registro), añada `/usr/local/bin/nuage` en Ajustes del Sistema →
+  Privacidad y seguridad → Acceso total al disco. En Windows, un recurso compartido de NAS
+  (`\\nas\copias\nuage`) debe dejar escribir a la cuenta del ordenador (`ORDENADOR$`).
+- **Cambiar** de destino: vuelva a ejecutar el instalador con la nueva opción; reemplaza la
+  anterior en el fichero de ajustes y reinicia el servicio. Sin opción, las conserva.
+- **Comprobar**: la página *Almacenamiento* de la consola, y `/app`, muestran la última copia
+  y sus errores.
+- **Restaurar** en un ordenador nuevo: instale, ponga en el nuevo fichero de ajustes la
+  `NUAGE_ENCRYPTION_KEY` del antiguo y los mismos ajustes de copia, vacíe la carpeta de datos y
+  reinicie el servicio: restaura la última instantánea y reproduce el registro posterior.
+- **Un solo escritor por copia**: dos servidores nunca deben copiar en la misma carpeta ni con
+  el mismo prefijo de bucket (cada uno sobrescribiría al otro). Un ordenador junto a un
+  servidor de Heroku usa su propia carpeta, su bucket o su `NUAGE_BACKUP_S3_PREFIX`.
 
 ## Inicio rápido
 
@@ -448,7 +501,8 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `NUAGE_ADMIN_TOKEN` | token de la API de gestión (`/api/apps`, `nuage apps`): crea las aplicaciones y sus tokens; 32 caracteres como mínimo (`nuage genkey`) | ninguno: la API está desactivada |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` y `/app` muestran una parte pública sin iniciar sesión | `false` |
 | `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB, o `auto` | `auto`: un octavo de la memoria, de 8 a 512 MiB |
-| `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta | |
+| `NUAGE_ENV_FILE` | lee también los ajustes de este fichero (líneas `CLAVE=valor`; `nuage --env-file <fichero>` hace lo mismo); el entorno gana al fichero | ninguno |
+| `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta, en otro disco (el servidor avisa cuando está en el disco de los datos) | |
 | `NUAGE_BACKUP_S3_BUCKET` | copias de seguridad en este bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint del almacenamiento compatible con S3 | `https://s3.<region>.amazonaws.com` |
 | `NUAGE_BACKUP_S3_REGION` | región | `us-east-1` |
