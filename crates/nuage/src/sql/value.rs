@@ -901,6 +901,16 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// Un paramètre JSON de `/v1/sql` arrive bit pour bit : une latitude réelle
+    /// (copiée d'une base PostgreSQL) était lue un ULP plus loin.
+    #[test]
+    fn json_doubles_exacts() {
+        for x in [44.833800000000004_f64, 0.1 + 0.2, 1e-310, f64::MAX, -2.2250738585072014e-308] {
+            let j: Json = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+            assert_eq!(from_json(&j), Value::F64(x), "{x:?}");
+        }
+    }
+
     #[test]
     fn values() {
         assert_eq!(compare(&Value::I32(3), &Value::F64(3.0)), Some(Ordering::Equal));

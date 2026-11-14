@@ -31,7 +31,10 @@ json = []
 memoire-orm = { workspace = true }
 nuage-site = { workspace = true, optional = true }
 redb = "4"
-serde_json = "1"
+# `float_roundtrip` : sans elle, le parseur rapide de serde_json peut décaler un
+# nombre d'un ULP (44.833800000000004 lu 44.8338) : un DOUBLE envoyé à /v1/sql
+# doit arriver bit pour bit, comme par le protocole PostgreSQL.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 libc = "0.2"
 getrandom = "0.4"
