@@ -49,7 +49,7 @@ the query builder, relations, transactions and migrations.
 # The engine, embedded mode and the server, without the website.
 nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false, features = ["server"] }
 # The same Memoire as Nuage DB (the `nuage` feature is the client of a server).
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "66b9c38", features = ["nuage"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "a7419cb", features = ["nuage"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

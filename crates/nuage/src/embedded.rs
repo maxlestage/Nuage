@@ -262,18 +262,37 @@ impl Embedded {
 
     /// Statements run in one transaction: all of them apply, or none. Each
     /// is `(returns_rows, statement)`; the result is the rows, or the write's
-    /// outcome.
+    /// outcome. A batch that writes takes its turn from its first statement
+    /// to its commit: no other commit lands in between, so it never conflicts.
     pub fn batch(
         &self,
         statements: &[(bool, Query<'_>)],
     ) -> Result<Vec<std::result::Result<Vec<Vec<Value>>, ExecResult>>> {
-        let tx = self.begin_now()?;
-        let mut out = Vec::with_capacity(statements.len());
-        for (rows, q) in statements {
-            out.push(if *rows { Ok(tx.fetch_rows(q)?) } else { Err(tx.execute_now(q)?) });
+        let run = |tx: &EmbeddedTransaction| {
+            let mut out = Vec::with_capacity(statements.len());
+            for (rows, q) in statements {
+                out.push(if *rows { Ok(tx.fetch_rows(q)?) } else { Err(tx.execute_now(q)?) });
+            }
+            Ok(out)
+        };
+        if statements.iter().all(|(rows, _)| *rows) {
+            // Reads alone see what is on disk and wait for nothing.
+            return run(&self.begin_read()?);
         }
-        tx.commit_now()?;
-        Ok(out)
+        let store = &self.engine.store;
+        let mut writer = store.writer();
+        let tx = self.begin_locked()?;
+        let since = tx.since()?;
+        let done = run(&tx).and_then(|out| Ok((out, tx.commit_locked(&mut writer)?)));
+        drop(writer);
+        // The writers behind share the sync of the log this waits for.
+        match done {
+            Ok((out, lsn)) => store.wait_durable(lsn).map(|()| out),
+            Err(e) => {
+                store.wait_durable(since)?;
+                Err(e)
+            }
+        }
     }
 
     /// Opens a transaction (the synchronous form of [`Database::begin`]).
