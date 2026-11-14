@@ -130,7 +130,11 @@ Hasta la 0.4, las páginas eran un archivo [redb](https://docs.rs/redb), `nuage.
 Ahora son las de Nuage DB (`nuage.db`). No hay nada que hacer: un directorio de datos de una
 versión anterior, o una copia de seguridad de una de ellas restaurada en un directorio vacío,
 se importa la primera vez que esta versión lo abre, cifrado como estaba, y el registro escrito
-desde su último punto de control se vuelve a aplicar encima. El archivo antiguo queda junto al
+desde su último punto de control se vuelve a aplicar encima. Antes de ocupar su lugar, el
+archivo nuevo se vuelve a leer y se compara con el antiguo, entrada por entrada: cualquier
+diferencia detiene la apertura y deja el archivo antiguo como estaba. El servidor escribe en
+su registro de arranque lo que contiene cada aplicación (tablas, filas) y lo que se importó.
+El archivo antiguo queda junto al
 nuevo como `nuage.redb.imported`: bórralo cuando hayas comprobado tus datos. Si hay copias de
 seguridad configuradas, una instantánea de esta versión sigue en un momento: la restauración
 siguiente ya no pasa por la importación. Justo antes, la copia de seguridad de la versión

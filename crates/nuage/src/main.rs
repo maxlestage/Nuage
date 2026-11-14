@@ -104,6 +104,23 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "site"))]
         let options = config.server;
         let server = Server::new(engine.clone(), options);
+        // What each application holds, and what came from an earlier version.
+        for app in server.apps() {
+            let Some(e) = server.app_engine(&app.name) else { continue };
+            let tables = nuage::Embedded::from_engine(e.clone()).tables().unwrap_or_default();
+            let rows: i64 = tables.iter().map(|t| t.rows).sum();
+            log(&format!("application `{}`: {} table(s), {rows} row(s)", app.name, tables.len()));
+            if let Some(i) = e.imported() {
+                log(&format!(
+                    "application `{}`: its data was written by an earlier version; it was imported and compared \
+                     with it, entry by entry ({} entries, {} bytes)",
+                    app.name, i.entries, i.bytes
+                ));
+            }
+        }
+        for (name, error) in server.failed_apps() {
+            eprintln!("nuage: application `{name}` cannot be opened, its data is left as it was: {error}");
+        }
         let running = match server.listen((config.bind.as_str(), config.port)).await {
             Ok(r) => r,
             Err(e) => {

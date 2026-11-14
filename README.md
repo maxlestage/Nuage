@@ -141,6 +141,9 @@ Up to 0.4 the pages were a [redb](https://docs.rs/redb) file, `nuage.redb`. Sinc
 are Nuage DB's own (`nuage.db`). Nothing to do: a data directory of an earlier version, or a
 backup of one restored into an empty directory, is imported the first time this version opens
 it, encrypted as it was, and the log written since its last checkpoint is replayed over it.
+Before the new file takes its place it is read back and compared with the old one, entry by
+entry: anything that differs stops the opening and leaves the old file as it was. The server
+writes what each application holds (tables, rows) and what was imported in its startup log.
 The old file stays beside the new one as `nuage.redb.imported`: delete it once you have
 checked your data. When backups are configured, a snapshot of this version follows in a
 moment, so the next restore no longer goes through the import; before it, the backup of the

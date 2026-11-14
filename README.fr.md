@@ -131,8 +131,11 @@ Jusqu'à la 0.4, les pages étaient un fichier [redb](https://docs.rs/redb), `nu
 Ce sont maintenant celles de Nuage DB (`nuage.db`). Rien à faire : un répertoire de données
 d'une version antérieure, ou une sauvegarde d'une telle version restaurée dans un répertoire
 vide, est importé à la première ouverture par cette version, chiffré comme il l'était, et le
-journal écrit depuis son dernier point de contrôle est rejoué par-dessus. L'ancien fichier
-reste à côté du nouveau sous le nom `nuage.redb.imported` : supprimez-le une fois vos données
+journal écrit depuis son dernier point de contrôle est rejoué par-dessus. Avant de prendre sa
+place, le nouveau fichier est relu et comparé à l'ancien, entrée par entrée : le moindre écart
+arrête l'ouverture et laisse l'ancien fichier tel quel. Le serveur écrit dans son journal de
+démarrage ce que contient chaque application (tables, lignes) et ce qui a été importé.
+L'ancien fichier reste à côté du nouveau sous le nom `nuage.redb.imported` : supprimez-le une fois vos données
 vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version suit dans
 l'instant : la restauration suivante ne passe plus par l'import. Juste avant, la sauvegarde
 de l'ancienne version (son manifeste, son instantané, ses segments de journal et son en-tête

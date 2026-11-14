@@ -333,6 +333,12 @@ impl Server {
         self.state.apps.get(name).map(|a| a.engine.clone())
     }
 
+    /// The applications that could not be opened when the server started,
+    /// each with why: their data is left as it was.
+    pub fn failed_apps(&self) -> Vec<(String, String)> {
+        self.state.apps.failed()
+    }
+
     /// Creates an application (a database of its own) and its first token.
     /// The token is returned once: the server keeps only its digest.
     pub fn create_app(&self, name: &str, description: &str) -> Result<(AppInfo, String)> {

@@ -33,6 +33,7 @@ use memoire_orm::{Error, Result};
 use crate::crypto::{Encryption, Header, Keys};
 
 pub use backup::{BackupStore, DirectoryStore, PrefixedStore};
+pub use legacy::Imported;
 use store::Store;
 pub(crate) use store::{FILE, MAIN};
 
@@ -202,6 +203,8 @@ pub struct Engine {
     pub(crate) schemas: memoire_orm::nuage::wire::SchemaCache,
     /// `key` or `passphrase` when the data is encrypted.
     encryption: Option<&'static str>,
+    /// What opening brought from an earlier version's page store.
+    imported: Option<Imported>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -245,16 +248,20 @@ impl Engine {
             events_seq: AtomicU64::new(0),
             schemas: memoire_orm::nuage::wire::SchemaCache::default(),
             encryption,
+            imported,
         });
         if restored {
             engine.event("info", "data restored from the backup");
         }
-        if imported {
+        if let Some(i) = imported {
             engine.event(
                 "info",
                 format!(
-                    "the page store of an earlier version ({}) was imported; it is kept as {}",
+                    "the page store of an earlier version ({}) was imported and compared with it, entry by entry: \
+                     {} entries, {} bytes; it is kept as {}",
                     legacy::LEGACY_FILE,
+                    i.entries,
+                    i.bytes,
                     legacy::IMPORTED
                 ),
             );
@@ -284,6 +291,13 @@ impl Engine {
     /// `None` when it is stored in clear.
     pub fn encryption(&self) -> Option<&'static str> {
         self.encryption
+    }
+
+    /// What opening this directory brought from the page store of Nuage DB
+    /// 0.4 or earlier, when it found one: the new file was read back and
+    /// compared with the old one, entry by entry, before it took its place.
+    pub fn imported(&self) -> Option<Imported> {
+        self.imported
     }
 
     /// The data directory.
@@ -599,7 +613,7 @@ struct Unlocked {
     /// Data in clear was just encrypted.
     migrated: bool,
     /// The page store of an earlier version was just imported.
-    imported: bool,
+    imported: Option<Imported>,
 }
 
 /// The keys of `dir` for `options.encryption`: opens its header, creates one

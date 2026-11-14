@@ -24,7 +24,12 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - Encryption is the same (XTS-AES-256, one data unit per page, headers included), and the
   blocks of a page are now encrypted in one call to AES.
 - **Coming from 0.4**: a data directory or a backup whose pages are a redb file
-  (`nuage.redb`) is imported the first time it is opened, encrypted as it was; the old
+  (`nuage.redb`) is imported the first time it is opened, encrypted as it was. The new
+  file is read back and compared with the old one, entry by entry, before it takes its
+  place: a difference stops the opening and leaves the old file as it was
+  (`Engine::imported` says what was imported; the server writes it, and the tables and
+  rows of each application, in its startup log, and names an application that could not
+  be opened). The old
   file is kept as `nuage.redb.imported`, and a snapshot of this version follows in the
   backup (opening does not wait for it). Before that snapshot, the backup of the earlier
   version is copied whole under `before-import/`, where nothing prunes it: the database as
