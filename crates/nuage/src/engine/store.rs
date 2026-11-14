@@ -1,5 +1,5 @@
-//! The page store: redb B-trees on disk, one per branch, behind the
-//! write-ahead log.
+//! The page store: B-trees on disk ([`super::pages`]), one per branch, behind
+//! the write-ahead log.
 //!
 //! A branch is an overlay: its tree holds only the keys it changed (values
 //! or tombstones). Reading a branch reads its tree, then its parent's, up to
@@ -10,40 +10,37 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use memoire_orm::{Error, Result};
-use redb::{Durability, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::{Value as Json, json};
 
 use super::exec::TableMeta;
+use super::pages::{Node, Pages, Version};
 use super::storage_err;
 use super::wal::{self, Op, Record};
-use crate::crypto::{EncryptedFile, Keys};
+use crate::crypto::Keys;
 
 pub(crate) const MAIN: &str = "main";
 /// The page store's file in a data directory.
-pub(crate) const FILE: &str = "nuage.redb";
+pub(crate) const FILE: &str = "nuage.db";
 pub(crate) const META: &str = "meta";
+/// The store table of the main database.
+const MAIN_TABLE: &str = "b:main";
 const CHECKPOINT_LSN: &[u8] = b"checkpoint_lsn";
 const GENERATION: &[u8] = b"generation";
 const BRANCH_PREFIX: &[u8] = b"branch:";
-
-type Def<'a> = TableDefinition<'a, &'static [u8], &'static [u8]>;
-
-fn def(name: &str) -> Def<'_> {
-    TableDefinition::new(name)
-}
 
 /// The store table of a branch.
 pub(crate) fn branch_table(branch: &str) -> String {
     format!("b:{branch}")
 }
 
-fn redb_err(e: impl std::fmt::Display) -> Error {
+fn bad(e: impl std::fmt::Display) -> Error {
     storage_err(format!("page store: {e}"))
 }
 
@@ -61,11 +58,14 @@ pub(crate) struct BranchInfo {
     pub created_at: i64,
 }
 
-/// A consistent read view of one branch (a redb read transaction).
+/// A consistent read view of one branch: the trees as one commit left them.
 pub(crate) struct Snapshot {
+    pages: Arc<Pages>,
+    /// Held as long as the view is read: its pages are not reused meanwhile.
+    _version: Arc<Version>,
     /// The branch's tree, then its ancestors', main last. `None`: not
     /// created yet (a branch that never wrote anything).
-    layers: Vec<Option<ReadOnlyTable<&'static [u8], &'static [u8]>>>,
+    layers: Vec<Option<Arc<Node>>>,
 }
 
 /// Decodes a stored value: `[1, data...]` or the tombstone `[0]`.
@@ -95,8 +95,8 @@ impl Snapshot {
             return Ok(v.clone());
         }
         for layer in self.layers.iter().flatten() {
-            if let Some(v) = layer.get(key).map_err(redb_err)? {
-                return Ok(stored(v.value()));
+            if let Some(v) = self.pages.find(layer, key, stored)? {
+                return Ok(v);
             }
         }
         Ok(None)
@@ -107,6 +107,29 @@ impl Snapshot {
     /// (`None`: the range is exhausted).
     pub(crate) fn scan(&self, overlay: Option<&Overlay>, start: &[u8], end: &[u8], limit: usize) -> Result<Scanned> {
         let limit = limit.max(1);
+        let range = (Bound::Included(start), Bound::Excluded(end));
+        let overlay = overlay.filter(|o| start < end && o.range::<[u8], _>(range).next().is_some());
+        let mut layers = self.layers.iter().flatten();
+        let (first, second) = (layers.next(), layers.next());
+        if overlay.is_none() && second.is_none() {
+            // One tree and nothing pending in the range (the main database,
+            // outside a transaction that wrote there): no merge.
+            let mut out = Vec::new();
+            let mut next = None;
+            if let Some(root) = first {
+                self.pages.walk(root, start, end, &mut |k, v| {
+                    if out.len() == limit {
+                        next = Some(k.to_vec());
+                        return false;
+                    }
+                    if let Some((1, value)) = v.split_first() {
+                        out.push((k.to_vec(), value.to_vec()));
+                    }
+                    true
+                })?;
+            }
+            return Ok((out, next));
+        }
         // Each layer gives at most `limit` keys; past the smallest last key of
         // a layer that had more, the merge would be incomplete.
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
@@ -118,21 +141,26 @@ impl Snapshot {
         };
         // Layers from the farthest to the closest, so closer ones overwrite.
         for layer in self.layers.iter().rev().flatten() {
-            let mut last = None;
-            for (n, item) in layer.range(start..end).map_err(redb_err)?.enumerate() {
-                let (k, v) = item.map_err(redb_err)?;
+            let mut last: Option<Vec<u8>> = None;
+            let mut n = 0;
+            let mut more = false;
+            self.pages.walk(layer, start, end, &mut |k, v| {
                 if n == limit {
-                    cut(last.take().unwrap_or_default(), &mut boundary);
-                    break;
+                    more = true;
+                    return false;
                 }
-                let k = k.value().to_vec();
-                merged.insert(k.clone(), stored(v.value()));
-                last = Some(k);
+                n += 1;
+                merged.insert(k.to_vec(), stored(v));
+                last = Some(k.to_vec());
+                true
+            })?;
+            if more {
+                cut(last.unwrap_or_default(), &mut boundary);
             }
         }
         if let Some(o) = overlay {
             let mut last = None;
-            for (n, (k, v)) in o.range(start.to_vec()..end.to_vec()).enumerate() {
+            for (n, (k, v)) in o.range::<[u8], _>(range).enumerate() {
                 if n == limit {
                     cut(last.take().unwrap_or_default(), &mut boundary);
                     break;
@@ -167,9 +195,9 @@ pub(crate) struct Writer {
     pub commits_since_checkpoint: u64,
 }
 
-/// redb, the write-ahead log and the branch registry.
+/// The page file, the write-ahead log and the branch registry.
 pub(crate) struct Store {
-    pub db: RwLock<redb::Database>,
+    pub pages: Arc<Pages>,
     pub dir: PathBuf,
     pub writer: Mutex<Writer>,
     branches: RwLock<HashMap<String, BranchInfo>>,
@@ -180,6 +208,9 @@ pub(crate) struct Store {
     applied_lsn: AtomicU64,
     /// Catalog entries already parsed, by their stored bytes (see [`Store::parsed`]).
     catalog: Mutex<HashMap<Vec<u8>, Arc<Parsed>>>,
+    /// Bytes of changed nodes the page store may keep in memory before they
+    /// are written out, whatever the checkpoint interval.
+    dirty_limit: usize,
 }
 
 /// A catalog entry parsed once: its table metadata and, when a statement asked for it,
@@ -196,94 +227,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Applies operations in one redb write transaction.
-fn apply(db: &redb::Database, ops: &[Op], durable: bool) -> Result<()> {
-    let mut tx = db.begin_write().map_err(redb_err)?;
-    if !durable {
-        tx.set_durability(Durability::None).map_err(redb_err)?;
-    }
-    {
-        let mut tables: HashMap<&str, redb::Table<'_, &'static [u8], &'static [u8]>> = HashMap::new();
-        for op in ops {
-            match op {
-                Op::DropTable { table } => {
-                    tables.remove(table.as_str());
-                    tx.delete_table(def(table)).map_err(redb_err)?;
-                }
-                Op::Put { table, .. } | Op::Del { table, .. } | Op::DelRange { table, .. } => {
-                    if !tables.contains_key(table.as_str()) {
-                        let t = tx.open_table(def(table)).map_err(redb_err)?;
-                        tables.insert(table.as_str(), t);
-                    }
-                    let t = tables.get_mut(table.as_str()).ok_or_else(|| storage_err("table vanished"))?;
-                    match op {
-                        Op::Put { key, value, .. } => {
-                            t.insert(key.as_slice(), value.as_slice()).map_err(redb_err)?;
-                        }
-                        Op::Del { key, .. } => {
-                            t.remove(key.as_slice()).map_err(redb_err)?;
-                        }
-                        Op::DelRange { start, end, .. } => {
-                            t.retain_in(start.as_slice()..end.as_slice(), |_, _| false).map_err(redb_err)?;
-                        }
-                        Op::DropTable { .. } => {}
-                    }
-                }
-            }
-        }
-    }
-    tx.commit().map_err(redb_err)
+/// Opens (or creates) a page file, encrypted with `keys` if any.
+pub(crate) fn open_pages(path: &Path, cache_bytes: usize, keys: Option<&Keys>, sync: bool) -> Result<Pages> {
+    Pages::open(path, cache_bytes, keys.map(|k| k.pages.clone()), sync)
 }
 
-/// Opens (or creates) a page store file, encrypted with `keys` if any.
-pub(crate) fn open_redb(path: &Path, cache_bytes: usize, keys: Option<&Keys>) -> Result<redb::Database> {
-    let builder = {
-        let mut b = redb::Builder::new();
-        b.set_cache_size(cache_bytes);
-        b
-    };
-    match keys {
-        Some(k) => {
-            let file = EncryptedFile::open(path, k.pages.clone())
-                .map_err(|e| storage_err(format!("cannot open {}: {e}", path.display())))?;
-            builder.create_with_backend(file).map_err(|e| match e {
-                redb::DatabaseError::DatabaseAlreadyOpen => redb_err(e),
-                e => storage_err(format!(
-                    "cannot open the encrypted page store {} ({e}): is it damaged, or encrypted with another key?",
-                    path.display()
-                )),
-            })
-        }
-        None => builder.create(path).map_err(redb_err),
+fn read_meta(pages: &Pages, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    match pages.version().root(META) {
+        Some(root) => pages.find(&root, key, <[u8]>::to_vec),
+        None => Ok(None),
     }
-}
-
-/// Copies every table of `from` into `to` (a page store encrypted, or
-/// re-encrypted). Both are closed by the caller.
-pub(crate) fn copy_tables(from: &redb::Database, to: &redb::Database) -> Result<()> {
-    use redb::TableHandle;
-    let r = from.begin_read().map_err(redb_err)?;
-    let w = to.begin_write().map_err(redb_err)?;
-    for handle in r.list_tables().map_err(redb_err)? {
-        let name = handle.name().to_owned();
-        let src = r.open_table(def(&name)).map_err(redb_err)?;
-        let mut dst = w.open_table(def(&name)).map_err(redb_err)?;
-        for item in src.iter().map_err(redb_err)? {
-            let (k, v) = item.map_err(redb_err)?;
-            dst.insert(k.value(), v.value()).map_err(redb_err)?;
-        }
-    }
-    w.commit().map_err(redb_err)
-}
-
-fn read_meta(db: &redb::Database, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let tx = db.begin_read().map_err(redb_err)?;
-    let table = match tx.open_table(def(META)) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(redb_err(e)),
-    };
-    Ok(table.get(key).map_err(redb_err)?.map(|v| v.value().to_vec()))
 }
 
 fn u64_of(bytes: Option<Vec<u8>>) -> u64 {
@@ -299,18 +252,19 @@ impl Store {
     /// checkpoint, then checkpoints.
     pub(crate) fn open(dir: &Path, cache_bytes: usize, sync: bool, keys: Option<&Keys>) -> Result<Store> {
         fs::create_dir_all(dir).map_err(|e| storage_err(format!("cannot create {}: {e}", dir.display())))?;
-        let db = open_redb(&dir.join(FILE), cache_bytes, keys)?;
-        let checkpoint_lsn = u64_of(read_meta(&db, CHECKPOINT_LSN)?);
+        let pages = open_pages(&dir.join(FILE), cache_bytes, keys, sync)?;
+        let checkpoint_lsn = u64_of(read_meta(&pages, CHECKPOINT_LSN)?);
         let wal_dir = dir.join("wal");
         let records = wal::recover(&wal_dir, keys.map(|k| k.wal.as_ref()))?;
+        let dirty_limit = (cache_bytes / 4).max(1 << 20);
         let mut last = checkpoint_lsn;
         for r in records.iter().filter(|r| r.lsn > checkpoint_lsn) {
-            apply(&db, &r.ops, false)?;
+            pages.apply(&r.ops)?;
             last = last.max(r.lsn);
         }
-        let generation = u64_of(read_meta(&db, GENERATION)?);
+        let generation = u64_of(read_meta(&pages, GENERATION)?);
         let store = Store {
-            db: RwLock::new(db),
+            pages: Arc::new(pages),
             dir: dir.to_owned(),
             writer: Mutex::new(Writer {
                 wal: wal::Writer::open(&wal_dir, last + 1, sync, keys.map(|k| k.wal.clone()))?,
@@ -324,6 +278,7 @@ impl Store {
             versions: Mutex::new(HashMap::new()),
             applied_lsn: AtomicU64::new(last),
             catalog: Mutex::new(HashMap::new()),
+            dirty_limit,
         };
         store.load_branches()?;
         store.checkpoint(None)?;
@@ -331,24 +286,18 @@ impl Store {
     }
 
     fn load_branches(&self) -> Result<()> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let tx = db.begin_read().map_err(redb_err)?;
         let mut map = HashMap::new();
-        if let Ok(table) = tx.open_table(def(META)) {
-            let end = super::keys::prefix_end(BRANCH_PREFIX);
-            for item in table.range(BRANCH_PREFIX..end.as_slice()).map_err(redb_err)? {
-                let (k, v) = item.map_err(redb_err)?;
-                let name = String::from_utf8_lossy(&k.value()[BRANCH_PREFIX.len()..]).into_owned();
-                let j: Json = serde_json::from_slice(v.value()).map_err(redb_err)?;
-                map.insert(
-                    name.clone(),
-                    BranchInfo {
-                        name,
-                        parent: j.get("parent").and_then(Json::as_str).unwrap_or(MAIN).to_owned(),
-                        created_at: j.get("createdAt").and_then(Json::as_i64).unwrap_or(0),
-                    },
-                );
-            }
+        for (key, value) in self.meta_entries(BRANCH_PREFIX)? {
+            let name = String::from_utf8_lossy(&key[BRANCH_PREFIX.len()..]).into_owned();
+            let j: Json = serde_json::from_slice(&value).map_err(bad)?;
+            map.insert(
+                name.clone(),
+                BranchInfo {
+                    name,
+                    parent: j.get("parent").and_then(Json::as_str).unwrap_or(MAIN).to_owned(),
+                    created_at: j.get("createdAt").and_then(Json::as_i64).unwrap_or(0),
+                },
+            );
         }
         *self.branches.write().unwrap_or_else(|e| e.into_inner()) = map;
         Ok(())
@@ -411,21 +360,15 @@ impl Store {
 
     /// A read view of `branch` as of now.
     pub(crate) fn snapshot(&self, branch: &str) -> Result<Snapshot> {
-        let chain = self.chain(branch)?;
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let lsn = self.applied_lsn.load(Ordering::SeqCst);
-        let tx = db.begin_read().map_err(redb_err)?;
-        let mut layers = Vec::with_capacity(chain.len());
-        for b in &chain {
-            let name = branch_table(b);
-            layers.push(match tx.open_table(def(&name)) {
-                Ok(t) => Some(t),
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(e) => return Err(redb_err(e)),
-            });
+        if branch == MAIN {
+            let version = self.pages.version();
+            let layers = vec![version.root(MAIN_TABLE)];
+            return Ok(Snapshot { pages: self.pages.clone(), _version: version, layers });
         }
-        let _ = lsn;
-        Ok(Snapshot { layers })
+        let chain = self.chain(branch)?;
+        let version = self.pages.version();
+        let layers = chain.iter().map(|b| version.root(&branch_table(b))).collect();
+        Ok(Snapshot { pages: self.pages.clone(), _version: version, layers })
     }
 
     /// A new, never used table generation.
@@ -466,21 +409,16 @@ impl Store {
         if !children.is_empty() {
             // Copy-on-write: children keep the values they were made with.
             let before = self.snapshot(branch)?;
-            let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-            let tx = db.begin_read().map_err(redb_err)?;
+            let version = self.pages.version();
             for child in &children {
                 let name = branch_table(child);
-                let table = match tx.open_table(def(&name)) {
-                    Ok(t) => Some(t),
-                    Err(redb::TableError::TableDoesNotExist(_)) => None,
-                    Err(e) => return Err(redb_err(e)),
-                };
+                let own = version.root(&name);
                 for key in overlay.keys() {
-                    let own = match &table {
-                        Some(t) => t.get(key.as_slice()).map_err(redb_err)?.is_some(),
+                    let has = match &own {
+                        Some(root) => self.pages.find(root, key, |_| ())?.is_some(),
                         None => false,
                     };
-                    if !own {
+                    if !has {
                         let old = before.get(None, key)?;
                         ops.push(Op::Put { table: name.clone(), key: key.clone(), value: tagged(old.as_deref()) });
                     }
@@ -513,9 +451,27 @@ impl Store {
         writer.wal.append(&record)?;
         writer.next_lsn += 1;
         writer.commits_since_checkpoint += 1;
-        apply(&self.db.read().unwrap_or_else(|e| e.into_inner()), &record.ops, false)?;
+        self.pages.apply(&record.ops)?;
         self.applied_lsn.store(record.lsn, Ordering::SeqCst);
+        if self.pages.dirty_bytes() > self.dirty_limit {
+            // Much was written since the last checkpoint: the changed nodes go
+            // to disk now rather than wait in memory. The log is left as it is.
+            self.flush(writer)?;
+        }
         Ok(record.lsn)
+    }
+
+    /// Makes everything applied so far durable in the page store.
+    fn flush(&self, w: &mut Writer) -> Result<u64> {
+        let lsn = w.next_lsn - 1;
+        self.pages.apply(&[Op::Put {
+            table: META.into(),
+            key: CHECKPOINT_LSN.to_vec(),
+            value: lsn.to_le_bytes().to_vec(),
+        }])?;
+        self.pages.checkpoint()?;
+        w.checkpoint_lsn = lsn;
+        Ok(lsn)
     }
 
     /// Takes the writer lock.
@@ -532,10 +488,7 @@ impl Store {
     }
 
     pub(crate) fn checkpoint_locked(&self, w: &mut Writer, keep_after: Option<u64>) -> Result<u64> {
-        let lsn = w.next_lsn - 1;
-        let ops = vec![Op::Put { table: META.into(), key: CHECKPOINT_LSN.to_vec(), value: lsn.to_le_bytes().to_vec() }];
-        apply(&self.db.read().unwrap_or_else(|e| e.into_inner()), &ops, true)?;
-        w.checkpoint_lsn = lsn;
+        let lsn = self.flush(w)?;
         w.last_checkpoint = Some(SystemTime::now());
         w.commits_since_checkpoint = 0;
         if w.wal.bytes > 0 {
@@ -603,20 +556,14 @@ impl Store {
 
     /// Entries of the store's own metadata whose key starts with `prefix`
     /// (the server keeps its list of applications there).
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn meta_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let tx = db.begin_read().map_err(redb_err)?;
-        let table = match tx.open_table(def(META)) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
-        };
-        let end = super::keys::prefix_end(prefix);
         let mut out = Vec::new();
-        for item in table.range(prefix..end.as_slice()).map_err(redb_err)? {
-            let (k, v) = item.map_err(redb_err)?;
-            out.push((k.value().to_vec(), v.value().to_vec()));
+        if let Some(root) = self.pages.version().root(META) {
+            let end = super::keys::prefix_end(prefix);
+            self.pages.walk(&root, prefix, &end, &mut |k, v| {
+                out.push((k.to_vec(), v.to_vec()));
+                true
+            })?;
         }
         Ok(out)
     }
@@ -634,9 +581,7 @@ impl Store {
 
     /// Bytes stored by a branch's own tree.
     pub(crate) fn branch_bytes(&self, branch: &str) -> u64 {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let Ok(tx) = db.begin_read() else { return 0 };
-        tx.open_table(def(&branch_table(branch))).ok().and_then(|t| t.stats().ok()).map_or(0, |s| s.stored_bytes())
+        self.pages.version().bytes(&branch_table(branch))
     }
 
     pub(crate) fn applied_lsn(&self) -> u64 {

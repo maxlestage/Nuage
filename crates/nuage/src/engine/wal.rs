@@ -38,6 +38,17 @@ pub(crate) enum Op {
     DropTable { table: String },
 }
 
+impl Op {
+    /// The store table it changes.
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Op::Put { table, .. } | Op::Del { table, .. } | Op::DelRange { table, .. } | Op::DropTable { table } => {
+                table
+            }
+        }
+    }
+}
+
 /// One commit.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Record {

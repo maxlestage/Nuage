@@ -1,0 +1,10 @@
+{
+  "check": "a42735843617ebee3dd079def5ff45cc",
+  "format": "nuage-encryption/1",
+  "kdf": {
+    "name": "hkdf-sha256"
+  },
+  "salt": "f5e77def4f8f313918b24e4d3007826bb4485325775c2bac89da9c1fb556af30",
+  "scheme": "XTS-AES-256 (pages), AES-256-GCM (log)",
+  "secret": "key"
+}
