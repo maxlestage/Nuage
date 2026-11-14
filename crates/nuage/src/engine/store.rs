@@ -377,7 +377,7 @@ impl Store {
         let pages = open_pages(&dir.join(FILE), cache_bytes, keys, sync)?;
         let checkpoint_lsn = u64_of(read_meta(&pages, CHECKPOINT_LSN)?);
         let wal_dir = dir.join("wal");
-        let records = wal::recover(&wal_dir, keys.map(|k| k.wal.as_ref()))?;
+        let records = wal::recover_after(&wal_dir, keys.map(|k| k.wal.as_ref()), checkpoint_lsn)?;
         let dirty_limit = (cache_bytes / 4).max(1 << 20);
         let mut last = checkpoint_lsn;
         let mut log_gap = None;

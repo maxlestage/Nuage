@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/nuage", "crates/nuage-site"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -17,6 +17,13 @@ authors = ["Maxime Nathan Lestage"]
 # TODO: switch to memoire-orm 0.2.1 from crates.io once published
 memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "8f7e0cb", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
 nuage-site = { version = "0.1.0", path = "crates/nuage-site" }
+
+# The server (`nuage`, Dockerfile, heroku-build.sh) and the examples: one code generation unit,
+# optimized across crates (the engine calls Memoire's decoding for every value it reads):
+# reads up to a third faster, a binary a quarter smaller, for a longer link.
+[profile.release]
+lto = "fat"
+codegen-units = 1
 
 # The browser bundle of the site (crates/nuage-site/build-wasm.sh): cargo build -p nuage-site
 # --lib --target wasm32-unknown-unknown --profile wasm-release, then wasm-bindgen into pkg/.

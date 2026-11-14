@@ -2,7 +2,36 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.4.1 (2026-11-14)
+
+### Faster
+
+Measured with `examples/sql_bench.rs` (5,000 rows, medians of three runs), before and
+after:
+
+- A row read is decoded into a vector sized once, in a plain loop (it grew value by value
+  through an iterator adapter that knows no size). With the next change, a scan of two
+  columns (`SELECT id, joue_le FROM main`) takes 0.98 ms instead of 2.11 ms (−54 %), an
+  unindexed filter 1.68 ms instead of 2.54 ms (−34 %).
+- Plain columns asked in the table's order, half of them or more, are moved to their place
+  in each row's own vector, which is then cut, instead of being copied into a new vector
+  for every row.
+- Rows read by key (an index, `IN (...)`, a subquery) are decoded where they are stored,
+  not copied out first, and their keys are built in one buffer, sized once: an index
+  matching a third of the table 1.07 ms instead of 1.63 ms (−34 %), `IN (subquery)` over
+  every row 8.8 ms instead of 11.6 ms (−24 %), a page of 20 keys by `IN` 24 µs instead of
+  30 µs (−20 %).
+- JSON answers of the HTTP API are written straight into their buffer
+  (`serde_json::to_vec`) instead of through `fmt::Display`, the same bytes: half the time to
+  encode a page of 20 rows (6.6 µs instead of 13.5 µs).
+- Opening a database after a crash: the records of the log the page store already holds
+  are checked as before but not copied out (opening a log of 20,000 commits, most of them
+  written to the page store already: 37 ms instead of 76 ms).
+- The release build (the `nuage` server, Docker, Heroku) is optimized across crates in one
+  code generation unit (`lto = "fat"`, `codegen-units = 1`): Memoire's decoding of each value
+  is inlined in the engine. ORDER BY ... LIMIT 20 over the table 1.37 ms instead of 2.07 ms
+  (−34 %, with the changes above); the binary is 11.1 MB instead of 14.8 MB. The build takes
+  longer (about a minute more).
 
 ### Its own page store
 

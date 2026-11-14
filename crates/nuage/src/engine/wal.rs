@@ -81,8 +81,8 @@ impl Enc {
 
 struct Dec<'a>(&'a [u8]);
 
-impl Dec<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8]> {
+impl<'a> Dec<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.0.len() < n {
             return Err(storage_err("truncated log record"));
         }
@@ -99,12 +99,12 @@ impl Dec<'_> {
     fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap_or_default()))
     }
-    fn bytes(&mut self) -> Result<Vec<u8>> {
+    fn bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.u32()? as usize;
-        Ok(self.take(n)?.to_vec())
+        self.take(n)
     }
-    fn str(&mut self) -> Result<String> {
-        String::from_utf8(self.bytes()?).map_err(|_| storage_err("invalid UTF-8 in the log"))
+    fn str(&mut self) -> Result<&'a str> {
+        std::str::from_utf8(self.bytes()?).map_err(|_| storage_err("invalid UTF-8 in the log"))
     }
 }
 
@@ -167,21 +167,38 @@ impl Record {
         *out = e.0;
     }
 
-    fn decode(payload: &[u8]) -> Result<Record> {
+    /// The record of `payload`, `None` when its number is `after` or before
+    /// (a commit the page store holds already). Such a record is read through
+    /// all the same, checked as a kept one is, without copying anything out:
+    /// whether a record is whole does not depend on what it is read for.
+    fn decode(payload: &[u8], after: u64) -> Result<Option<Record>> {
         let mut d = Dec(payload);
         let lsn = d.i64()? as u64;
         let n = d.u32()? as usize;
-        let mut ops = Vec::with_capacity(n.min(1 << 16));
+        let keep = lsn > after;
+        let mut ops = Vec::with_capacity(if keep { n.min(1 << 16) } else { 0 });
         for _ in 0..n {
-            ops.push(match d.u8()? {
-                1 => Op::Put { table: d.str()?, key: d.bytes()?, value: d.bytes()? },
-                2 => Op::Del { table: d.str()?, key: d.bytes()? },
-                3 => Op::DelRange { table: d.str()?, start: d.bytes()?, end: d.bytes()? },
-                4 => Op::DropTable { table: d.str()? },
-                t => return Err(storage_err(format!("unknown log operation {t}"))),
-            });
+            let op = d.u8()?;
+            if !(1..=4).contains(&op) {
+                return Err(storage_err(format!("unknown log operation {op}")));
+            }
+            let table = d.str()?;
+            let (a, b) = match op {
+                1 | 3 => (d.bytes()?, d.bytes()?),
+                2 => (d.bytes()?, &[][..]),
+                _ => (&[][..], &[][..]),
+            };
+            if keep {
+                let table = table.to_owned();
+                ops.push(match op {
+                    1 => Op::Put { table, key: a.to_vec(), value: b.to_vec() },
+                    2 => Op::Del { table, key: a.to_vec() },
+                    3 => Op::DelRange { table, start: a.to_vec(), end: b.to_vec() },
+                    _ => Op::DropTable { table },
+                });
+            }
         }
-        Ok(Record { lsn, ops })
+        Ok(keep.then_some(Record { lsn, ops }))
     }
 }
 
@@ -198,7 +215,13 @@ fn segment_key(bytes: &[u8], key: &WalKey) -> Option<SegmentKey> {
 /// returns the records before it and the length of the valid part.
 /// Encrypted (`key`), a record that does not open under the segment's key
 /// ends it too.
+#[cfg(test)]
 pub(crate) fn read_segment(bytes: &[u8], key: Option<&WalKey>) -> (Vec<Record>, usize) {
+    read_segment_after(bytes, key, 0)
+}
+
+/// [`read_segment`], keeping only the records numbered after `after`.
+fn read_segment_after(bytes: &[u8], key: Option<&WalKey>, after: u64) -> (Vec<Record>, usize) {
     let mut records = Vec::new();
     let seg = match key {
         Some(k) => match segment_key(bytes, k) {
@@ -226,8 +249,8 @@ pub(crate) fn read_segment(bytes: &[u8], key: Option<&WalKey>) -> (Vec<Record>, 
             },
             None => payload,
         };
-        match Record::decode(payload) {
-            Ok(r) => records.push(r),
+        match Record::decode(payload, after) {
+            Ok(r) => records.extend(r),
             Err(_) => break,
         }
         at += 8 + len;
@@ -375,7 +398,15 @@ impl Writer {
 /// records follow valid ones. Encrypted (`key`), a segment without a valid
 /// header is an error, not a tail to cut: it was written in clear, or by
 /// another key.
+#[cfg(test)]
 pub(crate) fn recover(dir: &Path, key: Option<&WalKey>) -> Result<Vec<Record>> {
+    recover_after(dir, key, 0)
+}
+
+/// [`recover`], returning only the records numbered after `after` (those of
+/// the commits the page store does not hold yet): the segments are checked
+/// and cut the same way, the records before are not copied out.
+pub(crate) fn recover_after(dir: &Path, key: Option<&WalKey>, after: u64) -> Result<Vec<Record>> {
     let mut all = Vec::new();
     for (_, path) in segments(dir)? {
         let mut bytes = Vec::new();
@@ -390,7 +421,7 @@ pub(crate) fn recover(dir: &Path, key: Option<&WalKey>) -> Result<Vec<Record>> {
         {
             return Err(storage_err(format!("{} is not an encrypted log segment", path.display())));
         }
-        let (records, valid) = read_segment(&bytes, key);
+        let (records, valid) = read_segment_after(&bytes, key, after);
         if valid < bytes.len() {
             let f = OpenOptions::new().write(true).open(&path).map_err(io)?;
             f.set_len(valid as u64).map_err(io)?;
@@ -435,6 +466,46 @@ mod tests {
         let last = flipped.len() - 1;
         flipped[last] ^= 1;
         assert!(read_segment(&flipped, None).0.is_empty());
+    }
+
+    /// Records the page store holds already (numbered up to `after`) are left
+    /// out, and checked all the same: a damaged one still ends the segment.
+    #[test]
+    fn records_before_the_checkpoint_are_checked_not_kept() {
+        let ops = |n: u8| {
+            vec![
+                Op::Put { table: "b:main".into(), key: vec![n], value: vec![n; 40] },
+                Op::Del { table: "b:main".into(), key: vec![n, 1] },
+                Op::DelRange { table: "b:x".into(), start: vec![0], end: vec![n] },
+                Op::DropTable { table: "b:y".into() },
+            ]
+        };
+        let records: Vec<Record> = (1..=5).map(|lsn| Record { lsn, ops: ops(lsn as u8) }).collect();
+        let bytes: Vec<u8> = records.iter().flat_map(Record::encode).collect();
+        for after in 0..=6 {
+            let (kept, valid) = read_segment_after(&bytes, None, after);
+            assert_eq!(kept, records[(after as usize).min(5)..].to_vec(), "after {after}");
+            assert_eq!(valid, bytes.len());
+        }
+        // Record 2 framed and checksummed, but not a record: 3 to 5 are not read either.
+        let mut bad = records[0].encode();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u64.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(9);
+        let mut framed = vec![0u8; FRAME];
+        framed.extend_from_slice(&payload);
+        frame(&mut framed);
+        bad.extend_from_slice(&framed);
+        let good_len = records[0].encode().len();
+        for r in &records[2..] {
+            bad.extend(r.encode());
+        }
+        for after in [0, 2, 4] {
+            let (kept, valid) = read_segment_after(&bad, None, after);
+            assert_eq!(valid, good_len, "after {after}");
+            assert_eq!(kept, if after == 0 { vec![records[0].clone()] } else { vec![] });
+        }
     }
 
     #[test]

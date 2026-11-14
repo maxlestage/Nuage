@@ -215,7 +215,11 @@ fn pk_enc(v: &Value) -> Vec<u8> {
 }
 
 fn row_key_raw(generation: u64, pk: &[u8]) -> Vec<u8> {
-    let mut k = keys::data_prefix(generation, keys::ROW);
+    // `D` + generation + `r`, then the key: sized once.
+    let mut k = Vec::with_capacity(10 + pk.len());
+    k.push(keys::DATA);
+    k.extend_from_slice(&generation.to_be_bytes());
+    k.push(keys::ROW);
     k.extend_from_slice(pk);
     k
 }
@@ -223,6 +227,14 @@ fn row_key_raw(generation: u64, pk: &[u8]) -> Vec<u8> {
 impl Ctx<'_> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.snap.get(Some(self.overlay), key)
+    }
+
+    /// [`get`](Self::get), the value lent to `f` where it is instead of copied.
+    fn with_value<R>(&self, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
+        match self.overlay.get(key) {
+            Some(pending) => Ok(pending.as_deref().map(f)),
+            None => self.snap.with(key, f),
+        }
     }
 
     fn put(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
@@ -330,9 +342,14 @@ impl Ctx<'_> {
         pks: &[Vec<u8>],
     ) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::with_capacity(pks.len());
+        // One key buffer for all of them, and each row decoded where it is stored.
+        let mut key = keys::data_prefix(meta.generation, keys::ROW);
+        let prefix = key.len();
         for pk in pks {
-            if let Some(b) = self.get(&row_key_raw(meta.generation, pk))? {
-                out.push(self.decode(want, map, &b)?);
+            key.truncate(prefix);
+            key.extend_from_slice(pk);
+            if let Some(row) = self.with_value(&key, |b| self.decode(want, map, b))? {
+                out.push(row?);
             }
         }
         Ok(out)
@@ -914,6 +931,21 @@ fn plain_answer(ast: &SelectAst, rows: Vec<Vec<Value>>) -> std::result::Result<V
     Ok(match columns {
         None => rows.collect(),
         Some(columns) => {
+            // In the table's order, each once, and at least half of them: the row keeps its
+            // vector, each column moved to its place (nothing before `c` has been moved to
+            // `c`, the columns only go up), the rest cut off.
+            let in_place = columns.windows(2).all(|w| w[0] < w[1]) && columns.len() * 2 >= ast.from.columns.len();
+            if in_place {
+                return Ok(rows
+                    .map(|mut row| {
+                        for (to, &from) in columns.iter().enumerate() {
+                            row.swap(to, from);
+                        }
+                        row.truncate(columns.len());
+                        row
+                    })
+                    .collect());
+            }
             // A column asked once is moved out of the row; asked twice, copied.
             let once = columns.iter().enumerate().all(|(i, c)| !columns[..i].contains(c));
             rows.map(|mut row| {
@@ -1433,6 +1465,26 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
             ctx.put_meta(table, &meta);
             ctx.written.insert(table.clone());
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row's key, built in one go, is the rows' prefix and the primary key.
+    #[test]
+    fn row_keys_are_the_prefix_then_the_key() {
+        for generation in [0, 1, 7 << 40, u64::MAX - 1] {
+            for pk in [Value::Text("a\0b".into()), Value::I64(-3), Value::Text("x".repeat(40))] {
+                let pk = pk_enc(&pk);
+                let mut want = keys::data_prefix(generation, keys::ROW);
+                want.extend_from_slice(&pk);
+                assert_eq!(row_key_raw(generation, &pk), want);
+                let (start, end) = keys::rows_range(generation);
+                assert!(want >= start && want < end);
+            }
         }
     }
 }
