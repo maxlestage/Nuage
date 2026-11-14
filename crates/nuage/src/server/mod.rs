@@ -14,15 +14,18 @@
 //! answers are gzip-compressed for clients that accept it.
 //! | `/api/health` | `{"status":"ok"}` | public |
 //! | `/api/status`, `/api/status/stream` | live status, as JSON and as Server-Sent Events | token or console session; a public subset with `public_status` |
+//! | `/api/apps`, `/api/apps/{name}`, `/api/apps/{name}/tokens` | the management API: applications and their tokens, as JSON (see `manage`) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 //! | `/admin` | the management console | `NUAGE_ADMIN_PASSWORD` |
 //! | anything else (`GET`) | the site handler, if any, else a small home page | public |
 
 mod admin;
 pub(crate) mod apps;
 mod i18n;
+mod manage;
 mod pg;
 mod status;
 
+pub use manage::MIN_ADMIN_TOKEN;
 pub use pg::{PgOptions, tls_config};
 
 use std::collections::HashMap;
@@ -105,6 +108,10 @@ pub struct ServerOptions {
     /// Password of the console (`NUAGE_ADMIN_PASSWORD`). Without it, the
     /// console is off.
     pub admin_password: Option<String>,
+    /// Token of the management API (`NUAGE_ADMIN_TOKEN`, at least
+    /// [`MIN_ADMIN_TOKEN`] characters): `/api/apps` creates applications and
+    /// their tokens with it. Without it, the API is off.
+    pub admin_token: Option<String>,
     /// Status without credentials: the public subset (`NUAGE_PUBLIC_STATUS`).
     pub public_status: bool,
     /// An interactive transaction left without a request this long is
@@ -126,6 +133,7 @@ impl std::fmt::Debug for ServerOptions {
         f.debug_struct("ServerOptions")
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("admin_password", &self.admin_password.as_ref().map(|_| "***"))
+            .field("admin_token", &self.admin_token.as_ref().map(|_| "***"))
             .field("public_status", &self.public_status)
             .field("site", &self.site.is_some())
             .field("pg_port", &self.pg_port)
@@ -139,6 +147,7 @@ impl Default for ServerOptions {
         ServerOptions {
             token: None,
             admin_password: None,
+            admin_token: None,
             public_status: false,
             transaction_timeout: Duration::from_secs(30),
             max_body_bytes: 16 << 20,
@@ -593,6 +602,9 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     }
     if path == "/api/status" || path == "/api/status/stream" {
         return status::route(state, req, &path).await;
+    }
+    if path == "/api/apps" || path.starts_with("/api/apps/") {
+        return manage::route(state, req, &path).await;
     }
     if path == "/admin" || path.starts_with("/admin/") {
         return admin::route(state, req, peer).await;

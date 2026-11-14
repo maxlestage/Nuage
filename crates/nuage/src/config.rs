@@ -12,6 +12,7 @@
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
 //! | `NUAGE_TOKEN` | token of the first application (named `NUAGE_NAME`); the console creates the others | none: that application has no token |
 //! | `NUAGE_ADMIN_PASSWORD` | password of the console (`/admin`) | none: the console is off |
+//! | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
 //! | `NUAGE_CACHE_MB` | page cache of each application's database, in MiB, or `auto` | `auto`: an eighth of the memory (8 to 512 MiB) |
 //! | `NUAGE_BACKUP_DIR` | back up to this directory | |
@@ -146,7 +147,18 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         (None, None) => None,
         _ => return Err(Error::Validation("set both NUAGE_TLS_CERT and NUAGE_TLS_KEY, or neither".into())),
     };
+    let admin_token = get("NUAGE_ADMIN_TOKEN");
+    if let Some(t) = &admin_token
+        && t.chars().count() < crate::server::MIN_ADMIN_TOKEN
+    {
+        return Err(Error::Validation(format!(
+            "NUAGE_ADMIN_TOKEN is too short ({} characters): it makes applications, so it needs {} at least; `nuage genkey` makes one",
+            t.chars().count(),
+            crate::server::MIN_ADMIN_TOKEN
+        )));
+    }
     let server = ServerOptions {
+        admin_token,
         pg_port,
         pg_tls: tls.is_some(),
         token: get("NUAGE_TOKEN"),
@@ -213,5 +225,15 @@ mod tests {
         assert_eq!(key.engine.encryption.unwrap().kind(), "key");
         assert!(from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "short".to_owned())).is_err());
         assert!(from_vars(|k| (k == "NUAGE_BACKUP_S3_BUCKET").then(|| "b".to_owned())).is_err(), "credentials needed");
+    }
+
+    #[test]
+    fn the_management_token_is_long_enough() {
+        assert!(from_vars(|_| None).unwrap().server.admin_token.is_none());
+        let long = "f".repeat(64);
+        let on = from_vars(|k| (k == "NUAGE_ADMIN_TOKEN").then(|| format!("  {long} "))).unwrap();
+        assert_eq!(on.server.admin_token.as_deref(), Some(long.as_str()));
+        let short = from_vars(|k| (k == "NUAGE_ADMIN_TOKEN").then(|| "secret".to_owned())).unwrap_err();
+        assert!(short.to_string().contains("too short") && short.to_string().contains("nuage genkey"), "{short}");
     }
 }

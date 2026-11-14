@@ -40,6 +40,11 @@ fn main() -> ExitCode {
             }
         };
     }
+    // `nuage apps create <name> [description]`, `nuage apps list`: the management
+    // API of a server (NUAGE_URL, NUAGE_ADMIN_TOKEN).
+    if std::env::args().nth(1).as_deref() == Some("apps") {
+        return apps(std::env::args().skip(2).collect());
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("version" | "--version" | "-V")) {
         println!("nuage {}", nuage::VERSION);
         return ExitCode::SUCCESS;
@@ -97,6 +102,9 @@ fn main() -> ExitCode {
         }
         if config.server.admin_password.is_none() {
             log("NUAGE_ADMIN_PASSWORD is not set: the console (/admin) is off");
+        }
+        if config.server.admin_token.is_some() {
+            log("the management API (/api/apps) is on, with NUAGE_ADMIN_TOKEN");
         }
         // The website (pages, the live dashboard at /app, PWA) on the same port.
         #[cfg(feature = "site")]
@@ -212,4 +220,44 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+const APPS_USAGE: &str = "usage: nuage apps create <name> [description]
+       nuage apps list
+with NUAGE_URL (the server, https://…) and NUAGE_ADMIN_TOKEN (its management token)";
+
+/// `nuage apps …`: creates or lists the applications of a server.
+fn apps(args: Vec<String>) -> ExitCode {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let (Some(url), Some(token)) = (var("NUAGE_URL"), var("NUAGE_ADMIN_TOKEN")) else {
+        eprintln!("{APPS_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let answer = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["create", name, description @ ..] => {
+            runtime.block_on(nuage::keepawake::create_app(&url, &token, name, &description.join(" ")))
+        }
+        ["list"] => runtime.block_on(nuage::keepawake::list_apps(&url, &token)),
+        _ => {
+            eprintln!("{APPS_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match answer {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
