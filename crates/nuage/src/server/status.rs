@@ -231,6 +231,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
         },
         "applications": all.len(),
         "databases": databases,
+        "postgresql": state.options.pg_port.map(|port| json!({ "port": port, "tls": state.options.pg_tls })),
         "services": services,
     })
 }

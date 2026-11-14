@@ -39,8 +39,53 @@ pub struct Status {
     /// application's token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databases: Option<Vec<Database>>,
+    /// Memory of the machine and of the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+    /// The PostgreSQL protocol, when the server speaks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgresql: Option<Postgres>,
     #[serde(default)]
     pub services: Vec<Service>,
+}
+
+/// Memory figures (bytes; `None` when the server cannot tell).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Memory {
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
+    #[serde(default)]
+    pub process_bytes: Option<u64>,
+    #[serde(default)]
+    pub swap_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub swap_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub cache_per_app_bytes: Option<u64>,
+}
+
+/// Where the PostgreSQL protocol listens.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Postgres {
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub tls: bool,
+}
+
+/// The last connection of an application's client.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LastConnection {
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub via: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -132,6 +177,13 @@ pub struct Database {
     pub file_bytes: u64,
     #[serde(default)]
     pub tokens: u64,
+    #[serde(default)]
+    pub read_only_tokens: u64,
+    /// Websites whose pages may call it (CORS).
+    #[serde(default)]
+    pub websites: Vec<String>,
+    #[serde(default)]
+    pub last_connection: Option<LastConnection>,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -330,6 +382,15 @@ pub fn format_time(ms: f64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// `2026-11-14 10:30 UTC` of an RFC 3339 time.
+pub fn when(time: &str) -> String {
+    if time.len() >= 16 && time.as_bytes().get(10) == Some(&b'T') {
+        format!("{} {} UTC", &time[..10], &time[11..16])
+    } else {
+        time.to_string()
+    }
 }
 
 /// `HH:MM:SS` (UTC) of an RFC 3339 time, for the event log.

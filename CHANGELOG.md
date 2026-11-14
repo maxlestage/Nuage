@@ -4,6 +4,17 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### The dashboard's cards open
+
+- Every card of `/app` opens its details, live: the requests (the last minute larger, its
+  peak and average, each application), the latency and the connections (each application,
+  its last connection, the PostgreSQL port), each application (requests, latency, tables,
+  rows, sizes, tokens, websites, branches, last connection, recent events, a link to the
+  console), each service, the storage (with the memory and the swap), the log and the
+  backups; with a sentence that says what each figure means. A sheet from the bottom on a
+  phone, a window on a computer; it closes with ✕, Escape or a tap outside.
+- `/api/status` gives `postgresql` (port, TLS).
+
 ### Dark theme
 
 - The console has a real dark theme (deep night blue, sky-blue accents, Nuage DB's
