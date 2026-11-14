@@ -59,6 +59,22 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 | 8 writers | fails (conflict) | 14,000 /s |
 | 32 writers | fails (conflict) | 24,000 /s |
 
+### A lighter protocol
+
+- A statement of Memoire's client (`NuageDb`) no longer describes its tables each time: the
+  server says in `/v1/info` (`schemaRefs`) that it keeps schemas by reference, the client
+  sends each schema whole once, then a short reference. Describing and reading the schema
+  was more than half of the work of a short request, on both sides. A client or a server
+  that does not know references works as before (Memoire pinned to `66b9c38`).
+
+| Server and client on one machine, encrypted, `fsync` (`examples/bench.rs`) | Before | After |
+|---|---:|---:|
+| Read by id (p50) | 0.21 ms | 0.12 ms |
+| Read by a unique column (p50) | 0.27 ms | 0.19 ms |
+| A page of 20 rows through an index (p50) | 0.59 ms | 0.39 ms |
+| `POST /v1/sql`, a page of 20 rows (p50) | 0.70 ms | 0.40 ms |
+| Reads by id, 32 clients | 15,000 /s | 42,000 /s |
+
 ### Faster reads and writes
 
 - A SQL text already parsed is kept (512 of them): applications send the same statements

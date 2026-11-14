@@ -79,6 +79,23 @@ async fn client_and_server_end_to_end() {
     use common::{User, user};
     db.drop_table_if_exists::<User>().await.unwrap();
     db.create_table::<User>().await.unwrap();
+
+    // A table's schema travels whole once, then as a reference: the suite above ran that way
+    // (the server says in `/v1/info` that it keeps schemas by reference). The server knows the
+    // reference of a schema it was sent, and says so of one it never saw.
+    let auth = [("authorization", "Bearer t0ken"), ("content-type", "application/json")];
+    let info = http(running.local_addr(), "GET", "/v1/info", &auth, "").await;
+    assert!(info.body.contains(r#""schemaRefs":true"#), "{}", info.body);
+    let by_reference = |reference: &str| {
+        let key = memoire_orm::nuage::wire::value_to_json(&Value::I64(1));
+        serde_json::json!({ "query": { "findByKey": reference, "key": key } }).to_string()
+    };
+    let known = memoire_orm::nuage::wire::schema_ref(User::SCHEMA);
+    let found = http(running.local_addr(), "POST", "/v1/fetch", &auth, &by_reference(&known)).await;
+    assert_eq!((found.status, found.body.as_str()), (200, r#"{"rows":[]}"#));
+    let never = http(running.local_addr(), "POST", "/v1/fetch", &auth, &by_reference("users#0000000000000000")).await;
+    assert_eq!(never.status, 400, "{}", never.body);
+    assert!(never.body.contains("unknown schema reference"), "{}", never.body);
     let mut a = user("a@x.dev", "A", Some(30), 1.0);
     a.insert(&db).await.unwrap();
     let err = user("a@x.dev", "B", None, 0.0).insert(&db).await.unwrap_err();

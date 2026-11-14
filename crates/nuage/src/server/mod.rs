@@ -835,6 +835,9 @@ async fn app_protocol(
                 "database": engine.options().name,
                 "application": app.name,
                 "encrypted": engine.encryption().is_some(),
+                // A client may send a table's schema once, then its reference
+                // (`memoire_orm::nuage::wire::schema_ref`) in its place.
+                "schemaRefs": true,
             }),
         )),
         (Method::POST, [op @ ("fetch" | "execute")]) => {
