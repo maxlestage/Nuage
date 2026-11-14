@@ -498,11 +498,7 @@ pub(crate) fn unauthorized(message: &str) -> Response<HttpBody> {
 
 /// Compares in constant time: the answer's timing tells nothing about how
 /// much of a secret was right.
-pub(crate) fn same_secret(a: &[u8], b: &[u8]) -> bool {
-    // Digests first: equal lengths, so not even the length leaks.
-    let (x, y) = (ring::digest::digest(&ring::digest::SHA256, a), ring::digest::digest(&ring::digest::SHA256, b));
-    x.as_ref().iter().zip(y.as_ref()).fold(0u8, |acc, (p, q)| acc | (p ^ q)) == 0
-}
+pub(crate) use crate::hash::same_secret;
 
 pub(crate) fn random_token() -> String {
     let mut bytes = [0u8; 24];

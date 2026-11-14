@@ -93,8 +93,7 @@ pub struct AppInfo {
 }
 
 fn digest(token: &str) -> [u8; 32] {
-    let d = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
-    d.as_ref().try_into().unwrap_or([0; 32])
+    crate::hash::sha256(token.as_bytes())
 }
 
 fn hex(b: &[u8]) -> String {

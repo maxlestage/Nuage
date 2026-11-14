@@ -10,7 +10,6 @@ use hyper::client::conn::http1;
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use memoire_orm::{Error, Result};
-use ring::{digest, hmac};
 use tokio::net::TcpStream;
 
 use crate::engine::BackupStore;
@@ -66,11 +65,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    hex(digest::digest(&digest::SHA256, data).as_ref())
+    hex(&crate::hash::sha256(data))
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data).as_ref().to_vec()
+    crate::hash::hmac_sha256(key, data).to_vec()
 }
 
 /// Percent-encoding of SigV4: everything but `A-Z a-z 0-9 - _ . ~` (and

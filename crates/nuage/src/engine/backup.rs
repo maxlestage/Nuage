@@ -184,6 +184,7 @@ impl BackupStore for PrefixedStore {
 }
 
 /// Removes every object of a backup (a deleted application's).
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
     for prefix in ["snapshots/", "wal/"] {
         for name in backup.list(prefix)? {

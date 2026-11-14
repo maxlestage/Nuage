@@ -19,7 +19,21 @@ default = ["chrono", "uuid", "json", "site"]
 ## The website of Nuage DB (crates/nuage-site: pages, the live dashboard at `/app`, PWA),
 ## served by the `nuage` binary next to the database: `nuage::site()`. Without it, `/`
 ## is a small home page.
-site = ["dep:nuage-site"]
+site = ["server", "dep:nuage-site"]
+## The server: the database protocol over HTTP(S) (`/v1`), the PostgreSQL protocol, the
+## console, the live status, `Db::Remote` (Memoire's client) and the `nuage` binary.
+server = [
+    "s3", "memoire-orm/nuage", "tokio/net", "tokio/signal", "dep:flate2",
+    "hyper/server", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
+]
+## Backups to S3-compatible storage (a small HTTP/1.1 client over rustls).
+s3 = [
+    "dep:tokio", "dep:hyper", "hyper/client", "hyper/http1", "dep:hyper-util", "dep:http-body-util",
+    "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
+]
+## Without `s3`, `server` and `site` (`default-features = false`), Nuage DB is its embedded
+## engine alone (`nuage::Embedded`, backups to a folder): pure Rust, no network stack, no
+## C or assembly (cryptography from RustCrypto).
 ## Nuage DB always stores dates, UUIDs and JSON (memoire-orm's `chrono`, `uuid` and
 ## `json` features are on). These flags only say so to code shared with
 ## memoire-orm, such as its backend test suite.
@@ -38,26 +52,32 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 libc = "0.2"
 getrandom = "0.4"
-ring = "0.17"
-# gzip of the JSON answers (websites, browsers).
-flate2 = "1"
-# Encryption at rest (see src/crypto.rs): XTS-AES-256 for the page store (`aes`), Argon2id
-# when the key is a passphrase, base64 keys; AES-256-GCM and HKDF come from `ring`.
+# Encryption at rest (see src/crypto.rs), all RustCrypto (pure Rust): XTS-AES-256 for the
+# page store (`aes`), AES-256-GCM for the log, HKDF-SHA256, Argon2id when the key is a
+# passphrase, base64 keys.
 aes = "0.9"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 zeroize = "1"
 uuid = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
+# The server and the S3 client (features `server`, `s3`).
+flate2 = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
+hyper = { version = "1", optional = true }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 memoire-orm = { workspace = true }
+# The tests of the embedded engine run without the `server` feature.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
@@ -65,3 +85,8 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"
 [[bin]]
 name = "nuage"
 path = "src/main.rs"
+required-features = ["server"]
+
+[[example]]
+name = "bench"
+required-features = ["server"]

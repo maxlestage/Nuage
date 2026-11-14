@@ -33,9 +33,11 @@ mod ast;
 mod exec;
 mod lex;
 mod parse;
+#[cfg(feature = "server")]
 mod types;
 pub(crate) mod value;
 
+#[cfg(feature = "server")]
 pub(crate) use types::Typing;
 
 use std::sync::Arc;
@@ -62,6 +64,7 @@ impl Script {
     }
 
     /// Number of statements.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.stmts.len()
     }
@@ -72,16 +75,19 @@ impl Script {
     }
 
     /// Number of parameters.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn params(&self) -> usize {
         self.params
     }
 
     /// One script per statement; parameters keep their numbers.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn split(&self) -> Vec<Script> {
         self.stmts.iter().map(|s| Script { stmts: vec![s.clone()], params: self.params }).collect()
     }
 
     /// `begin`, `commit` or `rollback`, when the script is that one statement.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn control(&self) -> Option<&'static str> {
         match self.stmts.as_slice() {
             [ast::Stmt::Transaction(t)] => Some(t),
@@ -90,6 +96,7 @@ impl Script {
     }
 
     /// It returns rows (a `SELECT`, `EXPLAIN` or `RETURNING`), when it is one statement.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn returns_rows(&self) -> bool {
         use ast::Stmt::*;
         match self.stmts.as_slice() {
@@ -100,6 +107,7 @@ impl Script {
     }
 
     /// PostgreSQL's command tag of statement `i` (`SELECT 3`, `INSERT 0 1`...).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn tag(&self, i: usize, r: &SqlResult) -> String {
         use ast::Stmt::*;
         match self.stmts.get(i) {
@@ -121,6 +129,7 @@ impl Script {
 
 /// Runs `script` inside `tx`, a transaction its caller commits or rolls back
 /// (the PostgreSQL protocol's `BEGIN` ... `COMMIT`).
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn run_in(
     tx: &crate::embedded::EmbeddedTransaction,
     schemas: &SchemaCache,
@@ -133,7 +142,8 @@ pub(crate) fn run_in(
 }
 
 /// The types of a one-statement script's parameters and result columns, from
-/// the columns of its tables (read in `tx`).
+/// the columns of its tables (read in `tx`). For the PostgreSQL protocol (feature `server`).
+#[cfg(feature = "server")]
 pub(crate) fn typing(tx: &crate::embedded::EmbeddedTransaction, schemas: &SchemaCache, script: &Script) -> Typing {
     let runner = exec::Runner::new(tx, schemas, &[]);
     match script.stmts.as_slice() {

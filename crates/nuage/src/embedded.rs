@@ -17,6 +17,7 @@ use crate::engine::wal::Op;
 use crate::engine::{Engine, EngineOptions, MAIN};
 
 /// A transaction's writes at a `SAVEPOINT`.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) struct Savepoint {
     overlay: Overlay,
     extra: Vec<Op>,
@@ -326,6 +327,7 @@ impl EmbeddedTransaction {
     }
 
     /// What the transaction wrote so far, to come back to (`SAVEPOINT`).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn savepoint(&self) -> Result<Savepoint> {
         let guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
         let w = guard.as_ref().ok_or(Error::TransactionFinished)?;
@@ -338,6 +340,7 @@ impl EmbeddedTransaction {
     }
 
     /// Forgets what the transaction wrote since `sp` (`ROLLBACK TO SAVEPOINT`).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn rollback_to(&self, sp: &Savepoint) -> Result<()> {
         let mut guard = self.work.lock().unwrap_or_else(|e| e.into_inner());
         let w = guard.as_mut().ok_or(Error::TransactionFinished)?;

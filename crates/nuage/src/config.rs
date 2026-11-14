@@ -33,10 +33,13 @@ use memoire_orm::{Error, Result};
 
 use crate::crypto::Encryption;
 use crate::engine::{BackupOptions, DirectoryStore, EngineOptions};
+#[cfg(feature = "s3")]
 use crate::s3::{S3Options, S3Store};
+#[cfg(feature = "server")]
 use crate::server::ServerOptions;
 
-/// Everything the binary needs.
+/// Everything the binary needs (feature `server`).
+#[cfg(feature = "server")]
 #[derive(Debug)]
 pub struct Config {
     /// Port to listen on.
@@ -59,14 +62,13 @@ pub struct Config {
     pub keep_awake: Option<crate::keepawake::KeepAwake>,
 }
 
-/// Reads the configuration through `var` (`std::env::var` in the binary).
-pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
+/// The data directory and the engine settings, through `var`: `NUAGE_DATA_DIR`,
+/// `NUAGE_NAME`, `NUAGE_ENCRYPTION_KEY`, `NUAGE_CACHE_MB`, and the backups
+/// (`NUAGE_BACKUP_DIR`, or `NUAGE_BACKUP_S3_*` with the feature `s3`,
+/// `NUAGE_BACKUP_SNAPSHOT_MINUTES`). What an embedded database needs, without the server.
+pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf, EngineOptions)> {
     let get = |k: &str| var(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
     let bad = |k: &str, v: &str| Error::Validation(format!("{k}=`{v}` is not valid"));
-    let port = match get("PORT") {
-        Some(p) => p.parse().map_err(|_| bad("PORT", &p))?,
-        None => 8080,
-    };
     let mut engine = EngineOptions::default();
     if let Some(name) = get("NUAGE_NAME") {
         engine.name = name;
@@ -78,21 +80,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
     let store: Option<Arc<dyn crate::engine::BackupStore>> = if let Some(dir) = get("NUAGE_BACKUP_DIR") {
         Some(Arc::new(DirectoryStore::new(dir)))
     } else if let Some(bucket) = get("NUAGE_BACKUP_S3_BUCKET") {
-        let region = get("NUAGE_BACKUP_S3_REGION").unwrap_or_else(|| "us-east-1".into());
-        let key = get("NUAGE_BACKUP_S3_ACCESS_KEY_ID")
-            .or_else(|| get("AWS_ACCESS_KEY_ID"))
-            .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_ACCESS_KEY_ID is missing".into()))?;
-        let secret = get("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY")
-            .or_else(|| get("AWS_SECRET_ACCESS_KEY"))
-            .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY is missing".into()))?;
-        Some(Arc::new(S3Store::new(S3Options {
-            endpoint: get("NUAGE_BACKUP_S3_ENDPOINT").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
-            bucket,
-            region,
-            prefix: get("NUAGE_BACKUP_S3_PREFIX").unwrap_or_else(|| "nuage/".into()),
-            access_key_id: key,
-            secret_access_key: secret,
-        })?))
+        s3_store(&get, bucket)?
     } else {
         None
     };
@@ -104,6 +92,51 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         }
         engine.backup = Some(backup);
     }
+    let data_dir = get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from);
+    Ok((data_dir, engine))
+}
+
+#[cfg(feature = "s3")]
+fn s3_store(
+    get: &impl Fn(&str) -> Option<String>,
+    bucket: String,
+) -> Result<Option<Arc<dyn crate::engine::BackupStore>>> {
+    let region = get("NUAGE_BACKUP_S3_REGION").unwrap_or_else(|| "us-east-1".into());
+    let key = get("NUAGE_BACKUP_S3_ACCESS_KEY_ID")
+        .or_else(|| get("AWS_ACCESS_KEY_ID"))
+        .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_ACCESS_KEY_ID is missing".into()))?;
+    let secret = get("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY")
+        .or_else(|| get("AWS_SECRET_ACCESS_KEY"))
+        .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY is missing".into()))?;
+    Ok(Some(Arc::new(S3Store::new(S3Options {
+        endpoint: get("NUAGE_BACKUP_S3_ENDPOINT").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
+        bucket,
+        region,
+        prefix: get("NUAGE_BACKUP_S3_PREFIX").unwrap_or_else(|| "nuage/".into()),
+        access_key_id: key,
+        secret_access_key: secret,
+    })?)))
+}
+
+/// Without the feature `s3`, S3 backups are refused rather than silently ignored.
+#[cfg(not(feature = "s3"))]
+fn s3_store(
+    _get: &impl Fn(&str) -> Option<String>,
+    _bucket: String,
+) -> Result<Option<Arc<dyn crate::engine::BackupStore>>> {
+    Err(Error::Validation("NUAGE_BACKUP_S3_BUCKET is set, but this build of Nuage DB has no `s3` feature".into()))
+}
+
+/// Reads the configuration through `var` (`std::env::var` in the binary).
+#[cfg(feature = "server")]
+pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
+    let get = |k: &str| var(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let bad = |k: &str, v: &str| Error::Validation(format!("{k}=`{v}` is not valid"));
+    let port = match get("PORT") {
+        Some(p) => p.parse().map_err(|_| bad("PORT", &p))?,
+        None => 8080,
+    };
+    let (data_dir, engine) = engine_from_vars(&var)?;
     let pg_port = match get("NUAGE_PG_PORT") {
         Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_PG_PORT", &p))?),
         None => None,
@@ -136,18 +169,19 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         pg_bind: get("NUAGE_PG_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
         pg_port,
         tls,
-        data_dir: get("NUAGE_DATA_DIR").map_or_else(|| PathBuf::from("nuage-data"), PathBuf::from),
+        data_dir,
         engine,
         server,
     })
 }
 
 /// [`from_vars`] with the process environment.
+#[cfg(feature = "server")]
 pub fn from_env() -> Result<Config> {
     from_vars(|k| std::env::var(k).ok())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
 

@@ -46,12 +46,23 @@ the query builder, relations, transactions and migrations.
 
 ```toml
 [dependencies]
-# The engine, embedded mode and the server. `default-features = false` leaves the website out.
-nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false }
+# The engine, embedded mode and the server, without the website.
+nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false, features = ["server"] }
 # The same Memoire as Nuage DB (the `nuage` feature is the client of a server).
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "fd1fdd5464547ce1f60f4a11e552c394da73cfc8", features = ["nuage"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "074fbde", features = ["nuage"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+| Cargo feature | What it adds | Default |
+|---|---|---|
+| *(none)* | the embedded engine (`nuage::Embedded`), SQL, encryption, backups to a folder: **pure Rust**, no network stack, no C or assembly (RustCrypto) | always |
+| `s3` | backups to S3-compatible storage (HTTP/1.1 over rustls) | yes |
+| `server` | the server (`/v1`, PostgreSQL protocol, console, live status), `nuage::Db::Remote` and the `nuage` binary; implies `s3` | yes |
+| `site` | the website and the `/app` dashboard, served by the binary; implies `server` | yes |
+
+`default-features = false` is the embedded engine alone; add `features = ["s3"]` for
+S3 backups (the configuration of an embedded database with them:
+`nuage::config::engine_from_vars`).
 
 ### Embedded: a directory on disk
 

@@ -1,5 +1,7 @@
 //! The server end to end: Memoire's client against a local Nuage DB server,
 //! the status API, the console and S3 backups.
+
+#![cfg(feature = "server")]
 #[path = "common/mod.rs"]
 mod common;
 
