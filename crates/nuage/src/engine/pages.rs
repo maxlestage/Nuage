@@ -181,7 +181,7 @@ struct Slot {
 
 /// Sorted keys with their values, in one buffer: a key and its value follow
 /// each other in `data`, `slots` gives them in key order.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct Cells {
     slots: Vec<Slot>,
     data: Vec<u8>,
@@ -189,6 +189,26 @@ pub(crate) struct Cells {
     live: usize,
     /// Bytes of their lengths once on disk.
     lens: usize,
+}
+
+/// A node is copied to be changed: the copy leaves the unused bytes behind
+/// and has room for what comes next, so that writing to it does not move it.
+impl Clone for Cells {
+    fn clone(&self) -> Cells {
+        let mut slots = Vec::with_capacity(self.slots.len() + 8);
+        slots.extend_from_slice(&self.slots);
+        let mut data = Vec::with_capacity(self.live + self.live / 8 + 256);
+        if self.data.len() == self.live {
+            data.extend_from_slice(&self.data);
+        } else {
+            for s in &mut slots {
+                let off = data.len() as u32;
+                data.extend_from_slice(&self.data[s.off as usize..(s.off + s.klen + s.vlen) as usize]);
+                s.off = off;
+            }
+        }
+        Cells { slots, data, live: self.live, lens: self.lens }
+    }
 }
 
 impl Cells {

@@ -514,7 +514,7 @@ impl<'a> Pin<'a> {
             return false;
         }
         if self.allowed.len() <= 8 {
-            return self.allowed.iter().any(|v| *v == held);
+            return self.allowed.contains(&held);
         }
         let by_key = self.by_key.get_or_init(|| self.allowed.iter().map(|v| (pk_enc(v), *v)).collect());
         by_key.get(&pk_enc(held)).is_some_and(|v| *v == held)
