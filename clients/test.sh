@@ -11,8 +11,10 @@ cd "$here"
 
 dir=$(mktemp -d)
 port=$((20000 + RANDOM % 20000))
-export NUAGE_URL=http://127.0.0.1:$port NUAGE_TOKEN=test-token-$RANDOM
-PORT=$port NUAGE_DATA_DIR=$dir/data NUAGE_TOKEN=$NUAGE_TOKEN NUAGE_ENCRYPTION_KEY=$("$bin" genkey) \
+admin=$("$bin" genkey)
+export NUAGE_URL=http://127.0.0.1:$port NUAGE_TOKEN=test-token-$RANDOM NUAGE_ADMIN_TOKEN=$admin
+PORT=$port NUAGE_DATA_DIR=$dir/data NUAGE_TOKEN=$NUAGE_TOKEN NUAGE_ADMIN_TOKEN=$NUAGE_ADMIN_TOKEN \
+	NUAGE_ENCRYPTION_KEY=$("$bin" genkey) \
 	"$bin" >"$dir/server.log" 2>&1 &
 server=$!
 trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$dir"' EXIT
@@ -39,8 +41,11 @@ check() { # name runtime command...
 		fi
 		return
 	fi
+	# Without NUAGE_TOKEN, with the management token: each program makes its own application
+	# (notes-<name>), then writes and reads on it with the token it got.
 	local out
-	if out=$("$@" 2>&1) && grep -q "hello from $name" <<<"$out"; then
+	if out=$(unset NUAGE_TOKEN; "$@" 2>&1) && grep -q "created the application notes-$name" <<<"$out" &&
+		grep -q "hello from $name" <<<"$out"; then
 		echo "ok   $name"
 	else
 		echo "FAIL $name"
@@ -71,6 +76,12 @@ check elixir elixir elixir elixir.exs
 # An error comes back as {"error": {"kind", "message"}} with its status code.
 code=$(curl -s -o "$dir/err" -w '%{http_code}' --max-time 10 "$NUAGE_URL/v1/sql" -H "Authorization: Bearer $NUAGE_TOKEN" -d '{"sql": "SELECT * FROM nowhere"}' || true)
 if [ "$code" -ge 400 ] && grep -q '"kind"' "$dir/err"; then echo "ok   errors ($code)"; else echo "FAIL errors"; failed=1; fi
+# A token opens only its own application: the first one's (NUAGE_TOKEN) sees none of their notes.
+if curl -fs "$NUAGE_URL/v1/sql" -H "Authorization: Bearer $NUAGE_TOKEN" -d '{"sql": "SELECT * FROM notes"}' >/dev/null 2>&1; then
+	echo "FAIL isolation: the first application sees a table of another"; failed=1
+else
+	echo "ok   isolation"
+fi
 # The description of the API, for code generators.
 if curl -fs "$NUAGE_URL/v1/openapi.json" | grep -q '"openapi"'; then echo "ok   openapi.json"; else echo "FAIL openapi.json"; failed=1; fi
 

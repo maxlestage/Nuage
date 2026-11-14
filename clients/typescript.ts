@@ -1,7 +1,8 @@
 // Nuage DB from TypeScript (Bun, Deno, Node 22+ with --experimental-strip-types, or any bundler).
 //   NUAGE_URL=https://db.example.com NUAGE_TOKEN=... bun typescript.ts
+//   Without NUAGE_TOKEN, with the server's NUAGE_ADMIN_TOKEN: it makes its own application first.
 const URL = process.env.NUAGE_URL ?? "http://localhost:8080";
-const TOKEN = process.env.NUAGE_TOKEN;
+let TOKEN = process.env.NUAGE_TOKEN;
 
 type Value = string | number | boolean | null | Value[] | { [key: string]: Value };
 interface Result<Row = Record<string, Value>> {
@@ -22,9 +23,26 @@ async function sql<Row = Record<string, Value>>(query: string, params: Value[] =
   return body;
 }
 
+/** Makes an application (a database of its own) with the management token; returns its token. */
+async function createApp(name: string, adminToken: string): Promise<string> {
+  const res = await fetch(`${URL}/api/apps`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(`${body.error.kind}: ${body.error.message}`);
+  return body.token;
+}
+
 interface Note {
   id: number;
   text: string;
+}
+
+if (!TOKEN && process.env.NUAGE_ADMIN_TOKEN) {
+  TOKEN = await createApp("notes-typescript", process.env.NUAGE_ADMIN_TOKEN);
+  console.log("created the application notes-typescript");
 }
 
 await sql("CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, text TEXT NOT NULL)");

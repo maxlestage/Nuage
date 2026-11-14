@@ -1,6 +1,8 @@
 // Nuage DB from Go, with the standard library only.
 //
 //	NUAGE_URL=https://db.example.com NUAGE_TOKEN=... go run go.go
+//
+// Without NUAGE_TOKEN, with the server's NUAGE_ADMIN_TOKEN: it makes its own application first.
 package main
 
 import (
@@ -56,7 +58,43 @@ func SQL(query string, params ...any) (*Result, error) {
 	return &r, nil
 }
 
+// CreateApp makes an application (a database of its own) with the management token and
+// returns its token.
+func CreateApp(name, adminToken string) (string, error) {
+	body, _ := json.Marshal(map[string]any{"name": name})
+	req, _ := http.NewRequest("POST", url+"/api/apps", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	var r struct {
+		Token string `json:"token"`
+		Error *struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+		return "", err
+	}
+	if r.Error != nil {
+		return "", fmt.Errorf("%s: %s", r.Error.Kind, r.Error.Message)
+	}
+	return r.Token, nil
+}
+
 func main() {
+	if admin := os.Getenv("NUAGE_ADMIN_TOKEN"); token == "" && admin != "" {
+		t, err := CreateApp("notes-go", admin)
+		if err != nil {
+			panic(err)
+		}
+		token = t
+		fmt.Println("created the application notes-go")
+	}
 	must := func(r *Result, err error) *Result {
 		if err != nil {
 			panic(err)
