@@ -54,6 +54,14 @@ if (-not $token) { Fail "no token: $lines" }
 & $Binary check "http://127.0.0.1:$Port" $token
 if ($LASTEXITCODE -ne 0) { Fail 'the new token does not connect' }
 
+Step "nuage apps create on the server's computer, with nothing else: the settings file says it all"
+Remove-Item env:NUAGE_URL, env:NUAGE_ADMIN_TOKEN
+$lines = & $Binary apps create sans-reglage
+if (-not ($lines -match '^NUAGE_TOKEN=nuage_')) { Fail "no token without settings: $lines" }
+if (-not ($lines -match "^NUAGE_URL=http://127.0.0.1:$Port$")) { Fail "not the local server: $lines" }
+$env:NUAGE_URL = "http://127.0.0.1:$Port"
+$env:NUAGE_ADMIN_TOKEN = $admin
+
 Step 'run again without options: the backup setting stays, the service restarts'
 Clear-Options
 $again = & .\install.ps1 *>&1 | Out-String

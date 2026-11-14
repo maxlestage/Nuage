@@ -40,6 +40,11 @@ token=$(printf '%s\n' "$lines" | sed -n 's/^NUAGE_TOKEN=//p')
 [ -n "$token" ] || fail "no token: $lines"
 "$binary" check "http://127.0.0.1:$port" "$token" || fail "the new token does not connect"
 
+step "nuage apps create on the server's computer, with nothing else: the settings file says it all"
+lines=$(sudo env -u NUAGE_URL -u NUAGE_ADMIN_TOKEN "$binary" apps create sans-reglage)
+printf '%s\n' "$lines" | grep -q '^NUAGE_TOKEN=nuage_' || fail "no token without settings: $lines"
+printf '%s\n' "$lines" | grep -q "^NUAGE_URL=http://127.0.0.1:$port\$" || fail "not the local server: $lines"
+
 step "run again without options: the backup setting stays, the service restarts"
 sudo env CI=1 NUAGE_BINARY="$binary" NUAGE_SWAP_MB=0 bash install.sh | tee "$RUNNER_TEMP/again.txt"
 grep -q "Backups: kept as they are" "$RUNNER_TEMP/again.txt" || fail "the backup setting was not kept"

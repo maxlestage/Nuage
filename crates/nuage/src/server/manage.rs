@@ -52,7 +52,12 @@ fn error(status: u16, kind: &'static str, message: &str) -> Refus {
 
 impl Refus {
     fn response(&self) -> Response<HttpBody> {
-        json_response(self.status, &json!({ "error": { "kind": self.kind, "message": self.message } }))
+        let mut error = json!({ "kind": self.kind, "message": self.message });
+        if self.kind == "unique_violation" {
+            error["table"] = json!("applications");
+            error["column"] = json!("name");
+        }
+        json_response(self.status, &json!({ "error": error }))
     }
 }
 
@@ -176,7 +181,13 @@ async fn answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Resul
                 ));
             }
             if state.apps.get(&name).is_some() {
-                return Err(error(409, "conflict", &format!("there is already an application named `{name}`")));
+                // Memoire reads `unique_violation` as `Error::UniqueViolation` (`conflict`
+                // would be a transaction to retry).
+                return Err(Refus {
+                    status: 409,
+                    kind: "unique_violation",
+                    message: format!("there is already an application named `{name}`"),
+                });
             }
             let s = state.clone();
             let (app, token) = blocking(move || s.apps.create(&name, &description)).await?;

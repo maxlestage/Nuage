@@ -258,14 +258,84 @@ async fn shutdown_signal() {
 
 const APPS_USAGE: &str = "usage: nuage apps create <name> [description]
        nuage apps list
-with NUAGE_URL (the server, https://…) and NUAGE_ADMIN_TOKEN (its management token)";
+On the server's computer, nothing else: the settings file of the installer gives the token and
+the port (sudo reads it). From anywhere else: NUAGE_URL (the server, https://…) and
+NUAGE_ADMIN_TOKEN (its management token).";
+
+/// Where the installers put the settings file.
+fn installed_settings() -> Vec<std::path::PathBuf> {
+    let mut files = vec![
+        std::path::PathBuf::from("/etc/nuage/nuage.env"),
+        std::path::PathBuf::from("/usr/local/etc/nuage/nuage.env"),
+    ];
+    if let Ok(data) = std::env::var("ProgramData") {
+        files.push(std::path::Path::new(&data).join("Nuage").join("nuage.env"));
+    }
+    files
+}
+
+/// The server and the management token of `nuage apps`, and the address to show to the
+/// applications: NUAGE_URL and NUAGE_ADMIN_TOKEN, else the settings file (`--env-file`,
+/// NUAGE_ENV_FILE, or the installers' one), whose server is on this computer.
+fn apps_target() -> Result<(String, String, Option<String>), String> {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let args: Vec<String> = std::env::args().collect();
+    let explicit = args
+        .iter()
+        .position(|a| a == "--env-file")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| var("NUAGE_ENV_FILE"))
+        .map(std::path::PathBuf::from);
+    let settings = match explicit {
+        Some(path) => Some(path),
+        None if var("NUAGE_ADMIN_TOKEN").is_some() => None,
+        None => installed_settings().into_iter().find(|p| p.exists()),
+    };
+    let file: std::collections::HashMap<String, String> = match &settings {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!(
+                        "{} is readable by administrators only: run it with sudo (Windows: as administrator)",
+                        path.display()
+                    )
+                } else {
+                    format!("cannot read {}: {e}", path.display())
+                }
+            })?;
+            nuage::config::parse_env_file(&text).map_err(|e| format!("{}: {e}", path.display()))?.into_iter().collect()
+        }
+        None => Default::default(),
+    };
+    let get = |k: &str| var(k).or_else(|| file.get(k).cloned().filter(|v| !v.is_empty()));
+    let Some(token) = get("NUAGE_ADMIN_TOKEN") else {
+        return Err(match &settings {
+            Some(path) => format!(
+                "{} has no NUAGE_ADMIN_TOKEN: add one (`nuage genkey`), restart the server, and run this again",
+                path.display()
+            ),
+            None => APPS_USAGE.to_owned(),
+        });
+    };
+    // A server of this computer is reached on its own port; its applications, elsewhere,
+    // use its public address when the settings know it.
+    let local = settings.is_some() && var("NUAGE_URL").is_none();
+    let url = match get("NUAGE_URL") {
+        Some(url) if !local => url,
+        _ => format!("http://127.0.0.1:{}", get("PORT").unwrap_or_else(|| "8080".into())),
+    };
+    let public = if local { get("SITE_URL") } else { None };
+    Ok((url, token, public))
+}
 
 /// `nuage apps …`: creates or lists the applications of a server.
 fn apps(args: Vec<String>) -> ExitCode {
-    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
-    let (Some(url), Some(token)) = (var("NUAGE_URL"), var("NUAGE_ADMIN_TOKEN")) else {
-        eprintln!("{APPS_USAGE}");
-        return ExitCode::FAILURE;
+    let (url, token, public) = match apps_target() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     };
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(r) => r,
@@ -274,10 +344,20 @@ fn apps(args: Vec<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let answer = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["create", name, description @ ..] => {
-            runtime.block_on(nuage::keepawake::create_app(&url, &token, name, &description.join(" ")))
-        }
+    let args: Vec<&str> = args.iter().map(String::as_str).take_while(|a| *a != "--env-file").collect();
+    let answer = match args.as_slice() {
+        ["create", name, description @ ..] => runtime
+            .block_on(nuage::keepawake::create_app(&url, &token, name, &description.join(" ")))
+            .map(|lines| match &public {
+                // The address the applications use, not this computer's loopback.
+                Some(site) => {
+                    lines.replacen(&format!("NUAGE_URL={url}"), &format!("NUAGE_URL={}", site.trim_end_matches('/')), 1)
+                }
+                None if url.starts_with("http://127.0.0.1") => format!(
+                    "{lines}\n(an application on another computer replaces 127.0.0.1 by this computer's address)"
+                ),
+                None => lines,
+            }),
         ["list"] => runtime.block_on(nuage::keepawake::list_apps(&url, &token)),
         _ => {
             eprintln!("{APPS_USAGE}");
@@ -303,6 +383,7 @@ usage: nuage                              start the server
                                           the environment wins), as NUAGE_ENV_FILE does
        nuage genkey                       a new key (NUAGE_ENCRYPTION_KEY, NUAGE_ADMIN_TOKEN)
        nuage check [url] [token]          does a connection work? (NUAGE_URL, NUAGE_TOKEN)
-       nuage apps create <name> [desc]    a new application on a server (NUAGE_URL, NUAGE_ADMIN_TOKEN)
+       nuage apps create <name> [desc]    a new application: on the server's computer with nothing else
+                                          (sudo), from anywhere with NUAGE_URL and NUAGE_ADMIN_TOKEN
        nuage apps list                    the applications of a server
        nuage version                      the version";

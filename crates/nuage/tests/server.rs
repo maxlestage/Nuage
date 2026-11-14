@@ -1321,6 +1321,14 @@ async fn management_api() {
     assert_eq!(User::query().count(&first).await.unwrap(), 0);
     assert_eq!(User::query().count(&shop).await.unwrap(), 1);
 
+    // A name already taken: what Memoire reads as `Error::UniqueViolation`.
+    let taken = json(&http(addr, "POST", "/api/apps", auth, r#"{"name": "shop"}"#).await);
+    assert_eq!(taken["error"]["kind"], "unique_violation");
+    assert_eq!(
+        (taken["error"]["table"].as_str(), taken["error"]["column"].as_str()),
+        (Some("applications"), Some("name"))
+    );
+
     // Refusals, with a reason.
     for (body, status, words) in [
         (r#"{"name": "shop"}"#, 409, "already an application"),
