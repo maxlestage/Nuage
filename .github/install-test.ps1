@@ -36,7 +36,11 @@ $bytes = [IO.File]::ReadAllBytes($EnvFile)
 if ($bytes[0] -eq 0xEF) { Fail 'the settings file starts with a byte order mark' }
 
 Step 'the first backup lands in the folder'
-for ($i = 0; $i -lt 90 -and -not (Test-Path (Join-Path $Backup 'manifest.json'))); $i++) { Start-Sleep -Seconds 1 }
+$manifest = Join-Path $Backup 'manifest.json'
+for ($i = 0; $i -lt 90; $i++) {
+    if (Test-Path $manifest) { break }
+    Start-Sleep -Seconds 1
+}
 if (-not (Test-Path (Join-Path $Backup 'manifest.json'))) { Fail "no backup in $Backup after 90 s" }
 Get-ChildItem $Backup
 
