@@ -258,10 +258,8 @@ impl Engine {
                     legacy::IMPORTED
                 ),
             );
-            if !migrated && engine.options.backup.is_some() {
-                // The next restore then starts from a snapshot of this version.
-                let _ = engine.backup_now(true);
-            }
+            // The upkeep thread sends a snapshot of this version in a moment, after it
+            // has set the earlier version's backup aside: opening does not wait for it.
         }
         if migrated {
             engine.event("warn", "the data was stored in clear: it is now encrypted");
@@ -373,7 +371,17 @@ impl Engine {
             status.last_snapshot_at.is_none_or(|at| store::now_millis() - at >= b.snapshot_every.as_millis() as i64);
         let result = (|| -> Result<(u64, bool)> {
             if force_snapshot || due {
-                let lsn = backup::snapshot(&self.store, b.store.as_ref(), b.keep_snapshots)?;
+                let (lsn, kept) = backup::snapshot(&self.store, b.store.as_ref(), b.keep_snapshots)?;
+                if kept {
+                    self.event(
+                        "info",
+                        format!(
+                            "the backup of the earlier version is kept under {} in {}: delete it once the data has been checked",
+                            backup::BEFORE_IMPORT,
+                            b.store.describe()
+                        ),
+                    );
+                }
                 let shipped = backup::ship_segments(&self.store, b.store.as_ref(), lsn)?;
                 Ok((shipped.max(lsn), true))
             } else {

@@ -15,6 +15,7 @@
 //! | `encryption.json` | the header of an encrypted database (salt, check value: no key) |
 //! | `snapshots/<lsn>.db` | page store files (`.redb`: written by a version up to 0.4, see [`super::legacy`]) |
 //! | `wal/<first lsn>.log` | log segments |
+//! | `before-import/...` | the last backup of a version up to 0.4, as it was when this version took over (see [`keep_aside`]) |
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -187,16 +188,67 @@ impl BackupStore for PrefixedStore {
 /// Removes every object of a backup (a deleted application's).
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
-    for prefix in ["snapshots/", "wal/"] {
-        for name in backup.list(prefix)? {
-            backup.delete(&name)?;
+    for base in ["", BEFORE_IMPORT] {
+        for prefix in ["snapshots/", "wal/"] {
+            for name in backup.list(&format!("{base}{prefix}"))? {
+                backup.delete(&name)?;
+            }
         }
+        backup.delete(&format!("{base}{}", crate::crypto::HEADER_FILE))?;
+        backup.delete(&format!("{base}{MANIFEST}"))?;
     }
-    backup.delete(crate::crypto::HEADER_FILE)?;
-    backup.delete(MANIFEST)
+    Ok(())
 }
 
 const MANIFEST: &str = "manifest.json";
+
+/// Where the last backup of a version up to 0.4 is kept once this version
+/// writes its own (see [`keep_aside`]).
+pub(crate) const BEFORE_IMPORT: &str = "before-import/";
+
+/// Sets the backup of a version up to 0.4 aside, before this version writes
+/// its first snapshot over it: its manifest, the snapshot it names, the log
+/// segments after that snapshot and the encryption header are copied under
+/// `before-import/`, where nothing prunes them. Whatever happens to the data
+/// from then on, the database as that version left it can be restored (by
+/// that version, or by this one) from `before-import/` taken as the backup
+/// location. To delete once the data has been checked.
+///
+/// Returns `true` when it copied something: `false` when the backup is of
+/// this version, or was set aside before. `encrypted`: the data directory is
+/// encrypted; a backup in clear of a directory encrypted since is not kept.
+pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bool> {
+    let Some(manifest) = backup.get(MANIFEST)? else { return Ok(false) };
+    let j: Json = serde_json::from_slice(&manifest).map_err(|e| storage_err(format!("backup manifest: {e}")))?;
+    let name = j.get("snapshot").and_then(Json::as_str).unwrap_or_default();
+    let was_encrypted = j.get("encrypted").and_then(Json::as_bool) == Some(true);
+    if !name.ends_with(".redb") || was_encrypted != encrypted {
+        return Ok(false);
+    }
+    let aside = |object: &str| format!("{BEFORE_IMPORT}{object}");
+    // The manifest goes last: it is there only when everything it needs is.
+    if backup.get(&aside(MANIFEST))?.is_some() {
+        return Ok(false);
+    }
+    let lsn = j.get("lsn").and_then(Json::as_u64).unwrap_or(0);
+    let snapshot = backup.get(name)?.ok_or_else(|| storage_err(format!("backup snapshot `{name}` is missing")))?;
+    backup.put(&aside(name), &snapshot)?;
+    drop(snapshot);
+    for segment in backup.list("wal/")? {
+        // The segments a restore of that snapshot reads (see `restore`).
+        if segment_lsn(segment.trim_start_matches("wal/")).is_some_and(|first| first > lsn)
+            && let Some(bytes) = backup.get(&segment)?
+        {
+            backup.put(&aside(&segment), &bytes)?;
+        }
+    }
+    if was_encrypted {
+        let header = backup.get(HEADER_FILE)?.ok_or_else(|| storage_err(format!("the backup has no {HEADER_FILE}")))?;
+        backup.put(&aside(HEADER_FILE), &header)?;
+    }
+    backup.put(&aside(MANIFEST), &manifest)?;
+    Ok(true)
+}
 
 /// Ships the sealed log segments not shipped yet. Returns the last LSN they
 /// cover (everything up to it is in the backup).
@@ -217,7 +269,11 @@ pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u6
 
 /// Takes a snapshot: checkpoint, copy of the page store, upload, manifest.
 /// Older snapshots and the segments before them are pruned, keeping `keep`.
-pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> Result<u64> {
+/// The backup of a version up to 0.4 is first set aside ([`keep_aside`]).
+/// Returns the snapshot's LSN, and whether an earlier version's backup was
+/// set aside now.
+pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> Result<(u64, bool)> {
+    let kept = keep_aside(backup, store.dir.join(HEADER_FILE).exists())?;
     let local = store.dir.join("snapshot.partial");
     let lsn = {
         // No commit may land while the file is copied.
@@ -260,7 +316,7 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
             }
         }
     }
-    Ok(lsn)
+    Ok((lsn, kept))
 }
 
 /// The LSN in the name of a snapshot (`snapshots/<lsn>.db`, or `.redb` for one

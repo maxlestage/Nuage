@@ -142,8 +142,13 @@ are Nuage DB's own (`nuage.db`). Nothing to do: a data directory of an earlier v
 backup of one restored into an empty directory, is imported the first time this version opens
 it, encrypted as it was, and the log written since its last checkpoint is replayed over it.
 The old file stays beside the new one as `nuage.redb.imported`: delete it once you have
-checked your data. When backups are configured, a snapshot of this version is sent right
-after, so the next restore no longer goes through the import.
+checked your data. When backups are configured, a snapshot of this version follows in a
+moment, so the next restore no longer goes through the import; before it, the backup of the
+earlier version (its manifest, snapshot, log segments and encryption header) is copied
+under `before-import/` in the backup location of each database, where nothing prunes it.
+Going back is restoring from there: an empty data directory, and `before-import` (of the
+database, `apps/<name>/before-import` for an application) taken as the backup location.
+Delete it once you have checked your data.
 
 Reading the old file is the `import-redb` Cargo feature, on by default: the server has it.
 An application that embeds the engine (`default-features = false`, with or without `s3`)
