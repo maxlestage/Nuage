@@ -133,8 +133,14 @@ d'une version antérieure, ou une sauvegarde d'une telle version restaurée dans
 vide, est importé à la première ouverture par cette version, chiffré comme il l'était, et le
 journal écrit depuis son dernier point de contrôle est rejoué par-dessus. L'ancien fichier
 reste à côté du nouveau sous le nom `nuage.redb.imported` : supprimez-le une fois vos données
-vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version est envoyé
-aussitôt après : la restauration suivante ne passe plus par l'import.
+vérifiées. Quand des sauvegardes sont configurées, un instantané de cette version suit dans
+l'instant : la restauration suivante ne passe plus par l'import. Juste avant, la sauvegarde
+de l'ancienne version (son manifeste, son instantané, ses segments de journal et son en-tête
+de chiffrement) est copiée sous `before-import/` dans l'emplacement de sauvegarde de chaque
+base, où rien ne la purge. Revenir en arrière, c'est restaurer depuis là : un répertoire de
+données vide, et `before-import` (de la base, `apps/<nom>/before-import` pour une
+application) pris comme emplacement de sauvegarde. Supprimez-la une fois vos données
+vérifiées.
 
 La lecture de l'ancien fichier est la fonctionnalité Cargo `import-redb`, active par défaut :
 le serveur l'a. Une application qui embarque le moteur (`default-features = false`, avec ou

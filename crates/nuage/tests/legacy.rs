@@ -171,28 +171,69 @@ fn a_directory_in_clear_is_imported_then_encrypted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A new, empty disk restores a backup of the earlier version; the backup
-/// then gets a snapshot of this version, which restores in turn.
+/// Every file under `dir`, by its path from it.
+fn files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let name = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+                out.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    if dir.exists() {
+        walk(dir, dir, &mut out);
+    }
+    out
+}
+
+/// A new, empty disk restores a backup of the earlier version. That backup is
+/// set aside, whole, before this version writes its own over it, and stays
+/// there however many snapshots follow: the database as the earlier version
+/// left it can still be restored from it.
 fn restore_backup(name: &str, encryption: Option<Encryption>) {
+    let original = files(&fixture(name));
     let backup = copy_of(name, "backup");
-    let dir = std::env::temp_dir().join(format!("nuage-legacy-restored-{name}-{}", std::process::id()));
-    let again = std::env::temp_dir().join(format!("nuage-legacy-restored-again-{name}-{}", std::process::id()));
-    for d in [&dir, &again] {
+    let tmp = |what: &str| std::env::temp_dir().join(format!("nuage-legacy-{what}-{name}-{}", std::process::id()));
+    let (dir, again, back) = (tmp("restored"), tmp("restored-again"), tmp("rolled-back"));
+    for d in [&dir, &again, &back] {
         let _ = std::fs::remove_dir_all(d);
     }
-    let with_backup = || EngineOptions {
-        backup: Some(BackupOptions::new(Arc::new(DirectoryStore::new(&backup)))),
+    let with = |store: &Path| EngineOptions {
+        backup: Some(BackupOptions::new(Arc::new(DirectoryStore::new(store)))),
         ..options(encryption.clone())
     };
     let gone = {
-        let db = Embedded::open_with(&dir, with_backup()).unwrap();
+        let db = Embedded::open_with(&dir, with(&backup)).unwrap();
         assert!(db.engine().backup_status().restored);
         check(&db, false);
+        // Opening does not wait for it: the snapshot of this version follows in a moment.
+        for _ in 0..400 {
+            if db.engine().backup_status().last_snapshot_at.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let status = db.engine().backup_status();
         assert!(status.last_ok && status.last_snapshot_at.is_some(), "{status:?}");
+        let (events, _) = db.engine().events();
+        assert!(events.iter().any(|e| e.message.contains("before-import")), "{events:?}");
+        // The earlier version's backup, byte for byte, where nothing prunes it.
+        assert_eq!(files(&backup.join("before-import")), original);
         db.sql("INSERT INTO notes (label, grp, body) VALUES ('after-the-import', 6, 'n')", &[]).unwrap();
         db.engine().checkpoint().unwrap();
         db.engine().backup_now(false).unwrap();
+        // Snapshot after snapshot: the earlier version's own snapshots go, the copy aside stays.
+        for n in 0..4 {
+            db.sql("INSERT INTO notes (label, grp, body) VALUES (?, 6, 'n')", &[format!("later-{n}").into()]).unwrap();
+            db.engine().backup_now(true).unwrap();
+        }
+        assert!(!files(&backup).keys().any(|k| k.starts_with("snapshots/") && k.ends_with(".redb")));
+        assert_eq!(files(&backup.join("before-import")), original);
         Arc::downgrade(db.engine())
     };
     for _ in 0..400 {
@@ -204,13 +245,24 @@ fn restore_backup(name: &str, encryption: Option<Encryption>) {
     let manifest: Json = serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
     let snapshot = manifest["snapshot"].as_str().unwrap();
     assert!(snapshot.ends_with(".db"), "the latest snapshot is of this version: {snapshot}");
-    let db = Embedded::open_with(&again, with_backup()).unwrap();
-    assert!(db.engine().backup_status().restored);
-    assert!(again.join("nuage.db").exists() && !again.join("nuage.redb.imported").exists());
-    assert_eq!(one(&db, "SELECT count(*) FROM notes"), "353");
-    assert_eq!(one(&db, "SELECT count(*) FROM notes WHERE label = 'after-the-import'"), "1");
-    drop(db);
-    for d in [&dir, &again, &backup] {
+    {
+        // Another empty disk: restored from the snapshot of this version, nothing to import.
+        let db = Embedded::open_with(&again, with(&backup)).unwrap();
+        assert!(db.engine().backup_status().restored);
+        assert!(again.join("nuage.db").exists() && !again.join("nuage.redb.imported").exists());
+        assert_eq!(one(&db, "SELECT count(*) FROM notes"), "357");
+        assert_eq!(one(&db, "SELECT count(*) FROM notes WHERE label = 'after-the-import'"), "1");
+    }
+    {
+        // Going back: the copy set aside is a whole backup of the earlier version.
+        let db = Embedded::open_with(&back, with(&backup.join("before-import"))).unwrap();
+        assert!(db.engine().backup_status().restored);
+        check(&db, false);
+        assert_eq!(one(&db, "SELECT count(*) FROM notes WHERE label = 'after-the-import'"), "0");
+    }
+    // Wait for the handles above to let go before the directories are removed.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    for d in [&dir, &again, &back, &backup] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

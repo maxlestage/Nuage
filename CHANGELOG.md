@@ -25,8 +25,10 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   blocks of a page are now encrypted in one call to AES.
 - **Coming from 0.4**: a data directory or a backup whose pages are a redb file
   (`nuage.redb`) is imported the first time it is opened, encrypted as it was; the old
-  file is kept as `nuage.redb.imported`, and a snapshot of this version is sent to the
-  backup. This is the `import-redb` Cargo feature (on by default: the server has it), the
+  file is kept as `nuage.redb.imported`, and a snapshot of this version follows in the
+  backup (opening does not wait for it). Before that snapshot, the backup of the earlier
+  version is copied whole under `before-import/`, where nothing prunes it: the database as
+  that version left it can be restored from there, by that version or by this one. This is the `import-redb` Cargo feature (on by default: the server has it), the
   only remaining use of redb: an application that embeds the engine (`default-features =
   false`, with or without `s3`) compiles no redb at all, and asks for the feature if it has
   data of those versions.
