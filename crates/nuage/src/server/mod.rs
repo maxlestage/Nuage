@@ -850,6 +850,39 @@ async fn app_protocol(
                 Some(id) => Some(state.transaction(id, &app.name, &branch)?),
                 None => None,
             };
+            // `db.raw(...)` and `db.raw_execute(...)` of Memoire's client: the
+            // SQL layer runs them, as for `/v1/sql`, inside the open transaction
+            // when there is one.
+            if let Some((script, params)) = raw_script(&query)? {
+                if read_only && script.writes() {
+                    return Ok(forbidden(READ_ONLY));
+                }
+                let schemas = state.clone();
+                let answer = tokio::task::spawn_blocking(move || -> Result<Json> {
+                    let results = match tx {
+                        Some(tx) => crate::sql::run_in(&tx.tx, &schemas.schemas, &script, &params)?,
+                        None => {
+                            check_branch(&engine, &branch)?;
+                            crate::sql::run_values(&engine, &branch, &schemas.schemas, &[(&script, &params)], true)?
+                                .pop()
+                                .unwrap_or_default()
+                        }
+                    };
+                    Ok(if fetch {
+                        let rows = results.into_iter().rev().find(|r| !r.columns.is_empty()).map(|r| r.rows);
+                        json!({ "rows": wire::rows_to_json(&rows.unwrap_or_default()) })
+                    } else {
+                        let done = memoire_orm::ExecResult {
+                            rows_affected: results.iter().map(|r| r.rows_affected).sum(),
+                            last_insert_id: results.iter().rev().find_map(|r| r.last_insert_id.clone()),
+                        };
+                        wire::exec_result_to_json(&done)
+                    })
+                })
+                .await
+                .map_err(|e| Error::Pool(e.to_string()))??;
+                return Ok(json_response(200, &answer));
+            }
             // The engine blocks on disk: off the async workers.
             let answer = tokio::task::spawn_blocking(move || -> Result<Json> {
                 let q = query.as_query();
@@ -989,6 +1022,16 @@ async fn app_protocol(
         }
         _ => Err(Error::NotFound),
     }
+}
+
+/// The SQL of a raw statement of Memoire's protocol (`Query::Raw`,
+/// `Query::Script`), parsed, with its parameters; `None` for the others.
+fn raw_script(query: &wire::OwnedQuery) -> Result<Option<(crate::sql::Script, Vec<memoire_orm::Value>)>> {
+    Ok(match query {
+        wire::OwnedQuery::Raw(sql, params) => Some((crate::sql::Script::parse(sql)?, params.clone())),
+        wire::OwnedQuery::Script(sql) => Some((crate::sql::Script::parse(sql)?, Vec::new())),
+        _ => None,
+    })
 }
 
 /// A script of a `/v1/sql` request: `{"sql": "...", "params": [...]}`.
