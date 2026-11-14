@@ -30,13 +30,15 @@ use std::sync::{Arc, Mutex};
 
 use aes::Aes256;
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
+use hkdf::Hkdf;
 use memoire_orm::{Error, Result};
 use redb::StorageBackend;
 use redb::backends::FileBackend;
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use ring::hkdf;
 use serde_json::{Value as Json, json};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 /// Name of the header of an encrypted data directory (and of its copy in the
@@ -160,19 +162,10 @@ impl Encryption {
     }
 }
 
-struct Len(usize);
-
-impl hkdf::KeyType for Len {
-    fn len(&self) -> usize {
-        self.0
-    }
-}
-
+/// HKDF-SHA256 (RFC 5869). An empty salt is HMAC's empty key, the same as a salt of zeros.
 fn hkdf_into(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
-    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(ikm);
-    let info = [info];
     // Infallible for outputs up to 255 × 32 bytes.
-    prk.expand(&info, Len(out.len())).and_then(|okm| okm.fill(out)).expect("HKDF output length");
+    Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, out).expect("HKDF output length");
 }
 
 fn derive<const N: usize>(root: &[u8], info: &[u8]) -> Zeroizing<[u8; N]> {
@@ -224,7 +217,7 @@ impl Header {
         }
         let root = encryption.root(&self.salt)?;
         let check = derive::<CHECK_LEN>(root.as_ref(), b"nuage/v1/check");
-        if !crate::server::same_secret(check.as_ref(), &self.check) {
+        if !crate::hash::same_secret(check.as_ref(), &self.check) {
             return Err(invalid("wrong encryption key: this data was encrypted with another NUAGE_ENCRYPTION_KEY"));
         }
         Ok(keys(root.as_ref()))
@@ -501,20 +494,22 @@ const TAG: usize = 16;
 pub(crate) struct WalKey(Zeroizing<[u8; KEY_LEN]>);
 
 /// The key of one segment.
-pub(crate) struct SegmentKey(LessSafeKey);
+pub(crate) struct SegmentKey(Aes256Gcm);
 
 impl WalKey {
     pub(crate) fn segment(&self, salt: &[u8; SEGMENT_SALT]) -> SegmentKey {
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         hkdf_into(salt, self.0.as_ref(), b"nuage/v1/wal-segment", key.as_mut());
-        SegmentKey(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key.as_ref()).expect("AES-256 key")))
+        SegmentKey(Aes256Gcm::new_from_slice(key.as_ref()).expect("AES-256 key"))
     }
 }
 
-fn nonce(lsn: u64) -> Nonce {
+/// The nonce of a record: its LSN, little-endian, in the last 8 of 12 bytes (unique per
+/// segment key, as each segment has a key of its own).
+fn nonce(lsn: u64) -> Nonce<aes_gcm::aead::consts::U12> {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&lsn.to_le_bytes());
-    Nonce::assume_unique_for_key(n)
+    n.into()
 }
 
 impl SegmentKey {
@@ -523,9 +518,7 @@ impl SegmentKey {
         let mut out = Vec::with_capacity(8 + record.len() + TAG);
         out.extend_from_slice(&lsn.to_le_bytes());
         let mut body = record.to_vec();
-        self.0
-            .seal_in_place_append_tag(nonce(lsn), Aad::from(lsn.to_le_bytes()), &mut body)
-            .expect("AES-GCM seals any record");
+        self.0.encrypt_in_place(&nonce(lsn), &lsn.to_le_bytes(), &mut body).expect("AES-GCM seals any record");
         out.extend_from_slice(&body);
         out
     }
@@ -535,8 +528,8 @@ impl SegmentKey {
     pub(crate) fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
         let lsn = u64::from_le_bytes(sealed.get(..8)?.try_into().ok()?);
         let mut body = sealed.get(8..)?.to_vec();
-        let plain = self.0.open_in_place(nonce(lsn), Aad::from(lsn.to_le_bytes()), &mut body).ok()?;
-        Some(plain.to_vec())
+        self.0.decrypt_in_place(&nonce(lsn), &lsn.to_le_bytes(), &mut body).ok()?;
+        Some(body)
     }
 }
 
@@ -553,8 +546,8 @@ mod tests {
         let plain: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
         let mut unit = plain.clone();
         xts.apply(7 * 4096, &mut unit, true);
-        let digest = ring::digest::digest(&ring::digest::SHA256, &unit);
-        assert_eq!(hex(digest.as_ref()), "ec9a52b0ff1e7a3e79ca853436d07c74f0b08be6a9e4b7f6ae23e34dcf077773");
+        let digest = crate::hash::sha256(&unit);
+        assert_eq!(hex(&digest), "ec9a52b0ff1e7a3e79ca853436d07c74f0b08be6a9e4b7f6ae23e34dcf077773");
         // A range that starts inside the unit gives the same bytes.
         let mut part = plain[32..96].to_vec();
         xts.apply(7 * 4096 + 32, &mut part, true);
@@ -620,5 +613,31 @@ mod tests {
         let (h2, _) = Header::create(&phrase).unwrap();
         assert!(h2.unlock(&phrase).is_ok());
         assert!(String::from_utf8(h2.to_json()).unwrap().contains("argon2id"));
+    }
+}
+#[cfg(test)]
+mod compatibility {
+    //! Outputs of the `ring` implementation (before RustCrypto), so that data and backups
+    //! written by earlier versions keep opening.
+    use super::*;
+
+    #[test]
+    fn hkdf_and_aes_gcm_match_the_ring_implementation() {
+        let mut out = [0u8; 42];
+        hkdf_into(b"sel", b"cle d'entree", b"info", &mut out);
+        assert_eq!(hex(&out), "2d9e31783f6bf605bbf22cd1b968151e227d082827415367962351ad7e45ed0a039793de1f91e99971be");
+        let mut out = [0u8; 32];
+        hkdf_into(&[], b"racine", b"nuage/v1/pages", &mut out);
+        assert_eq!(hex(&out), "7bc6adab37db370ad9539c6d6076808aab2e8432da64e271ea832c74674f2d2f");
+        let segment = WalKey(Zeroizing::new([7u8; KEY_LEN])).segment(&[9u8; SEGMENT_SALT]);
+        let sealed = segment.seal(42, b"enregistrement du journal");
+        assert_eq!(
+            hex(&sealed),
+            "2a00000000000000b9677a048c6284c885ae23cb3de5be6dea77411668b12ea89c73a6fa2c20fa9e6ab63df2bdf64dd5ea"
+        );
+        assert_eq!(segment.open(&sealed).as_deref(), Some(&b"enregistrement du journal"[..]));
+        let mut altered = sealed.clone();
+        altered[12] ^= 1;
+        assert!(segment.open(&altered).is_none());
     }
 }

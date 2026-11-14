@@ -4,6 +4,22 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### The embedded engine in pure Rust
+
+- New Cargo features `server` and `s3` (both on by default, with `site`): without them
+  (`default-features = false`), Nuage DB is its embedded engine alone, with no network
+  stack and no C or assembly. Its dependency tree has no `ring`, `cc`, `rustls`, `hyper` or
+  `tokio`.
+- Cryptography from RustCrypto instead of `ring`: AES-256-GCM (`aes-gcm`), HKDF-SHA256
+  (`hkdf`), SHA-256 and HMAC (`sha2`, `hmac`), in a new `nuage::hash` module. The outputs are
+  the same: databases and backups written by earlier versions open as they are (tested
+  against values computed with `ring`, and an encrypted database and backup written by the
+  previous version). `ring` remains only as rustls's provider, under `s3` and `server`.
+- `nuage::config::engine_from_vars`: the data directory and the engine settings (encryption,
+  cache, backups) from variables, without the server. `config::from_vars` builds on it
+  (feature `server`). Without `s3`, `NUAGE_BACKUP_S3_BUCKET` is refused rather than ignored.
+- Memoire pinned to `074fbde` (its `nuage-wire` feature: the protocol without the client).
+
 ### PostgreSQL applications, as they are written
 
 - `SELECT ... FOR UPDATE` (`FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, `OF t`,

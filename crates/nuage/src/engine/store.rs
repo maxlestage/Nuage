@@ -572,6 +572,7 @@ impl Store {
 
     /// Entries of the store's own metadata whose key starts with `prefix`
     /// (the server keeps its list of applications there).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn meta_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
         let tx = db.begin_read().map_err(redb_err)?;
@@ -590,6 +591,7 @@ impl Store {
     }
 
     /// Writes (`Some`) or removes (`None`) a metadata entry, through the log.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn set_meta(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         let mut w = self.writer();
         let op = match value {

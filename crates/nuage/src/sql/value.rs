@@ -611,13 +611,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                         .join(" "),
                 ),
                 "md5" => return Err(syntax("md5() is not available: use sha256()")),
-                "sha256" => Value::Text(
-                    ring::digest::digest(&ring::digest::SHA256, s.as_bytes())
-                        .as_ref()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
-                ),
+                "sha256" => Value::Text(crate::hash::sha256(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()),
                 "hex" => Value::Text(match &a[0] {
                     Value::Bytes(b) => b.iter().map(|x| format!("{x:02X}")).collect(),
                     _ => s.bytes().map(|x| format!("{x:02X}")).collect(),

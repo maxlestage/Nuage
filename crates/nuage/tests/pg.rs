@@ -1,6 +1,8 @@
 //! The PostgreSQL protocol end to end, with tokio-postgres (a driver that
 //! prepares every statement and reads and writes values in binary).
 
+#![cfg(feature = "server")]
+
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};

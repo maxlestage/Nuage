@@ -54,17 +54,21 @@ pub mod config;
 pub mod crypto;
 mod embedded;
 pub mod engine;
+pub mod hash;
+#[cfg(feature = "server")]
 pub mod keepawake;
 pub mod memory;
+#[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "site")]
 mod site;
 pub mod sql;
 
-use memoire_orm::{
-    Database, Dialect, ExecResult, Executor, FromRow, NuageDb, NuageTransaction, Query, Result, Transaction,
-};
+use memoire_orm::{Database, Dialect, ExecResult, Executor, FromRow, Query, Result, Transaction};
+#[cfg(feature = "server")]
+use memoire_orm::{NuageDb, NuageTransaction};
 
 pub use crypto::Encryption;
 pub use embedded::{Embedded, EmbeddedTransaction, TableInfo};
@@ -72,6 +76,7 @@ pub use engine::{
     BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, PrefixedStore, StorageStats,
 };
 pub use memoire_orm::nuage::Branch;
+#[cfg(feature = "server")]
 pub use server::{
     AppInfo, PgOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo, tls_config,
 };
@@ -87,7 +92,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum Db {
     /// The engine in this process.
     Embedded(Embedded),
-    /// A Nuage DB server.
+    /// A Nuage DB server (feature `server`).
+    #[cfg(feature = "server")]
     Remote(NuageDb),
 }
 
@@ -97,11 +103,21 @@ impl Db {
     /// [`Db::from_env`] and [`EngineOptions::encryption`]).
     pub async fn open(target: &str, token: Option<&str>) -> Result<Db> {
         if target.starts_with("http://") || target.starts_with("https://") {
-            let mut b = NuageDb::builder(target);
-            if let Some(t) = token {
-                b = b.token(t);
+            #[cfg(feature = "server")]
+            {
+                let mut b = NuageDb::builder(target);
+                if let Some(t) = token {
+                    b = b.token(t);
+                }
+                Ok(Db::Remote(b.connect().await?))
             }
-            Ok(Db::Remote(b.connect().await?))
+            #[cfg(not(feature = "server"))]
+            {
+                let _ = token;
+                Err(memoire_orm::Error::Unsupported(format!(
+                    "`{target}` is a Nuage DB server: connecting to one needs the `server` feature"
+                )))
+            }
         } else {
             Ok(Db::Embedded(Embedded::open(target)?))
         }
@@ -136,6 +152,7 @@ impl Executor for Db {
     {
         match self {
             Db::Embedded(db) => db.fetch_all(query).await,
+            #[cfg(feature = "server")]
             Db::Remote(db) => db.fetch_all(query).await,
         }
     }
@@ -143,6 +160,7 @@ impl Executor for Db {
     async fn execute(&self, query: Query<'_>) -> Result<ExecResult> {
         match self {
             Db::Embedded(db) => db.execute(query).await,
+            #[cfg(feature = "server")]
             Db::Remote(db) => db.execute(query).await,
         }
     }
@@ -153,7 +171,8 @@ impl Executor for Db {
 pub enum DbTransaction {
     /// Of an embedded database.
     Embedded(EmbeddedTransaction),
-    /// On a server.
+    /// On a server (feature `server`).
+    #[cfg(feature = "server")]
     Remote(NuageTransaction),
 }
 
@@ -163,6 +182,7 @@ impl Database for Db {
     async fn begin(&self) -> Result<DbTransaction> {
         Ok(match self {
             Db::Embedded(db) => DbTransaction::Embedded(db.begin().await?),
+            #[cfg(feature = "server")]
             Db::Remote(db) => DbTransaction::Remote(db.begin().await?),
         })
     }
@@ -179,6 +199,7 @@ impl Executor for DbTransaction {
     {
         match self {
             DbTransaction::Embedded(tx) => tx.fetch_all(query).await,
+            #[cfg(feature = "server")]
             DbTransaction::Remote(tx) => tx.fetch_all(query).await,
         }
     }
@@ -186,6 +207,7 @@ impl Executor for DbTransaction {
     async fn execute(&self, query: Query<'_>) -> Result<ExecResult> {
         match self {
             DbTransaction::Embedded(tx) => tx.execute(query).await,
+            #[cfg(feature = "server")]
             DbTransaction::Remote(tx) => tx.execute(query).await,
         }
     }
@@ -195,6 +217,7 @@ impl Transaction for DbTransaction {
     async fn commit(self) -> Result<()> {
         match self {
             DbTransaction::Embedded(tx) => tx.commit().await,
+            #[cfg(feature = "server")]
             DbTransaction::Remote(tx) => tx.commit().await,
         }
     }
@@ -202,6 +225,7 @@ impl Transaction for DbTransaction {
     async fn rollback(self) -> Result<()> {
         match self {
             DbTransaction::Embedded(tx) => tx.rollback().await,
+            #[cfg(feature = "server")]
             DbTransaction::Remote(tx) => tx.rollback().await,
         }
     }

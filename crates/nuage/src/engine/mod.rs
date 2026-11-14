@@ -493,11 +493,13 @@ impl Engine {
 
     /// Metadata entries starting with `prefix` (not data: the server's
     /// records, such as its applications).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn meta_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.store.meta_entries(prefix)
     }
 
     /// Writes or removes a metadata entry, durably (through the log).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn set_meta(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         self.store.set_meta(key, value)
     }

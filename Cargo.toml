@@ -11,9 +11,10 @@ repository = "https://github.com/maxlestage/Nuage"
 authors = ["Maxime Nathan Lestage"]
 
 [workspace.dependencies]
-# Pinned to the commit of Memoire that has the `nuage` client and the evaluator Nuage DB uses.
+# Pinned to the commit of Memoire whose `nuage-wire` feature has the protocol alone (no HTTP
+# client): the engine needs only that. The `server` feature adds Memoire's client (`nuage`).
 # TODO: switch to memoire-orm 0.2.1 from crates.io once published
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "fd1fdd5464547ce1f60f4a11e552c394da73cfc8", default-features = false, features = ["memory", "nuage", "chrono", "uuid", "json"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "074fbde", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
 nuage-site = { version = "0.1.0", path = "crates/nuage-site" }
 
 # The browser bundle of the site (crates/nuage-site/build-wasm.sh): cargo build -p nuage-site
