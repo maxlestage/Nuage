@@ -11,6 +11,7 @@
 use active::html::svg;
 use active::prelude::*;
 
+use crate::details::{self, Detail, opener};
 use crate::i18n::{Texts, fill, t};
 use crate::icons::{Icon, icon};
 use crate::routes::{Lang, Page, href};
@@ -160,7 +161,7 @@ pub fn ago(tx: &Texts, now: f64, then: f64) -> String {
 }
 
 /// [`ago`] of an RFC 3339 time, `never` without one.
-fn ago_of(tx: &Texts, now: f64, time: Option<&str>) -> String {
+pub fn ago_of(tx: &Texts, now: f64, time: Option<&str>) -> String {
     match time.and_then(status::parse_time) {
         Some(then) if now > 0.0 => ago(tx, now, then),
         Some(_) => time.map(status::clock).unwrap_or_default(),
@@ -168,7 +169,7 @@ fn ago_of(tx: &Texts, now: f64, time: Option<&str>) -> String {
     }
 }
 
-fn status_class(status: &str) -> &'static str {
+pub fn status_class(status: &str) -> &'static str {
     match status {
         "ok" => "is-ok",
         "degraded" => "is-degraded",
@@ -186,7 +187,7 @@ fn status_text(tx: &Texts, status: &str) -> &'static str {
     }
 }
 
-fn service_state(tx: &Texts, status: &str) -> &'static str {
+pub fn service_state(tx: &Texts, status: &str) -> &'static str {
     match status {
         "ok" => tx.service_states[0],
         "degraded" => tx.service_states[1],
@@ -195,11 +196,11 @@ fn service_state(tx: &Texts, status: &str) -> &'static str {
     }
 }
 
-fn service_label(tx: &Texts, name: &str) -> String {
+pub fn service_label(tx: &Texts, name: &str) -> String {
     SERVICES.iter().position(|s| *s == name).map_or_else(|| name.to_string(), |i| tx.service_names[i].to_string())
 }
 
-const DASH: &str = "—";
+pub const DASH: &str = "—";
 
 /// The sparkline's points (`x,y …`) in a 120×36 box.
 pub fn spark_points(values: &[f64]) -> String {
@@ -227,6 +228,9 @@ pub fn dashboard(props: &str) -> Node {
     let tx = t(lang);
     let live = Live::new();
     let Live { data, conn, now, history, app_history, filter, log, updated, .. } = live;
+    // The card whose details are open.
+    let detail: State<Option<Detail>> = use_state(None);
+    let open_label = move |name: &str| format!("{} : {name}", tx.detail_open);
 
     // A value of the status, or a dash.
     let val =
@@ -326,7 +330,8 @@ pub fn dashboard(props: &str) -> Node {
         .bool_attr("hidden", move || !private())
         .child(
             div()
-                .class("kpi card kpi-requests")
+                .class("kpi card kpi-requests is-clickable")
+                .child(opener(detail, Detail::Requests, open_label(tx.kpi_requests)))
                 .child(h3().class("kpi-label").text(tx.kpi_requests))
                 .child(p().class("kpi-value").text_dyn(val(|d| d.requests.as_ref().map(|r| status::rate(r.per_s)))))
                 .child(
@@ -352,44 +357,52 @@ pub fn dashboard(props: &str) -> Node {
                 ),
         )
         .child(
-            div().class("kpi card").child(h3().class("kpi-label").text(tx.kpi_latency)).child(
-                div()
-                    .class("kpi-pair")
-                    .child(
-                        p().child(span().class("kpi-tag").text("p50")).child(
-                            span()
-                                .class("kpi-value sm")
-                                .text_dyn(val(|d| d.requests.as_ref().map(|r| status::millis(r.p50_ms)))),
+            div()
+                .class("kpi card is-clickable")
+                .child(opener(detail, Detail::Latency, open_label(tx.kpi_latency)))
+                .child(h3().class("kpi-label").text(tx.kpi_latency))
+                .child(
+                    div()
+                        .class("kpi-pair")
+                        .child(
+                            p().child(span().class("kpi-tag").text("p50")).child(
+                                span()
+                                    .class("kpi-value sm")
+                                    .text_dyn(val(|d| d.requests.as_ref().map(|r| status::millis(r.p50_ms)))),
+                            ),
+                        )
+                        .child(
+                            p().child(span().class("kpi-tag").text("p99")).child(
+                                span()
+                                    .class("kpi-value sm")
+                                    .text_dyn(val(|d| d.requests.as_ref().map(|r| status::millis(r.p99_ms)))),
+                            ),
                         ),
-                    )
-                    .child(
-                        p().child(span().class("kpi-tag").text("p99")).child(
-                            span()
-                                .class("kpi-value sm")
-                                .text_dyn(val(|d| d.requests.as_ref().map(|r| status::millis(r.p99_ms)))),
-                        ),
-                    ),
-            ),
+                ),
         )
         .child(
-            div().class("kpi card").child(h3().class("kpi-label").text(tx.kpi_connections)).child(
-                div()
-                    .class("kpi-pair")
-                    .child(
-                        p().child(span().class("kpi-tag").text(tx.conn_active)).child(
-                            span()
-                                .class("kpi-value sm")
-                                .text_dyn(val(|d| d.connections.as_ref().map(|c| c.active.to_string()))),
+            div()
+                .class("kpi card is-clickable")
+                .child(opener(detail, Detail::Connections, open_label(tx.kpi_connections)))
+                .child(h3().class("kpi-label").text(tx.kpi_connections))
+                .child(
+                    div()
+                        .class("kpi-pair")
+                        .child(
+                            p().child(span().class("kpi-tag").text(tx.conn_active)).child(
+                                span()
+                                    .class("kpi-value sm")
+                                    .text_dyn(val(|d| d.connections.as_ref().map(|c| c.active.to_string()))),
+                            ),
+                        )
+                        .child(
+                            p().child(span().class("kpi-tag").text(tx.conn_idle)).child(
+                                span()
+                                    .class("kpi-value sm")
+                                    .text_dyn(val(|d| d.connections.as_ref().map(|c| c.idle.to_string()))),
+                            ),
                         ),
-                    )
-                    .child(
-                        p().child(span().class("kpi-tag").text(tx.conn_idle)).child(
-                            span()
-                                .class("kpi-value sm")
-                                .text_dyn(val(|d| d.connections.as_ref().map(|c| c.idle.to_string()))),
-                        ),
-                    ),
-            ),
+                ),
         );
 
     let services = section()
@@ -406,7 +419,9 @@ pub fn dashboard(props: &str) -> Node {
             });
             list.into_iter()
                 .map(|s| {
-                    li().class(format!("service card {}", status_class(&s.status)))
+                    let label = service_label(tx, &s.name);
+                    li().class(format!("service card is-clickable {}", status_class(&s.status)))
+                        .child(opener(detail, Detail::Service(s.name.clone()), open_label(&label)))
                         .child(
                             div()
                                 .class("service-head")
@@ -421,7 +436,8 @@ pub fn dashboard(props: &str) -> Node {
         }));
 
     let storage = div()
-        .class("panel card")
+        .class("panel card is-clickable")
+        .child(opener(detail, Detail::Storage, open_label(tx.storage_title)))
         .child(h2().class("dash-h2").child(icon(Icon::HardDrive)).text(tx.storage_title))
         .child(div().class("bar").attr("aria-hidden", "true").child(span().class("bar-fill").style_dyn(
             "width",
@@ -463,8 +479,11 @@ pub fn dashboard(props: &str) -> Node {
                 ),
         );
 
-    let wal =
-        div().class("panel card").child(h2().class("dash-h2").child(icon(Icon::Refresh)).text(tx.wal_title)).child(
+    let wal = div()
+        .class("panel card is-clickable")
+        .child(opener(detail, Detail::Wal, open_label(tx.wal_title)))
+        .child(h2().class("dash-h2").child(icon(Icon::Refresh)).text(tx.wal_title))
+        .child(
             dl().class("facts")
                 .child(div().child(dt().text(tx.last_checkpoint)).child(dd().class("big").text_dyn(move || {
                     let n = now.get();
@@ -481,7 +500,8 @@ pub fn dashboard(props: &str) -> Node {
         );
 
     let backup = div()
-        .class("panel card")
+        .class("panel card is-clickable")
+        .child(opener(detail, Detail::Backup, open_label(tx.backup_title)))
         .class_if("is-error", move || {
             data.with(|d| d.as_ref().and_then(|d| d.backup.as_ref()).is_some_and(|b| b.last_ok == Some(false)))
         })
@@ -584,7 +604,7 @@ pub fn dashboard(props: &str) -> Node {
                 .map(|db| {
                     let values =
                         history.iter().find(|(name, _)| *name == db.name).map(|(_, v)| v.clone()).unwrap_or_default();
-                    app_card(tx, &db, &values, n)
+                    app_card(tx, &db, &values, n, detail)
                 })
                 .collect()
         }));
@@ -630,6 +650,48 @@ pub fn dashboard(props: &str) -> Node {
             },
         ));
 
+    let sheet = div()
+        .class("sheet-layer")
+        .bool_attr("hidden", move || detail.with(|d| d.is_none()))
+        .on("keydown", move |e| {
+            if e.key() == "Escape" {
+                detail.set(None);
+            }
+        })
+        .child(div().class("sheet-backdrop").attr("aria-hidden", "true").on_click(move |_| detail.set(None)))
+        .child(
+            div()
+                .class("sheet")
+                .attr("role", "dialog")
+                .attr("aria-modal", "true")
+                .attr("aria-labelledby", "sheet-title")
+                .child(
+                    div()
+                        .class("sheet-head")
+                        .child(span().class("sheet-grip").attr("aria-hidden", "true"))
+                        .child(h2().id("sheet-title").class("sheet-title").text_dyn(move || {
+                            detail.with(|d| d.as_ref().map(|w| details::title(tx, w)).unwrap_or_default())
+                        }))
+                        .child(
+                            button()
+                                .attr("type", "button")
+                                .class("sheet-close icon-btn")
+                                .attr("aria-label", tx.detail_close)
+                                .attr("title", tx.detail_close)
+                                .child(icon(Icon::Close))
+                                .on_click(move |_| detail.set(None)),
+                        ),
+                )
+                .child(div().class("sheet-body").children_dyn(move || {
+                    let Some(which) = detail.get() else { return Vec::new() };
+                    let n = now.get();
+                    let h = history.get();
+                    let ah = app_history.get();
+                    let lines = log.get();
+                    data.with(|d| details::body(tx, &which, d.as_ref(), n, &h, &ah, &lines, detail))
+                })),
+        );
+
     div()
         .class("dash")
         .class_if("is-locked", move || conn.get() == Conn::Unauthorized)
@@ -649,6 +711,7 @@ pub fn dashboard(props: &str) -> Node {
                 .class("dash-body")
                 .bool_attr("hidden", move || conn.get() == Conn::Unauthorized)
                 .child(public_note)
+                .child(p().class("dash-hint muted").text(tx.detail_hint))
                 .child(kpis)
                 .child(applications)
                 .child(services)
@@ -662,11 +725,12 @@ pub fn dashboard(props: &str) -> Node {
                 )
                 .child(events),
         )
+        .child(sheet)
         .into()
 }
 
 /// The card of one application.
-fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64) -> Node {
+fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64, detail: State<Option<Detail>>) -> Node {
     let degraded = db.status.as_deref() == Some("degraded");
     let mut head = div().class("app-card-head").child(strong().class("mono app-name").text(db.name.clone()));
     if db.first {
@@ -685,8 +749,9 @@ fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64) -> Nod
     let requests = db.requests.clone().unwrap_or_default();
     let fact = |label: &str, value: String| div().child(dt().text(label.to_string())).child(dd().text(value));
     let mut card = li()
-        .class(if degraded { "app-card card is-error" } else { "app-card card" })
+        .class(if degraded { "app-card card is-clickable is-error" } else { "app-card card is-clickable" })
         .attr("data-app", db.name.clone())
+        .child(opener(detail, Detail::App(db.name.clone()), format!("{} : {}", tx.detail_open, db.name)))
         .child(head);
     if let Some(d) = db.description.as_ref().filter(|d| !d.is_empty()) {
         card = card.child(p().class("app-desc muted").text(d.clone()));
@@ -804,7 +869,7 @@ mod tests {
             4000.0,
         );
         assert_eq!(live.filter.get(), None);
-        let html = app_card(t(Lang::Fr), &db("shop", 2.5), &[1.0, 2.5], 0.0).render();
+        let html = app_card(t(Lang::Fr), &db("shop", 2.5), &[1.0, 2.5], 0.0, use_state(None)).render();
         assert!(html.contains("shop") && html.contains("chiffrée") && html.contains("2.5"), "{html}");
     }
 
