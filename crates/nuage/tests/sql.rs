@@ -338,3 +338,45 @@ fn fast_paths_and_big_tables() {
     let each = started.elapsed() / 200;
     assert!(each < std::time::Duration::from_millis(50), "{each:?} per page");
 }
+
+/// Ce que l'API de Seriously envoie, écrit pour PostgreSQL : verrous de ligne
+/// et consultatifs, liste d'identifiants passée en un seul paramètre JSON.
+#[test]
+fn postgres_idioms() {
+    let db = blog();
+    // `FOR UPDATE` et ses variantes : acceptés, les lignes lues telles quelles.
+    for lock in
+        ["FOR UPDATE", "FOR UPDATE SKIP LOCKED", "FOR NO KEY UPDATE OF users NOWAIT", "FOR SHARE", "FOR KEY SHARE"]
+    {
+        assert_eq!(db.rows(&format!("SELECT id FROM users WHERE id = $1 {lock}"), &[json!(2)]), json!([[2]]), "{lock}");
+    }
+    assert_eq!(db.rows("SELECT id FROM users ORDER BY id LIMIT 1 FOR UPDATE", &[]), json!([[1]]));
+    db.err("SELECT id FROM users FOR nothing");
+    // La liste d'exclusion de la découverte : un tableau JSON en un paramètre.
+    let sql =
+        "SELECT name FROM users WHERE id NOT IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint) ORDER BY id";
+    assert_eq!(db.rows(sql, &[json!("[1,3]")]), json!([["Bob"], ["Dee"]]));
+    assert_eq!(db.rows(sql, &[json!("[]")]), json!([["Ada"], ["Bob"], ["Cy"], ["Dee"]]));
+    assert_eq!(
+        db.rows(
+            "SELECT name FROM users WHERE id IN (SELECT jsonb_array_elements_text($1)::bigint + 1)",
+            &[json!("[0]")]
+        ),
+        json!([["Ada"]])
+    );
+    assert_eq!(db.rows("SELECT json_array_elements_text('[\"a\", 2, null]')", &[]), json!([["a"], ["2"], [null]]));
+    assert_eq!(db.rows("SELECT jsonb_array_elements('[1, 2]') AS n", &[]), json!([[1], [2]]));
+    assert!(db.err("SELECT jsonb_array_elements_text('{\"a\": 1}')").contains("not an array"));
+    assert!(db.err("SELECT upper(jsonb_array_elements_text('[\"a\"]')) FROM users").contains("set of rows"));
+    // Verrous consultatifs : rien à attendre (un commit concurrent sur une table
+    // lue fait échouer la transaction), et une clé de hachage stable.
+    assert_eq!(
+        db.rows("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[json!("report:1:2")]),
+        json!([[null]])
+    );
+    assert_eq!(db.rows("SELECT pg_try_advisory_lock(42), pg_advisory_unlock(42)", &[]), json!([[true, true]]));
+    assert_eq!(
+        db.rows("SELECT hashtextextended('a', 0) = hashtextextended('a', 0), hashtextextended('a', 0) = hashtextextended('a', 1)", &[]),
+        json!([[true, false]])
+    );
+}
