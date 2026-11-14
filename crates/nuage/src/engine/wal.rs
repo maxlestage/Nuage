@@ -15,9 +15,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::pages::crc32;
 use super::storage_err;
 use memoire_orm::Result;
-use memoire_orm::evaluator::crc32;
 
 use crate::crypto::{SEGMENT_SALT, SegmentKey, WalKey, random};
 
@@ -111,24 +111,31 @@ fn io(e: std::io::Error) -> memoire_orm::Error {
     storage_err(format!("write-ahead log: {e}"))
 }
 
+/// Bytes of the head of a record on disk: length, CRC-32.
+const FRAME: usize = 8;
+
 /// `length ‖ CRC-32 ‖ payload`: a CRC over what is on disk tells a torn
-/// record from a whole one.
-fn frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 8);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&crc32(payload).to_le_bytes());
-    out.extend_from_slice(payload);
-    out
+/// record from a whole one. `buf` is the payload after [`FRAME`] bytes left
+/// for its head.
+fn frame(buf: &mut [u8]) {
+    let len = (buf.len() - FRAME) as u32;
+    let crc = crc32(&buf[FRAME..]);
+    buf[..4].copy_from_slice(&len.to_le_bytes());
+    buf[4..FRAME].copy_from_slice(&crc.to_le_bytes());
 }
 
 impl Record {
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
-        frame(&self.payload())
+        let mut buf = vec![0u8; FRAME];
+        self.payload_into(&mut buf);
+        frame(&mut buf);
+        buf
     }
 
-    fn payload(&self) -> Vec<u8> {
-        let mut e = Enc(Vec::new());
+    /// Appends the record to `out`.
+    fn payload_into(&self, out: &mut Vec<u8>) {
+        let mut e = Enc(std::mem::take(out));
         e.i64(self.lsn as i64);
         e.u32(self.ops.len() as u32);
         for op in &self.ops {
@@ -156,7 +163,7 @@ impl Record {
                 }
             }
         }
-        e.0
+        *out = e.0;
     }
 
     fn decode(payload: &[u8]) -> Result<Record> {
@@ -292,11 +299,17 @@ impl Writer {
     }
 
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
-        let payload = record.payload();
-        let bytes = match &self.seg {
-            Some(seg) => frame(&seg.seal(record.lsn, &payload)),
-            None => frame(&payload),
-        };
+        // One buffer: the head, then the record, encrypted where it is.
+        let mut bytes = vec![0u8; FRAME];
+        match &self.seg {
+            Some(seg) => {
+                bytes.extend_from_slice(&record.lsn.to_le_bytes());
+                record.payload_into(&mut bytes);
+                seg.seal_in_place(record.lsn, &mut bytes, FRAME + 8);
+            }
+            None => record.payload_into(&mut bytes),
+        }
+        frame(&mut bytes);
         self.file.write_all(&bytes).map_err(io)?;
         if self.sync {
             self.file.sync_data().map_err(io)?;

@@ -438,7 +438,18 @@ fn nonce(lsn: u64) -> Nonce<aes_gcm::aead::consts::U12> {
 }
 
 impl SegmentKey {
+    /// [`seal`](Self::seal) where the record is: `buf` holds the LSN then the
+    /// record from `at` on; the record is encrypted in place and the tag appended.
+    pub(crate) fn seal_in_place(&self, lsn: u64, buf: &mut Vec<u8>, at: usize) {
+        let tag = self
+            .0
+            .encrypt_inout_detached(&nonce(lsn), &lsn.to_le_bytes(), (&mut buf[at..]).into())
+            .expect("AES-GCM seals any record");
+        buf.extend_from_slice(&tag);
+    }
+
     /// `lsn (8) ‖ AES-256-GCM(record) ‖ tag`, the LSN authenticated.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn seal(&self, lsn: u64, record: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + record.len() + TAG);
         out.extend_from_slice(&lsn.to_le_bytes());
@@ -543,6 +554,11 @@ mod compatibility {
             "2a00000000000000b9677a048c6284c885ae23cb3de5be6dea77411668b12ea89c73a6fa2c20fa9e6ab63df2bdf64dd5ea"
         );
         assert_eq!(segment.open(&sealed).as_deref(), Some(&b"enregistrement du journal"[..]));
+        // Sealed where it is (what the log does): the same bytes.
+        let mut in_place = 42u64.to_le_bytes().to_vec();
+        in_place.extend_from_slice(b"enregistrement du journal");
+        segment.seal_in_place(42, &mut in_place, 8);
+        assert_eq!(in_place, sealed);
         let mut altered = sealed.clone();
         altered[12] ^= 1;
         assert!(segment.open(&altered).is_none());

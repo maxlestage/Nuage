@@ -102,6 +102,67 @@ impl Snapshot {
         Ok(None)
     }
 
+    /// The stored value of `key` (what is pending in a transaction aside),
+    /// given to `f` where it is, without a copy.
+    pub(crate) fn with<R>(&self, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
+        let mut f = Some(f);
+        for layer in self.layers.iter().flatten() {
+            let found = self.pages.find(layer, key, |v| match (v.split_first(), f.take()) {
+                (Some((1, value)), Some(f)) => Some(f(value)),
+                _ => None,
+            })?;
+            // Found in this layer, as a value or as a deletion: the ones behind are hidden.
+            if let Some(value) = found {
+                return Ok(value);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Calls `f` with each live entry of `start..end`, in key order, until it
+    /// returns `Ok(false)`. The key and the value are lent where they are.
+    pub(crate) fn each(
+        &self,
+        overlay: Option<&Overlay>,
+        start: &[u8],
+        end: &[u8],
+        mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let range = (Bound::Included(start), Bound::Excluded(end));
+        let pending = overlay.is_some_and(|o| o.range::<[u8], _>(range).next().is_some());
+        let mut layers = self.layers.iter().flatten();
+        let (first, second) = (layers.next(), layers.next());
+        if !pending && second.is_none() {
+            // One tree, nothing pending in the range: straight from its pages.
+            let Some(root) = first else { return Ok(()) };
+            let mut failed = None;
+            self.pages.walk(root, start, end, &mut |k, v| match v.split_first() {
+                Some((1, value)) => f(k, value).unwrap_or_else(|e| {
+                    failed = Some(e);
+                    false
+                }),
+                _ => true,
+            })?;
+            return failed.map_or(Ok(()), Err);
+        }
+        let mut at = start.to_vec();
+        loop {
+            let (entries, next) = self.scan(overlay, &at, end, super::exec::CHUNK)?;
+            for (k, v) in &entries {
+                if !f(k, v)? {
+                    return Ok(());
+                }
+            }
+            match next {
+                Some(n) => at = n,
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Up to `limit` live entries in `start..end`, in key order, merging the
     /// layers (the closest one wins). Returns them and where to continue
     /// (`None`: the range is exhausted).
@@ -202,12 +263,14 @@ pub(crate) struct Store {
     pub writer: Mutex<Writer>,
     branches: RwLock<HashMap<String, BranchInfo>>,
     generation: AtomicU64,
-    /// Version of each (branch, table) for optimistic transactions.
-    versions: Mutex<HashMap<(String, String), u64>>,
+    /// Version of each table of each branch, for optimistic transactions.
+    versions: Mutex<HashMap<String, HashMap<String, u64>>>,
+    /// The table generation the page store holds.
+    saved_generation: AtomicU64,
     /// LSN of the last applied commit (what snapshots see).
     applied_lsn: AtomicU64,
-    /// Catalog entries already parsed, by their stored bytes (see [`Store::parsed`]).
-    catalog: Mutex<HashMap<Vec<u8>, Arc<Parsed>>>,
+    /// Catalog entries already parsed (see [`Store::parsed`]).
+    catalog: Mutex<Catalog>,
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
     dirty_limit: usize,
@@ -218,6 +281,16 @@ pub(crate) struct Store {
 pub(crate) struct Parsed {
     pub meta: Arc<TableMeta>,
     pub schema: OnceLock<&'static memoire_orm::TableSchema>,
+}
+
+/// Catalog entries parsed once.
+#[derive(Default)]
+struct Catalog {
+    /// By their stored bytes: the same bytes always describe the same table.
+    by_bytes: HashMap<Vec<u8>, Arc<Parsed>>,
+    /// The entry each table name last had, with its bytes: what nearly every
+    /// statement asks for again.
+    by_name: HashMap<String, (Vec<u8>, Arc<Parsed>)>,
 }
 
 /// Distinct catalog entries kept parsed; past it, the cache starts over.
@@ -276,8 +349,9 @@ impl Store {
             branches: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(generation),
             versions: Mutex::new(HashMap::new()),
+            saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
-            catalog: Mutex::new(HashMap::new()),
+            catalog: Mutex::new(Catalog::default()),
             dirty_limit,
         };
         store.load_branches()?;
@@ -316,15 +390,33 @@ impl Store {
     /// The same bytes always describe the same table, on every branch and in every
     /// transaction (a change to a table writes new bytes), so keying by them is exact.
     pub(crate) fn parsed(&self, bytes: Vec<u8>) -> Result<Arc<Parsed>> {
-        if let Some(p) = lock(&self.catalog).get(&bytes) {
+        if let Some(p) = lock(&self.catalog).by_bytes.get(&bytes) {
             return Ok(p.clone());
         }
         let parsed = Arc::new(Parsed { meta: Arc::new(TableMeta::from_json(&bytes)?), schema: OnceLock::new() });
         let mut cache = lock(&self.catalog);
-        if cache.len() >= CATALOG_CACHE {
-            cache.clear();
+        if cache.by_bytes.len() >= CATALOG_CACHE {
+            cache.by_bytes.clear();
         }
-        cache.insert(bytes, parsed.clone());
+        cache.by_bytes.insert(bytes, parsed.clone());
+        Ok(parsed)
+    }
+
+    /// [`parsed`](Self::parsed) for the entry of `table` as it is stored: when
+    /// its bytes are the ones the table had last time, comparing them is all
+    /// it takes (no copy, no hash of the whole entry).
+    pub(crate) fn parsed_as(&self, table: &str, bytes: &[u8]) -> Result<Arc<Parsed>> {
+        if let Some((known, parsed)) = lock(&self.catalog).by_name.get(table)
+            && known.as_slice() == bytes
+        {
+            return Ok(parsed.clone());
+        }
+        let parsed = self.parsed(bytes.to_vec())?;
+        let mut cache = lock(&self.catalog);
+        if cache.by_name.len() >= CATALOG_CACHE {
+            cache.by_name.clear();
+        }
+        cache.by_name.insert(table.to_owned(), (bytes.to_vec(), parsed.clone()));
         Ok(parsed)
     }
 
@@ -378,7 +470,7 @@ impl Store {
 
     /// Current version of a table of a branch (bumped by every commit to it).
     pub(crate) fn version(&self, branch: &str, table: &str) -> u64 {
-        lock(&self.versions).get(&(branch.to_owned(), table.to_owned())).copied().unwrap_or(0)
+        lock(&self.versions).get(branch).and_then(|tables| tables.get(table)).copied().unwrap_or(0)
     }
 
     /// Commits the changes of `branch`: `overlay` (and `extra` operations),
@@ -395,8 +487,9 @@ impl Store {
     ) -> Result<u64> {
         {
             let versions = lock(&self.versions);
+            let tables = versions.get(branch);
             for (table, v) in expect {
-                if versions.get(&(branch.to_owned(), table.clone())).copied().unwrap_or(0) != *v {
+                if tables.and_then(|t| t.get(table)).copied().unwrap_or(0) != *v {
                     return Err(Error::Conflict(table.clone()));
                 }
             }
@@ -433,15 +526,32 @@ impl Store {
             });
         }
         ops.extend(extra);
-        ops.push(Op::Put {
-            table: META.into(),
-            key: GENERATION.to_vec(),
-            value: self.generation.load(Ordering::SeqCst).to_le_bytes().to_vec(),
-        });
+        // The generation counter goes with the commit that moved it (a new table).
+        let generation = self.generation.load(Ordering::SeqCst);
+        if generation != self.saved_generation.load(Ordering::SeqCst) {
+            ops.push(Op::Put {
+                table: META.into(),
+                key: GENERATION.to_vec(),
+                value: generation.to_le_bytes().to_vec(),
+            });
+        }
         let lsn = self.log_and_apply(writer, ops)?;
-        let mut versions = lock(&self.versions);
-        for t in touched {
-            *versions.entry((branch.to_owned(), t.clone())).or_insert(0) += 1;
+        self.saved_generation.store(generation, Ordering::SeqCst);
+        if !touched.is_empty() {
+            let mut versions = lock(&self.versions);
+            if !versions.contains_key(branch) {
+                versions.insert(branch.to_owned(), HashMap::new());
+            }
+            if let Some(tables) = versions.get_mut(branch) {
+                for t in touched {
+                    match tables.get_mut(t) {
+                        Some(v) => *v += 1,
+                        None => {
+                            tables.insert(t.clone(), 1);
+                        }
+                    }
+                }
+            }
         }
         Ok(lsn)
     }
@@ -545,12 +655,11 @@ impl Store {
             self.branches.write().unwrap_or_else(|e| e.into_inner()).remove(name);
         }
         // Transactions open on the branch must not commit over the change.
-        lock(&self.versions).retain(|(b, _), v| {
-            if b == name {
+        if let Some(tables) = lock(&self.versions).get_mut(name) {
+            for v in tables.values_mut() {
                 *v += 1_000_000;
             }
-            true
-        });
+        }
         Ok(true)
     }
 

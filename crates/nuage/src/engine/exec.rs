@@ -11,7 +11,7 @@
 //! the tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memoire_orm::ast::{Projection, SelectAst};
 use memoire_orm::evaluator::{self, Tables};
@@ -54,6 +54,8 @@ pub(crate) struct TableMeta {
     pub indexes: Vec<IndexMeta>,
     /// The schema the table was created (or last widened) with, as JSON.
     pub schema: Json,
+    /// The type of each stored column, worked out from `schema` once.
+    kinds: OnceLock<Vec<Option<ColumnType>>>,
 }
 
 impl TableMeta {
@@ -82,12 +84,22 @@ impl TableMeta {
             pk: schema.primary_key,
             indexes,
             schema: schema_to_json(schema),
+            kinds: OnceLock::new(),
         }
     }
 
     /// The type of each stored column, from the table's schema (`None` for a
     /// column the schema does not name).
-    pub(crate) fn kinds(&self) -> Vec<Option<ColumnType>> {
+    pub(crate) fn kinds(&self) -> &[Option<ColumnType>] {
+        self.kinds.get_or_init(|| self.read_kinds())
+    }
+
+    /// The columns or the schema changed: their types are read again.
+    fn changed(&mut self) {
+        self.kinds = OnceLock::new();
+    }
+
+    fn read_kinds(&self) -> Vec<Option<ColumnType>> {
         const NAMES: [(&str, ColumnType); 14] = [
             ("bool", ColumnType::Bool),
             ("smallint", ColumnType::SmallInt),
@@ -161,6 +173,7 @@ impl TableMeta {
                 })
                 .collect::<Result<_>>()?,
             schema: j.get("schema").cloned().unwrap_or(Json::Null),
+            kinds: OnceLock::new(),
         })
     }
 
@@ -222,7 +235,13 @@ impl Ctx<'_> {
 
     fn parsed(&mut self, table: &str) -> Result<Option<Arc<Parsed>>> {
         self.touch(table);
-        self.get(&keys::catalog_key(table))?.map(|b| self.store.parsed(b)).transpose()
+        let key = keys::catalog_key(table);
+        // An entry this transaction wrote: by its bytes.
+        if let Some(pending) = self.overlay.get(&key) {
+            return pending.clone().map(|b| self.store.parsed(b)).transpose();
+        }
+        // The stored one: read in place, and the same as last time for nearly every statement.
+        self.snap.with(&key, |bytes| self.store.parsed_as(table, bytes))?.transpose()
     }
 
     /// The table's metadata (parsed once per distinct catalog entry, see [`Store::parsed`]).
@@ -278,9 +297,13 @@ impl Ctx<'_> {
     }
 
     fn decode(&self, meta: &TableMeta, map: &[Option<usize>], bytes: &[u8]) -> Result<Vec<Value>> {
-        let stored = keys::decode_row(bytes)?;
+        let mut stored = keys::decode_row(bytes)?;
         let _ = meta;
-        Ok(map.iter().map(|m| m.and_then(|i| stored.get(i).cloned()).unwrap_or(Value::Null)).collect())
+        // The model's columns in the stored order (nearly always): the row as it is.
+        if stored.len() == map.len() && map.iter().enumerate().all(|(i, m)| *m == Some(i)) {
+            return Ok(stored);
+        }
+        Ok(map.iter().map(|m| m.and_then(|i| stored.get_mut(i).map(std::mem::take)).unwrap_or(Value::Null)).collect())
     }
 
     fn rows_by_pk(&self, meta: &TableMeta, map: &[Option<usize>], pks: &[Vec<u8>]) -> Result<Vec<Vec<Value>>> {
@@ -298,15 +321,23 @@ impl Ctx<'_> {
         let prefix = keys::index_prefix(meta.generation, index as u16, values);
         let end = keys::prefix_end(&prefix);
         let mut out = Vec::new();
-        let mut at = prefix.clone();
-        loop {
-            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
-            out.extend(entries.into_iter().map(|(k, _)| k[prefix.len()..].to_vec()));
-            match next {
-                Some(n) => at = n,
-                None => return Ok(out),
-            }
-        }
+        self.snap.each(Some(self.overlay), &prefix, &end, |k, _| {
+            out.push(k[prefix.len()..].to_vec());
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Number of rows whose index `index` holds `values`: no key is kept.
+    fn index_count(&self, meta: &TableMeta, index: usize, values: &[&Value]) -> Result<i64> {
+        let prefix = keys::index_prefix(meta.generation, index as u16, values);
+        let end = keys::prefix_end(&prefix);
+        let mut n = 0;
+        self.snap.each(Some(self.overlay), &prefix, &end, |_, _| {
+            n += 1;
+            Ok(true)
+        })?;
+        Ok(n)
     }
 
     /// Calls `f` with each chunk of rows of the table, in primary-key order,
@@ -318,18 +349,20 @@ impl Ctx<'_> {
         mut f: impl FnMut(Vec<Vec<Value>>) -> Result<bool>,
     ) -> Result<()> {
         let (start, end) = keys::rows_range(meta.generation);
-        let mut at = start;
-        loop {
-            let (entries, next) = self.snap.scan(Some(self.overlay), &at, &end, CHUNK)?;
-            let rows = entries.iter().map(|(_, v)| self.decode(meta, map, v)).collect::<Result<Vec<_>>>()?;
-            if !rows.is_empty() && !f(rows)? {
-                return Ok(());
+        let mut rows = Vec::new();
+        let mut stopped = false;
+        // Rows are decoded where they are read, a chunk at a time.
+        self.snap.each(Some(self.overlay), &start, &end, |_, v| {
+            rows.push(self.decode(meta, map, v)?);
+            if rows.len() == CHUNK && !f(std::mem::take(&mut rows))? {
+                stopped = true;
             }
-            match next {
-                Some(n) => at = n,
-                None => return Ok(()),
-            }
+            Ok(!stopped)
+        })?;
+        if !stopped && !rows.is_empty() {
+            f(rows)?;
         }
+        Ok(())
     }
 }
 
@@ -668,7 +701,7 @@ fn count_by_index(ctx: &mut Ctx<'_>, ast: &SelectAst) -> Result<Option<i64>> {
     if values.iter().any(|v| v.is_null()) {
         return Ok(Some(0));
     }
-    Ok(Some(ctx.index_lookup(&meta, i, &values)?.len() as i64))
+    Ok(Some(ctx.index_count(&meta, i, &values)?))
 }
 
 /// The answer to a statement that returns rows.
@@ -830,18 +863,19 @@ pub(crate) fn execute(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<ExecResult
 }
 
 fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema) -> Result<ExecResult> {
-    let Some(mut meta) = ctx.meta_mut(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
+    let Some(mut meta) = ctx.meta(schema.name)? else { return Err(Error::NoSuchTable(schema.name.to_owned())) };
     // A model with new columns widens the stored rows.
     let missing: Vec<String> =
         schema.columns.iter().filter(|c| meta.position(c.name).is_none()).map(|c| c.name.to_owned()).collect();
     if !missing.is_empty() {
-        meta.columns.extend(missing);
+        let mut wider = (*meta).clone();
+        wider.columns.extend(missing);
         // The new columns come from the model; the columns already there keep
         // the type the table declared (a model may name a DOUBLE as text).
         let mut widened = schema_to_json(schema);
         if let (Some(new), Some(old)) = (
             widened.get_mut("columns").and_then(Json::as_array_mut),
-            meta.schema.get("columns").and_then(Json::as_array),
+            wider.schema.get("columns").and_then(Json::as_array),
         ) {
             for c in new.iter_mut() {
                 let name = c.get("name").and_then(Json::as_str).map(str::to_owned);
@@ -852,8 +886,10 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
                 }
             }
         }
-        meta.schema = widened;
-        ctx.put_meta(schema.name, &meta);
+        wider.schema = widened;
+        wider.changed();
+        ctx.put_meta(schema.name, &wider);
+        meta = Arc::new(wider);
     }
     let map = meta.map(schema);
     let pk = schema.primary_key;
@@ -1148,6 +1184,7 @@ pub(crate) fn alter(ctx: &mut Ctx<'_>, change: &Alter) -> Result<()> {
             if let Some(cols) = meta.schema.get_mut("columns").and_then(Json::as_array_mut) {
                 cols.push(column.clone());
             }
+            meta.changed();
             if !fill.is_null() {
                 let width = meta.columns.len();
                 let mut bytes = ctx.table_bytes(&meta)?;
