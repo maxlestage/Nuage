@@ -50,7 +50,7 @@ constructor de consultas, relaciones, transacciones y migraciones.
 # El motor, el modo integrado y el servidor. `default-features = false` deja fuera el sitio web.
 nuage = { git = "https://github.com/maxlestage/Nuage", default-features = false }
 # El mismo Memoire que Nuage DB (la feature `nuage` es el cliente de un servidor).
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "66b9c38", features = ["nuage"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "a7419cb", features = ["nuage"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

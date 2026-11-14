@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use memoire_orm::prelude::*;
+use memoire_orm::{Query, Value};
 use nuage::{BackupOptions, DirectoryStore, Embedded, EngineOptions};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -412,6 +413,64 @@ fn writers_at_the_same_time_share_the_log() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Batches sent at the same time each take their turn: none is refused for a
+/// conflict, each applies whole.
+#[test]
+fn batches_at_the_same_time_take_turns() {
+    let dir = temp_dir("batches");
+    let db = Embedded::open(&dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(db.create_table::<Item>()).unwrap();
+    let (threads, each) = (8i64, 25i64);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let db = &db;
+            scope.spawn(move || {
+                for n in 0..each {
+                    let rows: Vec<Vec<Value>> = (0..2)
+                        .map(|k| {
+                            let it = item(t * 1_000_000 + n * 2 + k);
+                            vec![
+                                Value::Null,
+                                Value::Text(it.code),
+                                Value::I32(it.group_no),
+                                Value::Text(it.payload),
+                                Value::F64(it.score),
+                            ]
+                        })
+                        .collect();
+                    let statements: Vec<(bool, Query<'_>)> = rows
+                        .iter()
+                        .map(|values| (false, Query::InsertRow { table: Item::SCHEMA, values }))
+                        .chain([(true, Query::Select(&COUNT))])
+                        .collect();
+                    let results = db.batch(&statements).unwrap();
+                    assert_eq!(results.len(), 3);
+                    // A batch of reads alone, in between.
+                    assert_eq!(db.batch(&[(true, Query::Select(&COUNT))]).unwrap().len(), 1);
+                }
+            });
+        }
+    });
+    assert_eq!(rt.block_on(Item::count(&db)).unwrap() as i64, threads * each * 2);
+    // A batch that fails leaves nothing behind.
+    let taken =
+        vec![Value::Null, Value::Text("code-00000000".into()), Value::I32(1), Value::Text("p".into()), Value::F64(0.0)];
+    let fresh = vec![Value::Null, Value::Text("fresh".into()), Value::I32(1), Value::Text("p".into()), Value::F64(0.0)];
+    let failing = [
+        (false, Query::InsertRow { table: Item::SCHEMA, values: &fresh }),
+        (false, Query::InsertRow { table: Item::SCHEMA, values: &taken }),
+    ];
+    assert!(db.batch(&failing).unwrap_err().is_unique_violation());
+    assert_eq!(rt.block_on(Item::count(&db)).unwrap() as i64, threads * each * 2);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `SELECT * FROM items`, for the batches above.
+static COUNT: std::sync::LazyLock<memoire_orm::ast::SelectAst> =
+    std::sync::LazyLock::new(|| memoire_orm::ast::SelectAst::new(Item::SCHEMA));
 
 /// The child half of `crash_recovery_of_writers_at_the_same_time`: four
 /// threads write forever, each printing the code of every row whose commit

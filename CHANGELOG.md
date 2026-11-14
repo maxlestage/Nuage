@@ -45,7 +45,8 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - A SQL script that writes (`POST /v1/sql`, the PostgreSQL protocol outside `BEGIN`,
   `Embedded::sql`) takes its turn from its first statement to its commit instead of running
   as an optimistic transaction retried on a conflict: writers on the same table used to
-  collide, wait and, with enough of them, fail with a conflict. Transactions opened by the
+  collide, wait and, with enough of them, fail with a conflict. A batch (`POST /v1/batch`,
+  `Embedded::batch`) that writes takes its turn the same way. Transactions opened by the
   application (`BEGIN`, `db.begin()`) stay optimistic.
 - **Fixed**: a transaction could write over a commit that landed between its beginning and
   its first read of the table (the conflict was looked for from that first read, the data
@@ -65,7 +66,7 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   server says in `/v1/info` (`schemaRefs`) that it keeps schemas by reference, the client
   sends each schema whole once, then a short reference. Describing and reading the schema
   was more than half of the work of a short request, on both sides. A client or a server
-  that does not know references works as before (Memoire pinned to `66b9c38`).
+  that does not know references works as before (Memoire pinned to `a7419cb`).
 
 | Server and client on one machine, encrypted, `fsync` (`examples/bench.rs`) | Before | After |
 |---|---:|---:|
