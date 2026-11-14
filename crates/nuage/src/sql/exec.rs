@@ -817,6 +817,49 @@ impl<'a> Runner<'a> {
 
     /// One `SELECT` core: rows read, joined, filtered, grouped, projected,
     /// sorted (`order`), deduplicated; `hint`: only the first rows are needed.
+    /// `SELECT jsonb_array_elements_text(x)::bigint` (no `FROM`): one row per
+    /// element of the JSON array, the expression around the function (casts,
+    /// arithmetic) computed for each. `None` when the SELECT is not one.
+    fn set_returning_core(
+        &self,
+        core: &Core,
+        scope: &Scope,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Result<Option<Rows>> {
+        fn find(e: &Expr) -> Option<(&str, &[Expr])> {
+            match e {
+                Expr::Func { name, args, .. } if v::SET_RETURNING.contains(&name.as_str()) => Some((name, args)),
+                Expr::Cast(x, _) | Expr::Neg(x) => find(x),
+                Expr::Bin(_, a, b) => find(a).or_else(|| find(b)),
+                _ => None,
+            }
+        }
+        fn replace(e: &Expr, with: &Value) -> Expr {
+            match e {
+                Expr::Func { name, .. } if v::SET_RETURNING.contains(&name.as_str()) => Expr::Lit(with.clone()),
+                Expr::Cast(x, k) => Expr::Cast(Box::new(replace(x, with)), *k),
+                Expr::Neg(x) => Expr::Neg(Box::new(replace(x, with))),
+                Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(replace(a, with)), Box::new(replace(b, with))),
+                other => other.clone(),
+            }
+        }
+        let [SelItem::Expr(item, alias)] = core.items.as_slice() else { return Ok(None) };
+        let Some((name, args)) = find(item) else { return Ok(None) };
+        if core.filter.is_some() || !core.group_by.is_empty() || core.having.is_some() || core.distinct {
+            return Err(syntax(format!("{name}(): use it alone, without WHERE, GROUP BY or DISTINCT")));
+        }
+        let [arg] = args else { return Err(syntax(format!("{name}() takes one argument"))) };
+        let env = Env { scope, row: &[], group: None, outer, used_outer: used, output: None };
+        let elements = v::set_returning(name, &self.eval(arg, &env)?)?;
+        let mut rows = Vec::with_capacity(elements.len());
+        for x in &elements {
+            rows.push(vec![self.eval(&replace(item, x), &env)?]);
+        }
+        let column = alias.clone().unwrap_or_else(|| name.to_owned());
+        Ok(Some(Rows { columns: vec![column], rows }))
+    }
+
     fn core(
         &self,
         core: &Core,
@@ -830,6 +873,11 @@ impl<'a> Runner<'a> {
         let mut sources: Vec<Option<Vec<Vec<Value>>>> = Vec::new();
         let refs: Vec<(&TableRef, Option<&Join>)> =
             core.from.iter().map(|f| (f, None)).chain(core.joins.iter().map(|j| (&j.table, Some(j)))).collect();
+        if refs.is_empty() {
+            if let Some(rows) = self.set_returning_core(core, &scope, outer, used)? {
+                return Ok(rows);
+            }
+        }
         for (t, _) in &refs {
             match &t.source {
                 Source::Table(name) => {

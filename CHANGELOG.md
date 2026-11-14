@@ -4,6 +4,19 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### PostgreSQL applications, as they are written
+
+- `SELECT ... FOR UPDATE` (`FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, `OF t`,
+  `NOWAIT`, `SKIP LOCKED`) is accepted: a transaction already fails at its commit (`40001`)
+  when another one changed a table it read.
+- `pg_advisory_lock`, `pg_advisory_xact_lock`, their `_shared` and `try_` forms,
+  `pg_advisory_unlock`, and `hashtext`/`hashtextextended` (a stable 64-bit key).
+- `jsonb_array_elements_text` (and `json_`, and the non-`_text` forms) in a SELECT without
+  FROM: `x NOT IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)` passes a list as one
+  JSON parameter.
+- A `DOUBLE` sent to `/v1/sql` arrives bit for bit (serde_json's `float_roundtrip`): a
+  latitude copied from PostgreSQL was read one ULP away.
+
 ### Dark theme
 
 - The console has a real dark theme (deep night blue, sky-blue accents, Nuage DB's

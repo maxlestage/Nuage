@@ -196,7 +196,7 @@ database/sql de Go, JDBC, PDO, la gema pg, tokio-postgres y Npgsql: ejemplos en
 [`clients/postgres/`](clients/postgres). Sentencias preparadas, parámetros `$1` (su tipo
 viene de las columnas con las que se encuentran), valores en texto y binario, `BEGIN` ...
 `COMMIT` entre mensajes, savepoints, códigos de error de PostgreSQL (`40001` en un conflicto
-de escritura: vuelve a ejecutar la transacción). TLS con `NUAGE_TLS_CERT` y `NUAGE_TLS_KEY`
+de escritura: vuelve a ejecutar la transacción). `SELECT ... FOR UPDATE` (`SKIP LOCKED`, `NOWAIT`, `FOR SHARE`) y los bloqueos consultivos (`pg_advisory_xact_lock`, `hashtextextended`) se aceptan: una transacción ya falla en su commit (`40001`) si otra modificó una tabla que leyó. `x IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)` recibe una lista en un solo parámetro JSON. TLS con `NUAGE_TLS_CERT` y `NUAGE_TLS_KEY`
 (el instalador usa el certificado del dominio). El SQL es el de Nuage DB (arriba); los
 catálogos del sistema (`pg_catalog`) no están: las herramientas que los recorren (pgAdmin)
 muestran poco, y Npgsql lleva `Server Compatibility Mode=NoTypeLoading`. Heroku solo
