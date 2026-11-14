@@ -120,7 +120,7 @@ impl BackupStore for DirectoryStore {
         // Written aside, then renamed: a reader never sees half an object.
         let tmp = path.with_extension("partial");
         fs::write(&tmp, data).map_err(io)?;
-        fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
         fs::rename(&tmp, &path).map_err(io)
     }
 
@@ -131,7 +131,7 @@ impl BackupStore for DirectoryStore {
         }
         let tmp = path.with_extension("partial");
         fs::copy(source, &tmp).map_err(io)?;
-        fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
         fs::rename(&tmp, &path).map_err(io)
     }
 
