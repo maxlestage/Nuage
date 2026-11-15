@@ -23,7 +23,7 @@
 //! whole machine it shares.
 
 /// Memory figures of this server (Linux; `None` elsewhere, or when unknown).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryInfo {
     /// Memory this server may use: the container's limit, else the machine's.
     pub total_bytes: Option<u64>,
@@ -41,6 +41,10 @@ pub struct MemoryInfo {
     /// `total_bytes` is a limit set on this server (a container, a dyno, or
     /// `NUAGE_MEMORY_MB`), not the whole machine.
     pub limited: bool,
+    /// With a memory said by hand: the share of the container's (else the
+    /// machine's) memory in use, so that the other programs running short is
+    /// seen too (see [`MemoryInfo::pressure`]).
+    pub host_pressure: Option<f64>,
 }
 
 /// What the system says, as text and numbers: read by [`read`], turned into
@@ -320,12 +324,20 @@ fn figures(raw: &Raw) -> MemoryInfo {
             swap_total_bytes: machine_swap.0,
             swap_free_bytes: machine_swap.1,
             limited: false,
+            host_pressure: None,
         };
     };
     // What the host counts against the limit; a host that does not say
     // (Heroku), or a limit said by hand: this process, the container's tenant.
     let used = if by_hand { process } else { raw.cgroup.usage.or(process) };
     let available = used.map(|u| limit.saturating_sub(u).min(machine_available.unwrap_or(u64::MAX)));
+    // Said by hand: what the container (else the machine) has in use still counts.
+    let host_pressure = by_hand
+        .then(|| match (under(raw.cgroup.limit), raw.cgroup.usage) {
+            (Some(l), Some(u)) => Some(u as f64 / l.max(1) as f64),
+            _ => machine_total.zip(machine_available).map(|(t, a)| t.saturating_sub(a) as f64 / t.max(1) as f64),
+        })
+        .flatten();
     let (swap_total, swap_free) = match raw.cgroup.swap_limit.filter(|_| !by_hand) {
         Some(total) => (Some(total), Some(total.saturating_sub(raw.cgroup.swap_usage.unwrap_or(0)))),
         // The machine's swap is shared with every other container: not this
@@ -340,6 +352,7 @@ fn figures(raw: &Raw) -> MemoryInfo {
         swap_total_bytes: swap_total,
         swap_free_bytes: swap_free,
         limited: true,
+        host_pressure,
     }
 }
 
@@ -350,10 +363,17 @@ impl MemoryInfo {
     }
 
     /// The share of the memory in use, from 0 to 1 (`None` when unknown).
+    /// With a memory said by hand, the larger of this server's share of it
+    /// and the share of the container's (else the machine's) memory in use:
+    /// saying less memory never hides the others running short.
     pub fn pressure(&self) -> Option<f64> {
-        match (self.used_bytes, self.total_bytes) {
+        let own = match (self.used_bytes, self.total_bytes) {
             (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64),
             _ => None,
+        };
+        match (own, self.host_pressure) {
+            (Some(own), Some(host)) => Some(own.max(host)),
+            (own, host) => own.or(host),
         }
     }
 }
@@ -589,9 +609,11 @@ mod tests {
         assert_eq!((m.total_bytes, m.used_bytes, m.available_bytes), (Some(16 << 30), Some(10 << 30), Some(6 << 30)));
         assert_eq!((m.process_bytes, m.limited, m.swap_total_bytes), (Some(200 << 20), false, None));
         assert_eq!(m.pressure(), Some(0.625));
-        // Said by hand (4 GiB for Nuage DB on that computer): counted from this process.
+        // Said by hand (4 GiB for Nuage DB on that computer): counted from this process,
+        // and the machine running short (10 of 16 GiB in use) still shows.
         let m = figures(&Raw { native, declared: Some(4 << 30), ..Raw::default() });
         assert_eq!((m.total_bytes, m.used_bytes, m.limited), (Some(4 << 30), Some(200 << 20), true));
+        assert_eq!(m.pressure(), Some(0.625), "the machine's share, larger than the process's 5 %");
         // The figures of the machine this test runs on.
         if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             let now = MemoryInfo::now();

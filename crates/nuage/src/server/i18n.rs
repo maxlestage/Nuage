@@ -501,8 +501,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     // The Settings page.
     (
         "What you save here applies at once and is kept with the data. It wins over the environment (the settings file, the host's variables); each line says where its value comes from, and one button gives it back.",
-        "Ce que vous enregistrez ici s'applique tout de suite et se conserve avec les données. Cela l'emporte sur l'environnement (le fichier de réglages, les variables de l'hébergeur) ; chaque ligne dit d'où vient sa valeur, et un bouton la rend.",
-        "Lo que guardas aquí se aplica al momento y se conserva con los datos. Tiene prioridad sobre el entorno (el archivo de ajustes, las variables del alojamiento); cada línea dice de dónde viene su valor, y un botón lo devuelve.",
+        "Ce que vous enregistrez ici s'applique tout de suite et se conserve avec les données. Cela l'emporte sur l'environnement (le fichier de réglages, les variables de l'hébergeur) ; chaque ligne dit d'où vient sa valeur, et un bouton la remet à la valeur de l'environnement.",
+        "Lo que guardas aquí se aplica al momento y se conserva con los datos. Tiene prioridad sobre el entorno (el archivo de ajustes, las variables del alojamiento); cada línea dice de dónde viene su valor, y un botón vuelve a poner el valor del entorno.",
     ),
     (
         "The settings of this server are those of its environment (<code>NUAGE_SETTINGS=environment</code>): they are shown here, and change there.",
@@ -547,9 +547,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Memoria con la que Nuage DB puede contar",
     ),
     (
-        "<code>auto</code>: what the system reports ({}).",
-        "<code>auto</code> : ce que le système annonce ({}).",
-        "<code>auto</code>: lo que indica el sistema ({}).",
+        "<code>auto</code>: what the system reports ({}), or <code>NUAGE_MEMORY_MB</code> when it is set.",
+        "<code>auto</code> : ce que le système annonce ({}), ou <code>NUAGE_MEMORY_MB</code> s'il est réglé.",
+        "<code>auto</code>: lo que indica el sistema ({}), o <code>NUAGE_MEMORY_MB</code> si está definido.",
     ),
     (
         "Page caches, all the applications together",
@@ -576,7 +576,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     (
         "Each application shares the page caches of the server by use (<code>auto</code>), or has an amount set apart for it alone.",
         "Chaque application partage les caches de pages du serveur selon l'usage (<code>auto</code>), ou dispose d'une part réservée pour elle seule.",
-        "Cada aplicación comparte los cachés de páginas del servidor según el uso (<code>auto</code>), o tiene una parte reservada solo para ella.",
+        "Cada aplicación comparte las cachés de páginas del servidor según el uso (<code>auto</code>), o tiene una parte reservada solo para ella.",
     ),
     ("Its cache holds", "Son cache contient", "Su caché contiene"),
     ("may hold", "peut contenir", "puede contener"),
@@ -588,9 +588,19 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Las cantidades se escriben <code>auto</code>, <code>512 MiB</code> o <code>2 GiB</code> (un número solo va en MiB).",
     ),
     (
+        "On a phone, each application's Settings tab has the same fields, one under the other.",
+        "Sur un téléphone, l'onglet Réglages de chaque application a les mêmes champs, l'un sous l'autre.",
+        "En un teléfono, la pestaña Ajustes de cada aplicación tiene los mismos campos, uno debajo del otro.",
+    ),
+    (
+        "Set apart: {} of the {} the caches may take (every application has an amount of its own). When memory runs short, what is set apart shrinks with the rest, and comes back.",
+        "Réservé : {} sur les {} que les caches peuvent prendre (chaque application a son propre montant). Quand la mémoire manque, ce qui est réservé diminue avec le reste, puis revient.",
+        "Reservado: {} de los {} que las cachés pueden ocupar (cada aplicación tiene su propia cantidad). Cuando falta memoria, lo reservado se reduce con el resto, y luego vuelve.",
+    ),
+    (
         "Set apart: {} of the {} the caches may take; the others share the rest by use. When memory runs short, what is set apart shrinks with the rest, and comes back.",
         "Réservé : {} sur les {} que les caches peuvent prendre ; les autres se partagent le reste selon l'usage. Quand la mémoire manque, ce qui est réservé diminue avec le reste, puis revient.",
-        "Reservado: {} de los {} que los cachés pueden ocupar; las demás comparten el resto según el uso. Cuando falta memoria, lo reservado se reduce con el resto, y luego vuelve.",
+        "Reservado: {} de los {} que las cachés pueden ocupar; las demás aplicaciones comparten el resto según el uso. Cuando falta memoria, lo reservado se reduce con el resto, y luego vuelve.",
     ),
     (
         "Memory is short: what is set apart is cut to {} of {} for now.",
@@ -651,8 +661,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Nothing changed.", "Rien n'a changé.", "Nada ha cambiado."),
     (
         "{} is given back: the value in force is shown below.",
-        "{} est rendu : la valeur en vigueur s'affiche ci-dessous.",
-        "{} se ha devuelto: el valor en vigor se muestra abajo.",
+        "{} revient à la valeur de l'environnement (ou par défaut) : la valeur en vigueur s'affiche ci-dessous.",
+        "{} vuelve al valor del entorno (o al de por defecto): el valor en vigor se muestra abajo.",
     ),
     (
         "Settings saved: in force now.",
@@ -706,7 +716,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     (
         "`memory.total_mb`: {} MiB is more than this server has ({} MiB): it would be killed for using it",
         "`memory.total_mb` : {} Mio, c'est plus que ce serveur n'en a ({} Mio) : il serait tué en les utilisant",
-        "`memory.total_mb`: {} MiB es más de lo que tiene este servidor ({} MiB): lo matarían por usarla",
+        "`memory.total_mb`: {} MiB es más de lo que tiene este servidor ({} MiB): el sistema lo detendría si la usara",
     ),
     (
         "`memory.cache_mb`: {} MiB is less than what is set apart for single databases ({} MiB, and {} MiB for the others to share): {} MiB at least, or lower their amounts first",
@@ -716,12 +726,12 @@ const TEXTS: &[(&str, &str, &str)] = &[
     (
         "a page cache needs {} MiB at least",
         "un cache de pages a besoin d'au moins {} Mio",
-        "un caché de páginas necesita al menos {} MiB",
+        "una caché de páginas necesita al menos {} MiB",
     ),
     (
         "{} MiB for `{}` is more than is left: the page caches of this server may take {} MiB in all, {} MiB of it are set apart for other databases and {} MiB stay for those that share: {} MiB at most",
         "{} Mio pour `{}`, c'est plus que ce qui reste : les caches de pages de ce serveur peuvent prendre {} Mio en tout, dont {} Mio réservés à d'autres bases et {} Mio pour celles qui partagent : {} Mio au plus",
-        "{} MiB para `{}` es más de lo que queda: los cachés de páginas de este servidor pueden ocupar {} MiB en total, de los cuales {} MiB están reservados para otras bases y {} MiB quedan para las que comparten: {} MiB como máximo",
+        "{} MiB para `{}` es más de lo que queda: las cachés de páginas de este servidor pueden ocupar {} MiB en total, de los cuales {} MiB están reservados para otras bases y {} MiB quedan para las que comparten: {} MiB como máximo",
     ),
     (
         "a key-value store needs {} MiB at least",
@@ -735,15 +745,30 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "{}: the key-value stores would take {} MiB in all: more than a quarter of the {} MiB this server counts on ({} MiB at most)",
-        "{} : les stockages clé-valeur prendraient {} Mio en tout : plus qu'un quart des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
-        "{}: los almacenes clave-valor ocuparían {} MiB en total: más de un cuarto de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
+        "{} : les stockages clé-valeur prendraient {} Mio en tout : plus du quart des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
+        "{}: los almacenes clave-valor ocuparían {} MiB en total: más de la cuarta parte de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
     ),
     (
         "{}: {} MiB would be set by hand ({} MiB for the page caches, {} MiB for the key-value stores): more than three quarters of the {} MiB this server counts on ({} MiB at most)",
-        "{} : {} Mio seraient fixés à la main ({} Mio pour les caches de pages, {} Mio pour les stockages clé-valeur) : plus que trois quarts des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
-        "{}: se fijarían a mano {} MiB ({} MiB para los cachés de páginas, {} MiB para los almacenes clave-valor): más de tres cuartos de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
+        "{} : {} Mio seraient fixés à la main ({} Mio pour les caches de pages, {} Mio pour les stockages clé-valeur) : plus des trois quarts des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
+        "{}: se fijarían a mano {} MiB ({} MiB para las cachés de páginas, {} MiB para los almacenes clave-valor): más de tres cuartos de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
     ),
-    ("Saved, and ignored", "Enregistrés, et ignorés", "Guardados, e ignorados"),
+    (
+        "`memory.total_mb`: {} MiB is too little for what is set by hand ({} MiB for the page caches, {} MiB for the key-value stores): {} MiB at least, or lower those amounts first",
+        "`memory.total_mb` : {} Mio, c'est trop peu pour ce qui est fixé à la main ({} Mio pour les caches de pages, {} Mio pour les stockages clé-valeur) : {} Mio au moins, ou baissez d'abord ces montants",
+        "`memory.total_mb`: {} MiB es demasiado poco para lo fijado a mano ({} MiB para las cachés de páginas, {} MiB para los almacenes clave-valor): {} MiB como mínimo, o baja antes esas cantidades",
+    ),
+    (
+        "`postgres.connections`: {} is more than this server can serve at once (each connection has a thread): {} at most",
+        "`postgres.connections` : {}, c'est plus que ce serveur ne peut en servir à la fois (chaque connexion a son fil d'exécution) : {} au plus",
+        "`postgres.connections`: {} es más de lo que este servidor puede atender a la vez (cada conexión tiene su hilo): {} como máximo",
+    ),
+    (
+        "The environment's figure is lower: {} is in force (a saved memory only lowers it).",
+        "Le chiffre de l'environnement est plus bas : {} est en vigueur (une mémoire enregistrée ne peut que la baisser).",
+        "La cifra del entorno es más baja: {} está en vigor (una memoria guardada solo puede bajarla).",
+    ),
+    ("Saved, and ignored", "Enregistrés mais ignorés", "Guardados pero ignorados"),
     ("Remove", "Retirer", "Quitar"),
     // The second copy of the backups.
     (
@@ -788,9 +813,24 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "esta compilación de Nuage DB no tiene la función `s3`: la segunda copia es una carpeta",
     ),
     (
-        "Not yet in the backup ({}): a restart of the server now would bring the earlier value back.",
-        "Pas encore dans la sauvegarde ({}) : un redémarrage du serveur maintenant ferait revenir l'ancienne valeur.",
-        "Aún no está en la copia ({}): un reinicio del servidor ahora devolvería el valor anterior.",
+        "Not yet in the backup: the backup failed (the log says why). A restart of the server now would bring the earlier value back.",
+        "Pas encore dans la sauvegarde : elle a échoué (le journal dit pourquoi). Un redémarrage du serveur maintenant ferait revenir l'ancienne valeur.",
+        "Aún no está en la copia: la copia falló (el registro dice por qué). Un reinicio del servidor ahora devolvería el valor anterior.",
+    ),
+    (
+        "the saved settings were written by another version of Nuage DB and cannot be read by this one: nothing is saved over them (start the version that wrote them, or NUAGE_SETTINGS=environment)",
+        "les réglages enregistrés ont été écrits par une autre version de Nuage DB et celle-ci ne sait pas les lire : rien n'est enregistré par-dessus (démarrez la version qui les a écrits, ou NUAGE_SETTINGS=environment)",
+        "los ajustes guardados los escribió otra versión de Nuage DB y esta no sabe leerlos: no se guarda nada encima (arranca la versión que los escribió, o NUAGE_SETTINGS=environment)",
+    ),
+    (
+        "application {}: page cache {}, key-value store {}",
+        "application {} : cache de pages {}, stockage clé-valeur {}",
+        "aplicación {}: caché de páginas {}, almacén clave-valor {}",
+    ),
+    (
+        "The memory was lowered since: what is set apart has {} of the {} asked, in proportion.",
+        "La mémoire a été réduite depuis : ce qui est réservé a {} sur les {} demandés, en proportion.",
+        "La memoria se ha reducido desde entonces: lo reservado tiene {} de los {} pedidos, en proporción.",
     ),
 ];
 

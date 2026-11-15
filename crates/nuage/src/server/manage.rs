@@ -160,6 +160,19 @@ pub(super) fn settings_json(state: &State) -> Json {
     json!({
         "read_only": state.settings.read_only(),
         "ignored": state.settings.ignored().into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        // Amounts of applications kept aside while the environment rules: POST
+        // {"cache_mb": "auto", "kv_mb": "auto"} to /api/apps/{name}/memory removes them.
+        "ignored_applications": state
+            .apps
+            .all()
+            .iter()
+            .filter(|a| a.kept_amounts() != (0, 0))
+            .map(|a| {
+                let (cache, kv) = a.kept_amounts();
+                let mib = |b: usize| if b == 0 { json!("auto") } else { json!(b >> 20) };
+                (a.name.clone(), json!({ "cache_mb": mib(cache), "kv_mb": mib(kv) }))
+            })
+            .collect::<serde_json::Map<String, Json>>(),
         "settings": settings,
         "memory": {
             "total_bytes": memory.total_bytes,
@@ -197,14 +210,16 @@ fn setting_text(key: &str, value: &Json) -> Result<Option<String>, Refus> {
 }
 
 /// A refused change of the settings: 400, or 403 when the server takes its
-/// settings from its environment only.
-fn settings_refusal(r: &super::settings::Refusal) -> Refus {
-    let message = r.said(super::i18n::Lang::En);
+/// settings from its environment only. Said in the language the client asks
+/// for (`Accept-Language`: the editor sends its own), else in English.
+fn settings_refusal(r: &super::settings::Refusal, l: super::i18n::Lang) -> Refus {
+    let message = r.said(l);
     if r.forbidden { error(403, "forbidden", &message) } else { error(400, "validation", &message) }
 }
 
 async fn settings_answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Result<Response<HttpBody>, Refus> {
     let method = req.method().clone();
+    let l = super::i18n::Lang::of(req.headers());
     let rest = path.trim_end_matches('/').trim_start_matches("/api/settings");
     let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     match (&method, segments.as_slice()) {
@@ -230,7 +245,7 @@ async fn settings_answer(state: &Arc<State>, req: Request<Incoming>, path: &str)
             })
             .await
             .map_err(|e| error(500, "internal", &e.to_string()))?;
-            let unshipped = saved.map_err(|e| settings_refusal(&e))?;
+            let unshipped = saved.map_err(|e| settings_refusal(&e, l))?;
             Ok(json_response(200, &with_warning(settings_json(state), unshipped)))
         }
         (&Method::DELETE, [key]) => {
@@ -239,7 +254,7 @@ async fn settings_answer(state: &Arc<State>, req: Request<Incoming>, path: &str)
             let saved = tokio::task::spawn_blocking(move || s.save_settings(&[(key.as_str(), None)]))
                 .await
                 .map_err(|e| error(500, "internal", &e.to_string()))?;
-            let unshipped = saved.map_err(|e| settings_refusal(&e))?;
+            let unshipped = saved.map_err(|e| settings_refusal(&e, l))?;
             Ok(json_response(200, &with_warning(settings_json(state), unshipped)))
         }
         (_, [] | [_]) => Err(error(405, "method_not_allowed", "method not allowed")),
@@ -398,16 +413,20 @@ async fn answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Resul
         }
         (&Method::POST, [name, "memory"]) => {
             let app = app_named(name)?;
+            let l = super::i18n::Lang::of(req.headers());
             let body = read_json(state, req).await.map_err(|e| bad_request(&e))?;
+            if !body.is_object() {
+                return Err(error(400, "validation", "send a JSON object: {\"cache_mb\": 256, \"kv_mb\": \"auto\"}"));
+            }
             // What the body does not name stays as it is.
             let cache = amount_of(&body, "cache_mb")?.unwrap_or(Some(app.cache_reserved()).filter(|b| *b > 0));
             let kv = amount_of(&body, "kv_mb")?.unwrap_or(Some(app.kv_fixed()).filter(|b| *b > 0));
             let s = state.clone();
             let a = app.clone();
-            let unshipped = tokio::task::spawn_blocking(move || s.set_app_memory(&a, cache, kv))
+            let (_, unshipped) = tokio::task::spawn_blocking(move || s.set_app_memory(&a, cache, kv))
                 .await
                 .map_err(|e| error(500, "internal", &e.to_string()))?
-                .map_err(|r| settings_refusal(&r))?;
+                .map_err(|r| settings_refusal(&r, l))?;
             Ok(json_response(200, &with_warning(app_json(&info(state, &app)), unshipped)))
         }
         (_, [] | [_] | [_, "tokens"] | [_, "tokens", _] | [_, "memory"]) => {

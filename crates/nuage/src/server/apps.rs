@@ -32,6 +32,12 @@ const TOKEN_PREFIX: &str = "nuage_";
 /// The least the page caches that share the budget keep together, whatever
 /// is set apart for the databases that have an amount of their own.
 const SHARED_FLOOR: usize = 16 << 20;
+/// What the databases that share the budget keep at least, together: 16 MiB,
+/// and 2 MiB for each of them (below, every read goes to the disk).
+fn shared_floor(sharing: usize) -> usize {
+    if sharing == 0 { 0 } else { SHARED_FLOOR.max(sharing * (2 << 20)) }
+}
+
 /// The least a database's own cache may be set to.
 const MIN_CACHE: usize = 4 << 20;
 /// The least a key-value store may be set to.
@@ -80,6 +86,8 @@ pub(crate) struct ByHand {
     pub kv_each: Option<usize>,
     /// How many stores follow the server's rule.
     pub kv_following: usize,
+    /// What all the key-value stores may hold together (`None`: no such limit).
+    pub kv_room: Option<usize>,
 }
 
 impl ByHand {
@@ -88,48 +96,135 @@ impl ByHand {
         self.cache.unwrap_or(self.apart + self.floor) + self.kv()
     }
 
-    /// All the key-value memory.
+    /// All the key-value memory, as the stores are given it: the amounts of
+    /// their own within the room, and those that follow the rule within what
+    /// is left of it.
     fn kv(&self) -> usize {
         let following = match (self.kv_each, self.kv_following) {
             (_, 0) => 0,
             (Some(each), n) => each * n,
             (None, _) => self.total.map_or(0, |t| (t / 8) as usize),
         };
-        self.kv_own + following
+        match self.kv_room {
+            Some(room) => {
+                let own = self.kv_own.min(room);
+                own + following.min(room - own)
+            }
+            None => self.kv_own + following,
+        }
     }
 
-    /// Refuses what does not fit: the key-value stores within a quarter of
-    /// the memory, and with the page caches set by hand within three
-    /// quarters. `what` names the change, for the refusal.
-    pub(crate) fn check(&self, what: &str) -> std::result::Result<(), Refusal> {
+    /// Whether what is set by hand fits: the key-value stores within a
+    /// quarter of the memory, and with the page caches set by hand within
+    /// three quarters.
+    pub(crate) fn fits(&self) -> bool {
+        let Some(total) = self.total else { return true };
+        let (quarter, most) = ((total / 4) as usize, (total / 4 * 3) as usize);
+        self.kv_own <= quarter && self.cache.unwrap_or(self.apart + self.floor) + self.kv() <= most
+    }
+
+    /// Refuses what does not fit (see [`ByHand::fits`]). `what` names the
+    /// change and `changed` the figure that changed, for the refusal: it
+    /// says the most that figure may be (the least, for the memory), the
+    /// others staying as they are.
+    pub(crate) fn check(&self, what: &str, changed: Changed) -> std::result::Result<(), Refusal> {
         let Some(total) = self.total else { return Ok(()) };
+        if self.fits() {
+            return Ok(());
+        }
         let mib = |bytes: usize| bytes >> 20;
         let (quarter, most) = ((total / 4) as usize, (total / 4 * 3) as usize);
         let kv = self.kv();
-        if kv > quarter {
-            return Err(Refusal::new(refused::KV_ALL_TOO_LARGE, &[&what, &mib(kv), &(total >> 20), &mib(quarter)]));
-        }
         let caches = self.cache.unwrap_or(self.apart + self.floor);
-        if caches + kv > most {
+        if let Changed::Total = changed {
+            // The least memory that holds it, by whole MiB: it does not fit at
+            // `lo`, it does at `hi`.
+            let fits_at = |m: u64| ByHand { total: Some(m << 20), ..*self }.fits();
+            let mut hi = (total >> 20).max(1);
+            while !fits_at(hi) && hi < 1 << 40 {
+                hi *= 2;
+            }
+            let mut lo = 0;
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if fits_at(mid) { hi = mid } else { lo = mid }
+            }
+            let least = hi;
             return Err(Refusal::new(
-                refused::BY_HAND_TOO_MUCH,
-                &[&what, &mib(caches + kv), &mib(caches), &mib(kv), &(total >> 20), &mib(most)],
+                refused::TOO_LITTLE_FOR_BY_HAND,
+                &[&(total >> 20), &mib(caches), &mib(kv), &least],
             ));
         }
-        Ok(())
+        // The most the changed figure may be, the others as they are.
+        let at_most = match changed {
+            Changed::Several | Changed::Total => None,
+            Changed::CacheBudget => Some(self.most_for(|b, x| ByHand { cache: Some(x), ..b })),
+            Changed::KvEach => Some(self.most_for(|b, x| ByHand { kv_each: Some(x), ..b })),
+            Changed::AppCache(own) => Some(self.most_for(|b, x| ByHand { apart: b.apart - own + x, ..b })),
+            Changed::AppKv(own) => Some(self.most_for(|b, x| ByHand { kv_own: b.kv_own - own + x, ..b })),
+        };
+        // The amounts of their own would be cut to fit: say so rather than accept them.
+        if self.kv_own > quarter {
+            return Err(Refusal::new(
+                refused::KV_ALL_TOO_LARGE,
+                &[&what, &mib(self.kv_own), &(total >> 20), &mib(at_most.unwrap_or(quarter))],
+            ));
+        }
+        Err(Refusal::new(
+            refused::BY_HAND_TOO_MUCH,
+            &[&what, &mib(caches + kv), &mib(caches), &mib(kv), &(total >> 20), &mib(at_most.unwrap_or(most))],
+        ))
+    }
+
+    /// The most a figure may be for what is set by hand to fit, by whole
+    /// MiB: `with(self, x)` is what is set by hand with that figure at `x`.
+    fn most_for(&self, with: impl Fn(ByHand, usize) -> ByHand) -> usize {
+        let total = self.total.unwrap_or(0) as usize;
+        if !with(*self, 0).fits() {
+            return 0;
+        }
+        // Fits at `lo` MiB, not at `hi`.
+        let (mut lo, mut hi) = (0usize, (total >> 20) + 1);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if with(*self, mid << 20).fits() { lo = mid } else { hi = mid }
+        }
+        lo << 20
     }
 }
 
-/// What is set apart for the page caches of single databases.
-struct Apart {
+/// The figure a change of the memory changes, for what a refusal says.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Changed {
+    /// The memory the server counts on.
+    Total,
+    /// The budget of the page caches.
+    CacheBudget,
+    /// The amount of each key-value store that follows the server's rule.
+    KvEach,
+    /// The amount set apart for one database's cache, `own` in what is checked.
+    AppCache(usize),
+    /// The amount of one database's key-value store, `own` in what is checked.
+    AppKv(usize),
+    /// Several at once.
+    Several,
+}
+
+/// How the page caches of single databases are given their memory.
+struct CachePlan {
     /// What their owners asked, in all.
     asked: usize,
-    /// What they have now.
+    /// What each application has set apart for it, in the order of `all()`
+    /// (0: it shares).
+    own: Vec<usize>,
+    /// What they have, in all.
     taken: usize,
     /// How many applications share the rest.
     sharing: usize,
     /// They have less than asked because the budget was cut (memory ran short).
     squeezed: bool,
+    /// They have less than asked because the memory was lowered since.
+    capped: bool,
 }
 
 /// A token of an application, as stored: a digest, never the token.
@@ -266,6 +361,13 @@ impl App {
         self.cache_reserved.load(Ordering::Relaxed)
     }
 
+    /// The amounts of its record that are not in force (the environment is
+    /// the only source of the settings): page cache and key-value store, in
+    /// bytes (0: none).
+    pub(crate) fn kept_amounts(&self) -> (usize, usize) {
+        (self.amounts_kept.0.load(Ordering::Relaxed), self.amounts_kept.1.load(Ordering::Relaxed))
+    }
+
     /// Memory of its key-value store when its owner set one (0: the server's rule).
     pub(crate) fn kv_fixed(&self) -> usize {
         self.kv_fixed.load(Ordering::Relaxed)
@@ -372,6 +474,12 @@ pub(crate) struct Apps {
     /// What the memory guard learned: a budget that did not fit lately, the
     /// one in force stays under (0: nothing).
     cache_lesson: AtomicUsize,
+    /// What was set apart for single databases when the budget in force was
+    /// last made room in (see [`Apps::make_room`]).
+    apart_counted: AtomicUsize,
+    /// One sharing of the memory at a time: two at once could leave the
+    /// limits of an earlier budget in force.
+    sharing: Mutex<()>,
 }
 
 impl Apps {
@@ -397,6 +505,8 @@ impl Apps {
             plan: RwLock::new(plan),
             cache_in_force: AtomicUsize::new(plan.cache_budget.unwrap_or(0)),
             cache_lesson: AtomicUsize::new(0),
+            apart_counted: AtomicUsize::new(0),
+            sharing: Mutex::new(()),
         };
         let entries = match engine.meta_entries(REGISTRY_PREFIX) {
             Ok(e) => e,
@@ -454,44 +564,70 @@ impl Apps {
         if (before.cache_budget, before.cache_ceiling) != (plan.cache_budget, plan.cache_ceiling) {
             let budget = plan.cache_budget.unwrap_or(0);
             let in_force = self.cache_in_force.load(Ordering::Relaxed);
+            let asked: usize = self.all().iter().map(|a| a.cache_reserved()).sum();
             let by_hand = budget == plan.cache_ceiling;
-            self.cache_in_force
-                .store(if by_hand || before.cache_budget.is_none() { budget } else { in_force }, Ordering::Relaxed);
+            let was_by_hand = before.cache_budget.is_some_and(|b| b == before.cache_ceiling);
+            let start = if by_hand {
+                // Set by hand: what is set apart comes out of it.
+                self.apart_counted.store(asked, Ordering::Relaxed);
+                budget
+            } else if was_by_hand || before.cache_budget.is_none() {
+                // Back to following the memory: where a start would be, and no higher than it was.
+                self.apart_counted.store(asked, Ordering::Relaxed);
+                in_force.min(budget + asked).max(if before.cache_budget.is_none() { budget + asked } else { 0 })
+            } else {
+                in_force
+            };
+            self.cache_in_force.store(start, Ordering::Relaxed);
         }
         self.make_room();
         true
     }
 
-    /// What is set apart for the page caches of single databases.
-    fn set_apart(&self, all: &[Arc<App>], plan: &MemoryPlan) -> Apart {
-        let asked: usize = all.iter().map(|a| a.cache_reserved()).sum();
-        let sharing = all.iter().filter(|a| a.cache_reserved() == 0).count();
+    /// How the page caches of single databases are given their memory. Each
+    /// has its amount, within the ceiling (the memory may have been lowered
+    /// since: they keep their proportions), the others keeping their floor.
+    /// When the budget in force cannot hold them (the memory guard cut it),
+    /// the part of an amount its database does not use goes first: each keeps
+    /// what it holds and a quarter more, and the rest, in proportion.
+    fn cache_plan(&self, all: &[Arc<App>], plan: &MemoryPlan) -> CachePlan {
+        let amounts: Vec<usize> = all.iter().map(|a| a.cache_reserved()).collect();
+        let asked: usize = amounts.iter().sum();
+        let sharing = amounts.iter().filter(|a| **a == 0).count();
+        let in_proportion = |amounts: &[usize], within: usize| -> Vec<usize> {
+            let sum: usize = amounts.iter().sum();
+            amounts
+                .iter()
+                .map(|a| if sum <= within { *a } else { (*a as u128 * within as u128 / sum.max(1) as u128) as usize })
+                .collect()
+        };
         if plan.cache_budget.is_none() {
-            return Apart { asked, taken: asked, sharing, squeezed: false };
+            return CachePlan { asked, own: amounts, taken: asked, sharing, squeezed: false, capped: false };
         }
-        // Within the ceiling, the others keeping their floor (the memory may
-        // have been lowered since the amounts were set)...
-        let allowed = asked.min(plan.cache_ceiling.saturating_sub(if sharing > 0 { SHARED_FLOOR } else { 0 }));
-        // ...and within the budget in force: cut because memory ran short,
-        // it takes what is set apart down with it (2 MiB stay to each of the
-        // others), and gives it back as it grows again.
-        let taken = allowed.min(self.cache_in_force.load(Ordering::Relaxed).saturating_sub(sharing * (2 << 20)));
-        Apart { asked, taken, sharing, squeezed: taken < allowed }
+        let floor = shared_floor(sharing);
+        let allowed = asked.min(plan.cache_ceiling.saturating_sub(floor));
+        let own = in_proportion(&amounts, allowed);
+        let room = self.cache_in_force.load(Ordering::Relaxed).saturating_sub(floor);
+        if allowed <= room {
+            return CachePlan { asked, own, taken: allowed, sharing, squeezed: false, capped: allowed < asked };
+        }
+        // Squeezed: what each uses (and a quarter more) first.
+        let needs: Vec<usize> = all
+            .iter()
+            .zip(&own)
+            .map(|(app, own)| {
+                let used = app.engine.cache_used();
+                if *own == 0 { 0 } else { (*own).min(used + used / 4 + (2 << 20)) }
+            })
+            .collect();
+        let own = in_proportion(&needs, room);
+        let taken = own.iter().sum();
+        CachePlan { asked, own, taken, sharing, squeezed: true, capped: allowed < asked }
     }
 
-    /// Gives each application its memory. The key-value stores: the amount
-    /// its owner set, else the server's rule among those that follow it. The
-    /// page caches: the amount set apart for a database, and for the others
-    /// what each holds plus an equal part of what is free in the rest of the
-    /// budget (see [`crate::memory::cache_shares`]), so the caches never
-    /// outgrow the budget and it goes where it is used. Called when the
-    /// applications or the settings change, and every few seconds.
-    pub(crate) fn share_cache(&self) {
-        let all = self.all();
-        let plan = self.plan();
-        // The stores with an amount of their own have it (in proportion when
-        // all do not fit any more: the memory was lowered since); those that
-        // follow the server's rule share what that leaves of the room.
+    /// What each key-value store that follows the server's rule has: the
+    /// rule's amount, or its equal part of what the others leave of the room.
+    fn kv_following(&self, all: &[Arc<App>], plan: &MemoryPlan) -> usize {
         let following = all.iter().filter(|a| a.kv_fixed() == 0).count();
         let own_asked: usize = all.iter().map(|a| a.kv_fixed()).sum();
         let own = plan.kv_room.map_or(own_asked, |room| own_asked.min(room));
@@ -500,22 +636,47 @@ impl Apps {
             (None, Some(room)) => Some(room.saturating_sub(own)),
             (budget, None) => budget,
         };
-        let kv = crate::memory::kv_share(plan.kv_bytes, budget, following);
+        crate::memory::kv_share(plan.kv_bytes, budget, following)
+    }
+
+    /// What each key-value store that follows the server's rule has now.
+    pub(crate) fn kv_each(&self) -> usize {
+        self.kv_following(&self.all(), &self.plan())
+    }
+
+    /// Gives each application its memory. The key-value stores: the amount
+    /// its owner set, else the server's rule among those that follow it. The
+    /// page caches: the amount set apart for a database (see
+    /// [`Apps::cache_plan`]), and for the others what each holds plus an
+    /// equal part of what is free in the rest of the budget (see
+    /// [`crate::memory::cache_shares`]), so the caches never outgrow the
+    /// budget and it goes where it is used. Called when the applications or
+    /// the settings change, and every few seconds.
+    pub(crate) fn share_cache(&self) {
+        let _one = self.sharing.lock().unwrap_or_else(|e| e.into_inner());
+        let all = self.all();
+        let plan = self.plan();
+        // The stores with an amount of their own have it (in proportion when
+        // all do not fit any more: the memory was lowered since); those that
+        // follow the server's rule share what that leaves of the room.
+        let kv = self.kv_following(&all, &plan);
+        let own_asked: usize = all.iter().map(|a| a.kv_fixed()).sum();
+        let own_kv = plan.kv_room.map_or(own_asked, |room| own_asked.min(room));
         for app in &all {
             let fixed = app.kv_fixed();
-            let part = (fixed as u128 * own as u128 / own_asked.max(1) as u128) as usize;
+            let part = (fixed as u128 * own_kv as u128 / own_asked.max(1) as u128) as usize;
             app.kv.set_max_bytes(if fixed > 0 { part.max(MIN_KV) } else { kv });
         }
-        let apart = self.set_apart(&all, &plan);
-        for app in all.iter().filter(|a| a.cache_reserved() > 0) {
-            // Its amount; a part of it in proportion when all do not fit.
-            let own = (app.cache_reserved() as u128 * apart.taken as u128 / apart.asked.max(1) as u128) as usize;
-            app.engine.set_cache_bytes(own.max(2 << 20));
+        let caches = self.cache_plan(&all, &plan);
+        for (app, own) in all.iter().zip(&caches.own) {
+            if app.cache_reserved() > 0 {
+                app.engine.set_cache_bytes((*own).max(2 << 20));
+            }
         }
         if plan.cache_budget.is_none() {
             return;
         }
-        let shared = self.cache_in_force.load(Ordering::Relaxed).saturating_sub(apart.taken);
+        let shared = self.cache_in_force.load(Ordering::Relaxed).saturating_sub(caches.taken);
         let sharing: Vec<&Arc<App>> = all.iter().filter(|a| a.cache_reserved() == 0).collect();
         let used: Vec<usize> = sharing.iter().map(|app| app.engine.cache_used()).collect();
         for (app, share) in sharing.iter().zip(crate::memory::cache_shares(shared, &used)) {
@@ -560,14 +721,23 @@ impl Apps {
         self.cache_lesson.store(bytes, Ordering::Relaxed);
     }
 
-    /// Makes the budget in force large enough for what is set apart (within
-    /// its ceiling), and shares it: when the applications, their amounts or
-    /// the plan change.
+    /// Follows what is set apart for single databases in the budget in force:
+    /// an amount added is put on top of what the others share, an amount
+    /// removed is taken off (within the floor, the ceiling and what the guard
+    /// learned), and everything is shared anew.
     fn make_room(&self) {
         let all = self.all();
         let asked: usize = all.iter().map(|a| a.cache_reserved()).sum();
-        let floor = if all.iter().any(|a| a.cache_reserved() == 0) { SHARED_FLOOR } else { 0 };
-        self.set_cache_budget(self.cache_in_force.load(Ordering::Relaxed).max(asked + floor));
+        let sharing = all.iter().filter(|a| a.cache_reserved() == 0).count();
+        let before = self.apart_counted.swap(asked, Ordering::Relaxed);
+        let in_force = self.cache_in_force.load(Ordering::Relaxed);
+        let plan = self.plan();
+        let target = match plan.cache_budget {
+            // Set by hand: what is set apart comes out of it, the budget stays what was said.
+            Some(budget) if budget == plan.cache_ceiling => budget,
+            _ => in_force.saturating_sub(before) + asked,
+        };
+        self.set_cache_budget(target.max(asked + shared_floor(sharing)));
     }
 
     /// A larger budget would be used: the caches that share it are full, or
@@ -577,10 +747,10 @@ impl Apps {
     /// sits between there and its limit.
     pub(crate) fn cache_demand(&self) -> bool {
         let all = self.all();
-        let apart = self.set_apart(&all, &self.plan());
-        let shared = self.cache_in_force.load(Ordering::Relaxed).saturating_sub(apart.taken);
+        let caches = self.cache_plan(&all, &self.plan());
+        let shared = self.cache_in_force.load(Ordering::Relaxed).saturating_sub(caches.taken);
         let used: usize = all.iter().filter(|a| a.cache_reserved() == 0).map(|a| a.engine.cache_used()).sum();
-        apart.squeezed || (apart.sharing > 0 && shared > 0 && used >= shared / 4 * 3)
+        caches.squeezed || (caches.sharing > 0 && shared > 0 && used >= shared / 4 * 3)
     }
 
     /// What is set apart for the page caches of single databases, as their
@@ -588,7 +758,7 @@ impl Apps {
     pub(crate) fn cache_set_apart(&self) -> (usize, usize) {
         let all = self.all();
         let asked = all.iter().map(|a| a.cache_reserved()).sum();
-        (asked, if all.iter().any(|a| a.cache_reserved() == 0) { SHARED_FLOOR } else { 0 })
+        (asked, shared_floor(all.iter().filter(|a| a.cache_reserved() == 0).count()))
     }
 
     /// What is set by hand for `apps` under `plan`, to be checked against
@@ -599,18 +769,20 @@ impl Apps {
             // A budget that does not grow was said by hand.
             cache: plan.cache_budget.filter(|b| *b == plan.cache_ceiling),
             apart: apps.iter().map(|a| a.cache_reserved()).sum(),
-            floor: if apps.iter().any(|a| a.cache_reserved() == 0) { SHARED_FLOOR } else { 0 },
+            floor: shared_floor(apps.iter().filter(|a| a.cache_reserved() == 0).count()),
             kv_own: apps.iter().map(|a| a.kv_fixed()).sum(),
             kv_each: plan.kv_by_hand.then_some(plan.kv_bytes),
             kv_following: apps.iter().filter(|a| a.kv_fixed() == 0).count(),
+            kv_room: plan.kv_room,
         }
     }
 
-    /// What is set apart for single databases is cut for now (memory ran
-    /// short): what they asked in all, and what they have.
-    pub(crate) fn cache_squeezed(&self) -> Option<(usize, usize)> {
-        let apart = self.set_apart(&self.all(), &self.plan());
-        apart.squeezed.then_some((apart.asked, apart.taken))
+    /// What is set apart for single databases has less than asked: memory
+    /// ran short (`squeezed`), or was lowered since (`capped`). What they
+    /// asked in all, what they have, and whether it is a cut of the guard.
+    pub(crate) fn cache_squeezed(&self) -> Option<(usize, usize, bool)> {
+        let caches = self.cache_plan(&self.all(), &self.plan());
+        (caches.squeezed || caches.capped).then_some((caches.asked, caches.taken, caches.squeezed))
     }
 
     /// Lets go of every application's cached pages (memory runs short).
@@ -630,8 +802,11 @@ impl Apps {
         app: &App,
         cache: Option<usize>,
         kv: Option<usize>,
-    ) -> std::result::Result<(), Refusal> {
+    ) -> std::result::Result<bool, Refusal> {
         let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        if (cache.unwrap_or(0), kv.unwrap_or(0)) == (app.cache_reserved(), app.kv_fixed()) {
+            return Ok(false);
+        }
         let plan = self.plan();
         let others: Vec<Arc<App>> = self.all().into_iter().filter(|a| a.name != app.name).collect();
         let mib = |bytes: usize| bytes >> 20;
@@ -641,9 +816,10 @@ impl Apps {
             }
             if plan.cache_budget.is_some() {
                 let taken: usize = others.iter().map(|a| a.cache_reserved()).sum();
-                let floor = if others.iter().any(|a| a.cache_reserved() == 0) { SHARED_FLOOR } else { 0 };
+                let floor = shared_floor(others.iter().filter(|a| a.cache_reserved() == 0).count());
                 let room = plan.cache_ceiling.saturating_sub(taken + floor);
-                if c > room {
+                // Lowering an amount is never refused: what does not fit is cut in proportion.
+                if c > room && c > app.cache_reserved() {
                     return Err(Refusal::new(
                         refused::CACHE_MORE_THAN_LEFT,
                         &[&mib(c), &app.name, &mib(plan.cache_ceiling), &mib(taken), &mib(floor), &mib(room)],
@@ -661,11 +837,17 @@ impl Apps {
         let now = self.by_hand(&self.all(), &plan);
         let mut then = self.by_hand(&others, &plan);
         then.apart += cache.unwrap_or(0);
-        then.floor = if cache.is_none() || then.floor > 0 { SHARED_FLOOR } else { 0 };
+        then.floor =
+            shared_floor(others.iter().filter(|a| a.cache_reserved() == 0).count() + usize::from(cache.is_none()));
         then.kv_own += kv.unwrap_or(0);
         then.kv_following += usize::from(kv.is_none());
-        if let Err(refusal) = then.check(&format!("`{}`", app.name))
-            && (now.check("").is_ok() || then.amount() > now.amount())
+        let changed = match (cache.unwrap_or(0) != app.cache_reserved(), kv.unwrap_or(0) != app.kv_fixed()) {
+            (true, false) => Changed::AppCache(cache.unwrap_or(0)),
+            (false, true) => Changed::AppKv(kv.unwrap_or(0)),
+            _ => Changed::Several,
+        };
+        if let Err(refusal) = then.check(&format!("`{}`", app.name), changed)
+            && (now.fits() || then.amount() > now.amount())
         {
             return Err(refusal);
         }
@@ -681,7 +863,25 @@ impl Apps {
             "info",
             format!("memory of application `{}`: page cache {}, key-value store {}", app.name, said(cache), said(kv)),
         );
-        Ok(())
+        Ok(true)
+    }
+
+    /// Removes from the record of `app` the amounts kept there while the
+    /// environment is the only source of the settings (they are not in force).
+    /// Returns whether there were any.
+    pub(crate) fn forget_kept_amounts(&self, app: &App) -> std::result::Result<bool, Refusal> {
+        let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        if app.kept_amounts() == (0, 0) {
+            return Ok(false);
+        }
+        self.save_record(app, &app.record_with(app.cache_reserved(), app.kv_fixed()))
+            .map_err(|e| Refusal::failed(&e))?;
+        app.amounts_kept.0.store(0, Ordering::Relaxed);
+        app.amounts_kept.1.store(0, Ordering::Relaxed);
+        self.first
+            .engine
+            .event("info", format!("memory of application `{}`: the amounts kept aside are removed", app.name));
+        Ok(true)
     }
 
     pub(crate) fn first(&self) -> &Arc<App> {
@@ -956,5 +1156,63 @@ impl App {
             cache_mb: Some(self.cache_reserved() as u64 >> 20).filter(|m| *m > 0),
             kv_mb: Some(self.kv_fixed() as u64 >> 20).filter(|m| *m > 0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+
+    /// A server of 512 MiB whose key-value stores follow the rule (64 MiB in all).
+    fn server() -> ByHand {
+        ByHand {
+            total: Some(512 << 20),
+            cache: None,
+            apart: 0,
+            floor: 16 * MIB,
+            kv_own: 0,
+            kv_each: None,
+            kv_following: 3,
+            kv_room: Some(128 * MIB),
+        }
+    }
+
+    fn figures(r: Refusal) -> (&'static str, Vec<String>) {
+        (r.text, r.with)
+    }
+
+    #[test]
+    fn a_refusal_gives_the_most_the_changed_figure_may_be() {
+        // A cache budget of 2 GiB: 384 MiB may be set by hand, 64 of them for
+        // the key-value stores, so the budget may be 320 MiB, not 384.
+        let then = ByHand { cache: Some(2048 * MIB), ..server() };
+        let (text, with) = figures(then.check("`memory.cache_mb`", Changed::CacheBudget).unwrap_err());
+        assert_eq!(text, refused::BY_HAND_TOO_MUCH);
+        assert_eq!(with.last().unwrap(), "320");
+        assert!(ByHand { cache: Some(320 * MIB), ..server() }.fits());
+        assert!(!ByHand { cache: Some(321 * MIB), ..server() }.fits());
+        // One database's amount, the others staying: 300 MiB set apart for
+        // another one, 4 for this one now.
+        let then = ByHand { apart: 300 * MIB + 200 * MIB, floor: 16 * MIB, ..server() };
+        let (_, with) = figures(then.check("`shop`", Changed::AppCache(200 * MIB)).unwrap_err());
+        assert_eq!(with.last().unwrap(), "4", "384 - 64 - 16 - 300");
+        // One database's key-value store: within the quarter for all of them.
+        let then = ByHand { kv_own: 200 * MIB, kv_following: 2, ..server() };
+        let (text, with) = figures(then.check("`shop`", Changed::AppKv(200 * MIB)).unwrap_err());
+        assert_eq!(text, refused::KV_ALL_TOO_LARGE);
+        assert_eq!(with.last().unwrap(), "128");
+        // The memory: the least that holds what is set by hand.
+        let then = ByHand { total: Some(300 << 20), apart: 300 * MIB, floor: 16 * MIB, ..server() };
+        let (text, with) = figures(then.check("`memory.total_mb`", Changed::Total).unwrap_err());
+        assert_eq!(text, refused::TOO_LITTLE_FOR_BY_HAND);
+        let least: u64 = with.last().unwrap().parse().unwrap();
+        assert!(ByHand { total: Some(least << 20), ..then }.fits());
+        assert!(!ByHand { total: Some((least - 1) << 20), ..then }.fits());
+        // Several at once: the most for all of them together.
+        let (_, with) =
+            figures(ByHand { cache: Some(2048 * MIB), ..server() }.check("x", Changed::Several).unwrap_err());
+        assert_eq!(with.last().unwrap(), "384");
     }
 }

@@ -251,8 +251,13 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
             &mut out,
             "53300",
             &format!(
-                "too many connections: this server serves {} PostgreSQL connections at once (NUAGE_PG_MAX_CONNECTIONS); use a connection pool, or close idle ones",
-                state.pg_max_connections()
+                "too many connections: this server serves {} PostgreSQL connections at once ({}); use a connection pool, or close idle ones",
+                state.pg_max_connections(),
+                if state.settings.saved("postgres.connections").is_some() {
+                    "the setting postgres.connections"
+                } else {
+                    "NUAGE_PG_MAX_CONNECTIONS"
+                }
             ),
         );
         return conn.write_all(&out.0);
