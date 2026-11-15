@@ -17,7 +17,7 @@
 //! | `NUAGE_ADMIN_PASSWORD` | password of the console (`/admin`) | none: the console is off |
 //! | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
-//! | `NUAGE_CACHE_MB` | memory the page caches of all the applications may hold together, in MiB, or `auto`; shared equally among them | `auto`: a quarter of the memory (16 MiB to 4 GiB) |
+//! | `NUAGE_CACHE_MB` | memory the page caches of all the applications may hold together, in MiB, or `auto`; shared equally among them | `auto`: it follows the memory: a quarter of it at first, more while there is room (up to six tenths), less when it gets tight |
 //! | `NUAGE_MEMORY_MB` | the memory to count on, in MiB, for a host that limits it without saying so | the container's limit, else the machine's memory |
 //! | `NUAGE_PG_MAX_CONNECTIONS` | PostgreSQL connections served at once (each has a thread) | `100`, less where the system allows few threads |
 //! | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); a variable of the environment wins over the file | none |
@@ -234,6 +234,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         files,
         admin_token,
         cache_budget: Some(engine.cache_bytes),
+        cache_ceiling: Some(crate::memory::cache_ceiling(get("NUAGE_CACHE_MB").as_deref(), engine.cache_bytes)),
         pg_max_connections,
         pg_port,
         pg_tls: tls.is_some(),

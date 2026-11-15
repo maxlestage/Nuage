@@ -513,14 +513,17 @@ SYSTEM, lisible des seuls administrateurs, avec une règle de pare-feu pour le r
   sauvegardes ; `... | sudo bash -s purge` efface les données et les réglages, jamais les
   sauvegardes. Sur Windows : `$env:NUAGE_ACTION = 'uninstall'` (ou `'purge'`), puis la même
   commande.
-- **Mémoire** : les caches de pages de toutes les applications partagent un seul budget,
-  `NUAGE_CACHE_MB=auto` : un quart de la mémoire (de 16 Mio à 4 Gio), à parts égales ; ils ne
-  le dépassent jamais, quel que soit le nombre d'applications, et le reste reste sur disque.
-  Si la mémoire utilisée dépasse 85 %, les caches sont vidés, leur budget divisé par deux et
-  la mémoire libérée rendue au système, pendant que les requêtes continuent ; il remonte quand
-  la mémoire redevient confortable. La page *Serveur* de la console et la carte **Mémoire** du
-  tableau de bord montrent la mémoire dont ce serveur dispose (la limite de son conteneur,
-  s'il en a une), ce qui est utilisé et ce qui reste.
+- **Mémoire** : Nuage DB utilise la mémoire du serveur où il tourne, quelle que soit sa
+  taille, et pas plus. Les données restent sur disque ; la mémoire va aux caches de pages, qui
+  partagent un budget (`NUAGE_CACHE_MB=auto`) qui suit la mémoire : un quart au départ,
+  davantage tant qu'il y a de la place et que les caches sont pleins (jusqu'à six dixièmes),
+  moins quand la mémoire se tend. Chaque application a ce qu'elle occupe plus une part égale de
+  ce qui est libre : le budget va aux applications qui s'en servent. Au-delà de 85 % utilisés,
+  les caches sont vidés, leur budget divisé par deux et la mémoire libérée rendue au système,
+  pendant que les requêtes continuent. La page *Serveur* de la console et la carte **Mémoire**
+  du tableau de bord montrent la mémoire dont ce serveur dispose (la limite de son conteneur,
+  s'il en a une : chez un hébergeur mutualisé, pas la mémoire de toute la machine), ce qui est
+  utilisé et ce qui reste, en gigaoctets.
 - **À la main** : des binaires pour Linux, macOS et Windows sont sur la
   [page des versions](https://github.com/maxlestage/Nuage/releases) ; `nuage --env-file nuage.env`
   démarre le serveur avec les réglages d'un fichier (lignes `CLÉ=valeur` ; l'environnement
@@ -670,7 +673,7 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_ADMIN_PASSWORD` | mot de passe de la console (et du tableau de bord) | aucun : la console est coupée |
 | `NUAGE_ADMIN_TOKEN` | jeton de l'API de gestion (`/api/apps`, `nuage apps`) : crée les applications et leurs jetons ; 32 caractères au moins (`nuage genkey`) | aucun : l'API est coupée |
 | `NUAGE_PUBLIC_STATUS` | `true` : `/api/status` et `/app` montrent une partie publique sans connexion | `false` |
-| `NUAGE_CACHE_MB` | mémoire que les caches de pages de toutes les applications peuvent occuper ensemble, en Mio, ou `auto` ; partagée à parts égales | `auto` : un quart de la mémoire, de 16 Mio à 4 Gio |
+| `NUAGE_CACHE_MB` | mémoire que les caches de pages de toutes les applications peuvent occuper ensemble, en Mio, ou `auto` | `auto` : il suit la mémoire : un quart au départ, davantage tant qu'il y a de la place (jusqu'à six dixièmes), moins quand elle se tend |
 | `NUAGE_MEMORY_MB` | la mémoire sur laquelle compter, en Mio, pour un hébergeur qui la limite sans le dire | la limite du conteneur, sinon la mémoire de la machine |
 | `NUAGE_PG_MAX_CONNECTIONS` | connexions PostgreSQL servies à la fois (chacune a un thread) | `100`, moins là où le système autorise peu de threads |
 | `NUAGE_ENV_FILE` | lit aussi les réglages de ce fichier (lignes `CLÉ=valeur` ; `nuage --env-file <fichier>` fait de même) ; l'environnement l'emporte sur le fichier | aucun |

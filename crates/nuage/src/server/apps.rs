@@ -214,8 +214,10 @@ pub(crate) struct Apps {
     /// Memory the page caches of all the applications may hold together
     /// (`None`: each engine keeps the size it was opened with).
     cache_budget: Option<usize>,
-    /// The budget in force: `cache_budget`, less when memory ran short
-    /// (see [`Apps::tighten_cache`]).
+    /// The most the budget may grow to while memory has room.
+    cache_ceiling: usize,
+    /// The budget in force: it starts at `cache_budget`, then follows the
+    /// memory (see [`crate::memory::cache_move`]).
     cache_in_force: std::sync::atomic::AtomicUsize,
 }
 
@@ -228,6 +230,7 @@ impl Apps {
         kv_bytes: usize,
         kv_budget: Option<usize>,
         cache_budget: Option<usize>,
+        cache_ceiling: Option<usize>,
     ) -> Apps {
         let first = Arc::new(App::new(
             engine.options().name.clone(),
@@ -245,6 +248,7 @@ impl Apps {
             kv_bytes,
             kv_budget,
             cache_budget,
+            cache_ceiling: cache_ceiling.unwrap_or(0).max(cache_budget.unwrap_or(0)),
             cache_in_force: std::sync::atomic::AtomicUsize::new(cache_budget.unwrap_or(0)),
         };
         let entries = match engine.meta_entries(REGISTRY_PREFIX) {
@@ -282,9 +286,10 @@ impl Apps {
         apps
     }
 
-    /// Gives each application its part of the cache budget: equal parts,
-    /// whatever their number, so the caches never outgrow the budget. Called
-    /// when the applications change.
+    /// Gives each application its part of the cache budget: what it holds,
+    /// plus an equal part of what is free (see [`crate::memory::cache_shares`]),
+    /// so the caches never outgrow the budget and it goes where it is used.
+    /// Called when the applications change, and every few seconds.
     pub(crate) fn share_cache(&self) {
         let all = self.all();
         // The key-value stores too: together they keep to their budget.
@@ -296,44 +301,49 @@ impl Apps {
             return;
         }
         let budget = self.cache_in_force.load(Ordering::Relaxed);
-        let share = crate::memory::cache_share(budget, all.len());
-        for app in all {
+        let used: Vec<usize> = all.iter().map(|app| app.engine.cache_used()).collect();
+        for (app, share) in all.iter().zip(crate::memory::cache_shares(budget, &used)) {
             app.engine.set_cache_bytes(share);
         }
     }
 
+    /// What the caches of all the applications hold now.
+    pub(crate) fn cache_used(&self) -> usize {
+        self.all().iter().map(|app| app.engine.cache_used()).sum()
+    }
+
     /// The cache budget of the server, all applications together: the one
-    /// in force (the configured one, less when memory ran short).
+    /// in force (it follows the memory). `None`: there is no shared budget.
     pub(crate) fn cache_budget(&self) -> Option<usize> {
         self.cache_budget.map(|_| self.cache_in_force.load(Ordering::Relaxed))
     }
 
-    /// Memory runs short: the caches let go of everything, and their budget
-    /// is halved (16 MiB at least), since what it was did not fit. Returns
-    /// the budget now in force.
-    pub(crate) fn tighten_cache(&self) -> Option<usize> {
-        if let Some(configured) = self.cache_budget {
-            let now = self.cache_in_force.load(Ordering::Relaxed);
-            self.cache_in_force.store((now / 2).max((16 << 20).min(configured)), Ordering::Relaxed);
+    /// The most the budget may grow to.
+    pub(crate) fn cache_ceiling(&self) -> Option<usize> {
+        self.cache_budget.map(|_| self.cache_ceiling)
+    }
+
+    /// Puts a new budget in force and shares it.
+    pub(crate) fn set_cache_budget(&self, bytes: usize) {
+        if self.cache_budget.is_some() {
+            self.cache_in_force.store(bytes, Ordering::Relaxed);
             self.share_cache();
         }
+    }
+
+    /// The caches are full: a larger budget would be used. Full is three
+    /// quarters of it: a cache lets go of pages by whole sixteenths of itself,
+    /// so one that turns pages away sits between there and its limit.
+    pub(crate) fn cache_demand(&self) -> bool {
+        let budget = self.cache_in_force.load(Ordering::Relaxed);
+        budget > 0 && self.cache_used() >= budget / 4 * 3
+    }
+
+    /// Lets go of every application's cached pages (memory runs short).
+    pub(crate) fn drop_caches(&self) {
         for app in self.all() {
             app.engine.drop_cache();
         }
-        self.cache_budget()
-    }
-
-    /// Memory has been comfortable for a while: the budget grows back by a
-    /// quarter of the configured one, up to it. Returns whether it changed.
-    pub(crate) fn loosen_cache(&self) -> bool {
-        let Some(configured) = self.cache_budget else { return false };
-        let now = self.cache_in_force.load(Ordering::Relaxed);
-        if now >= configured {
-            return false;
-        }
-        self.cache_in_force.store((now + configured / 4).min(configured), Ordering::Relaxed);
-        self.share_cache();
-        true
     }
 
     pub(crate) fn first(&self) -> &Arc<App> {
@@ -418,7 +428,7 @@ impl Apps {
         let first = &self.first.engine;
         let mut options = first.options().clone();
         options.name = name.to_owned();
-        if let Some(budget) = self.cache_budget {
+        if let Some(budget) = self.cache_budget() {
             // Its part once it is there; `share_cache` then evens the others.
             options.cache_bytes = crate::memory::cache_share(budget, self.all().len() + 1);
         }

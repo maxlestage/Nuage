@@ -211,6 +211,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
         "available_bytes": m.available_bytes,
         "limited": m.limited,
         "cache_budget_bytes": state.apps.cache_budget(),
+        "cache_ceiling_bytes": state.apps.cache_ceiling(),
         "reliefs": state.memory_reliefs(),
         "process_bytes": m.process_bytes,
         "swap_total_bytes": m.swap_total_bytes,

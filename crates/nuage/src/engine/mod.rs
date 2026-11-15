@@ -555,6 +555,11 @@ impl Engine {
         self.store.pages.cache_limit()
     }
 
+    /// Bytes the page cache holds now.
+    pub fn cache_used(&self) -> usize {
+        self.store.pages.cache_used()
+    }
+
     /// Lets go of every cached page (they are read again when needed): what a
     /// server does when memory runs short.
     pub fn drop_cache(&self) {
