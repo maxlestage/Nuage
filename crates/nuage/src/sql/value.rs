@@ -11,6 +11,7 @@ use serde_json::{Value as Json, json};
 
 use super::ast::Op;
 use super::lex::syntax;
+use super::limits::{text_fits, value_bytes};
 
 fn conversion(msg: impl Into<String>) -> Error {
     Error::Conversion(msg.into())
@@ -186,7 +187,7 @@ pub(crate) fn arith(op: Op, a: &Value, b: &Value) -> Result<Value> {
         return Ok(Null);
     }
     if op == Op::Concat {
-        return Ok(Text(format!("{}{}", to_text(a).unwrap_or_default(), to_text(b).unwrap_or_default())));
+        return concat(a.clone(), b);
     }
     let name = match op {
         Op::Add => "+",
@@ -202,7 +203,7 @@ pub(crate) fn arith(op: Op, a: &Value, b: &Value) -> Result<Value> {
             if let (Some(d), Some(n)) = (a.as_date_like(), b.as_i64()) {
                 return match op {
                     Op::Add => d.plus_days(n),
-                    Op::Sub => d.plus_days(-n),
+                    Op::Sub => d.plus_days(n.checked_neg().unwrap_or(i64::MAX)),
                     _ => Err(conversion(format!("cannot apply `{name}` to {} and {}", a.type_name(), b.type_name()))),
                 };
             }
@@ -256,6 +257,29 @@ pub(crate) fn arith(op: Op, a: &Value, b: &Value) -> Result<Value> {
     }
 }
 
+/// `a || b`: `b` written after `a`, in the text `a` already is when it is one
+/// (a long list of `||` copies each piece once).
+pub(crate) fn concat(a: Value, b: &Value) -> Result<Value> {
+    if a.is_null() || b.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut text = match a {
+        Value::Text(s) => s,
+        other => to_text(&other).unwrap_or_default(),
+    };
+    let converted;
+    let more = match b {
+        Value::Text(s) => s.as_str(),
+        other => {
+            converted = to_text(other).unwrap_or_default();
+            converted.as_str()
+        }
+    };
+    text_fits("`||`", text.len().saturating_add(more.len()))?;
+    text.push_str(more);
+    Ok(Value::Text(text))
+}
+
 trait DateLike {
     fn as_date_like(&self) -> Option<&Value>;
 }
@@ -272,13 +296,16 @@ trait PlusDays {
 
 impl PlusDays for &Value {
     fn plus_days(&self, n: i64) -> Result<Value> {
-        let d = chrono::Duration::days(n);
-        Ok(match self {
-            Value::Date(x) => Value::Date(*x + d),
-            Value::Timestamp(x) => Value::Timestamp(*x + d),
-            Value::TimestampTz(x) => Value::TimestampTz(*x + d),
-            _ => Value::Null,
-        })
+        // Dates have an end (the year 262142): past it, an error, not a panic.
+        let moved = chrono::Duration::try_days(n).and_then(|d| {
+            Some(match self {
+                Value::Date(x) => Value::Date(x.checked_add_signed(d)?),
+                Value::Timestamp(x) => Value::Timestamp(x.checked_add_signed(d)?),
+                Value::TimestampTz(x) => Value::TimestampTz(x.checked_add_signed(d)?),
+                _ => Value::Null,
+            })
+        });
+        moved.ok_or_else(|| conversion(format!("date out of range after {n} day(s)")))
     }
 }
 
@@ -522,6 +549,16 @@ fn arg_count(name: &str, args: &[Value], min: usize, max: usize) -> Result<()> {
     Ok(())
 }
 
+/// The length of texts of these lengths joined by a separator of `sep` bytes.
+pub(crate) fn joined_len(lens: impl Iterator<Item = usize>, sep: usize) -> usize {
+    let (mut total, mut count) = (0usize, 0usize);
+    for len in lens {
+        total = total.saturating_add(len);
+        count += 1;
+    }
+    total.saturating_add(sep.saturating_mul(count.saturating_sub(1)))
+}
+
 fn text_arg(v: &Value) -> Option<String> {
     to_text(v)
 }
@@ -558,8 +595,8 @@ pub(crate) fn interval_months_and_micros(text: &str) -> Result<(i32, i64)> {
         let unit = pair[1].to_ascii_lowercase();
         let unit = unit.trim_end_matches('s');
         match unit {
-            "year" | "yr" | "y" => months += (n * 12.0) as i64,
-            "mon" | "month" => months += n as i64,
+            "year" | "yr" | "y" => months = months.saturating_add((n * 12.0) as i64),
+            "mon" | "month" => months = months.saturating_add(n as i64),
             "week" | "w" => micros += n * 7.0 * 86_400e6,
             "day" | "d" => micros += n * 86_400e6,
             "hour" | "hr" | "h" => micros += n * 3_600e6,
@@ -576,14 +613,15 @@ pub(crate) fn interval_months_and_micros(text: &str) -> Result<(i32, i64)> {
 /// `x + INTERVAL '...'` (`sign` 1) or `x - INTERVAL '...'` (`sign` -1): months
 /// first, on the calendar (31 January + 1 month = 28 or 29 February), then
 /// the rest. A date gives a timestamp, as in PostgreSQL.
-fn shift(x: &Value, text: &str, sign: i64) -> Result<Value> {
+pub(crate) fn shift(x: &Value, text: &str, sign: i64) -> Result<Value> {
     use chrono::{Duration, Months, NaiveDateTime};
     let (months, micros) = interval_months_and_micros(text)?;
     let months = i64::from(months) * sign;
     let step = |t: NaiveDateTime| -> Result<NaiveDateTime> {
         let m = Months::new(months.unsigned_abs() as u32);
         let t = if months >= 0 { t.checked_add_months(m) } else { t.checked_sub_months(m) };
-        t.and_then(|t| t.checked_add_signed(Duration::microseconds(micros * sign)))
+        t.zip(micros.checked_mul(sign))
+            .and_then(|(t, micros)| t.checked_add_signed(Duration::microseconds(micros)))
             .ok_or_else(|| conversion(format!("date out of range after INTERVAL '{text}'")))
     };
     Ok(match x {
@@ -673,10 +711,13 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 ),
                 "md5" => return Err(syntax("md5() is not available: use sha256()")),
                 "sha256" => Value::Text(crate::hash::sha256(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()),
-                "hex" => Value::Text(match &a[0] {
-                    Value::Bytes(b) => b.iter().map(|x| format!("{x:02X}")).collect(),
-                    _ => s.bytes().map(|x| format!("{x:02X}")).collect(),
-                }),
+                "hex" => {
+                    text_fits("hex()", s.len().saturating_mul(2))?;
+                    Value::Text(match &a[0] {
+                        Value::Bytes(b) => b.iter().map(|x| format!("{x:02X}")).collect(),
+                        _ => s.bytes().map(|x| format!("{x:02X}")).collect(),
+                    })
+                }
                 "unhex" => {
                     let bytes: Option<Vec<u8>> = (0..s.len())
                         .step_by(2)
@@ -685,7 +726,10 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                     bytes.map_or(Value::Null, Value::Bytes)
                 }
                 _ => Value::Text(match &a[0] {
-                    Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+                    Value::Text(t) => {
+                        text_fits("quote()", t.len().saturating_mul(2))?;
+                        format!("'{}'", t.replace('\'', "''"))
+                    }
                     _ => s,
                 }),
             }
@@ -702,9 +746,11 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 None => None,
             };
             // 1-based; a start of 0 or less eats into the length, as in SQL.
-            let from = (start - 1).max(0) as usize;
+            let from = usize::try_from(start.saturating_sub(1).max(0)).unwrap_or(usize::MAX);
             let end = match len {
-                Some(l) => ((start - 1 + l).max(0) as usize).min(s.len()),
+                Some(l) => usize::try_from(start.saturating_sub(1).saturating_add(l).max(0))
+                    .unwrap_or(usize::MAX)
+                    .min(s.len()),
                 None => s.len(),
             };
             Value::Text(if from >= end { String::new() } else { s[from..end].iter().collect() })
@@ -715,7 +761,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let s: Vec<char> = text_arg(&a[0]).unwrap_or_default().chars().collect();
-            let n = (int_arg(name, &a[1])?.unwrap_or(0).max(0) as usize).min(s.len());
+            let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX).min(s.len());
             Value::Text(if name == "left" { s[..n].iter().collect() } else { s[s.len() - n..].iter().collect() })
         }
         "replace" => {
@@ -728,7 +774,15 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 text_arg(&a[1]).unwrap_or_default(),
                 text_arg(&a[2]).unwrap_or_default(),
             );
-            Value::Text(if from.is_empty() { s } else { s.replace(&from, &to) })
+            if from.is_empty() {
+                return Ok(Value::Text(s));
+            }
+            // Each occurrence grows the text by the difference: counted before it is built.
+            if to.len() > from.len() {
+                let grown = s.matches(from.as_str()).count().saturating_mul(to.len() - from.len());
+                text_fits("replace()", s.len().saturating_add(grown))?;
+            }
+            Value::Text(s.replace(&from, &to))
         }
         "instr" | "strpos" | "position" => {
             arg_count(name, a, 2, 2)?;
@@ -743,31 +797,42 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             if null_in() {
                 return Ok(Value::Null);
             }
-            let s: Vec<char> = text_arg(&a[0]).unwrap_or_default().chars().collect();
-            let n = int_arg(name, &a[1])?.unwrap_or(0).max(0) as usize;
+            let text = text_arg(&a[0]).unwrap_or_default();
+            let s: Vec<char> = text.chars().collect();
+            let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
             let fill: Vec<char> = a.get(2).and_then(text_arg).unwrap_or_else(|| " ".into()).chars().collect();
             if n <= s.len() || fill.is_empty() {
                 return Ok(Value::Text(s[..n.min(s.len())].iter().collect()));
             }
+            // The length asked for is the caller's: the size is known before the padding is built.
+            let widest = fill.iter().map(|c| c.len_utf8()).max().unwrap_or(1);
+            text_fits(&format!("{name}()"), text.len().saturating_add((n - s.len()).saturating_mul(widest)))?;
             let pad: String = fill.iter().cycle().take(n - s.len()).collect();
-            let s: String = s.iter().collect();
-            Value::Text(if name == "lpad" { pad + &s } else { s + &pad })
+            Value::Text(if name == "lpad" { pad + &text } else { text + &pad })
         }
         "repeat" => {
             arg_count(name, a, 2, 2)?;
             if null_in() {
                 return Ok(Value::Null);
             }
-            let n = int_arg(name, &a[1])?.unwrap_or(0).clamp(0, 1_000_000) as usize;
-            Value::Text(text_arg(&a[0]).unwrap_or_default().repeat(n))
+            let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+            let text = text_arg(&a[0]).unwrap_or_default();
+            text_fits("repeat()", text.len().saturating_mul(n))?;
+            Value::Text(text.repeat(n))
         }
-        "concat" => Value::Text(a.iter().filter_map(text_arg).collect()),
+        "concat" => {
+            let parts: Vec<String> = a.iter().filter_map(text_arg).collect();
+            text_fits("concat()", parts.iter().fold(0usize, |n, p| n.saturating_add(p.len())))?;
+            Value::Text(parts.concat())
+        }
         "concat_ws" => {
             if a.is_empty() {
                 return Err(syntax("concat_ws() needs a separator"));
             }
             let Some(sep) = text_arg(&a[0]) else { return Ok(Value::Null) };
-            Value::Text(a[1..].iter().filter_map(text_arg).collect::<Vec<_>>().join(&sep))
+            let parts: Vec<String> = a[1..].iter().filter_map(text_arg).collect();
+            text_fits("concat_ws()", joined_len(parts.iter().map(String::len), sep.len()))?;
+            Value::Text(parts.join(&sep))
         }
         "coalesce" | "ifnull" | "nvl" => {
             if a.is_empty() {
@@ -779,11 +844,14 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             arg_count(name, a, 2, 2)?;
             if compare(&a[0], &a[1]) == Some(Ordering::Equal) { Value::Null } else { a[0].clone() }
         }
-        "_same" => Value::Bool(match (a[0].is_null(), a[1].is_null()) {
-            (true, true) => true,
-            (false, false) => compare(&a[0], &a[1]) == Some(Ordering::Equal),
-            _ => false,
-        }),
+        "_same" => {
+            arg_count(name, a, 2, 2)?;
+            Value::Bool(match (a[0].is_null(), a[1].is_null()) {
+                (true, true) => true,
+                (false, false) => compare(&a[0], &a[1]) == Some(Ordering::Equal),
+                _ => false,
+            })
+        }
         "iif" | "if" => {
             arg_count(name, a, 3, 3)?;
             if truthy(&a[0]) { a[1].clone() } else { a[2].clone() }
@@ -939,7 +1007,12 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 Ok(Value::Timestamp(t)) => t,
                 _ => return Err(conversion("strftime(): not a date")),
             };
-            Value::Text(t.format(&fmt.replace("%f", "%.3f")).to_string())
+            // A format chrono does not know (`%J`) fails when it is written, not before.
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            write!(out, "{}", t.format(&fmt.replace("%f", "%.3f")))
+                .map_err(|_| conversion(format!("strftime(): `{fmt}` is not a format it knows")))?;
+            Value::Text(out)
         }
         "json_extract" | "json_value" => {
             arg_count(name, a, 2, 2)?;
@@ -965,6 +1038,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             }
         }
         "json_object" => {
+            text_fits("json_object()", a.iter().fold(0usize, |n, v| n.saturating_add(value_bytes(v))))?;
             let mut m = serde_json::Map::new();
             for pair in a.chunks(2) {
                 if let [k, v] = pair {
@@ -973,15 +1047,13 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             }
             Value::Json(Json::Object(m))
         }
-        "json_array" => Value::Json(Json::Array(a.iter().map(to_json).collect())),
+        "json_array" => {
+            text_fits("json_array()", a.iter().fold(0usize, |n, v| n.saturating_add(value_bytes(v))))?;
+            Value::Json(Json::Array(a.iter().map(to_json).collect()))
+        }
         "_interval" => {
             arg_count(name, a, 1, 1)?;
             Value::Text(text_arg(&a[0]).unwrap_or_default())
-        }
-        "_shift" => {
-            arg_count(name, a, 3, 3)?;
-            let sign = if matches!(a[2], Value::I64(-1)) { -1 } else { 1 };
-            shift(&a[0], &text_arg(&a[1]).unwrap_or_default(), sign)?
         }
         // PostgreSQL's advisory locks. A transaction of Nuage DB is checked at
         // its commit: if another commit changed a table it read since its
@@ -1034,6 +1106,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::limits::MAX_TEXT;
 
     /// Un paramètre JSON de `/v1/sql` arrive bit pour bit : une latitude réelle
     /// (copiée d'une base PostgreSQL) était lue un ULP plus loin.
@@ -1101,5 +1174,80 @@ mod tests {
         assert_eq!(f("extract", vec![t("year"), t("2026-11-13 10:00:00")]), Value::I64(2026));
         assert!(matches!(f("now", vec![]), Value::TimestampTz(_)));
         assert!(scalar("nope", vec![]).is_err());
+    }
+
+    /// A function asked for a huge text refuses before it takes the memory:
+    /// `repeat(repeat('a', 1000000), 1000000)` once asked the system for a terabyte.
+    #[test]
+    fn texts_have_a_maximum_size() {
+        let t = |s: &str| Value::Text(s.into());
+        let big = Value::Text("a".repeat(1 << 20));
+        let too_large = |n: &str, a: Vec<Value>| {
+            let e = scalar(n, a).unwrap_err().to_string();
+            assert!(e.contains(&format!("{n}(): the result would be larger than 64 MiB")), "{e}");
+        };
+        too_large("repeat", vec![big.clone(), Value::I64(1_000_000)]);
+        too_large("repeat", vec![t("ab"), Value::I64(i64::MAX)]);
+        too_large("lpad", vec![t("x"), Value::I64(2_000_000_000), t("abcdefgh")]);
+        too_large("lpad", vec![t("x"), Value::I64(9_000_000_000_000_000_000), t("y")]);
+        too_large("rpad", vec![t("x"), Value::I64(900_000_000)]);
+        too_large("rpad", vec![t("x"), Value::I64(30_000_000), t("é€")]);
+        too_large("replace", vec![big.clone(), t("a"), t(&"b".repeat(600))]);
+        too_large("concat", vec![big.clone(); 65]);
+        too_large("concat_ws", std::iter::once(t(&"-".repeat(1 << 20))).chain(vec![t("a"); 70]).collect());
+        too_large("json_array", vec![big.clone(); 65]);
+        too_large("json_object", vec![big.clone(); 66]);
+        too_large("hex", vec![Value::Text("a".repeat((32 << 20) + 1))]);
+        let e = arith(Op::Concat, &Value::Text("a".repeat(MAX_TEXT)), &t("b")).unwrap_err().to_string();
+        assert!(e.contains("`||`: the result would be larger than 64 MiB"), "{e}");
+        // Up to the limit, they answer; a count is no longer cut at a million.
+        let f = |n: &str, a: Vec<Value>| scalar(n, a).unwrap();
+        assert_eq!(f("repeat", vec![t("ab"), Value::I64(3)]), t("ababab"));
+        assert_eq!(f("repeat", vec![t(""), Value::I64(i64::MAX)]), t(""));
+        assert_eq!(f("repeat", vec![t("ab"), Value::I64(-1)]), t(""));
+        let Value::Text(long) = f("repeat", vec![t("x"), Value::I64(3_000_000)]) else { panic!() };
+        assert_eq!(long.len(), 3_000_000);
+        assert_eq!(f("lpad", vec![t("é"), Value::I64(4), t("àb")]), t("àbàé"));
+        assert_eq!(f("rpad", vec![t("é"), Value::I64(4), t("àb")]), t("éàbà"));
+        assert_eq!(f("lpad", vec![t("abc"), Value::I64(2)]), t("ab"));
+        assert_eq!(f("replace", vec![big.clone(), t("a"), t("bc")]), Value::Text("bc".repeat(1 << 20)));
+        assert_eq!(f("replace", vec![t("aXbXc"), t("X"), t("")]), t("abc"));
+        assert_eq!(f("concat_ws", vec![t(", "), t("a"), Value::Null, t("b")]), t("a, b"));
+        assert_eq!(concat(t("a"), &Value::I64(1)).unwrap(), t("a1"));
+        assert_eq!(concat(Value::I64(1), &t("a")).unwrap(), t("1a"));
+        assert_eq!(concat(Value::Null, &t("a")).unwrap(), Value::Null);
+        assert_eq!(joined_len([3usize, 4, 5].into_iter(), 2), 16);
+        assert_eq!(joined_len(std::iter::empty(), 2), 0);
+    }
+
+    /// Ordinary input a function cannot answer gives an error: these once
+    /// panicked (an unknown format, a date past the end of dates, arguments
+    /// left out, numbers past the end of integers).
+    #[test]
+    fn odd_input_is_refused_not_a_panic() {
+        let t = |s: &str| Value::Text(s.into());
+        let day = Value::Date("2026-01-01".parse().unwrap());
+        let at = Value::Timestamp("2026-01-01T10:00:00".parse().unwrap());
+        let e = scalar("strftime", vec![t("%J"), day.clone()]).unwrap_err().to_string();
+        assert!(e.contains("strftime(): `%J` is not a format it knows"), "{e}");
+        assert_eq!(scalar("strftime", vec![t("%Y-%m"), day.clone()]).unwrap(), t("2026-01"));
+        for far in [2_147_483_648, 99_999_999_999, i64::MAX, i64::MIN] {
+            for from in [&day, &at, &Value::TimestampTz(chrono::Utc::now())] {
+                let e = arith(Op::Add, from, &Value::I64(far)).unwrap_err().to_string();
+                assert!(e.contains("date out of range"), "{e}");
+                assert!(arith(Op::Sub, from, &Value::I64(far)).is_err());
+            }
+        }
+        assert_eq!(arith(Op::Add, &day, &Value::I64(31)).unwrap(), Value::Date("2026-02-01".parse().unwrap()));
+        assert!(scalar("_same", vec![]).unwrap_err().to_string().contains("takes 2 argument(s)"));
+        assert!(scalar("_interval", vec![]).is_err());
+        assert!(scalar("_shift", vec![]).unwrap_err().to_string().contains("unknown function"));
+        assert_eq!(scalar("substr", vec![t("abc"), Value::I64(i64::MAX), Value::I64(i64::MAX)]).unwrap(), t(""));
+        assert_eq!(scalar("substr", vec![t("abc"), Value::I64(i64::MIN), Value::I64(i64::MAX)]).unwrap(), t(""));
+        assert_eq!(scalar("substr", vec![t("abc"), Value::I64(2), Value::I64(i64::MAX)]).unwrap(), t("bc"));
+        assert!(interval_months_and_micros("1e300 years 1e300 years").is_err());
+        assert!(shift(&at, "1e300 seconds", -1).is_err());
+        assert!(shift(&at, "-1e300 seconds", -1).is_err());
+        assert_eq!(shift(&day, "1 month", 1).unwrap(), Value::Timestamp("2026-02-01T00:00:00".parse().unwrap()));
     }
 }

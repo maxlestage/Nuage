@@ -56,6 +56,27 @@ const RESERVED: [&str; 46] = [
     "glob",
 ];
 
+/// How many expressions and `SELECT`s may be open one inside the other
+/// (parentheses, function calls, subqueries, `NOT NOT`, `- -`...). The parser
+/// calls itself once per level, and a statement nested without end would take
+/// the whole stack of its thread: past this, it is a syntax error. Statements
+/// written by hand or by a query builder stay far under it; a long list
+/// (`a OR b OR c ...`, `IN (...)`) is not nested and has no limit.
+pub(crate) const MAX_NESTING: usize = 64;
+
+/// How tall an expression may be: the nodes from its top to its deepest
+/// operand, a subquery counting for [`SELECT_HEIGHT`] plus its own tallest
+/// expression. Evaluating, translating, copying and dropping an expression
+/// take one call per node on the way down.
+pub(crate) const MAX_HEIGHT: usize = 200;
+
+/// What a `SELECT` inside another counts for in the height of an expression:
+/// running it takes more of the stack than a node does.
+pub(crate) const SELECT_HEIGHT: usize = 16;
+
+/// The numbers of the `SELECT`s (see [`Select::id`]).
+static SELECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct Parser {
     toks: Vec<Tok>,
     at: usize,
@@ -63,11 +84,21 @@ pub(crate) struct Parser {
     next_param: usize,
     /// The highest parameter used, plus one.
     pub params_used: usize,
+    /// Expressions and `SELECT`s open around what is being read.
+    depth: usize,
+    /// The height of the expression (or `SELECT`) read last.
+    height: usize,
+    /// The tallest expression read in the `SELECT` being read.
+    tallest: usize,
+}
+
+fn too_deep() -> memoire_orm::Error {
+    syntax("the statement is nested too deeply (parentheses, subqueries, functions inside one another): write it in several statements")
 }
 
 /// The statements of `src`, separated by `;`.
 pub(crate) fn parse(src: &str) -> Result<(Vec<Stmt>, usize)> {
-    let mut p = Parser { toks: tokenize(src)?, at: 0, next_param: 0, params_used: 0 };
+    let mut p = Parser::new(tokenize(src)?);
     let mut out = Vec::new();
     loop {
         while p.sym(";") {}
@@ -87,7 +118,7 @@ pub(crate) fn parse(src: &str) -> Result<(Vec<Stmt>, usize)> {
 
 /// One expression of SQL (a column's `DEFAULT`).
 pub(crate) fn parse_expr(src: &str) -> Result<Expr> {
-    let mut p = Parser { toks: tokenize(src)?, at: 0, next_param: 0, params_used: 0 };
+    let mut p = Parser::new(tokenize(src)?);
     let e = p.expr()?;
     if p.at < p.toks.len() {
         return Err(syntax(format!("unexpected {}", p.describe())));
@@ -140,6 +171,38 @@ pub(crate) fn column_type(kind: &str) -> ColumnType {
 }
 
 impl Parser {
+    fn new(toks: Vec<Tok>) -> Parser {
+        Parser { toks, at: 0, next_param: 0, params_used: 0, depth: 0, height: 0, tallest: 0 }
+    }
+
+    /// One more expression or `SELECT` open (closed by `self.depth -= 1`).
+    fn open(&mut self) -> Result<()> {
+        if self.depth >= MAX_NESTING {
+            return Err(too_deep());
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// An expression was built over operands the tallest of which is `under` tall.
+    fn built(&mut self, under: usize) -> Result<()> {
+        self.height = under + 1;
+        if self.height > MAX_HEIGHT { Err(too_deep()) } else { Ok(()) }
+    }
+
+    /// `(255)`, `(10, 2)` after the name of a type: read, and left out.
+    fn type_modifier(&mut self) -> Result<()> {
+        if self.sym("(") {
+            while !self.sym(")") {
+                if self.peek().is_none() {
+                    return Err(syntax("expected `)`"));
+                }
+                self.at += 1;
+            }
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.at)
     }
@@ -292,7 +355,10 @@ impl Parser {
             "explain" => {
                 self.at += 1;
                 self.keywords(&["query", "plan"]);
-                Ok(Stmt::Explain(Box::new(self.statement()?)))
+                self.open()?;
+                let inner = self.statement();
+                self.depth -= 1;
+                Ok(Stmt::Explain(Box::new(inner?)))
             }
             "" if self.sym("(") => {
                 self.at -= 1;
@@ -306,6 +372,20 @@ impl Parser {
     }
 
     pub(crate) fn select(&mut self) -> Result<Select> {
+        self.open()?;
+        let around = std::mem::take(&mut self.tallest);
+        let select = self.select_body();
+        self.depth -= 1;
+        let select = select?;
+        self.height = self.tallest + SELECT_HEIGHT;
+        self.tallest = around.max(self.height);
+        if self.height > MAX_HEIGHT {
+            return Err(too_deep());
+        }
+        Ok(select)
+    }
+
+    fn select_body(&mut self) -> Result<Select> {
         if self.keyword("with") {
             return Err(syntax("WITH (common table expressions) is not supported: use a subquery in FROM"));
         }
@@ -370,7 +450,8 @@ impl Parser {
             self.expect("only")?;
         }
         self.locking_clause()?;
-        Ok(Select { first, rest, order, limit, offset })
+        let id = SELECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Select { id, first, rest, order, limit, offset })
     }
 
     /// PostgreSQL's `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY
@@ -487,19 +568,19 @@ impl Parser {
                         TableRef { source: Source::Table(t), .. } => t.clone(),
                         _ => return Err(syntax("USING needs a named table")),
                     };
-                    let mut on: Option<Expr> = None;
-                    for c in cols {
-                        let eq = Expr::Bin(
+                    let mut equalities = cols.into_iter().map(|c| {
+                        Expr::Bin(
                             Op::Eq,
                             Box::new(Expr::Col { table: Some(left.clone()), name: c.clone() }),
                             Box::new(Expr::Col { table: Some(right.clone()), name: c }),
-                        );
-                        on = Some(match on {
-                            Some(o) => Expr::Bin(Op::And, Box::new(o), Box::new(eq)),
-                            None => eq,
-                        });
+                        )
+                    });
+                    let first = equalities.next();
+                    let rest: Vec<(Op, Expr)> = equalities.map(|eq| (Op::And, eq)).collect();
+                    match first {
+                        Some(first) if !rest.is_empty() => Some(Expr::Chain(Box::new(first), rest)),
+                        first => first,
                     }
-                    on
                 } else {
                     return Err(syntax("expected ON or USING after the joined table"));
                 };
@@ -692,14 +773,7 @@ impl Parser {
             type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}` for column `{name}`")))?;
         // `DOUBLE PRECISION`, `VARCHAR(255)`, `TIMESTAMP WITH TIME ZONE`, `UNSIGNED`.
         let _ = self.keyword("precision") || self.keyword("varying") || self.keyword("unsigned");
-        if self.sym("(") {
-            while !self.sym(")") {
-                if self.peek().is_none() {
-                    return Err(syntax("expected `)`"));
-                }
-                self.at += 1;
-            }
-        }
+        self.type_modifier()?;
         if self.keywords(&["with", "time", "zone"]) {
             if kind == "timestamp" {
                 kind = "timestamptz";
@@ -932,42 +1006,72 @@ impl Parser {
     // -----------------------------------------------------------------------
 
     pub(crate) fn expr(&mut self) -> Result<Expr> {
-        self.or()
+        self.open()?;
+        let e = self.or();
+        self.depth -= 1;
+        self.tallest = self.tallest.max(self.height);
+        e
+    }
+
+    /// `operand (operator operand)*`, the operators of one level: one
+    /// [`Expr::Chain`] however many operands there are.
+    #[inline(always)]
+    fn chain(
+        &mut self,
+        operand: fn(&mut Parser) -> Result<Expr>,
+        operator: fn(&mut Parser) -> Option<Op>,
+    ) -> Result<Expr> {
+        let first = operand(self)?;
+        let Some(mut op) = operator(self) else { return Ok(first) };
+        let mut under = self.height;
+        let mut rest = Vec::new();
+        loop {
+            let x = operand(self)?;
+            under = under.max(self.height);
+            rest.push((op, x));
+            match operator(self) {
+                Some(next) => op = next,
+                None => break,
+            }
+        }
+        self.built(under)?;
+        Ok(Expr::Chain(Box::new(first), rest))
     }
 
     fn or(&mut self) -> Result<Expr> {
-        let mut e = self.and()?;
-        while self.keyword("or") {
-            e = Expr::Bin(Op::Or, Box::new(e), Box::new(self.and()?));
-        }
-        Ok(e)
+        self.chain(Parser::and, |p| p.keyword("or").then_some(Op::Or))
     }
 
     fn and(&mut self) -> Result<Expr> {
-        let mut e = self.not()?;
-        while self.keyword("and") {
-            e = Expr::Bin(Op::And, Box::new(e), Box::new(self.not()?));
-        }
-        Ok(e)
+        self.chain(Parser::not, |p| p.keyword("and").then_some(Op::And))
     }
 
     fn not(&mut self) -> Result<Expr> {
-        if self.keyword("not") {
-            return Ok(Expr::Not(Box::new(self.not()?)));
+        if !self.keyword("not") {
+            return self.comparison();
         }
-        self.comparison()
+        self.open()?;
+        let inner = self.not();
+        self.depth -= 1;
+        let inner = inner?;
+        self.built(self.height)?;
+        Ok(Expr::Not(Box::new(inner)))
     }
 
     fn comparison(&mut self) -> Result<Expr> {
         let left = self.concat()?;
+        let mut under = self.height;
         // `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] DISTINCT FROM`.
         if self.keyword("is") {
             let negated = self.keyword("not");
             if self.keyword("null") {
+                self.built(under)?;
                 return Ok(Expr::IsNull(Box::new(left), negated));
             }
             if self.keyword("true") || self.keyword("false") {
                 let want = matches!(&self.toks[self.at - 1], Tok::Word(w) if w.eq_ignore_ascii_case("true"));
+                // The comparison, `coalesce` around it, and `NOT` around both.
+                self.built(under + if negated { 2 } else { 1 })?;
                 let test = Expr::Func {
                     name: "coalesce".into(),
                     args: vec![
@@ -979,20 +1083,21 @@ impl Parser {
                 };
                 return Ok(if negated { Expr::Not(Box::new(test)) } else { test });
             }
-            if self.keywords(&["distinct", "from"]) {
-                let right = self.concat()?;
-                let same = Expr::Func { name: "_same".into(), args: vec![left, right], distinct: false, star: false };
-                return Ok(if negated { same } else { Expr::Not(Box::new(same)) });
-            }
-            // `a IS b`: SQLite's null-safe equality.
+            // `a IS [NOT] DISTINCT FROM b`; `a IS [NOT] b`: SQLite's null-safe equality.
+            let distinct = self.keywords(&["distinct", "from"]);
             let right = self.concat()?;
+            under = under.max(self.height);
             let same = Expr::Func { name: "_same".into(), args: vec![left, right], distinct: false, star: false };
-            return Ok(if negated { Expr::Not(Box::new(same)) } else { same });
+            let wrapped = distinct != negated;
+            self.built(under + usize::from(wrapped))?;
+            return Ok(if wrapped { Expr::Not(Box::new(same)) } else { same });
         }
         if self.keyword("isnull") {
+            self.built(under)?;
             return Ok(Expr::IsNull(Box::new(left), false));
         }
         if self.keyword("notnull") {
+            self.built(under)?;
             return Ok(Expr::IsNull(Box::new(left), true));
         }
         let negated = self.keyword("not");
@@ -1000,25 +1105,31 @@ impl Parser {
             self.expect_sym("(")?;
             if matches!(self.peek_word(0).as_deref(), Some("select" | "with")) {
                 let sub = self.select()?;
+                under = under.max(self.height);
                 self.expect_sym(")")?;
+                self.built(under)?;
                 return Ok(Expr::InSelect(Box::new(left), Box::new(sub), negated));
             }
             let mut list = Vec::new();
             if !self.sym(")") {
                 loop {
                     list.push(self.expr()?);
+                    under = under.max(self.height);
                     if !self.sym(",") {
                         break;
                     }
                 }
                 self.expect_sym(")")?;
             }
+            self.built(under)?;
             return Ok(Expr::In(Box::new(left), list, negated));
         }
         if self.keyword("between") {
             let low = self.concat()?;
+            under = under.max(self.height);
             self.expect("and")?;
             let high = self.concat()?;
+            self.built(under.max(self.height))?;
             return Ok(Expr::Between(Box::new(left), Box::new(low), Box::new(high), negated));
         }
         let like = if self.keyword("like") {
@@ -1030,7 +1141,15 @@ impl Parser {
         };
         if let Some(ci) = like {
             let pattern = self.concat()?;
-            let escape = if self.keyword("escape") { Some(Box::new(self.concat()?)) } else { None };
+            under = under.max(self.height);
+            let escape = if self.keyword("escape") {
+                let e = self.concat()?;
+                under = under.max(self.height);
+                Some(Box::new(e))
+            } else {
+                None
+            };
+            self.built(under)?;
             return Ok(Expr::Like { expr: Box::new(left), pattern: Box::new(pattern), ci, negated, escape });
         }
         if negated {
@@ -1048,86 +1167,79 @@ impl Parser {
         self.at += 1;
         // `x = ANY (...)` is not supported; plain comparisons only.
         let right = self.concat()?;
+        self.built(under.max(self.height))?;
         Ok(Expr::Bin(op, Box::new(left), Box::new(right)))
     }
 
     fn concat(&mut self) -> Result<Expr> {
-        let mut e = self.additive()?;
-        while self.sym("||") {
-            e = Expr::Bin(Op::Concat, Box::new(e), Box::new(self.additive()?));
-        }
-        Ok(e)
+        self.chain(Parser::additive, |p| p.sym("||").then_some(Op::Concat))
     }
 
+    /// `x + y - z`. `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`: the
+    /// interval stays an operand, and whoever evaluates the chain moves the
+    /// date by it ([`Expr::interval`]).
     fn additive(&mut self) -> Result<Expr> {
-        let mut e = self.term()?;
-        loop {
-            let op = if self.sym("+") {
-                Op::Add
-            } else if self.sym("-") {
-                Op::Sub
+        let e = self.chain(Parser::term, |p| {
+            if p.sym("+") {
+                Some(Op::Add)
+            } else if p.sym("-") {
+                Some(Op::Sub)
             } else {
-                return Ok(e);
-            };
-            let right = self.term()?;
-            e = match (op, e, right) {
-                // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`, `INTERVAL '...' + x`.
-                (op, x, Expr::Func { name, mut args, .. }) if name == "_interval" => {
-                    let sign = if op == Op::Sub { -1 } else { 1 };
-                    Expr::Func {
-                        name: "_shift".into(),
-                        args: vec![x, args.remove(0), Expr::Lit(Value::I64(sign))],
-                        distinct: false,
-                        star: false,
-                    }
-                }
-                (Op::Add, Expr::Func { name, mut args, .. }, x) if name == "_interval" => Expr::Func {
-                    name: "_shift".into(),
-                    args: vec![x, args.remove(0), Expr::Lit(Value::I64(1))],
-                    distinct: false,
-                    star: false,
-                },
-                (op, l, r) => Expr::Bin(op, Box::new(l), Box::new(r)),
-            };
-        }
+                None
+            }
+        })?;
+        Ok(match e {
+            // `INTERVAL '...' + x`: the date first.
+            Expr::Chain(mut first, mut rest)
+                if first.interval().is_some() && rest[0].0 == Op::Add && rest[0].1.interval().is_none() =>
+            {
+                std::mem::swap(&mut *first, &mut rest[0].1);
+                Expr::Chain(first, rest)
+            }
+            e => e,
+        })
     }
 
     fn term(&mut self) -> Result<Expr> {
-        let mut e = self.unary()?;
-        loop {
-            let op = if self.sym("*") {
-                Op::Mul
-            } else if self.sym("/") {
-                Op::Div
-            } else if self.sym("%") {
-                Op::Mod
+        self.chain(Parser::unary, |p| {
+            if p.sym("*") {
+                Some(Op::Mul)
+            } else if p.sym("/") {
+                Some(Op::Div)
+            } else if p.sym("%") {
+                Some(Op::Mod)
             } else {
-                return Ok(e);
-            };
-            e = Expr::Bin(op, Box::new(e), Box::new(self.unary()?));
-        }
+                None
+            }
+        })
     }
 
     fn unary(&mut self) -> Result<Expr> {
         if self.sym("-") {
-            return Ok(match self.unary()? {
-                Expr::Lit(Value::I64(n)) => Expr::Lit(Value::I64(-n)),
+            self.open()?;
+            let inner = self.unary();
+            self.depth -= 1;
+            return Ok(match inner? {
+                Expr::Lit(Value::I64(n)) if n != i64::MIN => Expr::Lit(Value::I64(-n)),
                 Expr::Lit(Value::F64(n)) => Expr::Lit(Value::F64(-n)),
-                e => Expr::Neg(Box::new(e)),
+                e => {
+                    self.built(self.height)?;
+                    Expr::Neg(Box::new(e))
+                }
             });
         }
         if self.sym("+") {
-            return self.unary();
+            self.open()?;
+            let inner = self.unary();
+            self.depth -= 1;
+            return inner;
         }
         let mut e = self.primary()?;
         while self.sym("::") {
             let word = self.name()?;
             let (kind, _) = type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}`")))?;
-            if self.sym("(") {
-                while !self.sym(")") {
-                    self.at += 1;
-                }
-            }
+            self.type_modifier()?;
+            self.built(self.height)?;
             e = Expr::Cast(Box::new(e), column_type(kind));
         }
         Ok(e)
@@ -1135,6 +1247,8 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr> {
         let tok = self.peek().cloned().ok_or_else(|| syntax("expected an expression, found the end"))?;
+        // A value or a name, unless said otherwise below.
+        self.height = 1;
         match tok {
             Tok::Str(s) => {
                 self.at += 1;
@@ -1160,6 +1274,7 @@ impl Parser {
                 if matches!(self.peek_word(0).as_deref(), Some("select" | "with" | "values")) {
                     let sub = self.select()?;
                     self.expect_sym(")")?;
+                    self.built(self.height)?;
                     return Ok(Expr::Scalar(Box::new(sub)));
                 }
                 let e = self.expr()?;
@@ -1199,6 +1314,7 @@ impl Parser {
                         let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
                         self.at += 2;
                         let (kind, _) = type_of(&lw).expect("a type");
+                        self.height = 2;
                         return Ok(Expr::Cast(Box::new(Expr::Lit(Value::Text(text))), column_type(kind)));
                     }
                     // `INTERVAL '1 day'`: a span to add to or take from a date
@@ -1207,6 +1323,7 @@ impl Parser {
                         let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
                         self.at += 2;
                         value::interval_months_and_micros(&text)?;
+                        self.height = 2;
                         return Ok(Expr::Func {
                             name: "_interval".into(),
                             args: vec![Expr::Lit(Value::Text(text))],
@@ -1219,6 +1336,7 @@ impl Parser {
                         self.expect_sym("(")?;
                         let sub = self.select()?;
                         self.expect_sym(")")?;
+                        self.built(self.height)?;
                         return Ok(Expr::Exists(Box::new(sub), false));
                     }
                     "case" => {
@@ -1228,15 +1346,22 @@ impl Parser {
                     "cast" if self.toks.get(self.at + 1) == Some(&Tok::Sym("(")) => {
                         self.at += 2;
                         let e = self.expr()?;
+                        let under = self.height;
                         self.expect("as")?;
                         let word = self.name()?;
                         let (kind, _) = type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}`")))?;
+                        // `DOUBLE PRECISION`, `VARCHAR(255)`, `TIMESTAMP WITH TIME ZONE`.
                         while !self.sym(")") {
+                            if self.peek() == Some(&Tok::Sym("(")) {
+                                self.type_modifier()?;
+                                continue;
+                            }
                             if self.peek().is_none() {
                                 return Err(syntax("expected `)`"));
                             }
                             self.at += 1;
                         }
+                        self.built(under)?;
                         return Ok(Expr::Cast(Box::new(e), column_type(kind)));
                     }
                     _ => {}
@@ -1252,6 +1377,7 @@ impl Parser {
 
     fn column(&mut self) -> Result<Expr> {
         let first = self.name()?;
+        self.height = 1;
         if self.sym(".") {
             let name = self.name()?;
             return Ok(Expr::Col { table: Some(first), name });
@@ -1260,15 +1386,21 @@ impl Parser {
     }
 
     fn call(&mut self, name: String) -> Result<Expr> {
+        // The functions the parser writes itself (`_same`, `_interval`) are not for statements.
+        if name.starts_with('_') {
+            return Err(syntax(format!("unknown function {name}()")));
+        }
         self.at += 2; // name (
         if name == "values" {
             // MySQL's `VALUES(col)` in ON DUPLICATE KEY UPDATE: the new value.
             let col = self.name()?;
             self.expect_sym(")")?;
+            self.height = 1;
             return Ok(Expr::Col { table: Some("excluded".into()), name: col });
         }
         if self.sym("*") {
             self.expect_sym(")")?;
+            self.height = 1;
             return Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: true });
         }
         // `extract(epoch FROM x)`: the standard form of extract('epoch', x).
@@ -1276,7 +1408,9 @@ impl Parser {
             let field = self.name()?;
             self.expect("from")?;
             let x = self.expr()?;
+            let under = self.height;
             self.expect_sym(")")?;
+            self.built(under)?;
             return Ok(Expr::Func {
                 name,
                 args: vec![Expr::Lit(Value::Text(field.to_ascii_lowercase())), x],
@@ -1286,9 +1420,11 @@ impl Parser {
         }
         let distinct = self.keyword("distinct");
         let mut args = Vec::new();
+        let mut under = 0;
         if !self.sym(")") {
             loop {
                 args.push(self.expr()?);
+                under = under.max(self.height);
                 if !self.sym(",") {
                     break;
                 }
@@ -1303,23 +1439,40 @@ impl Parser {
             return Err(syntax("window functions and FILTER are not supported"));
         }
         // `substring(x from 2 for 3)` is written substr(x, 2, 3) here.
+        self.built(under)?;
         Ok(Expr::Func { name, args, distinct, star: false })
     }
 
     fn case(&mut self) -> Result<Expr> {
-        let operand =
-            if matches!(self.peek_word(0).as_deref(), Some("when")) { None } else { Some(Box::new(self.expr()?)) };
+        let mut under = 0;
+        let operand = if matches!(self.peek_word(0).as_deref(), Some("when")) {
+            None
+        } else {
+            let e = self.expr()?;
+            under = self.height;
+            Some(Box::new(e))
+        };
         let mut whens = Vec::new();
         while self.keyword("when") {
             let w = self.expr()?;
+            under = under.max(self.height);
             self.expect("then")?;
-            whens.push((w, self.expr()?));
+            let then = self.expr()?;
+            under = under.max(self.height);
+            whens.push((w, then));
         }
         if whens.is_empty() {
             return Err(syntax("CASE needs at least one WHEN"));
         }
-        let otherwise = if self.keyword("else") { Some(Box::new(self.expr()?)) } else { None };
+        let otherwise = if self.keyword("else") {
+            let e = self.expr()?;
+            under = under.max(self.height);
+            Some(Box::new(e))
+        } else {
+            None
+        };
         self.expect("end")?;
+        self.built(under)?;
         Ok(Expr::Case { operand, whens, otherwise })
     }
 }
@@ -1445,7 +1598,17 @@ mod tests {
     #[test]
     fn expressions() {
         let e = parse_expr("a + b * 2 - -c || 'x' = 'y' AND NOT d IS NULL OR e IN (1, 2)").unwrap();
-        assert!(matches!(e, Expr::Bin(Op::Or, ..)));
+        let Expr::Chain(and, or) = e else { panic!() };
+        assert!(matches!(or.as_slice(), [(Op::Or, Expr::In(..))]));
+        let Expr::Chain(compared, not) = *and else { panic!() };
+        assert!(matches!(not.as_slice(), [(Op::And, Expr::Not(_))]));
+        let Expr::Bin(Op::Eq, left, _) = *compared else { panic!() };
+        // `a + (b * 2) - (-c)`, then `|| 'x'`.
+        let Expr::Chain(sum, concat) = *left else { panic!() };
+        assert!(matches!(concat.as_slice(), [(Op::Concat, Expr::Lit(_))]));
+        let Expr::Chain(a, terms) = *sum else { panic!() };
+        assert!(matches!(*a, Expr::Col { .. }));
+        assert!(matches!(terms.as_slice(), [(Op::Add, Expr::Chain(..)), (Op::Sub, Expr::Neg(_))]));
         assert!(matches!(parse_expr("CASE WHEN a > 1 THEN 'big' ELSE 'small' END").unwrap(), Expr::Case { .. }));
         assert!(matches!(parse_expr("CAST(x AS INTEGER)").unwrap(), Expr::Cast(_, ColumnType::Int)));
         assert!(matches!(parse_expr("x::text").unwrap(), Expr::Cast(_, ColumnType::Text)));
