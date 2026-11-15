@@ -138,6 +138,17 @@ pub struct ServerOptions {
     /// Memory of each application's key-value store (`/v1/kv`, the key-value
     /// port), in bytes (`NUAGE_KV_MB`). Default: 32 MiB.
     pub kv_bytes: usize,
+    /// Memory the key-value stores of all the applications may hold
+    /// together: each has the smaller of `kv_bytes` and its equal part of
+    /// this (`None`: `kv_bytes` each, whatever their number).
+    pub kv_budget: Option<usize>,
+    /// Memory the page caches of all the applications may hold together,
+    /// shared equally among them (`None`: each engine keeps its
+    /// [`EngineOptions::cache_bytes`](crate::EngineOptions)).
+    pub cache_budget: Option<usize>,
+    /// PostgreSQL connections served at once (each has a thread); the next
+    /// ones are refused as PostgreSQL does (`too_many_connections`).
+    pub pg_max_connections: usize,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -152,6 +163,8 @@ impl std::fmt::Debug for ServerOptions {
             .field("pg_tls", &self.pg_tls)
             .field("files", &self.files.as_ref().map(|f| f.describe()))
             .field("kv_bytes", &self.kv_bytes)
+            .field("cache_budget", &self.cache_budget)
+            .field("pg_max_connections", &self.pg_max_connections)
             .finish()
     }
 }
@@ -170,6 +183,9 @@ impl Default for ServerOptions {
             pg_tls: false,
             files: None,
             kv_bytes: 32 << 20,
+            kv_budget: None,
+            cache_budget: None,
+            pg_max_connections: 100,
         }
     }
 }
@@ -272,7 +288,20 @@ pub(crate) struct State {
     pub(crate) read_costs: Arc<fast::ReadCosts>,
     transactions: Mutex<HashMap<String, Arc<OpenTx>>>,
     pub(crate) admin: admin::Sessions,
+    /// PostgreSQL connections open now.
+    pub(crate) pg_connections: std::sync::atomic::AtomicUsize,
+    memory_ticks: AtomicU64,
+    memory_reliefs: AtomicU64,
+    /// Looks at the memory in a row that found it comfortable.
+    memory_calm: AtomicU64,
 }
+
+/// Seconds between two looks at the memory.
+const MEMORY_CHECK_EVERY: u64 = 2;
+/// The share of the memory in use past which the caches are emptied.
+const MEMORY_HIGH: f64 = 0.85;
+/// The share under which the memory is comfortable.
+const MEMORY_CALM: f64 = 0.6;
 
 /// A Nuage DB server. See the [module](self) docs.
 ///
@@ -333,7 +362,7 @@ impl Server {
     pub fn new(engine: Arc<Engine>, options: ServerOptions) -> Server {
         Server {
             state: Arc::new(State {
-                apps: apps::Apps::open(engine.clone(), options.kv_bytes),
+                apps: apps::Apps::open(engine.clone(), options.kv_bytes, options.kv_budget, options.cache_budget),
                 engine,
                 options,
                 metrics: Metrics::new(),
@@ -341,6 +370,10 @@ impl Server {
                 read_costs: Arc::new(fast::ReadCosts::new()),
                 transactions: Mutex::new(HashMap::new()),
                 admin: admin::Sessions::default(),
+                pg_connections: std::sync::atomic::AtomicUsize::new(0),
+                memory_ticks: AtomicU64::new(0),
+                memory_reliefs: AtomicU64::new(0),
+                memory_calm: AtomicU64::new(0),
             }),
         }
     }
@@ -434,6 +467,7 @@ impl Server {
                     _ = tick.tick() => {
                         state.expire_transactions();
                         state.sweep_keys();
+                        state.watch_memory();
                     }
                     accepted = listener.accept() => {
                         let Ok((stream, peer)) = accepted else { continue };
@@ -477,7 +511,16 @@ impl Server {
                         if stream.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let (state, options) = (state.clone(), options.clone());
+                        // Each connection has a thread: past the limit they are
+                        // told so (a short-lived thread), and far past it,
+                        // dropped, so that a flood cannot use up the threads.
+                        let open = state.pg_connections.load(Ordering::Relaxed);
+                        let max = state.options.pg_max_connections.max(1);
+                        if open >= max + 16 {
+                            continue;
+                        }
+                        let (state, mut options) = (state.clone(), options.clone());
+                        options.refuse = open >= max;
                         // A thread per connection, as PostgreSQL has a process:
                         // its statements block on the engine. Not a runtime
                         // task, so an idle client never delays a shutdown.
@@ -519,6 +562,51 @@ impl Server {
 }
 
 impl State {
+    /// Every few seconds: when the memory in use nears its limit, lets go of
+    /// what can be read again (the page caches) and gives the freed memory
+    /// back to the system. Statements go on; they only read the disk more.
+    fn watch_memory(&self) {
+        let tick = self.memory_ticks.fetch_add(1, Ordering::Relaxed);
+        if !tick.is_multiple_of(MEMORY_CHECK_EVERY) {
+            return;
+        }
+        let m = crate::memory::MemoryInfo::now();
+        let Some(pressure) = m.pressure() else { return };
+        if pressure < MEMORY_HIGH {
+            // Comfortable for ten minutes in a row: a budget that was
+            // tightened grows back, a step at a time.
+            let calm = if pressure < MEMORY_CALM { self.memory_calm.fetch_add(1, Ordering::Relaxed) + 1 } else { 0 };
+            if calm >= 600 / MEMORY_CHECK_EVERY {
+                self.memory_calm.store(0, Ordering::Relaxed);
+                if self.apps.loosen_cache() {
+                    let budget = self.apps.cache_budget().unwrap_or(0) >> 20;
+                    self.engine.event("info", format!("memory: comfortable again, the page caches get {budget} MiB"));
+                }
+            } else if pressure >= MEMORY_CALM {
+                self.memory_calm.store(0, Ordering::Relaxed);
+            }
+            return;
+        }
+        self.memory_calm.store(0, Ordering::Relaxed);
+        let budget = self.apps.tighten_cache();
+        crate::memory::release_free_memory();
+        self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
+        let message = format!(
+            "memory: {:.0} % of {} MiB in use: the page caches were emptied{} and the freed memory returned to the system",
+            pressure * 100.0,
+            m.total_bytes.unwrap_or(0) >> 20,
+            budget.map(|b| format!(", their budget set to {} MiB", b >> 20)).unwrap_or_default()
+        );
+        // In the event log, and in the server's own log.
+        println!("nuage: {message}");
+        self.engine.event("warn", message);
+    }
+
+    /// Times the memory guard emptied the caches.
+    pub(crate) fn memory_reliefs(&self) -> u64 {
+        self.memory_reliefs.load(Ordering::Relaxed)
+    }
+
     fn expire_transactions(&self) {
         let timeout = self.options.transaction_timeout;
         let mut txs = self.transactions.lock().unwrap_or_else(|e| e.into_inner());

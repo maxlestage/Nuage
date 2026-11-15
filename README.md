@@ -489,9 +489,13 @@ administrators only, with a firewall rule for the local network.
 - **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
   `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
   `$env:NUAGE_ACTION = 'uninstall'` (or `'purge'`), then the same command.
-- **Memory**: each application's page cache is `NUAGE_CACHE_MB=auto`, an eighth of the
-  memory (8 to 512 MiB); the rest stays on disk. The console's *Server* page shows the memory
-  Nuage DB uses, the free memory and the swap.
+- **Memory**: the page caches of all the applications share one budget,
+  `NUAGE_CACHE_MB=auto`: a quarter of the memory (16 MiB to 4 GiB), in equal parts, so they
+  never outgrow it however many applications there are; the rest stays on disk. If the memory
+  in use passes 85 %, the caches are emptied, their budget halved and the freed memory
+  returned to the system, while requests go on; it grows back once memory is comfortable.
+  The console's *Server* page and the dashboard's **Memory** card show the memory this server
+  may use (its container's limit, where it has one), what is used and what is left.
 - **By hand**: binaries for Linux, macOS and Windows are on the
   [releases page](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
   starts the server with the settings of a file (`KEY=value` lines; the environment wins).
@@ -635,7 +639,9 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_ADMIN_PASSWORD` | password of the console (and of the dashboard) | none: the console is off |
 | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
-| `NUAGE_CACHE_MB` | page cache of each application, in MiB, or `auto` | `auto`: an eighth of the memory, 8 to 512 MiB |
+| `NUAGE_CACHE_MB` | memory the page caches of all the applications may hold together, in MiB, or `auto`; shared equally among them | `auto`: a quarter of the memory, 16 MiB to 4 GiB |
+| `NUAGE_MEMORY_MB` | the memory to count on, in MiB, for a host that limits it without saying so | the container's limit, else the machine's memory |
+| `NUAGE_PG_MAX_CONNECTIONS` | PostgreSQL connections served at once (each has a thread) | `100`, less where the system allows few threads |
 | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); the environment wins over the file | none |
 | `NUAGE_BACKUP_DIR` | back up to this folder, on another disk (the server warns when it is on the data's disk) | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |

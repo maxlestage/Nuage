@@ -252,7 +252,9 @@ pub struct KeyInfo {
 /// A key-value store in memory. See the [module](self) docs.
 pub struct Kv {
     start: Instant,
-    max_bytes: usize,
+    /// It changes when a server shares its key-value memory among more or
+    /// fewer applications.
+    max_bytes: std::sync::atomic::AtomicUsize,
     inner: Mutex<Inner>,
 }
 
@@ -271,7 +273,21 @@ impl Kv {
     /// A store that keeps `max_bytes` of keys and values at most (64 KiB at
     /// least).
     pub fn new(max_bytes: usize) -> Kv {
-        Kv { start: Instant::now(), max_bytes: max_bytes.max(64 << 10), inner: Mutex::new(Inner::default()) }
+        Kv {
+            start: Instant::now(),
+            max_bytes: std::sync::atomic::AtomicUsize::new(max_bytes.max(64 << 10)),
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// Changes how much the store keeps at most (64 KiB at least); a smaller
+    /// limit lets go at once of what is over it: the keys that expired, then
+    /// the least recently used.
+    pub fn set_max_bytes(&self, max_bytes: usize) {
+        let max = max_bytes.max(64 << 10);
+        self.max_bytes.store(max, std::sync::atomic::Ordering::Relaxed);
+        let now = self.now();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).fit(max, now);
     }
 
     fn now(&self) -> u64 {
@@ -281,7 +297,8 @@ impl Kv {
     fn locked<T>(&self, f: impl FnOnce(&mut Locked<'_>) -> T) -> T {
         let now = self.now();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut Locked { max_bytes: self.max_bytes, inner: &mut inner, now })
+        let max_bytes = self.max_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        f(&mut Locked { max_bytes, inner: &mut inner, now })
     }
 
     /// The value of `key`.

@@ -903,8 +903,9 @@ const SHARDS: usize = 16;
 /// ones not read lately go first.
 struct Cache {
     shards: Vec<Mutex<Shard>>,
-    /// Bytes a shard may hold.
-    capacity: usize,
+    /// Bytes a shard may hold (it changes when the server shares its cache
+    /// budget among more or fewer applications).
+    capacity: AtomicUsize,
     used: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -914,7 +915,7 @@ impl Cache {
     fn new(bytes: usize) -> Cache {
         Cache {
             shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
-            capacity: bytes / SHARDS,
+            capacity: AtomicUsize::new(bytes / SHARDS),
             used: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -965,7 +966,8 @@ impl Cache {
         shard.bytes += bytes;
         shard.bytes -= freed;
         // The clock: a page read since the hand last passed gets another turn.
-        while shard.bytes > self.capacity {
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        while shard.bytes > capacity {
             let Some(victim) = shard.ring.pop_front() else { break };
             match shard.map.get_mut(&victim) {
                 Some(c) if c.hot && victim != page => {
@@ -998,6 +1000,30 @@ impl Cache {
             let mut shard = lock(shard);
             self.used.fetch_sub(shard.bytes, Ordering::Relaxed);
             *shard = Shard::default();
+        }
+    }
+
+    /// Bytes the cache may hold.
+    fn limit(&self) -> usize {
+        self.capacity.load(Ordering::Relaxed) * SHARDS
+    }
+
+    /// Changes what the cache may hold; a smaller one lets go of the pages
+    /// over it at once (the oldest first).
+    fn set_limit(&self, bytes: usize) {
+        let capacity = bytes / SHARDS;
+        self.capacity.store(capacity, Ordering::Relaxed);
+        for shard in &self.shards {
+            let mut shard = lock(shard);
+            let mut freed = 0;
+            while shard.bytes > capacity {
+                let Some(victim) = shard.ring.pop_front() else { break };
+                if let Some(c) = shard.map.remove(&victim) {
+                    shard.bytes -= c.bytes;
+                    freed += c.bytes;
+                }
+            }
+            self.used.fetch_sub(freed, Ordering::Relaxed);
         }
     }
 }
@@ -1237,6 +1263,21 @@ fn encode_directory(trees: &Trees) -> Vec<u8> {
 
 impl Pages {
     /// Opens (or creates) the page file at `path`, encrypted with `xts` if any.
+    /// Bytes the cache of decoded pages may hold.
+    pub(crate) fn cache_limit(&self) -> usize {
+        self.cache.limit()
+    }
+
+    /// Changes what the cache may hold (see [`Cache::set_limit`]).
+    pub(crate) fn set_cache_limit(&self, bytes: usize) {
+        self.cache.set_limit(bytes);
+    }
+
+    /// Lets go of every cached page: they are read again when needed.
+    pub(crate) fn drop_cache(&self) {
+        self.cache.clear();
+    }
+
     pub(crate) fn open(path: &Path, cache_bytes: usize, xts: Option<Arc<Xts>>, sync: bool) -> Result<Pages> {
         let disk = Disk::open(path, xts)?;
         let loaded = load(&disk)?;

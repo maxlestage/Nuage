@@ -285,7 +285,6 @@ pub(crate) struct Store {
     catalog: Mutex<Catalog>,
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
-    dirty_limit: usize,
     /// Commits the log read at opening does not hold, between two it does:
     /// the last one before the gap and the first one after it.
     pub log_gap: Option<(u64, u64)>,
@@ -369,7 +368,17 @@ pub(crate) fn now_millis() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Changed pages kept in memory before they go to disk on the way: a quarter
+/// of the cache, a mebibyte at least.
+fn dirty_limit_of(cache_bytes: usize) -> usize {
+    (cache_bytes / 4).max(1 << 20)
+}
+
 impl Store {
+    fn dirty_limit(&self) -> usize {
+        dirty_limit_of(self.pages.cache_limit())
+    }
+
     /// Opens the store in `dir`, replaying the log written since the last
     /// checkpoint, then checkpoints.
     pub(crate) fn open(dir: &Path, cache_bytes: usize, sync: bool, keys: Option<&Keys>) -> Result<Store> {
@@ -378,7 +387,7 @@ impl Store {
         let checkpoint_lsn = u64_of(read_meta(&pages, CHECKPOINT_LSN)?);
         let wal_dir = dir.join("wal");
         let records = wal::recover_after(&wal_dir, keys.map(|k| k.wal.as_ref()), checkpoint_lsn)?;
-        let dirty_limit = (cache_bytes / 4).max(1 << 20);
+        let dirty_limit = dirty_limit_of(cache_bytes);
         let mut last = checkpoint_lsn;
         let mut log_gap = None;
         for r in records.iter().filter(|r| r.lsn > checkpoint_lsn) {
@@ -421,7 +430,6 @@ impl Store {
             saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
             catalog: Mutex::new(Catalog::default()),
-            dirty_limit,
             log_gap,
         };
         store.load_branches()?;
@@ -737,7 +745,7 @@ impl Store {
             // Nothing is synced: a commit counts as on disk as soon as it is applied.
             self.on_disk(&self.pages.version());
         }
-        if self.pages.dirty_bytes() > self.dirty_limit {
+        if self.pages.dirty_bytes() > self.dirty_limit() {
             // Much was written since the last checkpoint: the changed nodes go
             // to disk now rather than wait in memory. The log is left as it is.
             // The commit is made whether this succeeds or not: a page store
@@ -1048,7 +1056,7 @@ mod tests {
         for id in 0..40 {
             db.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), body.clone().into()]).unwrap();
         }
-        assert!(store.pages.dirty_bytes() > store.dirty_limit, "past the limit: every commit tried to flush");
+        assert!(store.pages.dirty_bytes() > store.dirty_limit(), "past the limit: every commit tried to flush");
         assert_eq!(count(&db), "I64(40)");
         assert!(db.engine().checkpoint().is_err());
         store.pages.fail_checkpoints.store(false, Ordering::Relaxed);
