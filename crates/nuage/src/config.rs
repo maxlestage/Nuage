@@ -21,6 +21,7 @@
 //! | `NUAGE_MEMORY_MB` | the memory to count on, in MiB, for a host that limits it without saying so | the container's limit, else the machine's memory |
 //! | `NUAGE_PG_MAX_CONNECTIONS` | PostgreSQL connections served at once (each has a thread) | `100`, less where the system allows few threads |
 //! | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); a variable of the environment wins over the file | none |
+//! | `NUAGE_SETTINGS` | `environment`: the settings are those of the environment only; what was saved from the console (Settings page, `/api/settings`, `nuage settings`) is ignored and the console changes nothing | saved settings win over the environment |
 //! | `NUAGE_BACKUP_DIR` | back up to this directory (another disk: a backup on the data's disk dies with it) | |
 //! | `NUAGE_BACKUP_S3_BUCKET` | back up to this S3 bucket | |
 //! | `NUAGE_BACKUP_S3_ENDPOINT` | S3 endpoint URL | `https://s3.<region>.amazonaws.com` |
@@ -185,6 +186,46 @@ fn file_store(get: &impl Fn(&str) -> Option<String>, bucket: String) -> Result<c
     )
 }
 
+/// The settings read once at startup, in the order the console shows them,
+/// and whether each is a secret (shown as set or not, never its value).
+#[cfg(feature = "server")]
+const STARTUP: [(&str, bool); 34] = [
+    ("PORT", false),
+    ("NUAGE_BIND", false),
+    ("NUAGE_DATA_DIR", false),
+    ("NUAGE_NAME", false),
+    ("NUAGE_ENCRYPTION_KEY", true),
+    ("NUAGE_TOKEN", true),
+    ("NUAGE_ADMIN_PASSWORD", true),
+    ("NUAGE_ADMIN_TOKEN", true),
+    ("NUAGE_PG_PORT", false),
+    ("NUAGE_PG_BIND", false),
+    ("NUAGE_KV_PORT", false),
+    ("NUAGE_KV_BIND", false),
+    ("NUAGE_TLS_CERT", false),
+    ("NUAGE_TLS_KEY", false),
+    ("NUAGE_BACKUP_DIR", false),
+    ("NUAGE_BACKUP_S3_BUCKET", false),
+    ("NUAGE_BACKUP_S3_ENDPOINT", false),
+    ("NUAGE_BACKUP_S3_REGION", false),
+    ("NUAGE_BACKUP_S3_PREFIX", false),
+    ("NUAGE_BACKUP_S3_ACCESS_KEY_ID", true),
+    ("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY", true),
+    ("NUAGE_BACKUP_SNAPSHOT_MINUTES", false),
+    ("NUAGE_FILES_S3_BUCKET", false),
+    ("NUAGE_FILES_S3_ENDPOINT", false),
+    ("NUAGE_FILES_S3_REGION", false),
+    ("NUAGE_FILES_S3_PREFIX", false),
+    ("NUAGE_FILES_S3_ACCESS_KEY_ID", true),
+    ("NUAGE_FILES_S3_SECRET_ACCESS_KEY", true),
+    ("NUAGE_FILES_LINK_MINUTES", false),
+    ("NUAGE_KEEP_AWAKE_URL", false),
+    ("NUAGE_KEEP_AWAKE_MINUTES", false),
+    ("NUAGE_KEEP_AWAKE_HOURS", false),
+    ("NUAGE_ENV_FILE", false),
+    ("NUAGE_SETTINGS", false),
+];
+
 /// Reads the configuration through `var` (`std::env::var` in the binary).
 #[cfg(feature = "server")]
 pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
@@ -228,7 +269,32 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         // Each has a thread: well under what the system lets this user start.
         None => crate::memory::thread_limit().map_or(100, |limit| (limit / 2).clamp(8, 100)),
     };
+    let settings_read_only = match get("NUAGE_SETTINGS").as_deref() {
+        None | Some("saved") => false,
+        Some("environment") => true,
+        Some(other) => {
+            return Err(Error::Validation(format!(
+                "NUAGE_SETTINGS=`{other}` is not valid: `environment` (the settings are those of the environment only), \
+                 or nothing (what the console saved wins)"
+            )));
+        }
+    };
+    // What the environment says for the settings the owner may change later.
+    let settings_env = crate::server::settings::DEFS
+        .iter()
+        .filter_map(|d| get(d.var).map(|v| (d.var.to_owned(), v)))
+        .collect::<std::collections::HashMap<String, String>>();
+    let startup = STARTUP
+        .iter()
+        .map(|&(var, secret)| crate::server::StartupSetting {
+            var,
+            value: get(var).map(|v| if secret { crate::server::StartupSetting::SECRET.to_owned() } else { v }),
+        })
+        .collect();
     let server = ServerOptions {
+        settings_env: Some(settings_env),
+        settings_read_only,
+        startup,
         kv_bytes,
         kv_budget: crate::memory::kv_budget(get("NUAGE_KV_MB").as_deref()),
         files,
@@ -283,7 +349,9 @@ pub fn from_env_file(path: &std::path::Path) -> Result<Config> {
         .map_err(|e| Error::Validation(format!("cannot read the settings file {}: {e}", path.display())))?;
     let file: std::collections::HashMap<String, String> =
         parse_env_file(&text).map_err(|e| Error::Validation(format!("{}: {e}", path.display())))?.into_iter().collect();
-    from_vars(|k| std::env::var(k).ok().or_else(|| file.get(k).cloned()))
+    let mut config = from_vars(|k| std::env::var(k).ok().or_else(|| file.get(k).cloned()))?;
+    config.server.settings_file = Some(path.display().to_string());
+    Ok(config)
 }
 
 /// The variables of a settings file: `KEY=value` lines, `#` comments and blank

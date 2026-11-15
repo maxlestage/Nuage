@@ -45,6 +45,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("apps") {
         return apps(std::env::args().skip(2).collect());
     }
+    // `nuage settings`, `nuage settings set <key> <value>`, `nuage settings unset <key>`:
+    // what the console's Settings page changes, from a terminal.
+    if std::env::args().nth(1).as_deref() == Some("settings") {
+        return settings(std::env::args().skip(2).collect());
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("help" | "--help" | "-h")) {
         println!("{HELP}");
         return ExitCode::SUCCESS;
@@ -160,6 +165,9 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "site"))]
         let options = config.server;
         let server = Server::new(engine.clone(), options);
+        for line in server.setting_overrides() {
+            log(&line);
+        }
         // What each application holds, and what came from an earlier version.
         for app in server.apps() {
             let Some(e) = server.app_engine(&app.name) else { continue };
@@ -334,6 +342,10 @@ async fn shutdown_signal() {
 
 const APPS_USAGE: &str = "usage: nuage apps create <name> [description]
        nuage apps list
+       nuage apps memory <name> <page cache> [key-value store]   (amounts: 256, 2G, auto)
+       nuage settings
+       nuage settings set <key> <value>
+       nuage settings unset <key>
 On the server's computer, nothing else: the settings file of the installer gives the token and
 the port (sudo reads it). From anywhere else: NUAGE_URL (the server, https://…) and
 NUAGE_ADMIN_TOKEN (its management token).";
@@ -435,6 +447,51 @@ fn apps(args: Vec<String>) -> ExitCode {
                 None => lines,
             }),
         ["list"] => runtime.block_on(nuage::keepawake::list_apps(&url, &token)),
+        ["memory", name, cache] => runtime.block_on(nuage::keepawake::set_app_memory(&url, &token, name, cache, None)),
+        ["memory", name, cache, kv] => {
+            runtime.block_on(nuage::keepawake::set_app_memory(&url, &token, name, cache, Some(kv)))
+        }
+        _ => {
+            eprintln!("{APPS_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match answer {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `nuage settings …`: shows or changes the settings of a server.
+fn settings(args: Vec<String>) -> ExitCode {
+    let (url, token, _) = match apps_target() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).take_while(|a| *a != "--env-file").collect();
+    let answer = match args.as_slice() {
+        [] | ["list"] => runtime.block_on(nuage::keepawake::list_settings(&url, &token)),
+        // `2 GiB` may come as two words.
+        ["set", key, value @ ..] if !value.is_empty() => {
+            runtime.block_on(nuage::keepawake::set_setting(&url, &token, key, Some(&value.join(" "))))
+        }
+        ["unset", key] => runtime.block_on(nuage::keepawake::set_setting(&url, &token, key, None)),
         _ => {
             eprintln!("{APPS_USAGE}");
             return ExitCode::FAILURE;
@@ -462,4 +519,9 @@ usage: nuage                              start the server
        nuage apps create <name> [desc]    a new application: on the server's computer with nothing else
                                           (sudo), from anywhere with NUAGE_URL and NUAGE_ADMIN_TOKEN
        nuage apps list                    the applications of a server
+       nuage apps memory <name> <cache> [kv]
+                                          the memory of one application: amounts (256, 2G) or auto
+       nuage settings                     the settings of a server, and where each comes from
+       nuage settings set <key> <value>   changes one, in force at once (memory.cache_mb 2G)
+       nuage settings unset <key>         gives one back to the environment's value
        nuage version                      the version";

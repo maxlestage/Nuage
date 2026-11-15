@@ -4,7 +4,7 @@
     "title": "Nuage DB",
     "version": "0.4.6",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, at `/v1/kv`: values with an expiry, counters, locks, and commands by name as JSON.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, at `/v1/kv`: values with an expiry, counters, locks, and commands by name as JSON. The settings an owner changes while the server runs (memory of the server and of each application, limits, visibility) are at `/api/settings` and `/api/apps/{name}/memory`, with the same management token.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -1594,6 +1594,308 @@
           }
         }
       }
+    },
+    "/api/apps/{name}/memory": {
+      "post": {
+        "operationId": "setAppMemory",
+        "summary": "The memory of one application",
+        "description": "An amount of its own for its page cache (set apart from what the applications share) and for its key-value store, or `auto` to follow the server's rules again. In force at once. What the body does not name stays as it is. Refused, with the figures, when what is set by hand on the server would no longer fit its memory.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,63}$"
+            },
+            "description": "The application's name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "cache_mb": {
+                    "oneOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "A number of MiB."
+                      },
+                      {
+                        "type": "string",
+                        "description": "`auto`, or an amount with its unit: `512 MiB`, `2 GiB`, `2G`."
+                      }
+                    ]
+                  },
+                  "kv_mb": {
+                    "oneOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "A number of MiB."
+                      },
+                      {
+                        "type": "string",
+                        "description": "`auto`, or an amount with its unit: `512 MiB`, `2 GiB`, `2G`."
+                      }
+                    ]
+                  }
+                }
+              },
+              "example": {
+                "cache_mb": 2048,
+                "kv_mb": "auto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The application, with its memory.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Application"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not an amount, or more than fits.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off (`NUAGE_ADMIN_TOKEN` is not set), or the server takes its settings from its environment only (`NUAGE_SETTINGS=environment`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings": {
+      "get": {
+        "operationId": "listSettings",
+        "summary": "The settings of the server",
+        "description": "Each setting with its value, where it comes from (saved, the environment, the default) and what the environment says; the memory of each application; what is read once at startup. Never a secret.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The settings as they are now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off (`NUAGE_ADMIN_TOKEN` is not set), or the server takes its settings from its environment only (`NUAGE_SETTINGS=environment`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "saveSettings",
+        "summary": "Save settings",
+        "description": "A JSON object of setting names and values. In force at once, with no restart, and kept with the data; a saved value wins over the environment. `null` gives a setting back to the environment's value (or the default). All are checked first: one that does not fit, and nothing is saved.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "example": {
+                "memory.cache_mb": "2 GiB",
+                "status.public": true,
+                "memory.kv_mb": null
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The settings as they are now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No such setting, a value that is not one, or amounts that do not fit the memory: the message says the figures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off (`NUAGE_ADMIN_TOKEN` is not set), or the server takes its settings from its environment only (`NUAGE_SETTINGS=environment`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings/{key}": {
+      "delete": {
+        "operationId": "resetSetting",
+        "summary": "Give a setting back",
+        "description": "Removes what was saved: the environment's value, or the default, is in force again, at once.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The setting's name (`memory.cache_mb`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The settings as they are now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No such setting.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off (`NUAGE_ADMIN_TOKEN` is not set), or the server takes its settings from its environment only (`NUAGE_SETTINGS=environment`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1784,7 +2086,8 @@
           "created_at",
           "tokens",
           "env_token",
-          "origins"
+          "origins",
+          "memory"
         ],
         "properties": {
           "name": {
@@ -1818,6 +2121,38 @@
               "type": "string"
             },
             "description": "Websites whose pages may call it from the browser (CORS)."
+          },
+          "memory": {
+            "type": "object",
+            "description": "Its memory: an amount of its own in MiB, or `auto` (it follows the server's rules).",
+            "required": [
+              "cache_mb",
+              "kv_mb"
+            ],
+            "properties": {
+              "cache_mb": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "const": "auto"
+                  }
+                ],
+                "description": "Set apart for its page cache."
+              },
+              "kv_mb": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "const": "auto"
+                  }
+                ],
+                "description": "Its key-value store."
+              }
+            }
           }
         }
       },
@@ -1933,6 +2268,194 @@
           },
           "expired": {
             "type": "integer"
+          }
+        }
+      },
+      "Setting": {
+        "type": "object",
+        "required": [
+          "key",
+          "variable",
+          "value",
+          "source",
+          "saved",
+          "environment",
+          "default"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Its name: `memory.total_mb`, `memory.cache_mb`, `memory.kv_mb`, `statement.memory_mb`, `statement.seconds`, `postgres.connections`, `status.public`."
+          },
+          "variable": {
+            "type": "string",
+            "description": "The variable of the environment it starts from (`NUAGE_CACHE_MB`)."
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The value in force (`null`: the default)."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "saved",
+              "environment",
+              "default"
+            ],
+            "description": "Where the value in force comes from."
+          },
+          "saved": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What was saved (console, API, command line)."
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the environment, or the settings file, says."
+          },
+          "default": {
+            "type": "string",
+            "description": "What it is when nobody says anything."
+          }
+        }
+      },
+      "Settings": {
+        "type": "object",
+        "required": [
+          "read_only",
+          "ignored",
+          "settings",
+          "memory",
+          "applications",
+          "startup",
+          "settings_file"
+        ],
+        "properties": {
+          "read_only": {
+            "type": "boolean",
+            "description": "`NUAGE_SETTINGS=environment`: the environment is the only source, nothing can be saved."
+          },
+          "ignored": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "What was saved and is not in force (read-only servers): `DELETE` removes one."
+          },
+          "settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Setting"
+            }
+          },
+          "memory": {
+            "type": "object",
+            "description": "The memory the server counts on, the one the system reports, what is used, and the budget of the page caches (in force, and its ceiling), in bytes.",
+            "properties": {
+              "total_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "detected_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "used_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "cache_budget_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "cache_ceiling_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          },
+          "applications": {
+            "type": "array",
+            "description": "The memory of each application.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "cache_mb": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "const": "auto"
+                    }
+                  ]
+                },
+                "kv_mb": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "const": "auto"
+                    }
+                  ]
+                },
+                "cache_bytes": {
+                  "type": "integer",
+                  "description": "What its page cache holds."
+                },
+                "cache_capacity_bytes": {
+                  "type": "integer",
+                  "description": "What it may hold."
+                }
+              }
+            }
+          },
+          "startup": {
+            "type": "array",
+            "description": "What is read once, when the server starts. A secret shows as `***`, never its value.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "variable": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "settings_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The settings file the server was started with."
           }
         }
       }

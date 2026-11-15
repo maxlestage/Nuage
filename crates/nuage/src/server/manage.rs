@@ -9,6 +9,10 @@
 //! | `GET` | `/api/apps/{name}` | one application |
 //! | `POST` | `/api/apps/{name}/tokens` | a new token `{"read_only"?}` |
 //! | `DELETE` | `/api/apps/{name}/tokens/{id}` | revokes a token |
+//! | `POST` | `/api/apps/{name}/memory` | the memory of one application: `{"cache_mb", "kv_mb"}`, a number of MiB each, or `"auto"` |
+//! | `GET` | `/api/settings` | the settings: each with its value, where it comes from, and what the environment says |
+//! | `POST` | `/api/settings` | saves settings `{"memory.cache_mb": 512, "status.public": true}`, in force at once; `null` gives one back to the environment's value; one that does not fit and nothing is saved |
+//! | `DELETE` | `/api/settings/{key}` | gives a setting back to the environment's value, or the default |
 //!
 //! Security: the requests carry `Authorization: Bearer <NUAGE_ADMIN_TOKEN>`,
 //! a secret of its own (32 characters at least, checked at startup), compared
@@ -91,7 +95,156 @@ fn app_json(info: &AppInfo) -> Json {
         "tokens": info.tokens.iter().map(token_json).collect::<Vec<_>>(),
         "env_token": info.env_token,
         "origins": info.origins,
+        "memory": { "cache_mb": amount_json(info.cache_mb), "kv_mb": amount_json(info.kv_mb) },
     })
+}
+
+/// An amount of memory an owner may set: a number of MiB, or `"auto"`.
+fn amount_json(mib: Option<u64>) -> Json {
+    mib.map_or(json!("auto"), |m| json!(m))
+}
+
+/// An amount of memory in a JSON body: `Some(None)` for `"auto"` or `null`,
+/// `Some(Some(bytes))` for a number of MiB or a text with its unit (`"2 GiB"`),
+/// `None` when the body does not name it (it stays as it is).
+fn amount_of(body: &Json, key: &str) -> Result<Option<Option<usize>>, Refus> {
+    let mib = match body.get(key) {
+        None => return Ok(None),
+        Some(Json::Null) => return Ok(Some(None)),
+        Some(Json::String(s)) if s.trim().eq_ignore_ascii_case("auto") => return Ok(Some(None)),
+        Some(Json::Number(n)) => n.as_u64(),
+        Some(Json::String(s)) => super::settings::parse_mib(s),
+        Some(_) => None,
+    };
+    match mib {
+        Some(m) if m <= 1 << 24 => Ok(Some(Some((m as usize) << 20))),
+        _ => Err(error(400, "validation", &format!("`{key}` is a number of MiB, an amount (\"2 GiB\"), or \"auto\""))),
+    }
+}
+
+/// The settings, as `GET /api/settings` answers them. Never a secret.
+pub(super) fn settings_json(state: &State) -> Json {
+    let settings: Vec<Json> = super::settings::DEFS
+        .iter()
+        .map(|d| {
+            let (value, source) = state.settings.value(d.key);
+            json!({
+                "key": d.key,
+                "variable": d.var,
+                "value": value,
+                "source": source.name(),
+                "saved": state.settings.saved(d.key),
+                "environment": state.settings.environment(d.key),
+                "default": super::settings::default_text(&state.options, d.key),
+            })
+        })
+        .collect();
+    let memory = crate::memory::MemoryInfo::now();
+    let applications: Vec<Json> = state
+        .apps
+        .all()
+        .iter()
+        .map(|a| {
+            let i = a.info(false);
+            json!({
+                "name": i.name,
+                "cache_mb": amount_json(i.cache_mb),
+                "kv_mb": amount_json(i.kv_mb),
+                "cache_bytes": a.engine.cache_used(),
+                "cache_capacity_bytes": a.engine.cache_capacity(),
+            })
+        })
+        .collect();
+    let startup: Vec<Json> =
+        state.options.startup.iter().map(|s| json!({ "variable": s.var, "value": s.value })).collect();
+    json!({
+        "read_only": state.settings.read_only(),
+        "ignored": state.settings.ignored().into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        "settings": settings,
+        "memory": {
+            "total_bytes": memory.total_bytes,
+            "detected_bytes": crate::memory::detected().total_bytes,
+            "used_bytes": memory.used_bytes,
+            "cache_budget_bytes": state.apps.cache_budget(),
+            "cache_ceiling_bytes": state.apps.cache_ceiling(),
+        },
+        "applications": applications,
+        "startup": startup,
+        "settings_file": state.options.settings_file,
+    })
+}
+
+/// The answer to a change, with a `warning` when it is saved and in force
+/// but did not reach the backup yet.
+fn with_warning(mut answer: Json, unshipped: Option<String>) -> Json {
+    if let Some(why) = unshipped {
+        answer["warning"] = json!(format!(
+            "saved and in force, but not yet in the backup ({why}): a restart of the server now would bring the earlier value back"
+        ));
+    }
+    answer
+}
+
+/// A setting's value in a JSON body, as the text the settings keep.
+fn setting_text(key: &str, value: &Json) -> Result<Option<String>, Refus> {
+    match value {
+        Json::Null => Ok(None),
+        Json::String(s) => Ok(Some(s.clone())),
+        Json::Number(n) => Ok(Some(n.to_string())),
+        Json::Bool(b) => Ok(Some(b.to_string())),
+        _ => Err(error(400, "validation", &format!("`{key}`: a number, a text, true or false, or null"))),
+    }
+}
+
+/// A refused change of the settings: 400, or 403 when the server takes its
+/// settings from its environment only.
+fn settings_refusal(r: &super::settings::Refusal) -> Refus {
+    let message = r.said(super::i18n::Lang::En);
+    if r.forbidden { error(403, "forbidden", &message) } else { error(400, "validation", &message) }
+}
+
+async fn settings_answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Result<Response<HttpBody>, Refus> {
+    let method = req.method().clone();
+    let rest = path.trim_end_matches('/').trim_start_matches("/api/settings");
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    match (&method, segments.as_slice()) {
+        (&Method::GET, []) => Ok(json_response(200, &settings_json(state))),
+        (&Method::POST, []) => {
+            let body = read_json(state, req).await.map_err(|e| bad_request(&e))?;
+            let Some(object) = body.as_object() else {
+                return Err(error(
+                    400,
+                    "validation",
+                    "send a JSON object: {\"memory.cache_mb\": 512, \"status.public\": true}",
+                ));
+            };
+            let mut changes = Vec::new();
+            for (key, value) in object {
+                changes.push((key.clone(), setting_text(key, value)?));
+            }
+            let s = state.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                let changes: Vec<(&str, Option<&str>)> =
+                    changes.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+                s.save_settings(&changes)
+            })
+            .await
+            .map_err(|e| error(500, "internal", &e.to_string()))?;
+            let unshipped = saved.map_err(|e| settings_refusal(&e))?;
+            Ok(json_response(200, &with_warning(settings_json(state), unshipped)))
+        }
+        (&Method::DELETE, [key]) => {
+            let key = (*key).to_owned();
+            let s = state.clone();
+            let saved = tokio::task::spawn_blocking(move || s.save_settings(&[(key.as_str(), None)]))
+                .await
+                .map_err(|e| error(500, "internal", &e.to_string()))?;
+            let unshipped = saved.map_err(|e| settings_refusal(&e))?;
+            Ok(json_response(200, &with_warning(settings_json(state), unshipped)))
+        }
+        (_, [] | [_]) => Err(error(405, "method_not_allowed", "method not allowed")),
+        _ => Err(error(404, "not_found", "no such route: see /v1/openapi.json")),
+    }
 }
 
 fn info(state: &State, app: &App) -> AppInfo {
@@ -145,6 +298,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> memoire_orm::Result<T> 
 pub(super) async fn route(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Response<HttpBody> {
     if let Err(refused) = allowed(state, req.headers()) {
         return refused.response();
+    }
+    if path == "/api/settings" || path.starts_with("/api/settings/") {
+        return settings_answer(state, req, path).await.unwrap_or_else(|refused| refused.response());
     }
     answer(state, req, path).await.unwrap_or_else(|refused| refused.response())
 }
@@ -240,7 +396,23 @@ async fn answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Resul
                 Err(error(404, "not_found", &format!("application `{}` has no token with this id", app.name)))
             }
         }
-        (_, [] | [_] | [_, "tokens"] | [_, "tokens", _]) => Err(error(405, "method_not_allowed", "method not allowed")),
+        (&Method::POST, [name, "memory"]) => {
+            let app = app_named(name)?;
+            let body = read_json(state, req).await.map_err(|e| bad_request(&e))?;
+            // What the body does not name stays as it is.
+            let cache = amount_of(&body, "cache_mb")?.unwrap_or(Some(app.cache_reserved()).filter(|b| *b > 0));
+            let kv = amount_of(&body, "kv_mb")?.unwrap_or(Some(app.kv_fixed()).filter(|b| *b > 0));
+            let s = state.clone();
+            let a = app.clone();
+            let unshipped = tokio::task::spawn_blocking(move || s.set_app_memory(&a, cache, kv))
+                .await
+                .map_err(|e| error(500, "internal", &e.to_string()))?
+                .map_err(|r| settings_refusal(&r))?;
+            Ok(json_response(200, &with_warning(app_json(&info(state, &app)), unshipped)))
+        }
+        (_, [] | [_] | [_, "tokens"] | [_, "tokens", _] | [_, "memory"]) => {
+            Err(error(405, "method_not_allowed", "method not allowed"))
+        }
         _ => Err(error(404, "not_found", "no such route: see /v1/openapi.json")),
     }
 }

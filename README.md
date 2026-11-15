@@ -626,6 +626,56 @@ git push heroku master
 For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 `https://my-nuage.herokuapp.com/admin`.
 
+## Settings: yours to choose, and to change later
+
+Whoever runs a Nuage DB server, on their own computer or online, chooses how it works and
+changes it later, without a restart:
+
+- **the console's Settings page** (`/admin/settings`), in English, French and Spanish;
+- **`nuage settings`** in a terminal: `nuage settings` lists them, `nuage settings set
+  memory.cache_mb 2G` changes one, `nuage settings unset memory.cache_mb` gives it back;
+- **`/api/settings`**, with the management token (`GET`; `POST {"memory.cache_mb": 2048}`;
+  `DELETE /api/settings/memory.cache_mb`).
+
+What is saved is **in force at once** and **kept with the data**: encrypted, backed up and
+restored with it. It wins over the environment (the settings file, the host's variables),
+which wins over the default; each setting says where its value comes from, and one click
+gives it back to the environment. With `NUAGE_SETTINGS=environment` the environment is the
+only source: what was saved is ignored (the page shows it, and removes it if you ask).
+
+| Setting | What | Starts from |
+|---|---|---|
+| `memory.total_mb` | the memory Nuage DB may count on: `auto` (the container's limit, else all the memory of the machine: Linux, macOS, Windows), or an amount that leaves the rest to other programs | `NUAGE_MEMORY_MB` |
+| `memory.cache_mb` | the page caches of all the applications together: `auto` (it follows the memory) or a maximum | `NUAGE_CACHE_MB` |
+| `memory.kv_mb` | the key-value store of each application: `auto` or an amount | `NUAGE_KV_MB` |
+| `statement.memory_mb` | what one SQL statement may hold at once (`auto`: an eighth of the memory) | `NUAGE_STATEMENT_MB` |
+| `statement.seconds` | how long one statement may run (`0`: no limit) | `NUAGE_STATEMENT_SECONDS` |
+| `postgres.connections` | PostgreSQL connections served at once | `NUAGE_PG_MAX_CONNECTIONS` |
+| `status.public` | the public status (`true`, `false`) | `NUAGE_PUBLIC_STATUS` |
+
+An amount is written `auto`, `512 MiB` or `2 GiB` (`2G`, `2 Go`, `1.5 GiB`); a number alone is
+in MiB.
+
+**Memory: the server's, or by database.** By default a server uses the memory it has: one
+budget for the page caches of all its applications, which follows the memory and goes to the
+applications that use it. An application (a database) can instead have **an amount of its
+own**, set apart from the others: in its Settings tab, in the table *Memory by application*
+of the Settings page, with `nuage apps memory shop 2G` (then `auto` to share again), or
+`POST /api/apps/shop/memory {"cache_mb": 2048, "kv_mb": "auto"}`. Its cache then holds that
+much whatever the others do, and they share the rest. The same goes for its key-value store.
+
+Nuage DB checks what is set by hand before it saves it, and says the figures when it
+refuses: the key-value stores within a quarter of the memory, and with the page caches set
+by hand within three quarters; a memory said by hand may only lower the one the system
+reports. When memory runs short the guard keeps the last word: what is set apart shrinks
+with the rest, and comes back.
+
+**What stays in the environment.** What the server reads before it can open its data (the
+encryption key, the data directory), what it listens on (ports, addresses, certificates),
+what opens it (password, tokens) and where its backups go are read once, when it starts: a
+wrong value saved from the console could lock you out. The Settings page lists them (a
+secret shows as set, never its value) and says how to change them on this host.
+
 ## Environment variables
 
 | Variable | Meaning | Default |
@@ -646,6 +696,9 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_MEMORY_MB` | the memory to count on, in MiB, for a host that limits it without saying so | the container's limit, else the machine's memory |
 | `NUAGE_PG_MAX_CONNECTIONS` | PostgreSQL connections served at once (each has a thread) | `100`, less where the system allows few threads |
 | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); the environment wins over the file | none |
+| `NUAGE_SETTINGS` | `environment`: the settings are those of the environment only; what was saved from the console's Settings page, `nuage settings` or `/api/settings` is ignored, and nothing is saved there (see [Settings](#settings-yours-to-choose-and-to-change-later)) | saved settings win over the environment |
+| `NUAGE_STATEMENT_MB` | memory one SQL statement may hold at once (the rows it sorts, joins or returns), in MiB, or `auto`; past it the statement fails with a clear error | `auto`: an eighth of the memory (32 MiB to 2 GiB) |
+| `NUAGE_STATEMENT_SECONDS` | seconds one statement may run before it is stopped and its changes undone; `0`: no limit | `60` |
 | `NUAGE_BACKUP_DIR` | back up to this folder, on another disk (the server warns when it is on the data's disk) | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint of S3-compatible storage | `https://s3.<region>.amazonaws.com` |
