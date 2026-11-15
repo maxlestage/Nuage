@@ -167,7 +167,7 @@ tbody tr:hover{background:var(--card2)}
 .mini{display:grid;grid-template-columns:repeat(3,1fr);gap:.35rem .75rem;margin:.6rem 0 0}.mini dt{color:var(--muted);font-size:.78rem}.mini dd{margin:0;font-variant-numeric:tabular-nums}
 .reveal pre{user-select:all}
 details.lang{border-bottom:1px solid var(--line)}details.lang summary{cursor:pointer;padding:.45rem 0;font-weight:600}
-.set{margin:.9rem 0;max-width:46rem}.set label{font-weight:600}.set input:not([type=checkbox]){display:block;max-width:14rem;margin:.25rem 0;font-weight:400}.set small{display:block}.check{font-weight:400!important}.check input{width:auto;margin-right:.35rem}
+.set{margin:.9rem 0;max-width:46rem}.set label{font-weight:600}.set input:not([type=checkbox]){display:block;max-width:14rem;margin:.25rem 0;font-weight:400}.set small{display:block}.check{font-weight:400!important}.check input{width:auto;margin-right:.35rem}.phone{display:none}@media (max-width:700px){.phone{display:block}}
 "#;
 
 /// English, French, Spanish, or as the device (the browser's language): the one in use
@@ -794,6 +794,8 @@ fn app_header(state: &State, cx: &Cx, app: &App, tab: &str) -> String {
 }
 
 fn app_page(state: &State, cx: &Cx, app: &App, tab: &str, title: &str, body: &str) -> String {
+    // The page's own links (language, theme) lead to the tab, also after a form was sent.
+    let cx = &Cx { here: format!("{}{tab}", app_base(&app.name)), ..cx.clone() };
     cx.page(&format!("{title} · {}", app.name), &format!("{}{body}", app_header(state, cx, app, tab)))
 }
 
@@ -1648,7 +1650,26 @@ fn failed_settings(cx: &Cx, name: &str) -> String {
 }
 
 fn note(ok: bool, text: &str) -> String {
-    format!(r#"<p class="msg {}">{}</p>"#, if ok { "ok" } else { "bad" }, esc(text))
+    format!(r#"<p class="msg {}">{}</p>"#, if ok { "ok" } else { "bad" }, with_code(&esc(text)))
+}
+
+/// Escaped `text` with what is between backquotes (`memory.cache_mb`) as code.
+fn with_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut parts = text.split('`');
+    out.push_str(parts.next().unwrap_or_default());
+    let rest: Vec<&str> = parts.collect();
+    // An odd backquote stays as it is.
+    let pairs = rest.len() / 2;
+    for (i, part) in rest.iter().enumerate() {
+        if i < pairs * 2 {
+            out.push_str(if i % 2 == 0 { "<code>" } else { "</code>" });
+        } else {
+            out.push('`');
+        }
+        out.push_str(part);
+    }
+    out
 }
 
 async fn post(
@@ -1675,7 +1696,12 @@ async fn post(
 
 fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, origin: &str) -> Response<HttpBody> {
     let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default().to_owned();
+    // What is shown after a form is a page that also answers a link (the
+    // language, the theme): the list of applications, the Settings page, or
+    // the tab of an application (see `app_page`).
+    let list = Cx { here: "/admin/apps".into(), ..cx.clone() };
     if path == "/admin/apps" {
+        let cx = &list;
         let msg = match state.apps.create(field("name").trim(), &field("description")) {
             Ok((app, token)) => format!(
                 "{}{}",
@@ -1687,6 +1713,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
         return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
     }
     if let Some(sub) = path.strip_prefix("/admin/settings") {
+        let cx = &Cx { here: "/admin/settings".into(), ..cx.clone() };
         let (ok, msg) = settings_page::post(state, sub, form, cx);
         let body = settings_page::body(state, cx, Some(msg));
         return html(if ok { 200 } else { 400 }, cx.page(cx.t("Settings"), &body));
@@ -1715,7 +1742,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
             Ok(false) => note(false, &cx.tf("There is no application {}.", &[&name])),
             Err(e) => note(false, &e.to_string()),
         };
-        return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
+        return html(200, list.page(cx.t("Applications"), &apps_body(state, &list, Some(msg))));
     }
     let Some(app) = state.apps.get(&name) else { return not_found(cx, "No such application") };
     let engine = &app.engine;

@@ -18,7 +18,7 @@ const RESET_FORM: &str = "settings-reset";
 /// `512 MiB`, `2 GiB`, `1.5 GiB` (in GiB when that says it exactly).
 fn amount_text(l: Lang, mib: u64) -> String {
     let (m, g) = if l == Lang::Fr { ("Mio", "Gio") } else { ("MiB", "GiB") };
-    if mib >= 1024 && (mib * 100).is_multiple_of(1024) {
+    if mib >= 1024 && mib.checked_mul(100).is_some_and(|m| m.is_multiple_of(1024)) {
         let hundredths = mib * 100 / 1024;
         let text = match (hundredths / 100, hundredths % 100) {
             (whole, 0) => whole.to_string(),
@@ -40,7 +40,11 @@ fn spelled(key: &str, value: &str) -> String {
 fn shown(state: &State, cx: &Cx, key: &str) -> String {
     let value = state.settings.value(key).0.unwrap_or_else(|| default_text(&state.options, key));
     match def(key).map(|d| d.kind) {
-        Some(Kind::Mib { .. }) => parse_mib(&value).map_or(spelled(key, &value), |mib| amount_text(cx.l, mib)),
+        // Only a value this version accepts is written as an amount; anything else, as it was given.
+        Some(Kind::Mib { .. }) => match spelled(key, &value).parse::<u64>() {
+            Ok(mib) => amount_text(cx.l, mib),
+            Err(_) => spelled(key, &value),
+        },
         _ => value,
     }
 }
@@ -60,6 +64,17 @@ fn source_line(state: &State, cx: &Cx, key: &str) -> String {
         _ => cx.tf("Default (<code>{}</code> is not set).", &[&d.var]),
     };
     let mut out = format!(r#"<small class="muted">{text}"#);
+    if let Some(lower) = state.settings.memory_capped().filter(|_| key == "memory.total_mb" && source == Source::Saved)
+    {
+        let _ = write!(
+            out,
+            " {}",
+            cx.tf(
+                "The environment's figure is lower: {} is in force (a saved memory only lowers it).",
+                &[&amount_text(cx.l, lower)]
+            )
+        );
+    }
     if source == Source::Saved && !state.settings.read_only() {
         let _ = write!(
             out,
@@ -110,13 +125,26 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
 
     // What was saved and is not in force: shown, and removable.
     let ignored = state.settings.ignored();
-    if !ignored.is_empty() {
+    let kept: Vec<_> = state.apps.all().into_iter().filter(|a| a.kept_amounts() != (0, 0)).collect();
+    if !ignored.is_empty() || !kept.is_empty() {
         let _ = write!(body, r#"<h2>{}</h2><div class="scroll"><table><tbody>"#, cx.t("Saved, and ignored"));
         for (key, value) in &ignored {
             let _ = write!(
                 body,
                 r#"<tr><td><code>{key}</code></td><td><code>{}</code></td><td><button class="plain" form="{RESET_FORM}" name="key" value="{key}">{}</button></td></tr>"#,
                 esc(value),
+                cx.t("Remove")
+            );
+        }
+        for app in &kept {
+            let (cache, kv) = app.kept_amounts();
+            let said = |b: usize| if b == 0 { "auto".to_owned() } else { amount_text(cx.l, b as u64 >> 20) };
+            let _ = write!(
+                body,
+                r#"<tr><td colspan="2">{}</td><td><form method="post" action="{}/memory">{}<input type="hidden" name="cache_mb" value="auto"><input type="hidden" name="kv_mb" value="auto"><input type="hidden" name="back" value="settings"><button class="plain">{}</button></form></td></tr>"#,
+                esc(&cx.tf("application {}: page cache {}, key-value store {}", &[&app.name, &said(cache), &said(kv)])),
+                app_base(&app.name),
+                cx.field(),
                 cx.t("Remove")
             );
         }
@@ -133,7 +161,6 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
         ),
         _ => body.push_str(cx.t("This system does not tell Nuage DB its memory: say how much it may count on.")),
     }
-    let plan = state.apps.plan();
     let budget = state.apps.cache_budget();
     let _ = write!(
         body,
@@ -147,7 +174,7 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
         "memory.total_mb",
         "Memory Nuage DB may count on",
         &cx.tf(
-            "<code>auto</code>: what the system reports ({}).",
+            "<code>auto</code>: what the system reports ({}), or <code>NUAGE_MEMORY_MB</code> when it is set.",
             &[&detected.map_or_else(|| cx.t("unknown").to_owned(), |d| gigas(l, d))],
         ),
     ));
@@ -165,8 +192,7 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
         ),
     ));
     let apps = state.apps.all();
-    let kv_each =
-        crate::memory::kv_share(plan.kv_bytes, plan.kv_budget, apps.iter().filter(|a| a.kv_fixed() == 0).count());
+    let kv_each = state.apps.kv_each();
     body.push_str(&field(
         state,
         cx,
@@ -229,24 +255,43 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
         );
     }
     body.push_str("</tbody></table></div>");
-    let (apart, _) = state.apps.cache_set_apart();
+    let _ = write!(
+        body,
+        r#"<p class="muted phone">{}</p>"#,
+        cx.t("On a phone, each application's Settings tab has the same fields, one under the other.")
+    );
+    let (apart, floor) = state.apps.cache_set_apart();
     if apart > 0 {
-        let _ = write!(
-            body,
-            r#"<p class="muted">{}</p>"#,
+        let figures: [&dyn std::fmt::Display; 2] =
+            [&bytes(l, apart as u64), &bytes(l, state.apps.cache_ceiling().unwrap_or(apart) as u64)];
+        let said = if floor > 0 {
             cx.tf(
                 "Set apart: {} of the {} the caches may take; the others share the rest by use. When memory runs short, what is set apart shrinks with the rest, and comes back.",
-                &[&bytes(l, apart as u64), &bytes(l, state.apps.cache_ceiling().unwrap_or(apart) as u64)],
+                &figures,
             )
-        );
-        if let Some((asked, has)) = state.apps.cache_squeezed() {
-            body.push_str(&note(
+        } else {
+            cx.tf(
+                "Set apart: {} of the {} the caches may take (every application has an amount of its own). When memory runs short, what is set apart shrinks with the rest, and comes back.",
+                &figures,
+            )
+        };
+        let _ = write!(body, r#"<p class="muted">{said}</p>"#);
+        match state.apps.cache_squeezed() {
+            Some((asked, has, true)) => body.push_str(&note(
                 false,
                 &cx.tf(
                     "Memory is short: what is set apart is cut to {} of {} for now.",
                     &[&bytes(l, has as u64), &bytes(l, asked as u64)],
                 ),
-            ));
+            )),
+            Some((asked, has, false)) => body.push_str(&note(
+                false,
+                &cx.tf(
+                    "The memory was lowered since: what is set apart has {} of the {} asked, in proportion.",
+                    &[&bytes(l, has as u64), &bytes(l, asked as u64)],
+                ),
+            )),
+            None => {}
         }
     }
 
@@ -368,7 +413,13 @@ pub(super) fn post(state: &State, sub: &str, form: &HashMap<String, String>, cx:
             let Some(value) = value else { continue };
             // What the field showed and was left as it was stays where it comes from.
             let in_force = state.settings.value(key).0.unwrap_or_else(|| default_text(&state.options, key));
-            if spelled(key, &value) == spelled(key, &in_force) {
+            // Amounts are compared as amounts, whatever this version accepts.
+            let same_amount = matches!(def(key).map(|d| d.kind), Some(Kind::Mib { .. }))
+                && match (parse_mib(&value), parse_mib(&in_force)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => value.eq_ignore_ascii_case(&in_force),
+                };
+            if same_amount || spelled(key, &value) == spelled(key, &in_force) {
                 continue;
             }
             // An emptied field gives the setting back.
@@ -396,13 +447,11 @@ pub(super) fn post(state: &State, sub: &str, form: &HashMap<String, String>, cx:
 /// What is said when a change is saved and in force but did not reach the
 /// backup: on a disk the host erases, a restart would undo it.
 fn not_in_the_backup(cx: &Cx, unshipped: Option<String>) -> String {
-    unshipped.map_or_else(String::new, |why| {
+    // The cause, in the system's words, is in the log (and in the API's answer).
+    unshipped.map_or_else(String::new, |_| {
         note(
             false,
-            &cx.tf(
-                "Not yet in the backup ({}): a restart of the server now would bring the earlier value back.",
-                &[&why],
-            ),
+            cx.t("Not yet in the backup: the backup failed (the log says why). A restart of the server now would bring the earlier value back."),
         )
     })
 }
@@ -450,10 +499,14 @@ fn typed_amount(field: &str, typed: &str) -> Result<Option<usize>, Refusal> {
 /// The memory form of an application was sent.
 pub(super) fn post_app_memory(state: &State, cx: &Cx, app: &App, form: &HashMap<String, String>) -> (bool, String) {
     let typed = |key: &str| form.get(key).map(String::as_str).unwrap_or_default();
-    let amounts = typed_amount("cache_mb", typed("cache_mb"))
-        .and_then(|cache| typed_amount("kv_mb", typed("kv_mb")).map(|kv| (cache, kv)));
+    let amounts = typed_amount(cx.t("Page cache"), typed("cache_mb"))
+        .and_then(|cache| typed_amount(cx.t("Key-value store"), typed("kv_mb")).map(|kv| (cache, kv)));
+    // Where the environment rules, only removing what was kept aside is possible.
+    let amounts =
+        if state.settings.read_only() && matches!(amounts, Ok((None, None))) { Ok((None, None)) } else { amounts };
     match amounts.and_then(|(cache, kv)| state.set_app_memory(app, cache, kv)) {
-        Ok(unshipped) => (
+        Ok((false, _)) => (true, note(true, cx.t("Nothing changed."))),
+        Ok((true, unshipped)) => (
             true,
             note(true, &cx.tf("Memory of {} saved: in force now.", &[&app.name])) + &not_in_the_backup(cx, unshipped),
         ),

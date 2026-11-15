@@ -1972,21 +1972,30 @@ async fn settings_change_while_the_server_runs() {
         // The amount of the shop is not in force either; it stays in its record.
         assert_eq!(server.app_engine("shop").unwrap().cache_capacity(), 16 * MIB);
         server.new_app_token("shop").unwrap();
-        // What was saved is shown, and can be removed from there.
+        // What was saved is shown, and can be removed from there: the settings...
         assert_eq!(list["ignored"], serde_json::json!({ "status.public": "true" }));
         let removed = http(addr, "DELETE", "/api/settings/status.public", auth, "").await;
         assert_eq!(removed.status, 200, "{}", removed.body);
         assert_eq!(json(&removed)["ignored"], serde_json::json!({}));
+        // ...and the amounts of the applications.
+        assert_eq!(list["ignored_applications"], serde_json::json!({ "shop": { "cache_mb": 12, "kv_mb": "auto" } }));
+        let r = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"cache_mb": "auto", "kv_mb": "auto"}"#).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        let list = json(&http(addr, "GET", "/api/settings", auth, "").await);
+        assert_eq!(list["ignored_applications"], serde_json::json!({}));
         running.shutdown().await;
     }
 
-    // The environment no longer rules alone: the shop's amount is in force again,
-    // and what was removed stays removed.
+    // The environment no longer rules alone: what was removed stays removed.
     {
         let server = Server::new(open(), opts());
         let running = server.listen("127.0.0.1:0").await.unwrap();
-        assert_eq!(server.app_engine("shop").unwrap().cache_capacity(), 12 * MIB);
-        assert_eq!(http(running.local_addr(), "GET", "/api/status", &[], "").await.status, 401);
+        let addr = running.local_addr();
+        assert_eq!(server.app_engine("shop").unwrap().cache_capacity(), 16 * MIB, "it shares again");
+        assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 401);
+        // A body that is no object changes nothing.
+        let r = http(addr, "POST", "/api/apps/shop/memory", auth, "[1]").await;
+        assert_eq!(r.status, 400, "{}", r.body);
         running.shutdown().await;
     }
 }

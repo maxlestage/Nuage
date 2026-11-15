@@ -261,7 +261,7 @@ pub async fn set_setting(
             let body = serde_json::json!({ key: value }).to_string().into_bytes();
             send("POST", &format!("{base}/api/settings"), Some(admin_token), Some(body)).await
         }
-        None => send("DELETE", &format!("{base}/api/settings/{key}"), Some(admin_token), None).await,
+        None => send("DELETE", &format!("{base}/api/settings/{}", path_segment(key)), Some(admin_token), None).await,
     };
     let (status, answer) = sent.map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
@@ -269,7 +269,17 @@ pub async fn set_setting(
         return Err(settings_refusal(base, status, &json));
     }
     let line = settings_lines(&json).lines().find(|l| l.split('\t').next() == Some(key)).unwrap_or(key).to_owned();
-    Ok(format!("{line}\n(in force now, with no restart)"))
+    in_force(line, &json)
+}
+
+/// What a change answers: in force, and kept in the backup, or not yet
+/// (an error, so that a script notices: a restart would bring the earlier
+/// value back).
+fn in_force(line: String, json: &serde_json::Value) -> std::result::Result<String, String> {
+    match json["warning"].as_str() {
+        Some(warning) => Err(format!("{line}\n(in force now, but NOT in the backup yet: {warning})")),
+        None => Ok(format!("{line}\n(in force now, with no restart)")),
+    }
 }
 
 /// `nuage apps memory <name> <page cache> [key-value store]`: the memory of
@@ -286,26 +296,44 @@ pub async fn set_app_memory(
     if let Some(kv) = kv {
         body["kv_mb"] = serde_json::json!(kv);
     }
-    let (status, answer) =
-        send("POST", &format!("{base}/api/apps/{name}/memory"), Some(admin_token), Some(body.to_string().into_bytes()))
-            .await
-            .map_err(|e| e.to_string())?;
+    let (status, answer) = send(
+        "POST",
+        &format!("{base}/api/apps/{}/memory", path_segment(name)),
+        Some(admin_token),
+        Some(body.to_string().into_bytes()),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
     if status != 200 {
         return Err(settings_refusal(base, status, &json));
     }
     let amount = |v: &serde_json::Value| v.as_u64().map_or("auto".to_owned(), |mib| format!("{mib} MiB"));
-    Ok(format!(
-        "application {name}\tpage cache {}\tkey-value store {}\n(in force now, with no restart)",
+    let line = format!(
+        "application {name}\tpage cache {}\tkey-value store {}",
         amount(&json["memory"]["cache_mb"]),
         amount(&json["memory"]["kv_mb"])
-    ))
+    );
+    in_force(line, &json)
+}
+
+/// `text` as one segment of a path: what is not a letter, a digit or one of
+/// `-._~` is percent-encoded (a `/` in a name cannot reach another route).
+fn path_segment(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// A refusal of the settings routes: an older server does not have them.
 fn settings_refusal(base: &str, status: u16, json: &serde_json::Value) -> String {
     let message = json["error"]["message"].as_str().unwrap_or_default();
-    if matches!(status, 404 | 405) && (message.is_empty() || message.starts_with("no such route")) {
+    if matches!(status, 404 | 405)
+        && (message.is_empty() || message.starts_with("no such route") || message.starts_with("no such page"))
+    {
         return format!("{base} has no settings to change: they came with Nuage DB 0.4.7.");
     }
     refusal(base, status, json)
@@ -363,6 +391,13 @@ pub async fn check(url: &str, token: &str) -> std::result::Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_in_a_path_cannot_reach_another_route() {
+        assert_eq!(path_segment("memory.cache_mb"), "memory.cache_mb");
+        assert_eq!(path_segment("x/../../apps/shop"), "x%2F..%2F..%2Fapps%2Fshop");
+        assert_eq!(path_segment("a b"), "a%20b");
+    }
 
     #[test]
     fn settings_and_hours() {

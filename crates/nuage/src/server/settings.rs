@@ -91,13 +91,17 @@ pub(crate) mod refused {
     pub(crate) const CACHE_UNDER_WHAT_IS_APART: &str = "`memory.cache_mb`: {} MiB is less than what is set apart for single databases ({} MiB, and {} MiB for the others to share): {} MiB at least, or lower their amounts first";
     pub(crate) const KV_ALL_TOO_LARGE: &str = "{}: the key-value stores would take {} MiB in all: more than a quarter of the {} MiB this server counts on ({} MiB at most)";
     pub(crate) const BY_HAND_TOO_MUCH: &str = "{}: {} MiB would be set by hand ({} MiB for the page caches, {} MiB for the key-value stores): more than three quarters of the {} MiB this server counts on ({} MiB at most)";
+    pub(crate) const TOO_LITTLE_FOR_BY_HAND: &str = "`memory.total_mb`: {} MiB is too little for what is set by hand ({} MiB for the page caches, {} MiB for the key-value stores): {} MiB at least, or lower those amounts first";
+    pub(crate) const PG_MORE_THAN_THREADS: &str = "`postgres.connections`: {} is more than this server can serve at once (each connection has a thread): {} at most";
     pub(crate) const CACHE_TOO_SMALL: &str = "a page cache needs {} MiB at least";
     pub(crate) const CACHE_MORE_THAN_LEFT: &str = "{} MiB for `{}` is more than is left: the page caches of this server may take {} MiB in all, {} MiB of it are set apart for other databases and {} MiB stay for those that share: {} MiB at most";
     pub(crate) const KV_TOO_SMALL: &str = "a key-value store needs {} MiB at least";
+    pub(crate) const UNREADABLE: &str = "the saved settings were written by another version of Nuage DB and cannot be read by this one: nothing is saved over them (start the version that wrote them, or NUAGE_SETTINGS=environment)";
 
     /// Every sentence above.
     #[cfg(test)]
-    pub(crate) const ALL: [&str; 16] = [
+    pub(crate) const ALL: [&str; 19] = [
+        UNREADABLE,
         TOO_MUCH_FOR_ANY,
         TOO_LITTLE,
         NOT_AN_AMOUNT,
@@ -111,6 +115,8 @@ pub(crate) mod refused {
         CACHE_UNDER_WHAT_IS_APART,
         KV_ALL_TOO_LARGE,
         BY_HAND_TOO_MUCH,
+        TOO_LITTLE_FOR_BY_HAND,
+        PG_MORE_THAN_THREADS,
         CACHE_TOO_SMALL,
         CACHE_MORE_THAN_LEFT,
         KV_TOO_SMALL,
@@ -254,9 +260,12 @@ pub(crate) struct Settings {
     /// What was saved and is not in force, because the environment is the
     /// only source: shown, and removable.
     ignored: RwLock<BTreeMap<String, String>>,
-    /// Saved settings this version does not know (a later version's): kept
-    /// as they are.
-    unknown: BTreeMap<String, String>,
+    /// Saved settings this version does not understand (a later version's,
+    /// or a value it no longer accepts): kept as they are, never in force.
+    unknown: BTreeMap<String, serde_json::Value>,
+    /// The saved settings could not be read at all (written by another
+    /// version?): they are kept as they are, and nothing is saved over them.
+    unreadable: bool,
     /// The environment is the only source (`NUAGE_SETTINGS=environment`).
     read_only: bool,
 }
@@ -266,29 +275,48 @@ impl Settings {
     pub(crate) fn open(engine: Arc<Engine>, env: Option<HashMap<String, String>>, read_only: bool) -> Settings {
         let mut saved = BTreeMap::new();
         let mut unknown = BTreeMap::new();
+        let mut unreadable = false;
         let kept = engine.meta_entries(SAVED).map(|entries| entries.into_iter().find(|(key, _)| key == SAVED));
         match kept {
-            Ok(Some((_, value))) => {
-                let values: BTreeMap<String, String> = serde_json::from_slice(&value).unwrap_or_else(|e| {
-                    engine.event("error", format!("the saved settings cannot be read, none is in force: {e}"));
-                    BTreeMap::new()
-                });
-                for (key, value) in values {
-                    // A value an earlier version accepted and this one does not
-                    // is left aside rather than stopping the server.
-                    match def(&key).map(|d| d.kind.check(&key, &value)) {
-                        Some(Ok(v)) => {
-                            saved.insert(key, v);
-                        }
-                        Some(Err(e)) => engine.event("warn", format!("saved setting ignored: {}", e.said(Lang::En))),
-                        None => {
-                            unknown.insert(key, value);
+            Ok(Some((_, value))) => match serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&value) {
+                Ok(values) => {
+                    for (key, value) in values {
+                        // A value this version does not understand (a later version's,
+                        // or one it no longer accepts) is kept aside, as it is, rather
+                        // than stopping the server or being lost at the next save.
+                        let checked = match (def(&key), value.as_str()) {
+                            (Some(d), Some(text)) => Some(d.kind.check(&key, text)),
+                            _ => None,
+                        };
+                        match checked {
+                            Some(Ok(v)) => {
+                                saved.insert(key, v);
+                            }
+                            Some(Err(e)) => {
+                                engine.event("warn", format!("saved setting not in force: {}", e.said(Lang::En)));
+                                unknown.insert(key, value);
+                            }
+                            None => {
+                                unknown.insert(key, value);
+                            }
                         }
                     }
                 }
-            }
+                Err(e) => {
+                    engine.event(
+                        "error",
+                        format!(
+                            "the saved settings cannot be read (written by another version?): none is in force, and they are kept as they are: {e}"
+                        ),
+                    );
+                    unreadable = true;
+                }
+            },
             Ok(None) => {}
-            Err(e) => engine.event("error", format!("cannot read the saved settings: {e}")),
+            Err(e) => {
+                engine.event("error", format!("cannot read the saved settings: {e}"));
+                unreadable = true;
+            }
         }
         let mut ignored = BTreeMap::new();
         if read_only && !saved.is_empty() {
@@ -301,7 +329,15 @@ impl Settings {
             );
             ignored = std::mem::take(&mut saved);
         }
-        Settings { engine, env, saved: RwLock::new(saved), ignored: RwLock::new(ignored), unknown, read_only }
+        Settings {
+            engine,
+            env,
+            saved: RwLock::new(saved),
+            ignored: RwLock::new(ignored),
+            unknown,
+            unreadable,
+            read_only,
+        }
     }
 
     /// What was saved and is not in force (`NUAGE_SETTINGS=environment`):
@@ -318,6 +354,14 @@ impl Settings {
             .filter_map(|d| {
                 let (saved, env) = (self.saved(d.key)?, self.environment(d.key)?);
                 let same = d.kind.check(d.key, &env).is_ok_and(|e| e == saved);
+                // A saved memory only lowers the environment's.
+                if let Some(lower) = self.memory_capped().filter(|_| d.key == "memory.total_mb") {
+                    return Some(format!(
+                        "{}={env} is under the memory saved from the console ({saved} MiB): {lower} MiB is in force \
+                         (a saved memory only lowers the environment's)",
+                        d.var
+                    ));
+                }
                 (!same).then(|| {
                     format!(
                         "{}={env} is set in the environment, but the value saved from the console ({saved}) is the one \
@@ -386,7 +430,10 @@ impl Settings {
     /// value, or `None` to remove what was saved, so that the environment's
     /// value, or the default, is in force again. The caller puts them in
     /// force ([`super::State::save_settings`] does both).
-    pub(crate) fn save(&self, changes: &[(&str, Option<&str>)]) -> std::result::Result<(), Refusal> {
+    pub(crate) fn save(&self, changes: &[(&str, Option<&str>)]) -> std::result::Result<bool, Refusal> {
+        if self.unreadable {
+            return Err(Refusal::new(refused::UNREADABLE, &[]));
+        }
         let mut checked = Vec::new();
         for (key, value) in changes {
             checked.push((*key, self.check(key, *value)?));
@@ -403,10 +450,11 @@ impl Settings {
             };
         }
         if values == before {
-            return Ok(());
+            return Ok(false);
         }
-        let mut entry: BTreeMap<&str, &str> = self.unknown.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        entry.extend(values.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let mut entry: BTreeMap<&str, serde_json::Value> =
+            self.unknown.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        entry.extend(values.iter().map(|(k, v)| (k.as_str(), serde_json::Value::String(v.clone()))));
         let json = serde_json::to_vec(&entry).unwrap_or_default();
         self.engine.set_meta(SAVED, (!entry.is_empty()).then_some(json.as_slice())).map_err(|e| Refusal::failed(&e))?;
         *kept.write().unwrap_or_else(|e| e.into_inner()) = values;
@@ -421,7 +469,7 @@ impl Settings {
                 },
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Says the memory to count on to [`crate::memory`]: the value in force
@@ -432,8 +480,9 @@ impl Settings {
         match self.said("memory.total_mb") {
             Some(Some(said)) => match said.parse::<u64>() {
                 Ok(mib) => crate::memory::declare(Some(mib.min(self.memory_cap().unwrap_or(mib)) << 20)),
-                // `auto`, or something that is no number.
-                Err(_) => crate::memory::declare(None),
+                // `auto`: what the system reports, under the environment's figure
+                // when it gives one (a host that limits the memory without saying so).
+                Err(_) => crate::memory::declare(self.environment_memory().map(|mib| mib << 20)),
             },
             Some(None) => crate::memory::declare(None),
             None => crate::memory::follow_environment(),
@@ -446,6 +495,13 @@ impl Settings {
     pub(crate) fn memory_cap(&self) -> Option<u64> {
         self.saved("memory.total_mb")?;
         self.environment("memory.total_mb")?.parse().ok()
+    }
+
+    /// The memory in force, in MiB, when it is under the one saved: the
+    /// environment's figure is lower (see [`Settings::declare_memory`]).
+    pub(crate) fn memory_capped(&self) -> Option<u64> {
+        let saved: u64 = self.saved("memory.total_mb")?.parse().ok()?;
+        self.memory_cap().filter(|cap| *cap < saved)
     }
 
     /// The figure of the environment for the memory, in MiB, when it gives one.
@@ -492,22 +548,44 @@ impl Settings {
         };
         MemoryPlan { kv_bytes, kv_budget, kv_by_hand, kv_room, cache_budget, cache_ceiling }
     }
-
-    /// A whole number said for `key` (saved, else the environment's).
-    pub(crate) fn count(&self, key: &str) -> Option<u64> {
-        self.value(key).0?.parse().ok()
-    }
-
-    /// A flag said for `key` (saved, else the environment's).
-    pub(crate) fn flag(&self, key: &str) -> Option<bool> {
-        let v = self.value(key).0?;
-        Some(matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What this version does not understand is kept as it is, and saved
+    /// back untouched; saved settings it cannot read at all are never
+    /// overwritten.
+    #[test]
+    fn what_another_version_saved_is_kept() {
+        let dir = std::env::temp_dir().join(format!("nuage-settings-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = crate::engine::EngineOptions { sync: false, ..Default::default() };
+        let engine = Engine::open(&dir, options).unwrap();
+        let later = br#"{"status.public":"true","future.thing":{"a":1},"postgres.connections":"99999"}"#;
+        engine.set_meta(SAVED, Some(later)).unwrap();
+        let settings = Settings::open(engine.clone(), Some(HashMap::new()), false);
+        assert_eq!(settings.saved("status.public").as_deref(), Some("true"));
+        assert_eq!(settings.saved("postgres.connections"), None, "not accepted by this version: not in force");
+        assert!(settings.save(&[("memory.kv_mb", Some("8"))]).unwrap());
+        let kept = engine.meta_entries(SAVED).unwrap().pop().unwrap().1;
+        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(
+            kept,
+            serde_json::json!({
+                "status.public": "true", "future.thing": {"a": 1}, "postgres.connections": "99999", "memory.kv_mb": "8"
+            })
+        );
+        assert!(!settings.save(&[("memory.kv_mb", Some("8"))]).unwrap(), "nothing changed");
+        // Unreadable: nothing is saved over it.
+        engine.set_meta(SAVED, Some(b"not json")).unwrap();
+        let settings = Settings::open(engine.clone(), Some(HashMap::new()), false);
+        assert_eq!(settings.save(&[("status.public", Some("true"))]).unwrap_err().text, refused::UNREADABLE);
+        assert_eq!(engine.meta_entries(SAVED).unwrap().pop().unwrap().1, b"not json");
+        drop((settings, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn values_are_checked_and_spelled_one_way() {
