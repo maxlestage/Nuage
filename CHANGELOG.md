@@ -4,6 +4,54 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.2 (2026-11-15)
+
+### Install on any computer, backups where you choose
+
+- `install.sh` installs on **macOS** too (Apple silicon, Intel): a launchd daemon started with
+  the Mac and run as the person who ran `sudo`, the settings in
+  `/usr/local/etc/nuage/nuage.env`, the data in `/usr/local/var/nuage`, the log in
+  `/usr/local/var/log/nuage.log`.
+- `install.ps1` installs on **Windows** 10, 11 and Server, from an administrator PowerShell
+  (`irm …/install.ps1 | iex`): `nuage.exe` in `C:\Program Files\Nuage`, the data and the
+  settings in `C:\ProgramData\Nuage`, readable by administrators only, a scheduled task that
+  starts it with Windows and restarts it, a firewall rule for the local network.
+- **The backups are chosen at install**: a folder on another disk (`NUAGE_BACKUP_DIR`), S3-
+  compatible storage (`NUAGE_BACKUP_S3_*`) or none (`NUAGE_BACKUP=none`), given in the command
+  or asked in the terminal; written in the settings file, kept on upgrades, changed by running
+  the installer again with another option. The installer makes only the last folder (an
+  external disk that is not plugged in is not replaced by a folder on the computer's own disk)
+  and warns when the folder is on the data's disk. `uninstall` and `purge` never delete the
+  backups.
+- The installers generate `NUAGE_ADMIN_TOKEN` and print the `nuage apps create` line.
+- `nuage --env-file <file>` (or `NUAGE_ENV_FILE`): the settings from a file of `KEY=value`
+  lines (comments, `export`, quotes, Windows line ends and byte order mark accepted); the
+  environment wins over the file. The macOS and Windows services start the server so.
+- At startup the server warns when `NUAGE_BACKUP_DIR` is on the same disk as the data.
+- `nuage --help` lists the commands.
+- CI: the installers run end to end on Linux, macOS and Windows (service, health, first backup
+  in the folder, `nuage apps create`, upgrade, uninstall, purge).
+
+### Create an application in one command
+
+- `/api/apps`, the management API: `POST /api/apps {"name", "description"}` creates an
+  application, with its own encrypted database, and answers its first token and the two lines
+  to paste in its configuration (`env`: `NUAGE_URL`, `NUAGE_TOKEN`). `GET /api/apps` and
+  `GET /api/apps/{name}` show them, `POST /api/apps/{name}/tokens` makes another token
+  (`{"read_only": true}` for a website), `DELETE /api/apps/{name}/tokens/{id}` revokes one.
+  JSON refusals that say what to do (`401`, `403`, `400`, `404`, `409`). Deleting an
+  application stays in the console.
+- It opens with `NUAGE_ADMIN_TOKEN`, a secret of its own (32 characters at least, `nuage
+  genkey`; a shorter one stops the server at startup), compared in constant time. An
+  application's token, `NUAGE_TOKEN` included, never opens it. Without it, the API is off.
+- `nuage apps create <name> [description]` and `nuage apps list`: the same from a terminal.
+  On the server's computer they need nothing else (`sudo nuage apps create shop`): the token
+  and the port come from the installer's settings file, and the address shown is its
+  `SITE_URL` when it has one; from anywhere else, `NUAGE_URL` and `NUAGE_ADMIN_TOKEN`.
+- A name already taken answers `409` with `kind: unique_violation`, which Memoire's
+  `NuageAdmin` reads as `Error::UniqueViolation`.
+- In `/v1/openapi.json`, the READMEs, `nuage.env.example` and `app.json`.
+
 ### The dashboard's cards open
 
 - Every card of `/app` opens its details, live: the requests (the last minute larger, its

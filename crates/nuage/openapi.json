@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nuage DB",
-    "version": "0.4.1",
+    "version": "0.4.2",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -64,7 +64,7 @@
                 },
                 "example": {
                   "ok": true,
-                  "message": "Connected to Nuage DB 0.4.1: application `blog`, read and write, branch `main`, 3 table(s).",
+                  "message": "Connected to Nuage DB 0.4.2: application `blog`, read and write, branch `main`, 3 table(s).",
                   "application": "blog",
                   "access": "read-write",
                   "branch": "main",
@@ -246,6 +246,432 @@
           }
         }
       }
+    },
+    "/api/apps": {
+      "get": {
+        "operationId": "listApps",
+        "summary": "Every application of the server",
+        "description": "The first application (the server's own, `NUAGE_NAME`) first, then by name.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The applications.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "applications"
+                  ],
+                  "properties": {
+                    "applications": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Application"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off: set NUAGE_ADMIN_TOKEN on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createApp",
+        "summary": "Create an application, with its own encrypted database and a first token",
+        "description": "The token is in this answer only: the server keeps its SHA-256 digest. `env` holds the two lines to paste in the application's configuration. `nuage apps create <name>` sends this request.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9_-]{1,63}$",
+                    "description": "1 to 63 lowercase letters, digits, `-` and `_`: the name of the application and of its database."
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "A note shown in the console."
+                  }
+                }
+              },
+              "example": {
+                "name": "shop",
+                "description": "The shop"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "application",
+                    "token",
+                    "env",
+                    "message"
+                  ],
+                  "properties": {
+                    "application": {
+                      "$ref": "#/components/schemas/Application"
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "The first token (`nuage_…`), shown once."
+                    },
+                    "env": {
+                      "$ref": "#/components/schemas/Env"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a JSON object, a missing or invalid name, a field of the wrong type.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "There is already an application with this name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off: set NUAGE_ADMIN_TOKEN on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps/{name}": {
+      "get": {
+        "operationId": "getApp",
+        "summary": "One application",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,63}$"
+            },
+            "description": "The application's name."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Application"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off: set NUAGE_ADMIN_TOKEN on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps/{name}/tokens": {
+      "post": {
+        "operationId": "createAppToken",
+        "summary": "Another token for an application",
+        "description": "A read-only token reads and never writes: for the JavaScript of a website. Shown once.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,63}$"
+            },
+            "description": "The application's name."
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "read_only": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              },
+              "example": {
+                "read_only": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "application",
+                    "token",
+                    "read_only",
+                    "env"
+                  ],
+                  "properties": {
+                    "application": {
+                      "type": "string"
+                    },
+                    "token": {
+                      "type": "string"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    },
+                    "env": {
+                      "$ref": "#/components/schemas/Env"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`read_only` is not a boolean.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off: set NUAGE_ADMIN_TOKEN on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps/{name}/tokens/{id}": {
+      "delete": {
+        "operationId": "revokeAppToken",
+        "summary": "Revoke a token",
+        "description": "The token stops opening the database at once.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,63}$"
+            },
+            "description": "The application's name."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The token's id: its 8 characters after `nuage_`, as `tokens` lists them."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such application, or no such token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off: set NUAGE_ADMIN_TOKEN on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -254,6 +680,11 @@
         "type": "http",
         "scheme": "bearer",
         "description": "A token of an application (the console's Tokens tab, or NUAGE_TOKEN)."
+      },
+      "adminToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The server's NUAGE_ADMIN_TOKEN (32 characters at least): it opens the management API, `/api/apps`, and nothing else."
       }
     },
     "schemas": {
@@ -392,12 +823,96 @@
             "properties": {
               "kind": {
                 "type": "string",
-                "description": "`validation` (bad SQL or values), `unique_violation`, `constraint`, `no_such_table`, `table_exists`, `conversion`, `unsupported`, `unauthorized`, `forbidden` (a read-only token writing), `not_found`, `conflict` (another commit came first: retry), `transaction_finished`, `database`."
+                "description": "`validation` (bad SQL or values), `unique_violation`, `constraint`, `no_such_table`, `table_exists`, `conversion`, `unsupported`, `unauthorized`, `forbidden` (a read-only token writing), `not_found`, `conflict` (another commit came first: retry), `transaction_finished`, `database`; on `/api/apps`, also `method_not_allowed`."
               },
               "message": {
                 "type": "string"
               }
             }
+          }
+        }
+      },
+      "Token": {
+        "type": "object",
+        "required": [
+          "id",
+          "created_at",
+          "read_only"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Its 8 characters after `nuage_`: enough to tell tokens apart, not to guess one."
+          },
+          "created_at": {
+            "type": "integer",
+            "description": "Unix milliseconds."
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Application": {
+        "type": "object",
+        "required": [
+          "name",
+          "description",
+          "first",
+          "created_at",
+          "tokens",
+          "env_token",
+          "origins"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "first": {
+            "type": "boolean",
+            "description": "The server's own application (`NUAGE_NAME`)."
+          },
+          "created_at": {
+            "type": "integer",
+            "description": "Unix milliseconds."
+          },
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Token"
+            },
+            "description": "Its tokens, by id: never a token itself."
+          },
+          "env_token": {
+            "type": "boolean",
+            "description": "`NUAGE_TOKEN` opens it too (the first application)."
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Websites whose pages may call it from the browser (CORS)."
+          }
+        }
+      },
+      "Env": {
+        "type": "object",
+        "required": [
+          "NUAGE_URL",
+          "NUAGE_TOKEN"
+        ],
+        "description": "The two lines to paste in the application's configuration.",
+        "properties": {
+          "NUAGE_URL": {
+            "type": "string",
+            "description": "This server's address."
+          },
+          "NUAGE_TOKEN": {
+            "type": "string"
           }
         }
       }

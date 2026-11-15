@@ -120,7 +120,7 @@ impl BackupStore for DirectoryStore {
         // Written aside, then renamed: a reader never sees half an object.
         let tmp = path.with_extension("partial");
         fs::write(&tmp, data).map_err(io)?;
-        fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
         fs::rename(&tmp, &path).map_err(io)
     }
 
@@ -131,7 +131,7 @@ impl BackupStore for DirectoryStore {
         }
         let tmp = path.with_extension("partial");
         fs::copy(source, &tmp).map_err(io)?;
-        fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
         fs::rename(&tmp, &path).map_err(io)
     }
 
@@ -342,7 +342,8 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
         // No commit may land while the file is copied.
         let mut w = store.writer();
         let lsn = store.checkpoint_locked(&mut w, Some(0))?;
-        fs::copy(store.dir.join(FILE), &local).map_err(io)?;
+        // Through the store's own handle: Windows lets no other handle read the locked file.
+        store.pages.copy_file_to(&local)?;
         lsn
     };
     let name = format!("snapshots/{lsn:020}.db");
