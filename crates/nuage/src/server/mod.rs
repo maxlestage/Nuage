@@ -26,6 +26,7 @@ mod i18n;
 mod kv;
 mod kv_port;
 mod manage;
+mod net;
 mod pg;
 mod second_copy;
 pub(crate) mod settings;
@@ -154,6 +155,11 @@ pub struct ServerOptions {
     /// PostgreSQL connections served at once (each has a thread); the next
     /// ones are refused as PostgreSQL does (`too_many_connections`).
     pub pg_max_connections: usize,
+    /// Key-value port connections served at once ([`Server::listen_kv`]);
+    /// the next ones are told `max number of clients reached`, as Redis
+    /// says it, and closed. Default: 1,000, less when the system lets the
+    /// process open few files.
+    pub kv_max_connections: usize,
     /// What the environment (or the settings file) says for the settings the
     /// owner may change while the server runs, by variable (`NUAGE_CACHE_MB`
     /// → `auto`): the console shows it next to what was saved, and a value
@@ -224,6 +230,7 @@ impl Default for ServerOptions {
             cache_budget: None,
             cache_ceiling: None,
             pg_max_connections: 100,
+            kv_max_connections: net::default_kv_connections(),
             settings_env: None,
             settings_read_only: false,
             startup: Vec::new(),
@@ -576,7 +583,13 @@ impl Server {
                 tokio::select! {
                     _ = stopped.notified() => break,
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { continue };
+                        let stream = match accepted {
+                            Ok((stream, _)) => stream,
+                            Err(e) => {
+                                net::accept_failed(&e).await;
+                                continue;
+                            }
+                        };
                         let Ok(stream) = stream.into_std() else { continue };
                         if stream.set_nonblocking(false).is_err() {
                             continue;
@@ -584,9 +597,13 @@ impl Server {
                         // Each connection has a thread: past the limit they are
                         // told so (a short-lived thread), and far past it,
                         // dropped, so that a flood cannot use up the threads.
-                        let open = state.pg_connections.load(Ordering::Relaxed);
+                        // Counted here, before its thread starts (the thread
+                        // only counts it out): the limit holds however fast
+                        // connections come.
+                        let open = state.pg_connections.fetch_add(1, Ordering::Relaxed);
                         let max = state.pg_max_connections();
                         if open >= max + 16 {
+                            state.pg_connections.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
                         let (state, mut options) = (state.clone(), options.clone());
@@ -594,9 +611,15 @@ impl Server {
                         // A thread per connection, as PostgreSQL has a process:
                         // its statements block on the engine. Not a runtime
                         // task, so an idle client never delays a shutdown.
-                        let _ = std::thread::Builder::new()
+                        // Its stack has room for deeply nested statements.
+                        let counted = state.clone();
+                        let spawned = std::thread::Builder::new()
                             .name("nuage-pg".into())
+                            .stack_size(pg::THREAD_STACK)
                             .spawn(move || pg::serve(state, stream, options));
+                        if spawned.is_err() {
+                            counted.pg_connections.fetch_sub(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -617,12 +640,27 @@ impl Server {
         let state = self.state.clone();
         let stopped = stop.clone();
         let task = tokio::spawn(async move {
+            // Connections open now: each holds a socket and its buffers.
+            let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 tokio::select! {
                     _ = stopped.notified() => break,
                     accepted = listener.accept() => {
-                        let Ok((stream, peer)) = accepted else { continue };
-                        tokio::spawn(kv_port::serve(state.clone(), stream, peer, options.clone()));
+                        let (stream, peer) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(e) => {
+                                net::accept_failed(&e).await;
+                                continue;
+                            }
+                        };
+                        // Past the limit the client is told so, as Redis tells
+                        // it, and the socket closed at once.
+                        if open.load(Ordering::Relaxed) >= state.options.kv_max_connections.max(1) {
+                            let _ = stream.try_write(kv_port::TOO_MANY_CLIENTS);
+                            continue;
+                        }
+                        let place = kv_port::Place::take(&open);
+                        tokio::spawn(kv_port::serve(state.clone(), stream, peer, options.clone(), place));
                     }
                 }
             }

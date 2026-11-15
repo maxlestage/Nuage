@@ -20,12 +20,13 @@
 //! The SQL is Nuage DB's (see [`crate::sql`]); the system catalogs
 //! (`pg_catalog`, `information_schema`) are not there.
 
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use memoire_orm::nuage::wire;
@@ -41,6 +42,11 @@ use crate::sql::{Script, SqlResult};
 pub struct PgOptions {
     /// The server's certificate, for `sslmode=require`.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// How long a transaction (`BEGIN`) may wait for its client's next
+    /// message: past it, it is rolled back and that message is told so
+    /// (SQLSTATE `25P03`), as PostgreSQL's `idle_in_transaction_session_timeout`
+    /// does. Default (`None`): 5 minutes.
+    pub idle_in_transaction: Option<Duration>,
     /// Set by the listener for a connection past the limit: it is told
     /// `too_many_connections` and closed.
     #[doc(hidden)]
@@ -49,7 +55,10 @@ pub struct PgOptions {
 
 impl std::fmt::Debug for PgOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgOptions").field("tls", &self.tls.is_some()).finish()
+        f.debug_struct("PgOptions")
+            .field("tls", &self.tls.is_some())
+            .field("idle_in_transaction", &self.idle_in_transaction)
+            .finish()
     }
 }
 
@@ -77,9 +86,93 @@ pub fn tls_config(cert_pem: &std::path::Path, key_pem: &std::path::Path) -> Resu
 // Connection
 // ---------------------------------------------------------------------------
 
+/// Time a client has to log in, from its connection to its password checked
+/// (TLS included). Once logged in, it may stay idle as long as it likes: the
+/// connections of a pool wait for hours.
+const LOGIN_TIME: Duration = Duration::from_secs(15);
+/// Time a client past the connection limit has to hear why.
+const REFUSE_TIME: Duration = Duration::from_secs(5);
+/// The longest message before login (PostgreSQL's own limit for a startup
+/// packet): a client nobody knows holds no more than that.
+const LOGIN_MESSAGE: usize = 10_000;
+/// A transaction left this long without a word from its client is rolled
+/// back ([`PgOptions::idle_in_transaction`]): an open one keeps every page it
+/// sees, and the database's file grows meanwhile.
+const IDLE_IN_TRANSACTION: Duration = Duration::from_secs(300);
+/// Bytes of answers held before they are sent: a long result goes out as it
+/// is written, not once all of it is.
+const SEND_AT: usize = 1 << 16;
+/// What is read from the socket at once, after login.
+const READ_AHEAD: usize = 16 << 10;
+/// The stack of a connection's thread: statements may nest deep.
+pub(super) const THREAD_STACK: usize = 8 << 20;
+
+/// The client's socket. While a deadline is set (to log in), a read waits
+/// only for what is left of it; while `idle` is set (a transaction is open),
+/// a read waits that long at most. Either way a read that waited too long
+/// fails with [`timed_out`], and nothing was read.
+struct Socket {
+    stream: TcpStream,
+    deadline: Option<Instant>,
+    idle: Option<Duration>,
+    /// The read timeout set on the socket now.
+    armed: Option<Duration>,
+}
+
+impl Socket {
+    fn new(stream: TcpStream) -> Socket {
+        Socket { stream, deadline: None, idle: None, armed: None }
+    }
+}
+
+impl Read for Socket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let wait = match self.deadline {
+            Some(at) => {
+                let left = at.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Some(left)
+            }
+            None => self.idle,
+        };
+        // Set again only when it changes: once per transaction, not per read.
+        if wait != self.armed {
+            self.stream.set_read_timeout(wait)?;
+            self.armed = wait;
+        }
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Socket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// A read that ended for its timeout (a would-block error on Unix, a
+/// timed-out one on Windows).
+fn timed_out(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
 enum Conn {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+    Plain(Socket),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, Socket>>),
+}
+
+impl Conn {
+    fn socket(&mut self) -> &mut Socket {
+        match self {
+            Conn::Plain(s) => s,
+            Conn::Tls(s) => &mut s.sock,
+        }
+    }
 }
 
 impl Read for Conn {
@@ -106,18 +199,54 @@ impl Write for Conn {
     }
 }
 
-/// Messages to the client, sent at `flush`.
+/// Messages to the client. Those of a long answer are sent as they pile up
+/// (when it has a connection to send them to), the rest by [`Out::end`].
 #[derive(Default)]
-struct Out(Vec<u8>);
+struct Out<'c> {
+    buf: Vec<u8>,
+    to: Option<&'c mut Conn>,
+    /// Something was sent already.
+    sent: bool,
+    /// A write failed: the client is gone, nothing more is written.
+    failed: Option<io::Error>,
+}
 
-impl Out {
+impl<'c> Out<'c> {
+    fn to(conn: &'c mut Conn) -> Out<'c> {
+        Out { to: Some(conn), ..Out::default() }
+    }
+
     fn msg(&mut self, kind: u8, body: impl FnOnce(&mut Vec<u8>)) {
-        self.0.push(kind);
-        let at = self.0.len();
-        self.0.extend_from_slice(&[0; 4]);
-        body(&mut self.0);
-        let len = (self.0.len() - at) as u32;
-        self.0[at..at + 4].copy_from_slice(&len.to_be_bytes());
+        if self.failed.is_some() {
+            return;
+        }
+        self.buf.push(kind);
+        let at = self.buf.len();
+        self.buf.extend_from_slice(&[0; 4]);
+        body(&mut self.buf);
+        let len = (self.buf.len() - at) as u32;
+        self.buf[at..at + 4].copy_from_slice(&len.to_be_bytes());
+        if self.buf.len() >= SEND_AT
+            && let Some(conn) = self.to.as_deref_mut()
+        {
+            if let Err(e) = conn.write_all(&self.buf) {
+                self.failed = Some(e);
+            }
+            self.buf.clear();
+            self.sent = true;
+        }
+    }
+
+    /// Sends what is left; `flush`: now, not with the next answer.
+    fn end(mut self, flush: bool) -> io::Result<()> {
+        if let Some(e) = self.failed.take() {
+            return Err(e);
+        }
+        let Some(conn) = self.to.take() else { return Ok(()) };
+        if !self.buf.is_empty() {
+            conn.write_all(&self.buf)?;
+        }
+        if flush || self.sent { conn.flush() } else { Ok(()) }
     }
 }
 
@@ -126,17 +255,55 @@ fn cstr(b: &mut Vec<u8>, s: &str) {
     b.push(0);
 }
 
-/// Reads a client message: its type and body.
-fn read_msg(conn: &mut Conn) -> io::Result<(u8, Vec<u8>)> {
+/// What the client sent next.
+enum Incoming {
+    Message(u8, Vec<u8>),
+    /// Nothing came in the time a read may wait.
+    Quiet,
+    /// A message longer than may be read: its type and length, its body
+    /// still to be read (or skipped).
+    TooLong(u8, usize),
+}
+
+/// Reads a client message, of at most `max` bytes: its type and body. The
+/// body grows as its bytes arrive, so a message announced and never sent
+/// holds no memory.
+fn read_msg(conn: &mut impl Read, max: usize) -> io::Result<Incoming> {
     let mut head = [0u8; 5];
-    conn.read_exact(&mut head)?;
+    // The first byte apart: a wait that ends before it leaves the stream as it was.
+    loop {
+        match conn.read(&mut head[..1]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if timed_out(&e) => return Ok(Incoming::Quiet),
+            Err(e) => return Err(e),
+        }
+    }
+    conn.read_exact(&mut head[1..])?;
     let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
-    if !(4..=64 << 20).contains(&len) {
+    if len < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad message length"));
     }
-    let mut body = vec![0u8; len - 4];
-    conn.read_exact(&mut body)?;
-    Ok((head[0], body))
+    if len > max {
+        return Ok(Incoming::TooLong(head[0], len));
+    }
+    Ok(Incoming::Message(head[0], read_body(conn, len - 4)?))
+}
+
+/// `len` bytes of a message's body.
+fn read_body(conn: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    if len <= 64 << 10 {
+        let mut body = vec![0u8; len];
+        conn.read_exact(&mut body)?;
+        return Ok(body);
+    }
+    let mut body = Vec::with_capacity(64 << 10);
+    conn.by_ref().take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(body)
 }
 
 /// A cursor over a message body.
@@ -176,7 +343,8 @@ const GSS_REQUEST: i32 = 80877104;
 const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
 
-/// Serves one connection until the client leaves (blocking).
+/// Serves one connection until the client leaves (blocking). The listener
+/// counted it in `pg_connections`; it is counted out here.
 pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
     /// Counts a connection for as long as it lives, a panic included.
     struct Open<'a>(&'a State);
@@ -186,26 +354,36 @@ pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
             self.0.pg_connections.fetch_sub(1, Ordering::Relaxed);
         }
     }
-    let _ = stream.set_nodelay(true);
     state.metrics.open_connections.fetch_add(1, Ordering::Relaxed);
-    state.pg_connections.fetch_add(1, Ordering::Relaxed);
     let _open = Open(&state);
-    if options.refuse {
-        // Past the limit: a client that says nothing does not keep the thread.
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    }
-    let _ = session(&state, stream, &options);
+    let _ = stream.set_nodelay(true);
+    super::net::keep_alive(&stream);
+    // A bug met by one session ends that session alone (its client is told
+    // why when the session got that far), not the process's thread count.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| session(&state, stream, &options)));
+}
+
+/// The text of a panic.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("")
 }
 
 fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Result<()> {
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    let mut conn = Conn::Plain(stream);
+    // Until the password is checked, each read waits only for what is left
+    // of the time to log in, and the few answers the client is sent must go
+    // out in that time too.
+    let mut socket = Socket::new(stream);
+    let login = if options.refuse { REFUSE_TIME } else { LOGIN_TIME };
+    socket.deadline = Some(Instant::now() + login);
+    let _ = socket.stream.set_write_timeout(Some(login));
+    let mut conn = Conn::Plain(socket);
     // The startup packet, after an optional TLS (or GSS) request.
     let params = loop {
         let mut len = [0u8; 4];
         conn.read_exact(&mut len)?;
         let len = u32::from_be_bytes(len) as usize;
-        if !(8..=10_000).contains(&len) {
+        if !(8..=LOGIN_MESSAGE).contains(&len) {
             return Ok(());
         }
         let mut body = vec![0u8; len - 4];
@@ -240,7 +418,7 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
             _ => {
                 let mut out = Out::default();
                 error(&mut out, "0A000", "this server speaks version 3 of the PostgreSQL protocol");
-                return conn.write_all(&out.0);
+                return conn.write_all(&out.buf);
             }
         }
     };
@@ -255,13 +433,13 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
                 state.pg_max_connections()
             ),
         );
-        return conn.write_all(&out.0);
+        return conn.write_all(&out.buf);
     }
     // The password is a token of an application.
     let mut out = Out::default();
     out.msg(b'R', |b| b.extend_from_slice(&3i32.to_be_bytes()));
-    conn.write_all(&out.0)?;
-    let (kind, body) = read_msg(&mut conn)?;
+    conn.write_all(&out.buf)?;
+    let Incoming::Message(kind, body) = read_msg(&mut conn, LOGIN_MESSAGE)? else { return Ok(()) };
     let token = if kind == b'p' { Body(&body).str().unwrap_or_default() } else { String::new() };
     let mut out = Out::default();
     let Some((app, read_only)) = state.apps.authenticate(&token, state.options.token.as_deref()) else {
@@ -270,7 +448,7 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
             "28P01",
             "password authentication failed: the password is a token of an application (the console's Tokens tab, or NUAGE_TOKEN)",
         );
-        return conn.write_all(&out.0);
+        return conn.write_all(&out.buf);
     };
     let database = params.get("database").map(String::as_str).unwrap_or_default();
     let branch = if database.is_empty() || database == app.name || database == super::MAIN || database == "postgres" {
@@ -283,8 +461,12 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
             "3D000",
             &format!("database \"{database}\" does not exist: use the application's name, or one of its branches"),
         );
-        return conn.write_all(&out.0);
+        return conn.write_all(&out.buf);
     };
+    // Logged in: no more deadline.
+    let socket = conn.socket();
+    socket.deadline = None;
+    let _ = socket.stream.set_write_timeout(None);
     out.msg(b'R', |b| b.extend_from_slice(&0i32.to_be_bytes()));
     let app_name = params.get("application_name").cloned().unwrap_or_default();
     for (k, v) in server_params(&app_name) {
@@ -318,51 +500,75 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
         branch,
         tx: None,
         failed: false,
+        idled: None,
         savepoints: Vec::new(),
         statements: HashMap::new(),
         portals: HashMap::new(),
         skip_to_sync: false,
     };
     s.ready(&mut out);
-    conn.write_all(&out.0)?;
+    conn.write_all(&out.buf)?;
+    // A message is as long as a request body may be.
+    let max = state.options.max_body_bytes.max(64 << 10);
+    let idle = options.idle_in_transaction.unwrap_or(IDLE_IN_TRANSACTION).max(Duration::from_millis(1));
+    let mut conn = BufReader::with_capacity(READ_AHEAD, conn);
     loop {
-        let (kind, body) = read_msg(&mut conn)?;
-        let mut out = Out::default();
-        let flush = match kind {
-            b'X' => return Ok(()),
-            b'S' => {
-                s.skip_to_sync = false;
-                if s.tx.is_none() {
-                    // An implicit transaction ends at Sync: nothing to keep.
-                    s.portals.clear();
-                }
-                s.ready(&mut out);
-                true
+        conn.get_mut().socket().idle = s.tx.is_some().then_some(idle);
+        let (kind, body) = match read_msg(&mut conn, max)? {
+            Incoming::Message(kind, body) => (kind, body),
+            Incoming::Quiet => {
+                s.idle_too_long(idle);
+                continue;
             }
-            b'H' => true,
-            _ if s.skip_to_sync => false,
-            b'Q' => {
-                let sql = Body(&body).str().unwrap_or_default();
-                s.simple(&mut out, &sql);
-                s.ready(&mut out);
-                true
-            }
-            _ => {
-                if let Err(e) = s.extended(&mut out, kind, &body) {
-                    s.fail(&mut out, &e);
-                    s.skip_to_sync = true;
-                }
-                false
+            Incoming::TooLong(kind, len) => {
+                // Read through, not kept: the session goes on, the message refused.
+                io::copy(&mut conn.by_ref().take(len as u64 - 4), &mut io::sink())?;
+                let mut out = Out::to(conn.get_mut());
+                s.too_long(&mut out, kind, len, max);
+                out.end(true)?;
+                continue;
             }
         };
-        if flush || out.0.len() > 1 << 16 {
-            conn.write_all(&out.0)?;
-            conn.flush()?;
-        } else if !out.0.is_empty() {
-            // Sent with the next Sync or Flush; most clients send them at once.
-            conn.write_all(&out.0)?;
+        if answer_guarded(conn.get_mut(), |out| s.message(out, kind, &body))? == Step::Close {
+            return Ok(());
         }
     }
+}
+
+/// Answers a message with `answer`, and sends what it wrote. A bug met there
+/// (a panic) is told to the client as PostgreSQL tells an internal error
+/// (SQLSTATE `XX000`), and ends the session (its transaction rolled back),
+/// not the server: [`Step::Close`].
+fn answer_guarded(conn: &mut Conn, answer: impl FnOnce(&mut Out<'_>) -> Step) -> io::Result<Step> {
+    let answered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut out = Out::to(conn);
+        let step = answer(&mut out);
+        out.end(step == Step::Flush).map(|()| step)
+    }));
+    match answered {
+        Ok(step) => step,
+        Err(panic) => {
+            let mut out = Out::default();
+            error(
+                &mut out,
+                "XX000",
+                &format!("internal error: {}; this connection is closed, the server goes on", panic_text(&*panic)),
+            );
+            let _ = conn.write_all(&out.buf).and_then(|()| conn.flush());
+            Ok(Step::Close)
+        }
+    }
+}
+
+/// What a message leaves to do.
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    /// Its answers go with the next ones.
+    Hold,
+    /// Its answers go now (`Sync`, `Flush`, a simple query).
+    Flush,
+    /// The client said goodbye.
+    Close,
 }
 
 /// Parses SQL; a question about PostgreSQL's catalogs (`pg_type`,
@@ -415,7 +621,7 @@ fn server_params(app_name: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn error(out: &mut Out, code: &str, message: &str) {
+fn error(out: &mut Out<'_>, code: &str, message: &str) {
     out.msg(b'E', |b| {
         for (f, v) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', code), (b'M', message)] {
             b.push(f);
@@ -475,11 +681,31 @@ struct Prepared {
 
 struct Portal {
     stmt: Arc<Prepared>,
+    /// Its parameters, until it runs.
     params: Vec<Value>,
     formats: Vec<i16>,
-    /// Results, once run (at Describe or Execute), and the rows already sent.
-    results: Option<Vec<SqlResult>>,
-    sent: usize,
+    /// Its columns: as told to the client (`Describe`), else as found when
+    /// it ran (`None`: it returns no rows).
+    columns: Option<Vec<(String, i32)>>,
+    /// Once run (at Execute, or at Describe when only a run tells its columns).
+    ran: Option<Ran>,
+}
+
+/// What a portal's run left to send.
+struct Ran {
+    /// The rows not sent yet: each is let go once sent.
+    rows: VecDeque<Vec<Value>>,
+    /// Its command tag (`SELECT 3`), for when the last row is sent.
+    tag: String,
+}
+
+/// A statement's columns, as known before it runs.
+enum Columns {
+    Known(Vec<(String, i32)>),
+    /// It returns no rows.
+    None,
+    /// Only a run would tell.
+    Unknown,
 }
 
 struct Session {
@@ -491,6 +717,9 @@ struct Session {
     tx: Option<EmbeddedTransaction>,
     /// A statement of that transaction failed: only `ROLLBACK` is accepted.
     failed: bool,
+    /// The transaction was rolled back for having been left idle this long:
+    /// the client's next message is told so.
+    idled: Option<Duration>,
     /// Its savepoints, in order.
     savepoints: Vec<(String, Savepoint)>,
     statements: HashMap<String, Arc<Prepared>>,
@@ -513,7 +742,96 @@ enum Plan {
 }
 
 impl Session {
-    fn ready(&self, out: &mut Out) {
+    /// Answers one message of the client.
+    fn message(&mut self, out: &mut Out<'_>, kind: u8, body: &[u8]) -> Step {
+        match kind {
+            b'X' => return Step::Close,
+            b'H' => return Step::Flush,
+            _ => {}
+        }
+        if let Some(idle) = self.idled.take() {
+            // Whatever it asks (a `COMMIT` above all), the transaction it
+            // thinks open is gone: it is told before anything runs.
+            let secs = idle.as_secs_f64();
+            error(
+                out,
+                "25P03",
+                &format!(
+                    "the transaction was rolled back: it was left idle for more than {secs} seconds \
+                     (idle_in_transaction_session_timeout); run it again"
+                ),
+            );
+            match kind {
+                b'Q' => {
+                    self.ready(out);
+                    return Step::Flush;
+                }
+                b'S' => {}
+                _ => {
+                    self.skip_to_sync = true;
+                    return Step::Hold;
+                }
+            }
+        }
+        match kind {
+            b'S' => {
+                self.skip_to_sync = false;
+                if self.tx.is_none() {
+                    // An implicit transaction ends at Sync: nothing to keep.
+                    self.portals.clear();
+                }
+                self.ready(out);
+                Step::Flush
+            }
+            _ if self.skip_to_sync => Step::Hold,
+            b'Q' => {
+                let sql = Body(body).str().unwrap_or_default();
+                self.simple(out, &sql);
+                self.ready(out);
+                Step::Flush
+            }
+            _ => {
+                if let Err(e) = self.extended(out, kind, body) {
+                    self.fail(out, &e);
+                    self.skip_to_sync = true;
+                }
+                Step::Hold
+            }
+        }
+    }
+
+    /// The client left its transaction idle too long: rolled back, so that
+    /// it keeps no pages from being reused; the client hears of it at its
+    /// next message.
+    fn idle_too_long(&mut self, idle: Duration) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.rollback_now();
+            self.idled = Some(idle);
+        }
+        self.failed = false;
+        self.savepoints.clear();
+        // The portals of a transaction end with it.
+        self.portals.clear();
+    }
+
+    /// A message longer than a request body may be, skipped: refused as a
+    /// statement is.
+    fn too_long(&mut self, out: &mut Out<'_>, kind: u8, len: usize, max: usize) {
+        let message = format!(
+            "message too long: {len} bytes, this server reads {max} at most (the largest request body); send less at once"
+        );
+        error(out, "54000", &message);
+        if self.tx.is_some() {
+            self.failed = true;
+        }
+        if kind == b'Q' {
+            self.ready(out);
+        } else {
+            self.skip_to_sync = true;
+        }
+    }
+
+    fn ready(&self, out: &mut Out<'_>) {
         let status = match (&self.tx, self.failed) {
             (None, _) => b'I',
             (Some(_), false) => b'T',
@@ -522,7 +840,7 @@ impl Session {
         out.msg(b'Z', |b| b.push(status));
     }
 
-    fn fail(&mut self, out: &mut Out, e: &Error) {
+    fn fail(&mut self, out: &mut Out<'_>, e: &Error) {
         if self.tx.is_some() {
             self.failed = true;
         }
@@ -679,13 +997,13 @@ impl Session {
 
     // --- simple protocol --------------------------------------------------
 
-    fn simple(&mut self, out: &mut Out, sql: &str) {
+    fn simple(&mut self, out: &mut Out<'_>, sql: &str) {
         if let Err(e) = self.simple_inner(out, sql) {
             self.fail(out, &e);
         }
     }
 
-    fn simple_inner(&mut self, out: &mut Out, sql: &str) -> Result<()> {
+    fn simple_inner(&mut self, out: &mut Out<'_>, sql: &str) -> Result<()> {
         match self.plan(sql) {
             Ok(Plan::Empty) => {
                 out.msg(b'I', |_| {});
@@ -708,8 +1026,9 @@ impl Session {
                     )?
                     .pop()
                     .unwrap_or_default();
-                    for (i, r) in results.iter().enumerate() {
-                        send_result(out, r, None, &[], &script.tag(i, r))?;
+                    for (i, r) in results.into_iter().enumerate() {
+                        let tag = script.tag(i, &r);
+                        send_result(out, r, &tag)?;
                     }
                     return Ok(());
                 }
@@ -734,7 +1053,7 @@ impl Session {
         Ok(())
     }
 
-    fn simple_one(&mut self, out: &mut Out, plan: Plan) -> Result<()> {
+    fn simple_one(&mut self, out: &mut Out<'_>, plan: Plan) -> Result<()> {
         match plan {
             Plan::Empty => out.msg(b'I', |_| {}),
             Plan::Control(c) => {
@@ -758,8 +1077,9 @@ impl Session {
             }
             Plan::Run(script) => {
                 let results = self.run(&script, &[])?;
-                for (i, r) in results.iter().enumerate() {
-                    send_result(out, r, None, &[], &script.tag(i, r))?;
+                for (i, r) in results.into_iter().enumerate() {
+                    let tag = script.tag(i, &r);
+                    send_result(out, r, &tag)?;
                 }
             }
         }
@@ -768,7 +1088,7 @@ impl Session {
 
     // --- extended protocol ------------------------------------------------
 
-    fn extended(&mut self, out: &mut Out, kind: u8, body: &[u8]) -> Result<()> {
+    fn extended(&mut self, out: &mut Out<'_>, kind: u8, body: &[u8]) -> Result<()> {
         let mut b = Body(body);
         match kind {
             b'P' => {
@@ -841,7 +1161,7 @@ impl Session {
                 for _ in 0..nr {
                     formats.push(b.i16()?);
                 }
-                self.portals.insert(portal, Portal { stmt, params, formats, results: None, sent: 0 });
+                self.portals.insert(portal, Portal { stmt, params, formats, columns: None, ran: None });
                 out.msg(b'2', |_| {});
             }
             b'D' => {
@@ -859,7 +1179,11 @@ impl Session {
                             b.extend_from_slice(&t.to_be_bytes());
                         }
                     });
-                    let columns = self.describe_statement(&stmt);
+                    let columns = match self.known_columns(&stmt) {
+                        Columns::Known(cols) => Some(cols),
+                        Columns::None => None,
+                        Columns::Unknown => self.dry_run_columns(&stmt),
+                    };
                     match &columns {
                         Some(cols) => row_description(out, cols, &[]),
                         None => out.msg(b'n', |_| {}),
@@ -875,11 +1199,10 @@ impl Session {
                     };
                     self.statements.insert(name, Arc::new(described));
                 } else {
-                    self.run_portal(&name)?;
-                    let p = &self.portals[&name];
-                    match portal_columns(p) {
-                        Some(cols) => row_description(out, &cols, &p.formats),
-                        None => out.msg(b'n', |_| {}),
+                    let columns = self.describe_portal(&name)?;
+                    match (columns, self.portals.get(&name)) {
+                        (Some(cols), Some(p)) => row_description(out, &cols, &p.formats),
+                        _ => out.msg(b'n', |_| {}),
                     }
                 }
             }
@@ -888,21 +1211,20 @@ impl Session {
                 let max = b.i32()?.max(0) as usize;
                 self.run_portal(&name)?;
                 let p = self.portals.get_mut(&name).ok_or_else(|| Error::Validation("no such portal".into()))?;
-                let results = p.results.as_deref().unwrap_or_default();
-                match (&p.stmt.script, results.first()) {
-                    (Some(script), Some(r)) => {
-                        let cols = portal_columns(p).unwrap_or_default();
-                        let types: Vec<i32> = cols.iter().map(|c| c.1).collect();
-                        let rows = &r.rows[p.sent..];
-                        let n = if max > 0 { rows.len().min(max) } else { rows.len() };
-                        for row in &rows[..n] {
-                            data_row(out, row, &types, &p.formats)?;
+                match (&p.stmt.script, p.ran.as_mut()) {
+                    (Some(_), Some(ran)) => {
+                        let types: Vec<i32> = p.columns.iter().flatten().map(|c| c.1).collect();
+                        let n = if max > 0 { ran.rows.len().min(max) } else { ran.rows.len() };
+                        // Each row is let go once written: a portal read in
+                        // batches holds less and less.
+                        for row in ran.rows.drain(..n) {
+                            data_row(out, &row, &types, &p.formats)?;
                         }
-                        p.sent += n;
-                        if max > 0 && p.sent < r.rows.len() {
-                            out.msg(b's', |_| {});
+                        if ran.rows.is_empty() {
+                            ran.rows = VecDeque::new();
+                            complete(out, &ran.tag);
                         } else {
-                            complete(out, &script.tag(0, r));
+                            out.msg(b's', |_| {});
                         }
                     }
                     _ => {
@@ -947,41 +1269,93 @@ impl Session {
 
     /// Runs a portal's statement once (Describe and Execute share the result).
     fn run_portal(&mut self, name: &str) -> Result<()> {
-        let p = self.portals.get(name).ok_or_else(|| Error::Validation(format!("portal \"{name}\" does not exist")))?;
-        if p.results.is_some() {
+        let p =
+            self.portals.get_mut(name).ok_or_else(|| Error::Validation(format!("portal \"{name}\" does not exist")))?;
+        if p.ran.is_some() {
             return Ok(());
         }
         let Some(script) = p.stmt.script.clone() else { return Ok(()) };
-        let params = p.params.clone();
+        // It runs once: its parameters are not needed after.
+        let params = std::mem::take(&mut p.params);
         let results = self.run(&script, &params)?;
-        if let Some(p) = self.portals.get_mut(name) {
-            p.results = Some(results);
-        }
+        let Some(p) = self.portals.get_mut(name) else { return Ok(()) };
+        let ran = match results.into_iter().next() {
+            Some(r) => {
+                let told = p.columns.take().filter(|cols| cols.len() == r.columns.len());
+                p.columns = if r.returns_rows { told.or_else(|| Some(found_columns(&p.stmt, &r))) } else { None };
+                Ran { tag: script.tag(0, &r), rows: r.rows.into() }
+            }
+            None => Ran { rows: VecDeque::new(), tag: "SELECT 0".into() },
+        };
+        p.ran = Some(ran);
         Ok(())
     }
 
-    /// The columns a prepared statement returns, from a run that changes
-    /// nothing, with its parameters `NULL`.
-    fn describe_statement(&self, stmt: &Prepared) -> Option<Vec<(String, i32)>> {
-        if let Some(plan_value) = match self.plan(&stmt.sql) {
-            Ok(Plan::Value(name, _)) => Some(name),
-            _ => None,
-        } {
-            return Some(vec![(plan_value, 25)]);
+    /// The columns of a portal, for `Describe`: as its statement's say when
+    /// they are known; else, for a statement that reads, from its run (which
+    /// `Execute` sends); for one that writes, as the statement names them.
+    fn describe_portal(&mut self, name: &str) -> Result<Option<Vec<(String, i32)>>> {
+        let p = self.portals.get(name).ok_or_else(|| Error::Validation(format!("portal \"{name}\" does not exist")))?;
+        if p.ran.is_none() {
+            let told = match self.known_columns(&p.stmt) {
+                Columns::Known(cols) => Some(Some(cols)),
+                Columns::None => Some(None),
+                Columns::Unknown if p.stmt.script.as_ref().is_some_and(|s| s.writes()) => Some(named_columns(&p.stmt)),
+                Columns::Unknown => None,
+            };
+            if let Some(columns) = told {
+                if let Some(p) = self.portals.get_mut(name) {
+                    p.columns = columns.clone();
+                }
+                return Ok(columns);
+            }
+            self.run_portal(name)?;
         }
-        let script = stmt.script.as_ref()?;
+        Ok(self.portals.get(name).and_then(|p| p.columns.clone()))
+    }
+
+    /// The columns of a statement known without running it: from the
+    /// statement itself (what it reads from tables, how it names them).
+    fn known_columns(&self, stmt: &Prepared) -> Columns {
+        if let Some(cols) = stmt.columns.as_ref().filter(|c| !c.is_empty()) {
+            return Columns::Known(cols.clone());
+        }
+        let Some(script) = &stmt.script else {
+            return match self.plan(&stmt.sql) {
+                Ok(Plan::Value(name, _)) => Columns::Known(vec![(name, TEXT)]),
+                _ => Columns::None,
+            };
+        };
         if !script.returns_rows() {
-            return None;
+            return Columns::None;
+        }
+        let (names, types) = (&stmt.typed_names, &stmt.typed_columns);
+        // A run names an expression and a name met twice its own way, and
+        // `EXPLAIN` answers with a plan: those, only a run tells.
+        let explains = stmt.sql.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+        let complete = !names.is_empty()
+            && names.len() == types.len()
+            && !types.contains(&0)
+            && !names.iter().any(|n| n == "?column?")
+            && !names.iter().enumerate().any(|(i, n)| names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)));
+        if complete && !explains {
+            Columns::Known(names.iter().cloned().zip(types.iter().copied()).collect())
+        } else {
+            Columns::Unknown
+        }
+    }
+
+    /// The columns of a statement whose tables do not tell them all: for a
+    /// statement that only reads, from a run with its parameters `NULL`; a
+    /// statement that writes is never run for that, and has the names it
+    /// gives (text where the type is unknown).
+    fn dry_run_columns(&self, stmt: &Prepared) -> Option<Vec<(String, i32)>> {
+        let script = stmt.script.as_ref()?;
+        if script.writes() {
+            return named_columns(stmt);
         }
         let nulls = vec![Value::Null; script.params()];
         let dry = match &self.tx {
-            // In the transaction the client has open: what the run writes
-            // there is taken back before anything else happens.
-            Some(tx) if script.writes() => tx.savepoint().and_then(|before| {
-                let dry = crate::sql::run_in(tx, &self.state.schemas, script, &nulls);
-                tx.rollback_to(&before)?;
-                dry
-            }),
             Some(tx) => crate::sql::run_in(tx, &self.state.schemas, script, &nulls),
             None => {
                 crate::sql::run_values(&self.app.engine, &self.branch, &self.state.schemas, &[(script, &nulls)], false)
@@ -992,14 +1366,7 @@ impl Session {
             Some(r) => Some(columns_of(&r, &stmt.typed_columns)),
             // The run failed (a NOT NULL column and NULL parameters...): the
             // columns as the statement names them.
-            None if !stmt.typed_names.is_empty() && stmt.typed_names.len() == stmt.typed_columns.len() => Some(
-                stmt.typed_names
-                    .iter()
-                    .zip(&stmt.typed_columns)
-                    .map(|(n, t)| (n.clone(), if *t == 0 { TEXT } else { *t }))
-                    .collect(),
-            ),
-            None => None,
+            None => named_columns(stmt),
         }
     }
 
@@ -1025,16 +1392,20 @@ impl Session {
     }
 }
 
-/// A portal's columns: as described, else as found.
-fn portal_columns(p: &Portal) -> Option<Vec<(String, i32)>> {
-    let r = p.results.as_ref()?.first()?;
-    if !r.returns_rows {
-        return None;
+/// The columns of a statement's result: as described, else as found.
+fn found_columns(stmt: &Prepared, r: &SqlResult) -> Vec<(String, i32)> {
+    match &stmt.columns {
+        Some(cols) if cols.len() == r.columns.len() => cols.clone(),
+        _ => columns_of(r, &stmt.typed_columns),
     }
-    match &p.stmt.columns {
-        Some(cols) if cols.len() == r.columns.len() => Some(cols.clone()),
-        _ => Some(columns_of(r, &p.stmt.typed_columns)),
-    }
+}
+
+/// The columns as a statement names them, text where their type is unknown
+/// (`None`: their names are unknown too).
+fn named_columns(stmt: &Prepared) -> Option<Vec<(String, i32)>> {
+    let (names, types) = (&stmt.typed_names, &stmt.typed_columns);
+    (!names.is_empty() && names.len() == types.len())
+        .then(|| names.iter().zip(types).map(|(n, t)| (n.clone(), if *t == 0 { TEXT } else { *t })).collect())
 }
 
 /// The type of each result column: of its table's column when known, else
@@ -1052,17 +1423,18 @@ fn columns_of(r: &SqlResult, typed: &[i32]) -> Vec<(String, i32)> {
         .collect()
 }
 
-fn complete(out: &mut Out, tag: &str) {
+fn complete(out: &mut Out<'_>, tag: &str) {
     out.msg(b'C', |b| cstr(b, tag));
 }
 
-fn send_result(out: &mut Out, r: &SqlResult, cols: Option<&[(String, i32)]>, formats: &[i16], tag: &str) -> Result<()> {
+/// A result in the simple protocol (text): each row is let go once written.
+fn send_result(out: &mut Out<'_>, r: SqlResult, tag: &str) -> Result<()> {
     if r.returns_rows {
-        let cols = cols.map(<[_]>::to_vec).unwrap_or_else(|| columns_of(r, &[]));
-        row_description(out, &cols, formats);
+        let cols = columns_of(&r, &[]);
+        row_description(out, &cols, &[]);
         let types: Vec<i32> = cols.iter().map(|c| c.1).collect();
-        for row in &r.rows {
-            data_row(out, row, &types, formats)?;
+        for row in r.rows {
+            data_row(out, &row, &types, &[])?;
         }
     }
     complete(out, tag);
@@ -1077,7 +1449,7 @@ fn format_of(formats: &[i16], i: usize) -> i16 {
     }
 }
 
-fn row_description(out: &mut Out, cols: &[(String, i32)], formats: &[i16]) {
+fn row_description(out: &mut Out<'_>, cols: &[(String, i32)], formats: &[i16]) {
     out.msg(b'T', |b| {
         b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
         for (i, (name, oid)) in cols.iter().enumerate() {
@@ -1092,7 +1464,7 @@ fn row_description(out: &mut Out, cols: &[(String, i32)], formats: &[i16]) {
     });
 }
 
-fn data_row(out: &mut Out, row: &[Value], types: &[i32], formats: &[i16]) -> Result<()> {
+fn data_row(out: &mut Out<'_>, row: &[Value], types: &[i32], formats: &[i16]) -> Result<()> {
     let mut cells = Vec::with_capacity(row.len());
     for (i, v) in row.iter().enumerate() {
         let oid = types.get(i).copied().unwrap_or(25);
@@ -1286,9 +1658,25 @@ fn encode(v: &Value, oid: i32, format: i16) -> Result<Vec<u8>> {
     })
 }
 
+/// Bytes written as hexadecimal digits, two each (`None`: not that).
+fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let (pairs, odd) = hex.as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    pairs.iter().map(|[high, low]| Some(digit(*high)? << 4 | digit(*low)?)).collect()
+}
+
 /// A parameter the client sent, of type `oid` (0: unsaid), in text (0) or binary (1).
 fn decode_param(raw: &[u8], oid: i32, format: i16) -> Result<Value> {
     let bad = || Error::Conversion(format!("invalid input for a parameter of PostgreSQL type {oid}"));
+    // PostgreSQL's infinity among them, which no date here stands for.
+    let out_of_range = || {
+        Error::Conversion(format!(
+            "a parameter of PostgreSQL type {oid} is out of the range of dates this server stores"
+        ))
+    };
     let text = || String::from_utf8(raw.to_vec()).map_err(|_| bad());
     if format == 0 {
         let s = text()?;
@@ -1297,11 +1685,7 @@ fn decode_param(raw: &[u8], oid: i32, format: i16) -> Result<Value> {
             INT2 | INT4 | INT8 | OID => Value::I64(s.trim().parse().map_err(|_| bad())?),
             FLOAT4 | FLOAT8 => Value::F64(s.trim().parse().map_err(|_| bad())?),
             BYTEA => match s.strip_prefix("\\x") {
-                Some(hex) => Value::Bytes(
-                    (0..hex.len() / 2)
-                        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad()))
-                        .collect::<Result<_>>()?,
-                ),
+                Some(hex) => Value::Bytes(unhex(hex.as_bytes()).ok_or_else(bad)?),
                 None => Value::Bytes(s.into_bytes()),
             },
             // Text, or a type the column converts from text (dates, UUIDs,
@@ -1321,12 +1705,13 @@ fn decode_param(raw: &[u8], oid: i32, format: i16) -> Result<Value> {
         UUID => Value::Uuid(uuid::Uuid::from_slice(n(16)?).map_err(|_| bad())?),
         TIMESTAMP | TIMESTAMPTZ => {
             let micros = i64::from_be_bytes(n(8)?.try_into().map_err(|_| bad())?);
-            let t = epoch() + chrono::Duration::microseconds(micros);
+            let t = epoch().checked_add_signed(chrono::Duration::microseconds(micros)).ok_or_else(out_of_range)?;
             if oid == TIMESTAMP { Value::Timestamp(t) } else { Value::TimestampTz(t.and_utc()) }
         }
         DATE => {
             let days = i32::from_be_bytes(n(4)?.try_into().map_err(|_| bad())?);
-            Value::Date(epoch().date() + chrono::Duration::days(days as i64))
+            let day = chrono::Duration::try_days(days as i64).and_then(|d| epoch().date().checked_add_signed(d));
+            Value::Date(day.ok_or_else(out_of_range)?)
         }
         TIME => {
             let micros = i64::from_be_bytes(n(8)?.try_into().map_err(|_| bad())?);
@@ -1372,5 +1757,80 @@ mod tests {
         assert_eq!(decode_param(b"\\x01ab", BYTEA, 0).unwrap(), Value::Bytes(vec![1, 171]));
         assert_eq!(decode_param(b"12", INT4, 0).unwrap(), Value::I64(12));
         assert_eq!(decode_param(b"12", 0, 0).unwrap(), Value::Text("12".into()));
+    }
+
+    /// A bug met while answering is told to the client, after what was
+    /// already written, and ends the session; the thread goes on.
+    #[test]
+    fn a_panic_is_told_and_ends_the_session() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut conn = Conn::Plain(Socket::new(listener.accept().unwrap().0));
+        let step = answer_guarded(&mut conn, |out| {
+            complete(out, "SELECT 1");
+            panic!("a test of the guard");
+        })
+        .unwrap();
+        assert!(step == Step::Close);
+        let step = answer_guarded(&mut conn, |out| {
+            complete(out, "SELECT 2");
+            Step::Flush
+        })
+        .unwrap();
+        assert!(step == Step::Flush);
+        drop(conn);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        let text = String::from_utf8_lossy(&got);
+        // The error, then nothing of the first answer (it had not been sent), then the second.
+        assert_eq!(got[0], b'E', "{text}");
+        assert!(text.contains("XX000") && text.contains("internal error: a test of the guard"), "{text}");
+        assert!(!text.contains("SELECT 1") && text.contains("SELECT 2"), "{text}");
+    }
+
+    /// A read waits only for what is left of its deadline, and a wait that
+    /// ends before any byte leaves the stream as it was.
+    #[test]
+    fn reads_wait_until_their_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut socket = Socket::new(listener.accept().unwrap().0);
+        socket.idle = Some(Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(matches!(read_msg(&mut socket, 1 << 20).unwrap(), Incoming::Quiet));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        client.write_all(b"Q\0\0\0\x0dselect 1\0").unwrap();
+        let Incoming::Message(kind, body) = read_msg(&mut socket, 1 << 20).unwrap() else { panic!("a message") };
+        assert_eq!((kind, body.as_slice()), (b'Q', &b"select 1\0"[..]));
+        // A message longer than may be read is not read.
+        client.write_all(b"Q\0\x10\0\x01").unwrap();
+        assert!(matches!(read_msg(&mut socket, 1 << 20).unwrap(), Incoming::TooLong(b'Q', 0x10_0001)));
+        // A deadline passed: the read fails at once.
+        socket.deadline = Some(Instant::now());
+        let e = socket.read(&mut [0u8; 1]).unwrap_err();
+        assert!(timed_out(&e), "{e}");
+    }
+
+    /// Values a driver may send that no value here stands for are refused,
+    /// as a bad value is: the session goes on.
+    #[test]
+    fn parameters_out_of_range_are_refused() {
+        // PostgreSQL's infinity: the largest timestamp and date.
+        for (raw, oid) in [
+            (i64::MAX.to_be_bytes().to_vec(), TIMESTAMP),
+            (i64::MIN.to_be_bytes().to_vec(), TIMESTAMPTZ),
+            (i32::MAX.to_be_bytes().to_vec(), DATE),
+            (i32::MIN.to_be_bytes().to_vec(), DATE),
+            ((-1i64).to_be_bytes().to_vec(), TIME),
+        ] {
+            let e = decode_param(&raw, oid, 1).unwrap_err();
+            assert_eq!(sqlstate(&e), "22P02", "{oid}: {e}");
+        }
+        // Hexadecimal digits cut in the middle of a character, or odd in number.
+        for raw in ["\\xa\u{e9}", "\\xabc", "\\x+f", "\\xzz"] {
+            assert!(decode_param(raw.as_bytes(), BYTEA, 0).is_err(), "{raw}");
+        }
+        assert_eq!(decode_param(b"\\x", BYTEA, 0).unwrap(), Value::Bytes(Vec::new()));
+        assert_eq!(decode_param(b"\\xFF00", BYTEA, 0).unwrap(), Value::Bytes(vec![255, 0]));
     }
 }
