@@ -371,6 +371,7 @@ pub fn body(
                 heading(tx.cache_size),
                 facts(vec![
                     (tx.mem_cache_budget, c(m.cache_budget_bytes)),
+                    (tx.mem_cache_ceiling, c(m.cache_ceiling_bytes)),
                     (tx.detail_cache_app, c(m.cache_per_app_bytes)),
                     (tx.mem_cache_used, c(cache_used)),
                     (tx.mem_reliefs, m.reliefs.to_string()),

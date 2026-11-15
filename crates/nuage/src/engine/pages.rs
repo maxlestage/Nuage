@@ -1268,6 +1268,11 @@ impl Pages {
         self.cache.limit()
     }
 
+    /// Bytes the cache holds now.
+    pub(crate) fn cache_used(&self) -> usize {
+        self.cache.used.load(Ordering::Relaxed)
+    }
+
     /// Changes what the cache may hold (see [`Cache::set_limit`]).
     pub(crate) fn set_cache_limit(&self, bytes: usize) {
         self.cache.set_limit(bytes);

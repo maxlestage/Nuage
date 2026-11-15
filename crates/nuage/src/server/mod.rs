@@ -146,6 +146,9 @@ pub struct ServerOptions {
     /// shared equally among them (`None`: each engine keeps its
     /// [`EngineOptions::cache_bytes`](crate::EngineOptions)).
     pub cache_budget: Option<usize>,
+    /// The most that budget may grow to while memory has room (`None`: it
+    /// does not grow past `cache_budget`).
+    pub cache_ceiling: Option<usize>,
     /// PostgreSQL connections served at once (each has a thread); the next
     /// ones are refused as PostgreSQL does (`too_many_connections`).
     pub pg_max_connections: usize,
@@ -185,6 +188,7 @@ impl Default for ServerOptions {
             kv_bytes: 32 << 20,
             kv_budget: None,
             cache_budget: None,
+            cache_ceiling: None,
             pg_max_connections: 100,
         }
     }
@@ -292,16 +296,21 @@ pub(crate) struct State {
     pub(crate) pg_connections: std::sync::atomic::AtomicUsize,
     memory_ticks: AtomicU64,
     memory_reliefs: AtomicU64,
-    /// Looks at the memory in a row that found it comfortable.
-    memory_calm: AtomicU64,
+    /// The tick of the last cut of the cache budget, plus one (0: none yet).
+    memory_last_relief: AtomicU64,
+    /// What the budget may grow back to since that cut (0: its ceiling).
+    memory_learned: AtomicU64,
 }
 
 /// Seconds between two looks at the memory.
 const MEMORY_CHECK_EVERY: u64 = 2;
-/// The share of the memory in use past which the caches are emptied.
-const MEMORY_HIGH: f64 = 0.85;
-/// The share under which the memory is comfortable.
-const MEMORY_CALM: f64 = 0.6;
+/// Seconds between two adjustments of the cache budget (grow, shrink).
+const MEMORY_ADJUST_EVERY: u64 = 10;
+/// Seconds the budget waits after a cut before it grows again.
+const MEMORY_COOL: u64 = 300;
+/// Seconds a cut is remembered: until then the budget stays under three
+/// quarters of the one that did not fit.
+const MEMORY_LESSON: u64 = 3600;
 
 /// A Nuage DB server. See the [module](self) docs.
 ///
@@ -362,7 +371,13 @@ impl Server {
     pub fn new(engine: Arc<Engine>, options: ServerOptions) -> Server {
         Server {
             state: Arc::new(State {
-                apps: apps::Apps::open(engine.clone(), options.kv_bytes, options.kv_budget, options.cache_budget),
+                apps: apps::Apps::open(
+                    engine.clone(),
+                    options.kv_bytes,
+                    options.kv_budget,
+                    options.cache_budget,
+                    options.cache_ceiling,
+                ),
                 engine,
                 options,
                 metrics: Metrics::new(),
@@ -373,7 +388,8 @@ impl Server {
                 pg_connections: std::sync::atomic::AtomicUsize::new(0),
                 memory_ticks: AtomicU64::new(0),
                 memory_reliefs: AtomicU64::new(0),
-                memory_calm: AtomicU64::new(0),
+                memory_last_relief: AtomicU64::new(0),
+                memory_learned: AtomicU64::new(0),
             }),
         }
     }
@@ -562,44 +578,88 @@ impl Server {
 }
 
 impl State {
-    /// Every few seconds: when the memory in use nears its limit, lets go of
-    /// what can be read again (the page caches) and gives the freed memory
-    /// back to the system. Statements go on; they only read the disk more.
+    /// Keeps the memory in use where it should be, whatever the server: the
+    /// page caches take the memory there is and no more. Every two seconds:
+    /// past [`MEMORY_HIGH`](crate::memory::MEMORY_HIGH) the caches are emptied,
+    /// their budget halved and the freed memory given back to the system.
+    /// Every ten: the budget shrinks a step when memory gets tight, and grows
+    /// a step when there is room and some cache is full, up to its ceiling.
+    /// Statements go on throughout; they only read the disk more, or less.
     fn watch_memory(&self) {
+        use crate::memory::CacheMove;
         let tick = self.memory_ticks.fetch_add(1, Ordering::Relaxed);
         if !tick.is_multiple_of(MEMORY_CHECK_EVERY) {
             return;
         }
         let m = crate::memory::MemoryInfo::now();
-        let Some(pressure) = m.pressure() else { return };
-        if pressure < MEMORY_HIGH {
-            // Comfortable for ten minutes in a row: a budget that was
-            // tightened grows back, a step at a time.
-            let calm = if pressure < MEMORY_CALM { self.memory_calm.fetch_add(1, Ordering::Relaxed) + 1 } else { 0 };
-            if calm >= 600 / MEMORY_CHECK_EVERY {
-                self.memory_calm.store(0, Ordering::Relaxed);
-                if self.apps.loosen_cache() {
-                    let budget = self.apps.cache_budget().unwrap_or(0) >> 20;
-                    self.engine.event("info", format!("memory: comfortable again, the page caches get {budget} MiB"));
-                }
-            } else if pressure >= MEMORY_CALM {
-                self.memory_calm.store(0, Ordering::Relaxed);
+        let (Some(pressure), Some(total)) = (m.pressure(), m.total_bytes) else { return };
+        let gib = total as f64 / (1u64 << 30) as f64;
+        let Some(budget) = self.apps.cache_budget() else {
+            // No shared budget (a server built by hand): the caches are still
+            // emptied when memory runs short.
+            if pressure >= crate::memory::MEMORY_HIGH {
+                self.apps.drop_caches();
+                crate::memory::release_free_memory();
+                self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
             }
             return;
+        };
+        // The last cut: growth waits five minutes after it, and for an hour
+        // stays under three quarters of the budget that did not fit.
+        let last = self.memory_last_relief.load(Ordering::Relaxed);
+        let since = if last == 0 { u64::MAX } else { tick.saturating_sub(last - 1) };
+        if since >= MEMORY_LESSON {
+            self.memory_learned.store(0, Ordering::Relaxed);
         }
-        self.memory_calm.store(0, Ordering::Relaxed);
-        let budget = self.apps.tighten_cache();
-        crate::memory::release_free_memory();
-        self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
-        let message = format!(
-            "memory: {:.0} % of {:.2} GiB in use: the page caches were emptied{} and the freed memory returned to the system",
-            pressure * 100.0,
-            m.total_bytes.unwrap_or(0) as f64 / (1u64 << 30) as f64,
-            budget.map(|b| format!(", their budget set to {} MiB", b >> 20)).unwrap_or_default()
-        );
-        // In the event log, and in the server's own log.
-        println!("nuage: {message}");
-        self.engine.event("warn", message);
+        let learned = self.memory_learned.load(Ordering::Relaxed);
+        let hard = self.apps.cache_ceiling().unwrap_or(budget);
+        let ceiling = if learned == 0 { hard } else { hard.min(learned as usize) };
+        let slow = tick.is_multiple_of(MEMORY_ADJUST_EVERY);
+        if slow {
+            // The budget goes again to the applications that use it.
+            self.apps.share_cache();
+        }
+        let demand = slow && self.apps.cache_demand();
+        // The memory in use once the caches have filled what they may still take.
+        let unfilled = budget.saturating_sub(self.apps.cache_used()) as f64;
+        let committed = pressure + unfilled / total as f64;
+        match crate::memory::cache_move(budget, ceiling, total, pressure, committed, demand, since >= MEMORY_COOL) {
+            CacheMove::Relieve(to) => {
+                self.apps.set_cache_budget(to);
+                self.apps.drop_caches();
+                crate::memory::release_free_memory();
+                // The budget is at its floor already and memory is still
+                // short (something else holds it): the caches stay empty, and
+                // it is said once a minute, not every two seconds.
+                if to == budget && since < 60 {
+                    return;
+                }
+                self.memory_learned.store((budget / 4 * 3).max(to) as u64, Ordering::Relaxed);
+                self.memory_last_relief.store(tick + 1, Ordering::Relaxed);
+                self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
+                let message = format!(
+                    "memory: {:.0} % of {gib:.2} GiB in use: the page caches were emptied, their budget cut from {} to {} MiB and the freed memory returned to the system",
+                    pressure * 100.0,
+                    budget >> 20,
+                    to >> 20
+                );
+                // In the event log, and in the server's own log.
+                println!("nuage: {message}");
+                self.engine.event("warn", message);
+            }
+            CacheMove::Shrink(to) if slow => {
+                self.apps.set_cache_budget(to);
+                crate::memory::release_free_memory();
+            }
+            CacheMove::Grow(to) if slow => self.apps.set_cache_budget(to),
+            // The caches would take more and there is no room for it, or
+            // memory is past comfortable: what the allocator keeps of memory
+            // freed since (a large answer, a burst) goes back to the system,
+            // so that the figures say what is really in use and the room goes
+            // to the caches.
+            _ if slow && (demand || pressure >= crate::memory::MEMORY_ROOM) => crate::memory::release_free_memory(),
+            _ => {}
+        }
     }
 
     /// Times the memory guard emptied the caches.

@@ -18,10 +18,20 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   It was an eighth of the memory for each application: six of them could hold three quarters
   of it. `Engine::set_cache_bytes`, `cache_capacity`, `drop_cache`;
   `ServerOptions::cache_budget`.
+- **The caches use the memory there is.** With `NUAGE_CACHE_MB=auto` the budget follows the
+  memory of the server, whatever its size: a quarter of it at first; every ten seconds a
+  thirty-second more while the caches are full and the memory in use would stay under 65 %
+  once they have filled (up to six tenths of the memory), a thirty-second less past 78 %.
+  Each application has what it holds plus an equal part of what is free
+  (`memory::cache_shares`), given again every ten seconds: one busy application takes what
+  five nearly empty ones leave, where equal parts kept it to a sixth. What the allocator keeps
+  of memory freed since a burst goes back to the system when the caches want room.
+  `memory::cache_move`, `ServerOptions::cache_ceiling`, `Engine::cache_used`; `/api/status`:
+  `memory.cache_ceiling_bytes`.
 - **A memory guard.** Every two seconds; past 85 % in use, the caches are emptied, their
   budget halved (16 MiB at least) and the freed memory returned to the system, while requests
-  go on; the budget grows back after ten comfortable minutes. Said in the event log and in
-  the server's log.
+  go on; for five minutes the budget does not grow again, and for an hour it stays under
+  three quarters of the one that did not fit. Said in the event log and in the server's log.
 - **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
   memory held under load, for a few percent of throughput.
 - **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them

@@ -228,6 +228,7 @@ impl Sim {
                 used_bytes: Some(324 << 20),
                 limited: true,
                 cache_budget_bytes: Some(256 << 20),
+                cache_ceiling_bytes: Some(614 << 20),
                 reliefs: 0,
                 available_bytes: Some(700 << 20),
                 process_bytes: Some(24 << 20),

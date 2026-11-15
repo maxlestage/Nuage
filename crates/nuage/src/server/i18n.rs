@@ -235,9 +235,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Level", "Niveau", "Nivel"),
     ("Event", "Événement", "Evento"),
     (
-        "{} for all the applications, {} each",
-        "{} pour toutes les applications, {} chacune",
-        "{} para todas las aplicaciones, {} cada una",
+        "{} for all the applications (up to {} while memory has room), {} each",
+        "{} pour toutes les applications (jusqu'à {} tant que la mémoire le permet), {} chacune",
+        "{} para todas las aplicaciones (hasta {} mientras la memoria lo permita), {} cada una",
     ),
     ("Light", "Clair", "Claro"),
     ("Dark", "Sombre", "Oscuro"),

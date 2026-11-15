@@ -63,6 +63,9 @@ pub struct Memory {
     /// Memory the page caches of all the applications may hold together.
     #[serde(default)]
     pub cache_budget_bytes: Option<u64>,
+    /// The most that budget may grow to while memory has room.
+    #[serde(default)]
+    pub cache_ceiling_bytes: Option<u64>,
     /// Times the caches were emptied because memory ran short.
     #[serde(default)]
     pub reliefs: u64,

@@ -277,6 +277,91 @@ fn auto_cache(total: Option<u64>) -> usize {
     }
 }
 
+/// The most the page caches of a server may grow to: with `NUAGE_CACHE_MB`
+/// on `auto`, six tenths of the memory (what is left serves the requests,
+/// the key-value stores and the system); a budget set by hand is kept as said.
+pub fn cache_ceiling(setting: Option<&str>, budget: usize) -> usize {
+    match setting.map(str::trim) {
+        None | Some("") | Some("auto") => {
+            MemoryInfo::now().total_bytes.map_or(budget, |t| ((t / 10 * 6) as usize).max(budget))
+        }
+        Some(_) => budget,
+    }
+}
+
+/// The share of the memory in use past which the caches are emptied and their
+/// budget halved.
+pub const MEMORY_HIGH: f64 = 0.85;
+/// The share past which the budget shrinks, a step at a time.
+pub const MEMORY_TIGHT: f64 = 0.78;
+/// The share under which the budget may grow.
+pub const MEMORY_ROOM: f64 = 0.65;
+
+/// What becomes of the cache budget of a server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheMove {
+    /// It stays.
+    Keep,
+    /// It grows to this: memory has room, and the caches are full.
+    Grow(usize),
+    /// It shrinks to this: memory is getting tight.
+    Shrink(usize),
+    /// Memory runs short: it is cut to this and the caches emptied.
+    Relieve(usize),
+}
+
+/// Decides what the cache budget becomes, so that a server uses the memory
+/// it has and no more: it grows while there is room and the caches are full
+/// (`demand`), shrinks when memory gets tight, and is cut when it runs short.
+/// `budget` is the one in force, `ceiling` the most it may reach, `pressure`
+/// the share of the `total` memory in use, `committed` that share once the
+/// caches have filled what they are still allowed (it must leave room after a
+/// step more), `cooled` whether the last cut is far enough behind.
+pub fn cache_move(
+    budget: usize,
+    ceiling: usize,
+    total: u64,
+    pressure: f64,
+    committed: f64,
+    demand: bool,
+    cooled: bool,
+) -> CacheMove {
+    let floor = (16 << 20).min(ceiling);
+    // A thirty-second of the memory at a time: from a quarter to six tenths
+    // in a dozen steps.
+    let step = ((total / 32) as usize).max(4 << 20);
+    if pressure >= MEMORY_HIGH {
+        CacheMove::Relieve((budget / 2).max(floor))
+    } else if pressure >= MEMORY_TIGHT {
+        if budget > floor { CacheMove::Shrink(budget.saturating_sub(step).max(floor)) } else { CacheMove::Keep }
+    } else if committed + step as f64 / total.max(1) as f64 <= MEMORY_ROOM && demand && cooled && budget < ceiling {
+        CacheMove::Grow((budget + step).min(ceiling))
+    } else {
+        CacheMove::Keep
+    }
+}
+
+/// The cache of each application of a server, from what each one holds now
+/// (`used`): what it holds, plus an equal part of what is free in `budget`.
+/// The budget goes where it is used: an application with much data takes what
+/// five nearly empty ones leave, and each part is given again as use changes.
+/// Together they hold `budget` at most; when they hold more (it was just cut),
+/// each keeps its proportion. 2 MiB at least each.
+pub fn cache_shares(budget: usize, used: &[usize]) -> Vec<usize> {
+    let n = used.len().max(1);
+    let held: usize = used.iter().sum();
+    used.iter()
+        .map(|u| {
+            let share = if held <= budget {
+                u + (budget - held) / n
+            } else {
+                (*u as u128 * budget as u128 / held.max(1) as u128) as usize
+            };
+            share.max(2 << 20)
+        })
+        .collect()
+}
+
 /// The cache of each of `applications` sharing `budget`: equal parts, 2 MiB
 /// at least (below, every read would go to the disk).
 pub fn cache_share(budget: usize, applications: usize) -> usize {
@@ -367,6 +452,53 @@ mod tests {
         assert_eq!(cache_share(128 << 20, 0), 128 << 20);
         assert_eq!(cache_share(16 << 20, 100), 2 << 20, "2 MiB at least");
         assert!((8..=64).contains(&blocking_threads()));
+    }
+
+    #[test]
+    fn the_cache_budget_follows_the_memory() {
+        let total = 512u64 << 20;
+        let (quarter, ceiling) = (128usize << 20, 307usize << 20);
+        let step = 16 << 20;
+        // Room, and the caches are full: it grows, a step at a time, up to the ceiling.
+        assert_eq!(cache_move(quarter, ceiling, total, 0.40, 0.40, true, true), CacheMove::Grow(quarter + step));
+        assert_eq!(cache_move(ceiling - 1, ceiling, total, 0.40, 0.40, true, true), CacheMove::Grow(ceiling));
+        assert_eq!(cache_move(ceiling, ceiling, total, 0.40, 0.40, true, true), CacheMove::Keep);
+        // No demand, or a cut too recent: it stays.
+        assert_eq!(cache_move(quarter, ceiling, total, 0.40, 0.40, false, true), CacheMove::Keep);
+        assert_eq!(cache_move(quarter, ceiling, total, 0.40, 0.40, true, false), CacheMove::Keep);
+        // Between room and tight: it stays (no see-saw).
+        assert_eq!(cache_move(quarter, ceiling, total, 0.70, 0.70, true, true), CacheMove::Keep);
+        // Tight: it shrinks, a step at a time, 16 MiB at least.
+        assert_eq!(cache_move(quarter, ceiling, total, 0.80, 0.80, true, true), CacheMove::Shrink(quarter - step));
+        assert_eq!(cache_move(20 << 20, ceiling, total, 0.80, 0.80, true, true), CacheMove::Shrink(16 << 20));
+        assert_eq!(cache_move(16 << 20, ceiling, total, 0.80, 0.80, true, true), CacheMove::Keep);
+        // Short: it is halved.
+        assert_eq!(cache_move(quarter, ceiling, total, 0.90, 0.90, true, true), CacheMove::Relieve(64 << 20));
+        assert_eq!(cache_move(16 << 20, ceiling, total, 0.99, 0.99, false, false), CacheMove::Relieve(16 << 20));
+        // Room now, but not once the caches have filled what they are allowed: it stays.
+        assert_eq!(cache_move(quarter, ceiling, total, 0.40, 0.64, true, true), CacheMove::Keep);
+        assert_eq!(cache_move(quarter, ceiling, total, 0.40, 0.60, true, true), CacheMove::Grow(quarter + step));
+        // A budget set by hand does not grow past what was said.
+        assert_eq!(cache_ceiling(Some("64"), 64 << 20), 64 << 20);
+        assert!(cache_ceiling(None, 1 << 20) >= 1 << 20);
+        // A large server: steps of a thirty-second of its memory.
+        assert_eq!(cache_move(4 << 30, 38 << 30, 64 << 30, 0.30, 0.30, true, true), CacheMove::Grow(6 << 30));
+        // The budget goes where it is used.
+        let mib = |n: usize| n << 20;
+        assert_eq!(cache_shares(mib(120), &[0, 0, 0]), vec![mib(40); 3], "nothing held yet: equal parts");
+        // One busy application, five nearly empty: it keeps what it holds, plus its part of the rest.
+        let shares = cache_shares(mib(128), &[mib(21), 0, 0, 0, 0, 0]);
+        assert_eq!(shares[0], mib(21) + (mib(128) - mib(21)) / 6);
+        assert!(shares.iter().sum::<usize>() <= mib(128));
+        // ...and round after round it takes what the others leave.
+        let mut held = [mib(21), mib(1), mib(1), mib(1), mib(1), mib(1)];
+        for _ in 0..20 {
+            held[0] = cache_shares(mib(128), &held)[0];
+        }
+        assert!(held[0] > mib(120), "{}", held[0] >> 20);
+        // A budget just cut: each keeps its proportion, together within it.
+        assert_eq!(cache_shares(mib(60), &[mib(80), mib(40)]), vec![mib(40), mib(20)]);
+        assert_eq!(cache_shares(mib(16), &[0; 100])[0], mib(2), "2 MiB at least");
     }
 
     #[test]

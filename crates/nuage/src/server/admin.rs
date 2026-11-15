@@ -1312,8 +1312,12 @@ fn server_body(state: &State, cx: &Cx) -> String {
             "Page caches",
             match state.apps.cache_budget() {
                 Some(budget) => cx.tf(
-                    "{} for all the applications, {} each",
-                    &[&bytes(l, budget as u64), &bytes(l, engine.cache_capacity() as u64)],
+                    "{} for all the applications (up to {} while memory has room), {} each",
+                    &[
+                        &bytes(l, budget as u64),
+                        &bytes(l, state.apps.cache_ceiling().unwrap_or(budget) as u64),
+                        &bytes(l, engine.cache_capacity() as u64),
+                    ],
                 ),
                 None => bytes(l, engine.cache_capacity() as u64),
             },
