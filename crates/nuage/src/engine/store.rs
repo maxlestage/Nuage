@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
@@ -256,8 +256,6 @@ impl Snapshot {
 pub(crate) struct Writer {
     pub wal: wal::Writer,
     pub next_lsn: u64,
-    pub checkpoint_lsn: u64,
-    pub last_checkpoint: Option<SystemTime>,
     pub commits_since_checkpoint: u64,
 }
 
@@ -281,6 +279,13 @@ pub(crate) struct Store {
     saved_generation: AtomicU64,
     /// LSN of the last applied commit (what snapshots see).
     applied_lsn: AtomicU64,
+    /// LSN of the last commit the page store holds on disk, and when the last
+    /// checkpoint ran (Unix ms, 0: not yet). Outside the writer lock: whoever
+    /// only shows them (the status, every second) never waits for a write.
+    checkpoint_lsn: AtomicU64,
+    last_checkpoint: AtomicI64,
+    /// No commit is accepted any more (see [`Store::stop_commits`]).
+    stopping: AtomicBool,
     /// Catalog entries already parsed (see [`Store::parsed`]).
     catalog: Mutex<Catalog>,
     /// Bytes of changed nodes the page store may keep in memory before they
@@ -418,17 +423,14 @@ impl Store {
             },
             wal_file: Mutex::new(log.file()),
             sync,
-            writer: Mutex::new(Writer {
-                wal: log,
-                next_lsn: last + 1,
-                checkpoint_lsn,
-                last_checkpoint: None,
-                commits_since_checkpoint: 0,
-            }),
+            writer: Mutex::new(Writer { wal: log, next_lsn: last + 1, commits_since_checkpoint: 0 }),
             branches: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(generation),
             saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
+            checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
+            last_checkpoint: AtomicI64::new(0),
+            stopping: AtomicBool::new(false),
             catalog: Mutex::new(Catalog::default()),
             log_gap,
         };
@@ -723,7 +725,23 @@ impl Store {
         Ok(())
     }
 
+    /// Refuses every commit from now on, with the error [`super::Stopping`].
+    /// A commit holds the writer lock from before it is checked to after it
+    /// is applied: once this has returned, whoever takes that lock (the last
+    /// checkpoint) has every commit that was or ever will be acknowledged.
+    pub(crate) fn stop_commits(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// `true` once [`stop_commits`](Self::stop_commits) was called.
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
     fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
+        if self.stopping() {
+            return Err(Error::Database(Box::new(super::Stopping)));
+        }
         self.log_is_sound()?;
         if writer.wal.spent() {
             // A record was cut from this segment: its number is not sealed
@@ -761,7 +779,7 @@ impl Store {
         // The page store holds every commit so far: they are on disk whatever the log's state.
         save(&self.pages, lsn)?;
         self.durable.lsn.fetch_max(lsn, Ordering::SeqCst);
-        w.checkpoint_lsn = lsn;
+        self.checkpoint_lsn.store(lsn, Ordering::SeqCst);
         Ok(lsn)
     }
 
@@ -780,7 +798,7 @@ impl Store {
 
     pub(crate) fn checkpoint_locked(&self, w: &mut Writer, keep_after: Option<u64>) -> Result<u64> {
         let lsn = self.flush(w)?;
-        w.last_checkpoint = Some(SystemTime::now());
+        self.last_checkpoint.store(now_millis(), Ordering::SeqCst);
         w.commits_since_checkpoint = 0;
         if w.wal.bytes > 0 || w.wal.spent() {
             self.next_segment(w)?;
@@ -879,6 +897,16 @@ impl Store {
     pub(crate) fn applied_lsn(&self) -> u64 {
         self.applied_lsn.load(Ordering::SeqCst)
     }
+
+    /// The last commit the page store holds on disk.
+    pub(crate) fn checkpoint_lsn(&self) -> u64 {
+        self.checkpoint_lsn.load(Ordering::SeqCst)
+    }
+
+    /// When the last checkpoint ran (Unix ms), `None` before the first one.
+    pub(crate) fn last_checkpoint(&self) -> Option<i64> {
+        Some(self.last_checkpoint.load(Ordering::SeqCst)).filter(|at| *at > 0)
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +952,35 @@ mod tests {
         db.sql("INSERT INTO t (id, v) VALUES (4, 'after')", &[]).unwrap();
         assert_eq!(db.sql("SELECT count(*) FROM t WHERE id IN (1, 4)", &[]).unwrap()[0].rows[0][0].to_string(), "2");
         assert!(db.sql("SELECT count(*) FROM t WHERE id = 3", &[]).unwrap()[0].rows[0][0].to_string() == "0");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The figures the status shows are read without the lock a write
+    /// holds: asked for in the middle of a long statement, a checkpoint or a
+    /// snapshot, they come at once.
+    #[test]
+    fn the_figures_do_not_wait_for_a_write() {
+        let dir = temp("stats");
+        let db = Embedded::open(&dir).unwrap();
+        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+        db.sql("INSERT INTO t (id, v) VALUES (1, 'one')", &[]).unwrap();
+        let lsn = db.engine().checkpoint().unwrap();
+        db.sql("INSERT INTO t (id, v) VALUES (2, 'two')", &[]).unwrap();
+        let engine = db.engine().clone();
+        let before = engine.stats();
+        assert_eq!((before.lsn, before.checkpoint_lsn), (lsn + 1, lsn));
+        assert!(before.last_checkpoint.is_some_and(|at| at.elapsed().is_ok_and(|d| d.as_secs() < 60)));
+        // A write is in progress, for as long as the test says.
+        let writing = engine.store.writer();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = engine.clone();
+        std::thread::spawn(move || tx.send(asked.stats()));
+        let during =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the figures came while a write held the lock");
+        drop(writing);
+        let figures = |s: &crate::StorageStats| (s.lsn, s.checkpoint_lsn, s.last_checkpoint, s.file_bytes, s.pages);
+        assert_eq!(figures(&during), figures(&before));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

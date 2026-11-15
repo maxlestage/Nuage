@@ -105,7 +105,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    runtime.block_on(async move {
+    let code = runtime.block_on(async move {
         let backup = config.engine.backup.as_ref().map(|b| b.store.describe());
         let engine = match Engine::open(&config.data_dir, config.engine) {
             Ok(e) => e,
@@ -288,36 +288,97 @@ fn main() -> ExitCode {
             tokio::spawn(k.run(log))
         });
         shutdown_signal().await;
+        let give_up = tokio::time::Instant::now() + STOP_WITHIN;
         if let Some(task) = keep_awake {
             task.abort();
         }
         log("stopping: last checkpoint and backup");
         events.abort();
-        running.shutdown().await;
-        if let Some(pg) = pg {
-            pg.shutdown().await;
+        // No write is acknowledged from here on: the connections that are open are still
+        // served, and a commit that came after its application's last backup would be on a
+        // disk that may not come back. A late write is told that the server is stopping.
+        let engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
+        for engine in &engines {
+            engine.begin_shutdown();
         }
-        if let Some(kv_port) = kv_port {
-            kv_port.shutdown().await;
-        }
-        // Every application, the server's own last (it holds the list of the others):
-        // what was written since the last checkpoint goes to the backup before the disk is gone.
-        let mut engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
-        engines.reverse();
-        let _ = tokio::task::spawn_blocking(move || {
-            for engine in engines {
-                let _ = engine.checkpoint();
-                if engine.options().backup.is_some()
-                    && let Err(e) = engine.backup_now(false)
-                {
-                    eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
-                }
-                let _ = engine.close();
+        let listeners = async {
+            running.shutdown().await;
+            if let Some(pg) = pg {
+                pg.shutdown().await;
             }
-        })
-        .await;
+            if let Some(kv_port) = kv_port {
+                kv_port.shutdown().await;
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), listeners).await;
+        // Every application: what was written since the last checkpoint goes to the backup
+        // before the disk is gone. On threads of their own (the blocking pool may be full of
+        // statements that are not over), a few applications at a time, and not past the time
+        // the host gives a process to stop.
+        let mut left: Vec<String> = engines.iter().map(|e| e.options().name.clone()).collect();
+        let (done, mut finished) = tokio::sync::mpsc::unbounded_channel();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(engines));
+        let threads = (0..left.len().min(STOP_THREADS))
+            .filter(|_| {
+                let (queue, done) = (queue.clone(), done.clone());
+                std::thread::Builder::new().name("nuage-stop".into()).spawn(move || stop_engines(&queue, &done)).is_ok()
+            })
+            .count();
+        if threads == 0 {
+            // No thread to be had: here, then.
+            stop_engines(&queue, &done);
+        }
+        drop(done);
+        loop {
+            match tokio::time::timeout_at(give_up, finished.recv()).await {
+                Ok(Some(name)) => left.retain(|n| *n != name),
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!(
+                        "nuage: stopping after {} s: the last checkpoint and backup of {} did not finish",
+                        STOP_WITHIN.as_secs(),
+                        left.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                    );
+                    break;
+                }
+            }
+        }
         ExitCode::SUCCESS
-    })
+    });
+    // What still runs (a statement on a blocking thread, a backup past its time) is not
+    // waited for: every engine was checkpointed, or told why not.
+    runtime.shutdown_background();
+    code
+}
+
+/// How long the server takes to stop, at most: hosts kill a process that takes longer
+/// (Heroku: 30 seconds after SIGTERM).
+const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Applications checkpointed and backed up at the same time when the server stops.
+const STOP_THREADS: usize = 4;
+
+/// Takes the engines of `queue` one after the other, until none is left: last checkpoint,
+/// last backup, close. Tells `done` the name of each one that is over.
+fn stop_engines(
+    queue: &std::sync::Mutex<Vec<std::sync::Arc<Engine>>>,
+    done: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    loop {
+        // The server's own engine is the first of the list: taken last.
+        let Some(engine) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
+        let name = engine.options().name.clone();
+        if let Err(e) = engine.checkpoint() {
+            eprintln!("nuage: database `{name}`: last checkpoint: {e}");
+        }
+        if engine.options().backup.is_some()
+            && let Err(e) = engine.backup_now(false)
+        {
+            eprintln!("nuage: database `{name}`: last backup: {e}");
+        }
+        let _ = engine.close();
+        let _ = done.send(name);
+    }
 }
 
 /// SIGTERM (what Heroku and container hosts send) or Ctrl-C.
