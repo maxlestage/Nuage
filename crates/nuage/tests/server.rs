@@ -2290,9 +2290,24 @@ async fn files_through_signed_links() {
 /// `/v1/kv` and the key-value port: the key-value store of each application.
 #[tokio::test]
 async fn key_value_store() {
+    key_value_store_in(engine("kv"), false).await;
+}
+
+/// The same requests and the same answers with the keys in each
+/// application's database (`NUAGE_KV_STORAGE=database`).
+#[tokio::test]
+async fn key_value_store_in_the_database() {
+    let options = EngineOptions { sync: false, kv_in_database: true, ..EngineOptions::default() };
+    key_value_store_in(Engine::open(temp_dir("kv-database"), options).unwrap(), true).await;
+}
+
+/// The key-value store end to end, on a server whose first engine is
+/// `engine`: in memory, or in the databases (`in_database`).
+async fn key_value_store_in(engine: Arc<Engine>, in_database: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
-    let server = Server::new(engine("kv"), ServerOptions { kv_bytes: 1 << 20, ..options() });
+    let storage = if in_database { "database" } else { "memory" };
+    let server = Server::new(engine, ServerOptions { kv_bytes: 1 << 20, ..options() });
     let (_, token) = server.create_app("shop", "").unwrap();
     let read = server.new_app_read_only_token("shop").unwrap();
     let running = server.listen("127.0.0.1:0").await.unwrap();
@@ -2353,7 +2368,10 @@ async fn key_value_store() {
     assert_eq!(list["keys"][0]["key"], "session:42");
     assert_eq!(list["keys"][0]["size"], 6);
     assert_eq!(list["stats"]["keys"], 4);
-    assert_eq!(list["stats"]["max_bytes"], 1 << 20);
+    // In the database, nothing is evicted: no limit.
+    assert_eq!(list["stats"]["max_bytes"], if in_database { 0 } else { 1 << 20 });
+    assert_eq!(list["stats"]["evictions"], 0);
+    assert_eq!(list["stats"]["storage"], storage);
 
     // A read-only token reads, and nothing else; no token, nothing.
     assert_eq!(http(addr, "PUT", "/v1/kv/k", read_only, "v").await.status, 403);
@@ -2487,16 +2505,202 @@ async fn key_value_store() {
         assert!(!kv.delete("job").await.unwrap());
     }
 
-    // The status says what the store holds.
+    // The status says what the store holds, and where.
     let status = json(&http(addr, "GET", "/api/status", write, "").await);
     assert!(status.to_string().contains("\"kv\""), "{status}");
+    assert_eq!(status["databases"][0]["kv"]["storage"], storage, "{status}");
+    let all = server.status();
+    assert!(all["databases"].as_array().unwrap().iter().all(|d| d["kv"]["storage"] == storage), "{all}");
 
     // Everything deleted.
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv/hits", write, "").await)["deleted"], 1);
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 4);
     assert_eq!(json(&http(addr, "GET", "/v1/kv", write, "").await)["count"], 0);
+
+    // Many clients at once: each increment counts once, and each one sees
+    // its own value.
+    let clients: Vec<_> = (0..20)
+        .map(|_| {
+            let header = format!("Bearer {token}");
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..10 {
+                    let res = http(addr, "POST", "/v1/kv/racing?incr", &[("authorization", &header)], "").await;
+                    seen.push(serde_json::from_str::<serde_json::Value>(&res.body).unwrap()["value"].as_i64().unwrap());
+                }
+                seen
+            })
+        })
+        .collect();
+    let mut seen = Vec::new();
+    for client in clients {
+        seen.extend(client.await.unwrap());
+    }
+    seen.sort();
+    assert_eq!(seen, (1..=200).collect::<Vec<i64>>());
+    assert_eq!(http(addr, "GET", "/v1/kv/racing", read_only, "").await.body, "200");
+    assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 1);
     port.shutdown().await;
     running.shutdown().await;
+}
+
+/// The keys in the database are in its backup: written over HTTP and over
+/// the port, they come back on a server whose disk is empty, with their
+/// expiry dates; the first application's too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_key_value_store_in_the_database_comes_back_with_the_backup() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (dir, backups, restored) = (temp_dir("kv-backed"), temp_dir("kv-backed-up"), temp_dir("kv-backed-restored"));
+    let engine_options = EngineOptions { kv_in_database: true, ..backed_up_to(&backups) };
+    let server = Server::new(Engine::open(&dir, engine_options.clone()).unwrap(), options());
+    let (_, token) = server.create_app("shop", "").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let port = server.listen_kv("127.0.0.1:0", nuage::KvOptions::default()).await.unwrap();
+    let addr = running.local_addr();
+    let shop = format!("Bearer {token}");
+    let shop: &[(&str, &str)] = &[("authorization", &shop)];
+    let first: &[(&str, &str)] = &[("authorization", "Bearer t0ken")];
+    assert_eq!(http(addr, "PUT", "/v1/kv/session?ttl=600", shop, "ada").await.status, 200);
+    assert_eq!(http(addr, "POST", "/v1/kv/visits?incr=41", shop, "").await.status, 200);
+    assert_eq!(http(addr, "PUT", "/v1/kv/of-the-first", first, "1").await.status, 200);
+    let secret = "KV-SECRET-4f1c9e";
+    assert_eq!(http(addr, "PUT", "/v1/kv/secret", shop, secret).await.status, 200);
+    let mut conn = TcpStream::connect(port.local_addr()).await.unwrap();
+    let mut wire = Vec::new();
+    for command in [
+        &["AUTH", token.as_str()][..],
+        &["SET", "from-the-port", "yes"],
+        &["MULTI"],
+        &["INCR", "visits"],
+        &["SET", "in-a-transaction", "yes"],
+        &["EXEC"],
+    ] {
+        wire.extend_from_slice(format!("*{}\r\n", command.len()).as_bytes());
+        for arg in command {
+            wire.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+    }
+    conn.write_all(&wire).await.unwrap();
+    let mut answer = String::new();
+    while !answer.ends_with("*2\r\n:42\r\n+OK\r\n") {
+        let mut buf = [0u8; 256];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n > 0, "{answer:?}");
+        answer.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert_eq!(answer, "+OK\r\n+OK\r\n+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:42\r\n+OK\r\n");
+    drop(conn);
+    for app in server.apps() {
+        let engine = server.app_engine(&app.name).unwrap();
+        engine.checkpoint().unwrap();
+        engine.backup_now(true).unwrap();
+    }
+    // Encrypted like the rows: on the disk and in the backup.
+    assert_eq!((files_with(&dir, secret), files_with(&backups, secret)), (0, 0));
+    port.shutdown().await;
+    running.shutdown().await;
+    closed(server).await;
+
+    // A new disk: everything is restored from the backup, the keys with it.
+    let server = Server::new(Engine::open(&restored, engine_options).unwrap(), options());
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let got = http(addr, "GET", "/v1/kv/session", shop, "").await;
+    assert_eq!((got.status, got.body.as_str()), (200, "ada"));
+    let ttl: u64 = got.headers["nuage-ttl-ms"].to_str().unwrap().parse().unwrap();
+    assert!(ttl > 500_000 && ttl <= 600_000, "the same date: {ttl}");
+    for (key, value) in [("visits", "42"), ("from-the-port", "yes"), ("in-a-transaction", "yes"), ("secret", secret)] {
+        assert_eq!(http(addr, "GET", &format!("/v1/kv/{key}"), shop, "").await.body, value, "{key}");
+    }
+    assert_eq!(http(addr, "GET", "/v1/kv/of-the-first", first, "").await.body, "1");
+    assert_eq!(http(addr, "GET", "/v1/kv/of-the-first", shop, "").await.status, 404, "each its own");
+    let list: serde_json::Value = serde_json::from_str(&http(addr, "GET", "/v1/kv", shop, "").await.body).unwrap();
+    assert_eq!((list["count"].as_u64(), list["stats"]["storage"].as_str()), (Some(5), Some("database")));
+    running.shutdown().await;
+    closed(server).await;
+    for d in [dir, backups, restored] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Going back to memory leaves the keys in the database, unread: they are
+/// there again when the setting comes back. Nothing is dropped at start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn back_to_memory_leaves_the_keys_where_they_are() {
+    let dir = temp_dir("kv-back");
+    let start = async |kv_in_database: bool| {
+        let engine_options = EngineOptions { sync: false, kv_in_database, ..EngineOptions::default() };
+        let engine = (0..400)
+            .find_map(|_| match Engine::open(&dir, engine_options.clone()) {
+                Ok(e) => Some(e),
+                Err(e) if e.to_string().contains("already open") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(e) => panic!("{e}"),
+            })
+            .expect("opens again");
+        let server = Server::new(engine, options());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        (server, running)
+    };
+    let token: &[(&str, &str)] = &[("authorization", "Bearer t0ken")];
+    let storage = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["stats"]["storage"].clone();
+
+    let (server, running) = start(true).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "PUT", "/v1/kv/kept", token, "in the database").await.status, 200);
+    assert_eq!(storage(&http(addr, "GET", "/v1/kv", token, "").await), "database");
+    running.shutdown().await;
+    closed(server).await;
+
+    let (server, running) = start(false).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "GET", "/v1/kv/kept", token, "").await.status, 404, "not read in memory");
+    assert_eq!(http(addr, "PUT", "/v1/kv/fleeting", token, "in memory").await.status, 200);
+    assert_eq!(storage(&http(addr, "GET", "/v1/kv", token, "").await), "memory");
+    running.shutdown().await;
+    closed(server).await;
+
+    let (server, running) = start(true).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "GET", "/v1/kv/kept", token, "").await.body, "in the database");
+    assert_eq!(http(addr, "GET", "/v1/kv/fleeting", token, "").await.status, 404);
+    running.shutdown().await;
+    closed(server).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The binary says at startup where the key-value stores are when they are in
+/// the databases, and nothing without the setting; a value mistyped stops it.
+#[test]
+fn the_server_says_where_the_key_value_stores_are() {
+    let data = temp_dir("bin-kv-storage");
+    let (key, data_dir) = ("07".repeat(32), data.display().to_string());
+    let binary = |storage: Option<&str>| {
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data_dir.as_str()),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend(storage.map(|s| ("NUAGE_KV_STORAGE", s)));
+        nuage_binary(&vars)
+    };
+    let said = "nuage: key-value stores are kept in each application's database (NUAGE_KV_STORAGE=database): they \
+                survive a restart and are in the backups; a write waits for the disk";
+    let out = started(binary(Some("database"))).0.join("\n");
+    assert!(out.contains(said), "{out}");
+    let out = started(binary(None)).0.join("\n");
+    assert!(!out.contains("key-value stores are kept"), "{out}");
+    let (code, err) = stopped(binary(Some("disk")));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("nuage: configuration error: ") && err.contains("NUAGE_KV_STORAGE=`disk`: `memory` or `database`"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&data);
 }
 
 #[tokio::test]

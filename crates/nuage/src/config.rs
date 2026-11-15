@@ -9,7 +9,8 @@
 //! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) and the key-value port | none: in clear |
 //! | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the protocol Redis clients speak: they connect to an application's store, with a token as their password | off |
 //! | `NUAGE_KV_BIND` | address of the key-value port | `NUAGE_BIND` |
-//! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the key-value port), in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory (4 to 256 MiB) each, and an eighth of it for all of them together |
+//! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the key-value port), in MiB, or `auto`; past it, the least recently used keys go. Not used with `NUAGE_KV_STORAGE=database` | `auto`: a sixteenth of the memory (4 to 256 MiB) each, and an eighth of it for all of them together |
+//! | `NUAGE_KV_STORAGE` | where every application's key-value store is kept: `memory` (in the server's memory: the fastest; a restart empties it) or `database` (in the application's database, on disk: it survives restarts and is in the backups; a write waits for the disk like a row; nothing is evicted, so give cache entries an expiry; a value is 64 MiB at most). Going back to `memory` leaves the keys in the database, found again when `database` comes back. Any other value stops the start | `memory` |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
@@ -88,9 +89,10 @@ pub struct Config {
 }
 
 /// The data directory and the engine settings, through `var`: `NUAGE_DATA_DIR`,
-/// `NUAGE_NAME`, `NUAGE_ENCRYPTION_KEY`, `NUAGE_CACHE_MB`, and the backups
-/// (`NUAGE_BACKUP_DIR`, or `NUAGE_BACKUP_S3_*` with the feature `s3`,
-/// `NUAGE_BACKUP_SNAPSHOT_MINUTES`). What an embedded database needs, without the server.
+/// `NUAGE_NAME`, `NUAGE_ENCRYPTION_KEY`, `NUAGE_CACHE_MB`, `NUAGE_KV_STORAGE`,
+/// and the backups (`NUAGE_BACKUP_DIR`, or `NUAGE_BACKUP_S3_*` with the feature
+/// `s3`, `NUAGE_BACKUP_SNAPSHOT_MINUTES`). What an embedded database needs,
+/// without the server.
 pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf, EngineOptions)> {
     let get = |k: &str| var(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
     let bad = |k: &str, v: &str| Error::Validation(format!("{k}=`{v}` is not valid"));
@@ -104,6 +106,15 @@ pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf
     // One budget for the caches: a server shares it among its applications
     // (the first one opens with it all); an embedded database has it whole.
     engine.cache_bytes = crate::memory::cache_bytes(get("NUAGE_CACHE_MB").as_deref()).map_err(Error::Validation)?;
+    // A value mistyped must not mean memory: the keys would seem lost.
+    engine.kv_in_database = match get("NUAGE_KV_STORAGE") {
+        None => false,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "memory" => false,
+            "database" => true,
+            _ => return Err(Error::Validation(format!("NUAGE_KV_STORAGE=`{v}`: `memory` or `database`"))),
+        },
+    };
     let store: Option<Arc<dyn crate::engine::BackupStore>> = if let Some(dir) = get("NUAGE_BACKUP_DIR") {
         Some(Arc::new(DirectoryStore::new(dir)))
     } else if let Some(bucket) = get("NUAGE_BACKUP_S3_BUCKET") {
@@ -478,6 +489,30 @@ mod tests {
         for bad in ["ture", "on", "2", "y"] {
             let e = with(bad).unwrap_err().to_string();
             assert!(e.contains(&format!("NUAGE_RESTORE_REQUIRED=`{bad}`: `true` or `false`")), "{e}");
+        }
+    }
+
+    /// Where the key-value stores live: in memory unless the setting says
+    /// `database`; a value mistyped stops the start.
+    #[test]
+    fn where_the_key_value_store_lives() {
+        let with = |v: &str| {
+            let v = v.to_owned();
+            from_vars(move |k| (k == "NUAGE_KV_STORAGE").then(|| v.clone()))
+        };
+        assert!(!from_vars(|_| None).unwrap().engine.kv_in_database, "in memory by default");
+        for memory in ["memory", "", " Memory "] {
+            assert!(!with(memory).unwrap().engine.kv_in_database, "{memory}");
+        }
+        for database in ["database", "DATABASE "] {
+            assert!(with(database).unwrap().engine.kv_in_database, "{database}");
+        }
+        assert!(
+            engine_from_vars(|k| (k == "NUAGE_KV_STORAGE").then(|| "database".to_owned())).unwrap().1.kv_in_database
+        );
+        for bad in ["disk", "db", "files"] {
+            let e = with(bad).unwrap_err().to_string();
+            assert!(e.contains(&format!("NUAGE_KV_STORAGE=`{bad}`: `memory` or `database`")), "{e}");
         }
     }
 

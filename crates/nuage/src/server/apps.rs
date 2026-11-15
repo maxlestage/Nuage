@@ -56,8 +56,9 @@ pub(crate) struct App {
     pub last_request: AtomicI64,
     /// Who connected last, and how: the console shows it.
     pub last_connection: Mutex<Option<Connection>>,
-    /// Its key-value store, in memory (`/v1/kv`, the key-value port).
-    pub kv: crate::kv::Kv,
+    /// Its key-value store (`/v1/kv`, the key-value port): in memory, or in
+    /// its database (`NUAGE_KV_STORAGE=database`).
+    pub kv: crate::kv::database::AppKv,
 }
 
 /// A connection of an application's client, as the console shows it.
@@ -126,7 +127,7 @@ impl App {
         kv_bytes: usize,
     ) -> App {
         App {
-            kv: crate::kv::Kv::new(kv_bytes),
+            kv: crate::kv::database::AppKv::open(&engine, kv_bytes),
             name,
             description: Mutex::new(description),
             engine,

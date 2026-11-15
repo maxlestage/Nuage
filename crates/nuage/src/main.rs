@@ -184,6 +184,12 @@ fn main() -> ExitCode {
                 "no backup is configured: if this disk is ephemeral (Heroku dynos), set NUAGE_BACKUP_S3_* or NUAGE_BACKUP_DIR, or the data is lost at the next restart",
             ),
         }
+        if engine.options().kv_in_database {
+            log(
+                "key-value stores are kept in each application's database (NUAGE_KV_STORAGE=database): they survive a \
+                 restart and are in the backups; a write waits for the disk",
+            );
+        }
         if let Some(files) = &config.server.files {
             log(&format!(
                 "files (/v1/files) go to {}: the bytes travel between the clients and the bucket, through signed links",

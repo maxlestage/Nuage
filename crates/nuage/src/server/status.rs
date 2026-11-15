@@ -103,10 +103,11 @@ fn app_json(state: &State, app: &App, env_token: bool) -> Json {
         .collect();
     let last = app.last_request.load(Ordering::Relaxed);
     let info = app.info(env_token);
-    let kv = app.kv.stats();
+    let kv = app.kv.stats().unwrap_or_default();
     let kv = json!({
         "keys": kv.keys, "bytes": kv.bytes, "max_bytes": kv.max_bytes,
         "hits": kv.hits, "misses": kv.misses, "evictions": kv.evictions, "expired": kv.expired,
+        "storage": app.kv.storage(),
     });
     json!({
         "name": app.name,

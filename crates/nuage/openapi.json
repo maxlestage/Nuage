@@ -4,7 +4,7 @@
     "title": "Nuage DB",
     "version": "0.4.6",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, at `/v1/kv`: values with an expiry, counters, locks, and commands by name as JSON.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store, at `/v1/kv`: values with an expiry, counters, locks, and commands by name as JSON. It is in the server's memory, or in the application's database when the server runs with NUAGE_KV_STORAGE=database: the same requests and the same answers, kept across restarts and in the backups.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -614,7 +614,7 @@
             }
           },
           "413": {
-            "description": "The value is larger than the store (NUAGE_KV_MB).",
+            "description": "The value is larger than the store takes: NUAGE_KV_MB in memory, 64 MiB in the database.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1915,11 +1915,11 @@
           },
           "bytes": {
             "type": "integer",
-            "description": "Memory the keys and values take."
+            "description": "Memory the keys and values take; in the database, the bytes they take there."
           },
           "max_bytes": {
             "type": "integer",
-            "description": "The limit (NUAGE_KV_MB): past it, the least recently used keys go."
+            "description": "The limit (NUAGE_KV_MB): past it, the least recently used keys go. 0 in the database: no limit, nothing is evicted."
           },
           "hits": {
             "type": "integer"
@@ -1933,6 +1933,14 @@
           },
           "expired": {
             "type": "integer"
+          },
+          "storage": {
+            "type": "string",
+            "enum": [
+              "memory",
+              "database"
+            ],
+            "description": "Where the keys are: in the server's memory, or in the application's database (NUAGE_KV_STORAGE)."
           }
         }
       }

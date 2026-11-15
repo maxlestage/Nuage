@@ -109,6 +109,14 @@ pub struct EngineOptions {
     /// embedded database on a disk you trust; the server's binary requires
     /// `NUAGE_ENCRYPTION_KEY`). Default: `None`.
     pub encryption: Option<Encryption>,
+    /// A server keeps this database's key-value store (`/v1/kv`, the
+    /// key-value port) in its page file, in a tree of its own, instead of in
+    /// memory: the keys are written through the log like rows, encrypted,
+    /// and in the backups (`NUAGE_KV_STORAGE=database`). Read by the server
+    /// (`nuage::Server`, feature `server`) for every application; the engine
+    /// itself does nothing with it, and the tree is made by the first write.
+    /// Default: `false`.
+    pub kv_in_database: bool,
 }
 
 impl Default for EngineOptions {
@@ -122,6 +130,7 @@ impl Default for EngineOptions {
             sync: true,
             name: "nuage".into(),
             encryption: None,
+            kv_in_database: false,
         }
     }
 }

@@ -1,5 +1,8 @@
-//! `/v1/kv`: the key-value store of an application, in memory (see
-//! [`crate::kv`]): a cache, counters, locks.
+//! `/v1/kv`: the key-value store of an application (see [`crate::kv`]): a
+//! cache, counters, locks. It is in the server's memory, or in the
+//! application's database with `NUAGE_KV_STORAGE=database` (the same
+//! requests, the same answers; a write then waits for the disk, and a write
+//! the disk refuses is the server's storage error).
 //!
 //! | Request | What |
 //! |---|---|
@@ -12,7 +15,8 @@
 //! | `POST /v1/kv` | commands as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`, a list of commands answers `{"results": [...]}` in one round trip |
 //! | `DELETE /v1/kv` | deletes every key |
 //!
-//! A read-only token reads; writing takes a read-write token.
+//! A read-only token reads; writing takes a read-write token. The figures
+//! say where the keys are: `"storage": "memory"` or `"database"`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +28,18 @@ use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
 use super::{HttpBody, READ_ONLY, State, apps::App, forbidden, full, json_response, read_body};
+use crate::kv::database::AppKv;
 use crate::kv::{KvError, Reply, SetOptions, Ttl};
+
+/// Runs `f` on the key-value store of `app`: where it is in memory, on the
+/// blocking threads in the database (a call reads or waits for the disk).
+pub(super) async fn on<T: Send + 'static>(app: &Arc<App>, f: impl FnOnce(&AppKv) -> T + Send + 'static) -> Result<T> {
+    if !app.kv.in_database() {
+        return Ok(f(&app.kv));
+    }
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || f(&app.kv)).await.map_err(|e| Error::Pool(e.to_string()))
+}
 
 fn refusal(status: u16, kind: &str, message: impl Into<String>) -> Response<HttpBody> {
     json_response(status, &json!({ "error": { "kind": kind, "message": message.into() } }))
@@ -117,7 +132,6 @@ pub(super) async fn route(
     read_only: bool,
     req: Request<Incoming>,
 ) -> Result<Response<HttpBody>> {
-    let kv = &app.kv;
     let method = req.method().clone();
     let query = req.uri().query().unwrap_or_default().to_owned();
     let raw = req.uri().path().strip_prefix("/v1/kv").unwrap_or_default().to_owned();
@@ -129,12 +143,12 @@ pub(super) async fn route(
             Method::GET => {
                 let prefix = param(&query, "prefix").map(|p| decode(p, true)).unwrap_or_default();
                 let limit = param(&query, "limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(1000).min(10_000);
-                let keys: Vec<Json> = kv
-                    .keys(&prefix, limit)
+                let keys: Vec<Json> = on(app, move |kv| kv.keys(&prefix, limit))
+                    .await??
                     .into_iter()
                     .map(|k| json!({ "key": String::from_utf8_lossy(&k.key), "size": k.size, "ttl_ms": ttl_json(k.ttl) }))
                     .collect();
-                let s = kv.stats();
+                let s = on(app, |kv| kv.stats()).await??;
                 Ok(json_response(
                     200,
                     &json!({
@@ -143,12 +157,13 @@ pub(super) async fn route(
                         "stats": {
                             "keys": s.keys, "expiring": s.expiring, "bytes": s.bytes, "max_bytes": s.max_bytes,
                             "hits": s.hits, "misses": s.misses, "evictions": s.evictions, "expired": s.expired,
+                            "storage": app.kv.storage(),
                         },
                     }),
                 ))
             }
             Method::DELETE if read_only => Ok(forbidden(READ_ONLY)),
-            Method::DELETE => Ok(json_response(200, &json!({ "deleted": kv.clear() }))),
+            Method::DELETE => Ok(json_response(200, &json!({ "deleted": on(app, |kv| kv.clear()).await?? }))),
             Method::POST => {
                 let body = read_body(state, req).await?;
                 let body: Json =
@@ -162,13 +177,19 @@ pub(super) async fn route(
                     let Some(commands) = items.iter().map(command_of).collect::<Option<Vec<_>>>() else {
                         return Ok(refusal(400, "validation", BAD_COMMAND));
                     };
-                    let results: Vec<Json> = commands.iter().map(|c| reply_json(kv.command(c, read_only))).collect();
+                    // In the database, the list is one call: one record for all it writes.
+                    let replies = on(app, move |kv| match kv.in_database() {
+                        true => kv.transaction(&commands, read_only),
+                        false => commands.iter().map(|c| kv.command(c, read_only)).collect(),
+                    })
+                    .await??;
+                    let results: Vec<Json> = replies.into_iter().map(reply_json).collect();
                     return Ok(json_response(200, &json!({ "results": results })));
                 }
                 let Some(command) = command_of(list) else {
                     return Ok(refusal(400, "validation", BAD_COMMAND));
                 };
-                Ok(match kv.command(&command, read_only) {
+                Ok(match on(app, move |kv| kv.command(&command, read_only)).await?? {
                     Reply::Error(e) if e.starts_with("READONLY") => forbidden(READ_ONLY),
                     Reply::Error(e) => refusal(400, "validation", e.strip_prefix("ERR ").unwrap_or(&e)),
                     reply => json_response(200, &json!({ "result": reply_json(reply) })),
@@ -182,7 +203,7 @@ pub(super) async fn route(
         return Ok(forbidden(READ_ONLY));
     }
     match method {
-        Method::GET | Method::HEAD => match kv.get_with_ttl(&key) {
+        Method::GET | Method::HEAD => match on(app, move |kv| kv.get_with_ttl(&key)).await?? {
             Some((value, ttl)) => {
                 let mut res = Response::new(full(value));
                 let h = res.headers_mut();
@@ -210,19 +231,22 @@ pub(super) async fn route(
                 only_if_present: param(&query, "xx").is_some(),
             };
             let value = read_body(state, req).await?.to_vec();
-            Ok(match kv.set(&key, value, &options) {
+            Ok(match on(app, move |kv| kv.set(&key, value, &options)).await?? {
                 Ok(set) => json_response(200, &json!({ "set": set })),
                 Err(e) => refused(&e),
             })
         }
-        Method::DELETE => Ok(json_response(200, &json!({ "deleted": u8::from(kv.delete(&key)) }))),
+        Method::DELETE => {
+            let deleted = on(app, move |kv| kv.delete(&key)).await??;
+            Ok(json_response(200, &json!({ "deleted": u8::from(deleted) })))
+        }
         Method::POST => {
             if let Some(by) = param(&query, "incr") {
                 let Some(by) = (if by.is_empty() { Some(1) } else { by.parse::<i64>().ok() }) else {
                     return Ok(refusal(400, "validation", "`incr` is a whole number"));
                 };
                 let ttl = param(&query, "ttl").and_then(seconds);
-                return Ok(match kv.incr_by(&key, by, ttl) {
+                return Ok(match on(app, move |kv| kv.incr_by(&key, by, ttl)).await?? {
                     Ok(value) => json_response(200, &json!({ "value": value })),
                     Err(e) => refused(&e),
                 });
@@ -231,10 +255,12 @@ pub(super) async fn route(
                 let Some(ttl) = seconds(ttl) else {
                     return Ok(refusal(400, "validation", "`expire` is a number of seconds, more than 0"));
                 };
-                return Ok(json_response(200, &json!({ "set": kv.expire(&key, Some(ttl)) })));
+                let set = on(app, move |kv| kv.expire(&key, Some(ttl))).await??;
+                return Ok(json_response(200, &json!({ "set": set })));
             }
             if param(&query, "persist").is_some() {
-                return Ok(json_response(200, &json!({ "set": kv.expire(&key, None) })));
+                let set = on(app, move |kv| kv.expire(&key, None)).await??;
+                return Ok(json_response(200, &json!({ "set": set })));
             }
             Ok(refusal(400, "validation", "POST on a key takes `?incr`, `?expire=<seconds>` or `?persist`"))
         }

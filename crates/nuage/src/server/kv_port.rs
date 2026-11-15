@@ -13,6 +13,11 @@
 //! reads. With a certificate (`NUAGE_TLS_CERT`, `NUAGE_TLS_KEY`) the same port
 //! also answers TLS: the first byte of a connection tells which. Commands sent
 //! together (a pipeline) are answered together.
+//!
+//! With the store in the application's database (`NUAGE_KV_STORAGE=database`)
+//! a command waits for the disk off the async threads, a transaction
+//! (`MULTI` ... `EXEC`) is one commit, and a write the disk refuses answers
+//! `-ERR storage: <reason>`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +29,7 @@ use tokio::net::TcpStream;
 
 use super::State;
 use super::apps::App;
+use super::kv::on;
 use crate::kv::Reply;
 
 /// Settings of the key-value port.
@@ -123,7 +129,7 @@ impl Session {
     }
 
     /// Answers one command; `false` when the connection ends after it.
-    fn answer(&mut self, args: &[Vec<u8>], out: &mut Vec<u8>) -> bool {
+    async fn answer(&mut self, args: Vec<Vec<u8>>, out: &mut Vec<u8>) -> bool {
         let name = text(&args[0]).to_ascii_uppercase();
         let reply = match (name.as_str(), &args[1..]) {
             ("QUIT", _) => {
@@ -152,11 +158,15 @@ impl Session {
                 Some((commands, false)) => {
                     let started = Instant::now();
                     let (app, read_only) = self.app.as_ref().expect("checked above");
-                    let replies = app.kv.transaction(&commands, *read_only);
+                    let read_only = *read_only;
+                    let replies = on(app, move |kv| kv.transaction(&commands, read_only)).await.and_then(|r| r);
                     app.touch();
-                    app.metrics.record(started.elapsed(), false);
-                    self.state.metrics.record(started.elapsed(), false);
-                    Reply::Array(replies)
+                    app.metrics.record(started.elapsed(), replies.is_err());
+                    self.state.metrics.record(started.elapsed(), replies.is_err());
+                    match replies {
+                        Ok(replies) => Reply::Array(replies),
+                        Err(e) => Reply::Error(format!("ERR storage: {e}")),
+                    }
                 }
             },
             // Nothing is watched: a transaction runs alone, there is no race to detect.
@@ -170,7 +180,7 @@ impl Session {
                     *spoiled = true;
                     Reply::Error("READONLY this token only reads: use a read-write token".into())
                 } else {
-                    commands.push(args.to_vec());
+                    commands.push(args);
                     Reply::Status("QUEUED".into())
                 }
             }
@@ -193,11 +203,12 @@ impl Session {
             _ => {
                 let started = Instant::now();
                 let (app, read_only) = self.app.as_ref().expect("checked above");
-                let reply = app.kv.command(args, *read_only);
+                let read_only = *read_only;
+                let reply = on(app, move |kv| kv.command(&args, read_only)).await.and_then(|r| r);
                 app.touch();
-                app.metrics.record(started.elapsed(), false);
-                self.state.metrics.record(started.elapsed(), false);
-                reply
+                app.metrics.record(started.elapsed(), reply.is_err());
+                self.state.metrics.record(started.elapsed(), reply.is_err());
+                reply.unwrap_or_else(|e| Reply::Error(format!("ERR storage: {e}")))
             }
         };
         reply.write_resp(out, self.resp3);
@@ -270,7 +281,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut strea
                 Ok(Some((args, used))) => {
                     at += used;
                     if !args.is_empty() {
-                        open = session.answer(&args, &mut out);
+                        open = session.answer(args, &mut out).await;
                     }
                 }
                 Ok(None) => break,
@@ -340,5 +351,64 @@ mod tests {
         assert!(parse(b"*1\r\n:1\r\n", max).is_err());
         assert!(parse(b"*x\r\n", max).is_err());
         assert!(parse(b"*1\r\n$99999999\r\n", 1024).is_err(), "larger than a value may be");
+    }
+
+    /// With the keys in the database, a write the disk refuses answers
+    /// `-ERR storage: ...` on the port and the server's storage error over
+    /// HTTP, never a missing key; what it wrote is never read.
+    #[tokio::test]
+    async fn a_write_the_disk_refuses_is_an_error_on_the_port_and_over_http() {
+        let dir = std::env::temp_dir().join(format!("nuage-kv-port-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = crate::EngineOptions { kv_in_database: true, ..crate::EngineOptions::default() };
+        let engine = crate::Engine::open(&dir, options).unwrap();
+        let server = crate::Server::new(
+            engine.clone(),
+            crate::ServerOptions { token: Some("t0ken".into()), ..crate::ServerOptions::default() },
+        );
+        let port = server.listen_kv("127.0.0.1:0", KvOptions::default()).await.unwrap();
+        let web = server.listen("127.0.0.1:0").await.unwrap();
+        let mut conn = TcpStream::connect(port.local_addr()).await.unwrap();
+        async fn say(conn: &mut TcpStream, command: &[&str]) -> String {
+            let mut wire = format!("*{}\r\n", command.len());
+            for arg in command {
+                wire.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+            }
+            conn.write_all(wire.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = conn.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        }
+        async fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            let head = format!(
+                "{method} {path} HTTP/1.1\r\nHost: nuage\r\nAuthorization: Bearer t0ken\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(head.as_bytes()).await.unwrap();
+            let mut answer = Vec::new();
+            conn.read_to_end(&mut answer).await.unwrap();
+            String::from_utf8_lossy(&answer).into_owned()
+        }
+        assert_eq!(say(&mut conn, &["AUTH", "t0ken"]).await, "+OK\r\n");
+        assert_eq!(say(&mut conn, &["SET", "kept", "v"]).await, "+OK\r\n");
+        engine.store.fail_next_sync();
+        let refused = say(&mut conn, &["SET", "lost", "v"]).await;
+        assert!(refused.starts_with("-ERR storage: ") && refused.contains("write-ahead log"), "{refused}");
+        assert_eq!(say(&mut conn, &["GET", "lost"]).await, "$-1\r\n");
+        let multi = [say(&mut conn, &["MULTI"]).await, say(&mut conn, &["INCR", "n"]).await];
+        assert_eq!(multi, ["+OK\r\n", "+QUEUED\r\n"]);
+        assert!(say(&mut conn, &["EXEC"]).await.starts_with("-ERR storage: "));
+        // Over HTTP, the server's storage error; reads go on.
+        let put = request(web.local_addr(), "PUT", "/v1/kv/other", "v").await;
+        assert!(put.starts_with("HTTP/1.1 500") && put.contains("write-ahead log"), "{put}");
+        let get = request(web.local_addr(), "GET", "/v1/kv/kept", "").await;
+        assert!(get.starts_with("HTTP/1.1 200") && get.ends_with("\r\n\r\nv"), "{get}");
+        assert!(request(web.local_addr(), "GET", "/v1/kv/lost", "").await.starts_with("HTTP/1.1 404"));
+        port.shutdown().await;
+        web.shutdown().await;
+        drop((server, engine));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

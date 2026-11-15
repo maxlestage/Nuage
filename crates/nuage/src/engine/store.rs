@@ -691,6 +691,13 @@ impl Store {
         }
     }
 
+    /// The next sync of the log fails, as a disk that refuses a write would
+    /// (the tests of the key-value store in the database).
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn fail_next_sync(&self) {
+        self.durable.fail_next.store(true, Ordering::SeqCst);
+    }
+
     /// An error once a sync of the log has failed: the commits it covered
     /// may not be on disk, and no later sync can tell.
     fn log_is_sound(&self) -> Result<()> {
@@ -723,7 +730,11 @@ impl Store {
         Ok(())
     }
 
-    fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
+    /// Commits raw operations as one log record and applies them; returns
+    /// the commit's number. The caller holds the writer lock, and once it has
+    /// let go of it, waits for [`wait_durable`](Self::wait_durable) of that
+    /// number before telling anyone the commit is made.
+    pub(crate) fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
         self.log_is_sound()?;
         if writer.wal.spent() {
             // A record was cut from this segment: its number is not sealed
