@@ -50,10 +50,16 @@ impl Infer<'_, '_> {
                 memoire_orm::Value::Bool(_) => Some(ColumnType::Bool),
                 _ => None,
             },
-            Expr::Bin(Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod, a, b) => {
-                self.type_of(a).or_else(|| self.type_of(b))
-            }
-            Expr::Bin(Op::Concat, ..) | Expr::Like { .. } => Some(ColumnType::Text),
+            Expr::Chain(first, rest) => match rest.first()?.0 {
+                Op::Concat => Some(ColumnType::Text),
+                // A date moved by an interval: a date gives a timestamp, the others stay what they are.
+                Op::Add | Op::Sub if rest.iter().any(|(_, x)| x.interval().is_some()) => None,
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
+                    self.type_of(first).or_else(|| rest.iter().find_map(|(_, x)| self.type_of(x)))
+                }
+                _ => None,
+            },
+            Expr::Like { .. } => Some(ColumnType::Text),
             Expr::Func { name, star, args, .. } => match name.as_str() {
                 "count" => Some(ColumnType::BigInt),
                 "sum" | "min" | "max" | "coalesce" | "abs" => {
@@ -82,14 +88,33 @@ impl Infer<'_, '_> {
 
     fn expr(&mut self, e: &Expr) {
         match e {
-            Expr::Bin(op, a, b) => {
-                if !matches!(op, Op::And | Op::Or) {
-                    let (ta, tb) = (self.type_of(a), self.type_of(b));
-                    self.set(a, tb);
-                    self.set(b, ta);
-                }
+            Expr::Bin(_, a, b) => {
+                let (ta, tb) = (self.type_of(a), self.type_of(b));
+                self.set(a, tb);
+                self.set(b, ta);
                 self.expr(a);
                 self.expr(b);
+            }
+            Expr::Chain(first, rest) => {
+                // Arithmetic and `||`: each operand has the type of what stands before it
+                // (and the first, of the second), as pairs applied from the left have.
+                if let Some((op, second)) = rest.first()
+                    && !matches!(op, Op::And | Op::Or)
+                {
+                    let mut before = self.type_of(first);
+                    let after = self.type_of(second);
+                    self.set(first, after);
+                    for (op, x) in rest {
+                        self.set(x, before);
+                        before = if *op == Op::Concat {
+                            Some(ColumnType::Text)
+                        } else {
+                            before.or_else(|| self.type_of(x))
+                        };
+                    }
+                }
+                self.expr(first);
+                rest.iter().for_each(|(_, x)| self.expr(x));
             }
             Expr::In(x, list, _) => {
                 let t = self.type_of(x);

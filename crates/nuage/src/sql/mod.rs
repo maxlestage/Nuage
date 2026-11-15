@@ -28,11 +28,21 @@
 //!
 //! Not there: `RIGHT`/`FULL` joins, `WITH`, window functions, triggers,
 //! views, changing a primary key, a primary key of several columns.
+//!
+//! A statement cannot take the server down with it: what it holds in memory
+//! is counted against a budget ([`set_statement_memory`]), it has a deadline
+//! ([`set_statement_timeout`]), a function refuses to build a text larger
+//! than 64 MiB, and expressions nest up to a limit (a long flat list, `a OR b
+//! OR ...` or `IN (...)`, has none). Past any of them the statement fails with
+//! an error that says which, and its transaction is rolled back.
 
 mod ast;
 mod exec;
 mod lex;
+pub(crate) mod limits;
 mod parse;
+#[cfg(test)]
+mod probe;
 #[cfg(feature = "server")]
 mod types;
 pub(crate) mod value;
@@ -48,6 +58,7 @@ use memoire_orm::{Error, Result, Value};
 use serde_json::Value as Json;
 
 pub use exec::SqlResult;
+pub use limits::{set_statement_memory, set_statement_timeout, statement_memory, statement_timeout};
 
 use crate::embedded::Embedded;
 use crate::engine::Engine;
@@ -217,10 +228,12 @@ pub(crate) fn run_values(
     }
     let writes = batch.iter().any(|(s, _)| s.writes());
     let db = Embedded::from_engine(engine.clone()).on_branch(branch)?;
+    // One budget of memory for the request: the answers of its scripts are all held until it ends.
+    let limits = limits::Limits::from_settings();
     let run_all = |tx: &crate::embedded::EmbeddedTransaction| -> Result<Vec<Vec<SqlResult>>> {
         let mut out = Vec::with_capacity(batch.len());
         for (script, params) in batch {
-            let runner = exec::Runner::new(tx, schemas, params);
+            let runner = exec::Runner::with_limits(tx, schemas, params, limits.clone());
             out.push(script.stmts.iter().map(|s| runner.run(s)).collect::<Result<Vec<_>>>()?);
         }
         Ok(out)

@@ -11,6 +11,7 @@
 //! the tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use memoire_orm::ast::{Projection, SelectAst};
@@ -22,6 +23,7 @@ use serde_json::{Value as Json, json};
 use super::keys::{self, push_value};
 use super::store::{Overlay, Parsed, Snapshot, Store};
 use super::wal::Op;
+use crate::sql::limits::{self, Limits, rows_bytes};
 
 /// Rows read per step of a table scan.
 pub(crate) const CHUNK: usize = 2048;
@@ -359,9 +361,18 @@ impl Ctx<'_> {
     fn index_lookup(&self, meta: &TableMeta, index: usize, values: &[&Value]) -> Result<Vec<Vec<u8>>> {
         let prefix = keys::index_prefix(meta.generation, index as u16, values);
         let end = keys::prefix_end(&prefix);
-        let mut out = Vec::new();
+        let mut out: Vec<Vec<u8>> = Vec::new();
         self.snap.each(Some(self.overlay), &prefix, &end, |k, _| {
-            out.push(k[prefix.len()..].to_vec());
+            let key = &k[prefix.len()..];
+            out.push(key.to_vec());
+            // An index on a column of few values names most of the table: for a SQL
+            // statement, the keys count in what it may hold, and the walk in its time.
+            if out.len() % CHUNK == 0
+                && let Some(limits) = limits::at_work()
+            {
+                limits.check_time()?;
+                limits.fits(out.len().saturating_mul(key.len() + size_of::<Vec<u8>>()))?;
+            }
             Ok(true)
         })?;
         Ok(out)
@@ -410,21 +421,134 @@ impl Ctx<'_> {
 // Filters
 // ---------------------------------------------------------------------------
 
+/// The conditions `e` is the `AND` of, in their order. Without calling itself:
+/// SQL gives conditions of thousands of terms.
 fn conjuncts(e: &Expr) -> Vec<&Expr> {
-    match e {
-        Expr::Binary { op: BinOp::And, left, right } => {
-            let mut v = conjuncts(left);
-            v.extend(conjuncts(right));
-            v
+    let mut out = Vec::new();
+    let mut todo = vec![e];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Binary { op: BinOp::And, left, right } => {
+                todo.push(right);
+                todo.push(left);
+            }
+            other => out.push(other),
         }
-        other => vec![other],
+    }
+    out
+}
+
+/// `parts` joined by `AND`, as a tree no deeper than the logarithm of their
+/// number: the evaluator calls itself on each side of an `AND`, and thousands
+/// of conditions joined one after the other would be as deep as they are many.
+fn and_all(parts: &[&Expr]) -> Option<Expr> {
+    let mut level: Vec<Expr> = parts.iter().map(|e| (*e).clone()).collect();
+    while level.len() > 1 {
+        let mut pairs = Vec::with_capacity(level.len().div_ceil(2));
+        let mut it = level.into_iter();
+        while let Some(a) = it.next() {
+            pairs.push(match it.next() {
+                Some(b) => Expr::binary(BinOp::And, a, b),
+                None => a,
+            });
+        }
+        level = pairs;
+    }
+    level.pop()
+}
+
+/// What the SQL statement at work on this thread may still take
+/// ([`crate::sql::limits`]). A read keeps the rows that match: it stops when
+/// they no longer fit in the memory of the statement, or when the statement
+/// ran past its deadline. Outside SQL, nothing is watched.
+struct Watch {
+    limits: Option<Rc<Limits>>,
+    /// Bytes of the rows the read keeps.
+    held: usize,
+}
+
+impl Watch {
+    fn new() -> Watch {
+        Watch { limits: limits::at_work(), held: 0 }
+    }
+
+    /// One more step of a long read.
+    fn time(&self) -> Result<()> {
+        match &self.limits {
+            Some(limits) => limits.check_time(),
+            None => Ok(()),
+        }
+    }
+
+    /// `rows` more are kept.
+    fn more(&mut self, rows: &[Vec<Value>]) -> Result<()> {
+        let Some(limits) = &self.limits else { return Ok(()) };
+        self.held = self.held.saturating_add(rows_bytes(rows));
+        limits.fits(self.held)
+    }
+
+    /// What was kept since `base` bytes were held is now `rows`.
+    fn now(&mut self, base: usize, rows: &[Vec<Value>]) -> Result<()> {
+        let Some(limits) = &self.limits else { return Ok(()) };
+        self.held = base.saturating_add(rows_bytes(rows));
+        limits.fits(self.held)
     }
 }
 
-fn and_all(parts: &[&Expr]) -> Option<Expr> {
-    let mut it = parts.iter();
-    let first = (*it.next()?).clone();
-    Some(it.fold(first, |acc, e| Expr::binary(BinOp::And, acc, (*e).clone())))
+/// Bytes Memoire's evaluator holds for each table of each row a join gives:
+/// a reference in the rows joined so far, in those of the next join, and in
+/// those `WHERE` keeps.
+const JOINED_ROW_BYTES: usize = 3 * size_of::<Option<&[Value]>>();
+
+/// The most rows the joins of `ast` can give, from the rows loaded. A join on
+/// a column that names one row at most (a primary key, a unique column) gives
+/// no more rows than it gets; any other may give every pair.
+fn join_bound(ast: &SelectAst, tables: &Tables) -> usize {
+    let loaded = |name: &str| tables.rows(name).map_or(0, <[Vec<Value>]>::len);
+    let schemas: Vec<&'static TableSchema> = ast.tables().collect();
+    let unique = |table: &str, column: usize| {
+        schemas.iter().find(|s| s.name == table).is_some_and(|s| {
+            column == s.primary_key
+                || s.columns.get(column).is_some_and(|c| c.unique)
+                || s.indexes.iter().any(|ix| ix.unique && ix.columns == [column])
+        })
+    };
+    let mut bound = loaded(ast.from.name);
+    // The tables each row of which is in one joined row at most.
+    let mut once: Vec<&str> = vec![ast.from.name];
+    for (i, join) in ast.joins.iter().enumerate() {
+        let table = join.table.name;
+        let rows = loaded(table);
+        let before = |name: &str| name != table && schemas[..=i].iter().any(|s| s.name == name);
+        // `table.column = other.column`, the other table joined before: a hash join.
+        let equi = match &join.on {
+            Expr::Binary { op: BinOp::Eq, left, right } => match (&**left, &**right) {
+                (Expr::Column(a), Expr::Column(b)) if a.table == table && before(b.table) => Some((a.index, *b)),
+                (Expr::Column(a), Expr::Column(b)) if b.table == table && before(a.table) => Some((b.index, *a)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let left = join.kind == JoinKind::Left;
+        match equi {
+            // Each row so far meets one row of the table at most.
+            Some((column, other)) if unique(table, column) => {
+                if unique(other.table, other.index) && once.contains(&other.table) {
+                    once.push(table);
+                }
+            }
+            // Each row of the table meets one row so far at most.
+            Some((_, other)) if unique(other.table, other.index) && once.contains(&other.table) => {
+                bound = if left { bound.saturating_add(rows) } else { rows.min(bound.saturating_mul(rows)) };
+                once = vec![table];
+            }
+            _ => {
+                bound = bound.saturating_mul(if left { rows.max(1) } else { rows });
+                once.clear();
+            }
+        }
+    }
+    bound
 }
 
 /// Tables whose columns `e` reads, outside subqueries.
@@ -753,6 +877,7 @@ enum Stop {
 /// Rows of `schema` matching `parts`, read through an index when possible.
 /// `needed`: the columns the statement reads (see [`columns_read`]); the
 /// others come out `NULL`.
+#[allow(clippy::too_many_arguments)]
 fn matching_rows(
     ctx: &mut Ctx<'_>,
     schema: &'static TableSchema,
@@ -761,6 +886,7 @@ fn matching_rows(
     side_schemas: &[&'static TableSchema],
     stop: Stop,
     needed: Option<&[bool]>,
+    watch: &mut Watch,
 ) -> Result<Option<(Vec<Vec<Value>>, i64)>> {
     let Some(meta) = ctx.meta(schema.name)? else { return Ok(None) };
     let map = meta.map(schema);
@@ -793,23 +919,40 @@ fn matching_rows(
             if desc {
                 pks.reverse();
             }
-            let mut out = Vec::with_capacity(n);
-            for chunk in pks.chunks(n.max(16)) {
+            let mut out = Vec::with_capacity(n.min(CHUNK));
+            for chunk in pks.chunks(n.clamp(16, CHUNK)) {
+                watch.time()?;
                 let rows = ctx.rows_by_pk(&meta, &map, want, chunk)?;
-                out.extend(if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows });
+                let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
+                watch.more(&rows)?;
+                out.extend(rows);
                 if out.len() >= n {
                     break;
                 }
             }
             return Ok(Some((out, seq)));
         }
-        let rows = ctx.rows_by_pk(&meta, &map, want, &pks)?;
-        let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
-        return Ok(Some((rows, seq)));
+        // A chunk at a time: an index may name most of the table, and the rows that
+        // do not fit in the statement's memory are not read.
+        let mut out = Vec::with_capacity(pks.len().min(CHUNK));
+        for (i, chunk) in pks.chunks(CHUNK).enumerate() {
+            if i > 0 {
+                watch.time()?;
+            }
+            let rows = ctx.rows_by_pk(&meta, &map, want, chunk)?;
+            let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
+            watch.more(&rows)?;
+            out.extend(rows);
+        }
+        return Ok(Some((out, seq)));
     }
     let mut out: Vec<Vec<Value>> = Vec::new();
+    // What the read held before this table.
+    let base = watch.held;
     ctx.scan_rows(&meta, &map, want, |chunk| {
+        watch.time()?;
         let matched = if filter.is_some() { keep(chunk, &select)? } else { chunk };
+        watch.more(&matched)?;
         out.extend(matched);
         Ok(match &stop {
             Stop::Never => true,
@@ -820,6 +963,8 @@ fn matching_rows(
                     best.order = order.clone();
                     best.limit = Some(*n as u64);
                     out = keep(std::mem::take(&mut out), &best)?;
+                    // Only the best rows are still held.
+                    watch.now(base, &out)?;
                 }
                 true
             }
@@ -828,11 +973,11 @@ fn matching_rows(
     Ok(Some((out, seq)))
 }
 
-fn load_all(ctx: &mut Ctx<'_>, schema: &'static TableSchema, into: &mut Tables) -> Result<()> {
+fn load_all(ctx: &mut Ctx<'_>, schema: &'static TableSchema, into: &mut Tables, watch: &mut Watch) -> Result<()> {
     if into.contains(schema.name) {
         return Ok(());
     }
-    if let Some((rows, seq)) = matching_rows(ctx, schema, &[], &Tables::new(), &[], Stop::Never, None)? {
+    if let Some((rows, seq)) = matching_rows(ctx, schema, &[], &Tables::new(), &[], Stop::Never, None, watch)? {
         into.insert(schema, rows, seq);
     }
     Ok(())
@@ -985,8 +1130,10 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
             let mut side_schemas = Vec::new();
             subquery_tables(ast, &mut side_schemas);
             let mut side = Tables::new();
+            // One watch for all the tables of the statement: they are held together.
+            let mut watch = Watch::new();
             for s in &side_schemas {
-                load_all(ctx, s, &mut side)?;
+                load_all(ctx, s, &mut side, &mut watch)?;
             }
             let parts: Vec<&Expr> = ast.filter.as_ref().map(conjuncts).unwrap_or_default();
             let single = ast.joins.is_empty()
@@ -1026,7 +1173,7 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                 };
                 let needed = columns_read(ast, schema);
                 if let Some((rows, seq)) =
-                    matching_rows(ctx, schema, &own, &side, &side_schemas, stop, needed.as_deref())?
+                    matching_rows(ctx, schema, &own, &side, &side_schemas, stop, needed.as_deref(), &mut watch)?
                 {
                     // One table, its whole filter applied: plain columns need no evaluator.
                     let rows = if single && whole {
@@ -1038,6 +1185,18 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
                         rows
                     };
                     tables.insert(schema, rows, seq);
+                }
+            }
+            // Memoire joins the tables in memory, and what its join holds is counted
+            // nowhere. For a SQL statement, a join that could give more rows than the
+            // statement may hold is left to the SQL layer, which counts each row.
+            if !ast.joins.is_empty()
+                && let Some(limits) = &watch.limits
+            {
+                let references = join_bound(ast, &tables).saturating_mul((ast.joins.len() + 1) * JOINED_ROW_BYTES);
+                if limits.fits(watch.held.saturating_add(references)).is_err() {
+                    limits.decline();
+                    return Err(Error::Validation("SQL: the join may give more rows than the statement may hold".into()));
                 }
             }
             Ok(Fetched::Tables(tables))
@@ -1171,22 +1330,24 @@ fn write_rows(ctx: &mut Ctx<'_>, query: &Query<'_>, schema: &'static TableSchema
         Query::Update(u) => {
             filter_tables(u.filter.as_ref(), &mut side_schemas);
             let mut side = Tables::new();
+            let mut watch = Watch::new();
             for s in &side_schemas {
-                load_all(ctx, s, &mut side)?;
+                load_all(ctx, s, &mut side, &mut watch)?;
             }
             let parts: Vec<&Expr> = u.filter.as_ref().map(conjuncts).unwrap_or_default();
-            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None)?
+            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None, &mut watch)?
                 .map_or(Vec::new(), |r| r.0);
             (rows, side)
         }
         Query::Delete(d) => {
             filter_tables(d.filter.as_ref(), &mut side_schemas);
             let mut side = Tables::new();
+            let mut watch = Watch::new();
             for s in &side_schemas {
-                load_all(ctx, s, &mut side)?;
+                load_all(ctx, s, &mut side, &mut watch)?;
             }
             let parts: Vec<&Expr> = d.filter.as_ref().map(conjuncts).unwrap_or_default();
-            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None)?
+            let rows = matching_rows(ctx, schema, &parts, &side, &side_schemas, Stop::Never, None, &mut watch)?
                 .map_or(Vec::new(), |r| r.0);
             (rows, side)
         }

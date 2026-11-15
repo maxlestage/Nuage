@@ -32,7 +32,14 @@ pub(crate) enum Expr {
     },
     Neg(Box<Expr>),
     Not(Box<Expr>),
+    /// A comparison of two operands.
     Bin(Op, Box<Expr>, Box<Expr>),
+    /// Operands joined by the operators of one level, applied from the left:
+    /// `a AND b AND c`, `x + y - z`, `s || t`. One node however long the list
+    /// (a query builder writes ten thousand `OR`s): a tree of pairs would be as
+    /// deep as the list is long, and whatever walks it (evaluating, copying,
+    /// dropping) would need as much stack.
+    Chain(Box<Expr>, Vec<(Op, Expr)>),
     IsNull(Box<Expr>, bool),
     In(Box<Expr>, Vec<Expr>, bool),
     InSelect(Box<Expr>, Box<Select>, bool),
@@ -91,6 +98,17 @@ impl Expr {
         found
     }
 
+    /// The text of an `INTERVAL '...'`, when it is one.
+    pub(crate) fn interval(&self) -> Option<&str> {
+        match self {
+            Expr::Func { name, args, .. } if name == "_interval" => match args.as_slice() {
+                [Expr::Lit(Value::Text(text))] => Some(text),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Calls `f` on it and every expression in it, subqueries excepted.
     pub(crate) fn walk(&self, f: &mut dyn FnMut(&Expr)) {
         f(self);
@@ -100,6 +118,10 @@ impl Expr {
             Expr::Bin(_, a, b) => {
                 a.walk(f);
                 b.walk(f);
+            }
+            Expr::Chain(first, rest) => {
+                first.walk(f);
+                rest.iter().for_each(|(_, x)| x.walk(f));
             }
             Expr::In(e, list, _) => {
                 e.walk(f);
@@ -199,6 +221,10 @@ pub(crate) struct OrderItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Select {
+    /// Its number: no other `SELECT` read by this process has it (a copy of
+    /// this one does: it is the same query). What a statement remembers of a
+    /// subquery, it remembers by this number.
+    pub id: u64,
     pub first: Core,
     pub rest: Vec<(SetOp, Core)>,
     pub order: Vec<OrderItem>,
