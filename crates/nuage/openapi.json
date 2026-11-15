@@ -278,6 +278,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -393,6 +396,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -435,6 +441,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -496,6 +505,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -622,6 +634,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -731,6 +746,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -785,6 +803,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }

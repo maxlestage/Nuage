@@ -35,8 +35,8 @@ ligne.
 | **Sémantique de Memoire** | Les requêtes passent par l'évaluateur de Memoire, sur les lignes lues sur disque : Nuage DB se comporte exactement comme le moteur en mémoire de Memoire, quelle que soit la taille des données. |
 | **Transactions** | Lectures sur instantané, commits optimistes (`Error::Conflict`, rejoués par `db.transaction(...)`), transactions interactives en HTTP, lots tout-ou-rien. |
 | **Branches** | Une copie complète de la base pour une préversion, un test ou une expérience, créée en un instant : elle partage les pages de son parent et ne stocke que ses propres changements. |
-| **Sauvegardes restaurées au démarrage** | Instantanés et segments de journal, vers un dossier ou un stockage compatible S3. Un répertoire de données vide est restauré automatiquement au démarrage : les hébergeurs à disque éphémère fonctionnent. |
-| **Stockage clé-valeur** | Chaque application a un stockage en mémoire : valeurs avec expiration, compteurs, verrous, cache, en HTTP (`/v1/kv`) et sur un port à lui ([Stockage clé-valeur](#stockage-clé-valeur)). |
+| **Sauvegardes restaurées au démarrage** | Instantanés et segments de journal, vers un dossier ou un stockage compatible S3, à un endroit ou à deux tenus à jour ensemble. Un répertoire de données vide est restauré automatiquement au démarrage : les hébergeurs à disque éphémère fonctionnent. Une base n'écrit jamais sa sauvegarde par-dessus celle d'une autre. |
+| **Stockage clé-valeur** | Chaque application a un stockage, dans la mémoire du serveur ou dans sa propre base (`NUAGE_KV_STORAGE`) : valeurs avec expiration, compteurs, verrous, cache, en HTTP (`/v1/kv`) et sur un port à lui ([Stockage clé-valeur](#stockage-clé-valeur)). |
 | **Fichiers** | Chaque application garde des fichiers de toute taille (tuiles de carte, photos, archives) dans un bucket compatible S3 comme Cloudflare R2 : le serveur les liste et signe les liens, les octets vont directement du client au bucket ([Fichiers](#fichiers)). |
 | **Serveur** | Un seul binaire, configuré par variables d'environnement : le protocole de la base (`/v1`), le statut en direct (`/api/status`, `/api/status/stream`), la console (`/admin`) et le site avec son tableau de bord en direct (`/app`), sur un seul port. |
 | **Client WebAssembly** | `memoire_orm::NuageDb` parle HTTP(S) : en natif avec Tokio, et dans le navigateur via `fetch`. |
@@ -377,13 +377,49 @@ pause prend plusieurs secondes).
 
 ## Stockage clé-valeur
 
-À côté de sa base, chaque application a un **stockage clé-valeur en mémoire** :
-un cache devant tout ce qui est lent, des sessions, des compteurs, des limites de
-débit, des verrous. Rien ne touche le disque : une lecture ou une écriture coûte un
+À côté de sa base, chaque application a un **stockage clé-valeur** : un cache devant tout ce
+qui est lent, des sessions, des compteurs, des limites de débit, des verrous. Par défaut, il
+est dans la mémoire du serveur. Rien ne touche le disque : une lecture ou une écriture coûte un
 aller-retour, et le serveur en traite plus de 140 000 par seconde sur 4 cœurs. Un redémarrage
-le vide ; ce qui doit survivre va dans la base. La mémoire est bornée pour chaque application
-(`NUAGE_KV_MB`) : au-delà, les clés expirées partent d'abord, puis les moins récemment
-utilisées.
+le vide. La mémoire est bornée pour chaque application (`NUAGE_KV_MB`) : au-delà, les clés
+expirées partent d'abord, puis les moins récemment utilisées.
+
+**En mémoire ou dans la base.** `NUAGE_KV_STORAGE` dit où sont gardés les stockages de toutes
+les applications. `memory`, la valeur par défaut, est le stockage ci-dessus : le plus rapide,
+et vidé par un redémarrage. `database` garde les clés de chaque application dans sa propre
+base, sur disque. Elles sont écrites par le même journal que ses lignes : elles survivent à un
+redémarrage, sont chiffrées et sont dans les sauvegardes. Les requêtes, les commandes et le
+port restent les mêmes. Avec `database` :
+
+- **une écriture attend le disque**, comme la mise à jour d'une ligne : elle reçoit sa réponse
+  une fois synchronisée (les écritures faites en même temps partagent une synchronisation).
+  Une lecture n'attend pas ;
+- **rien n'est évincé**, et `NUAGE_KV_MB` ne sert pas : le stockage est borné par le disque,
+  comme les tables ; donnez donc une expiration aux entrées de cache. Une valeur fait 64 Mio
+  au plus ;
+- **une liste de commandes, ou `MULTI` … `EXEC`, est un seul commit** : tout ou rien. Une
+  écriture que le disque refuse est une erreur (`500` en HTTP, `-ERR storage: …` sur le port),
+  jamais à moitié écrite ;
+- **une expiration est une date** : une clé faite pour vivre une heure expire une heure plus
+  tard, que le serveur ait redémarré entre-temps ou non. Une clé expirée n'est jamais rendue
+  ni comptée, et un passage en arrière-plan l'efface du disque ;
+- **sur un disque effacé à chaque redémarrage** (Heroku), un redémarrage propre garde toutes
+  les clés : au `SIGTERM`, le serveur envoie son dernier segment de journal. Après un crash,
+  les clés reviennent telles qu'au dernier segment envoyé, comme les lignes (30 secondes par
+  défaut) : un verrou libéré dans cet intervalle est de nouveau pris, un compteur augmenté
+  revient à sa valeur d'avant ;
+- les chiffres (`GET /v1/kv`, `/api/status`) disent `"storage": "database"`, avec `max_bytes`
+  à 0 ; `INFO` dit `maxmemory:0` et `maxmemory_policy:noeviction`. Les branches et le SQL ne
+  voient pas les clés.
+
+Pour en changer, modifiez la ligne dans le fichier de réglages et redémarrez le serveur (voir
+la ligne « redémarrer » d'[Installer sur n'importe quel
+ordinateur](#installer-sur-nimporte-quel-ordinateur)) ; sur Heroku, `heroku config:set
+NUAGE_KV_STORAGE=database`, qui redémarre le dyno. Le journal du démarrage dit `key-value
+stores are kept in each application's database`. Passer de `memory` à `database` commence avec
+ce que la base contient déjà, rien la première fois : les clés en mémoire ne sont pas copiées.
+Revenir à `memory` laisse les clés dans la base, sans les lire, et elles sont retrouvées quand
+`database` revient. Toute autre valeur arrête le serveur au démarrage.
 
 **En HTTP**, depuis n'importe quel langage, avec un jeton de l'application (un jeton en lecture
 seule lit) :
@@ -495,6 +531,11 @@ sauvegardes, sans sa clé.
 | réglages | `/etc/nuage/nuage.env` | `/usr/local/etc/nuage/nuage.env` | `C:\ProgramData\Nuage\nuage.env` |
 | données | `/var/lib/nuage` | `/usr/local/var/nuage` | `C:\ProgramData\Nuage\data` |
 | journal | `journalctl -u nuage -f` | `tail -f /usr/local/var/log/nuage.log` | `Get-Content -Wait C:\ProgramData\Nuage\nuage.log` |
+| redémarrer | `sudo systemctl restart nuage` | `sudo launchctl kickstart -k system/io.github.maxlestage.nuage` | `Stop-ScheduledTask -TaskName 'Nuage DB'; Get-Process nuage -ErrorAction SilentlyContinue \| Stop-Process -Force; Start-ScheduledTask -TaskName 'Nuage DB'` |
+
+Une modification du fichier de réglages s'applique quand le service redémarre (avec Docker :
+`docker compose up -d` après une modification de `.env`). Sur Windows, l'arrêt est forcé : ce
+qui a été écrit est rejoué depuis le journal au démarrage suivant.
 
 Sur Linux, elle **crée aussi du swap** si le serveur n'en a pas (la taille de la mémoire, de
 1 à 4 Gio ; `vm.swappiness=10`, pour que la mémoire aille à la base) et un utilisateur système
@@ -588,8 +629,31 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   `/usr/local/bin/nuage` dans Réglages Système → Confidentialité et sécurité → Accès complet
   au disque. Sur Windows, un partage de NAS (`\\nas\sauvegarde\nuage`) doit laisser écrire le
   compte de l'ordinateur (`ORDINATEUR$`).
-- **Changer** de destination : relancez l'installateur avec la nouvelle option ; il remplace
-  l'ancienne dans le fichier de réglages et redémarre le service. Sans option, il les garde.
+- **Changer** de destination, sur un disque qui n'est pas effacé (votre ordinateur, un
+  serveur) : relancez l'installateur avec la nouvelle option. Il remplace l'ancienne dans le
+  fichier de réglages et redémarre le service ; sans option, il les garde. Pour un bucket,
+  modifier le fichier de réglages et redémarrer le service revient au même. Sur Linux, un
+  nouveau dossier passe par l'installateur, qui permet aussi au service d'y écrire. Juste
+  après le démarrage, le serveur envoie un instantané complet de chaque application au nouvel
+  endroit. L'ancien reste tel quel : effacez-le une fois que la console montre les sauvegardes
+  du nouveau.
+- **Une base n'écrit jamais par-dessus la sauvegarde d'une autre.** Avant chaque instantané,
+  le serveur compare le fichier `encryption.json` de la destination au sien. Un endroit qui
+  contient la sauvegarde d'une autre base est refusé, et rien n'y est écrit. Le journal
+  d'événements dit `backup failed: … holds the backup of another database (its encryption.json
+  is not this one's): nothing was written there`, et la console comme `/app` montrent la
+  sauvegarde en échec. Donnez à cette base un endroit à elle, ou videz celui-là. Un bucket qui
+  n'existe pas est une erreur aussi, jamais une sauvegarde vide.
+- **Un démarrage à vide est dit, et peut être refusé.** Quand le dossier des données est vide
+  et que la sauvegarde ne contient rien à restaurer, le serveur démarre une base neuve et vide,
+  et le dit dans son journal (`warning: the data directory was empty and … holds no backup:
+  this is a NEW, EMPTY database`) et dans le journal d'événements ; une application dont la
+  sauvegarde ne contient rien le dit aussi. Avec `NUAGE_RESTORE_REQUIRED=true`, ce démarrage
+  est refusé à la place : le serveur s'arrête et dit quoi vérifier, sans rien avoir créé ni
+  écrit. Une application enregistrée dont la sauvegarde ne contient rien n'est pas servie non
+  plus : le serveur démarre sans elle, et la console la range parmi celles qui ne s'ouvrent
+  pas (complétez sa sauvegarde et redémarrez, ou supprimez-la là). Activez-le une fois que le
+  serveur contient des données : un premier démarrage n'a rien à restaurer.
 - **Deux endroits à la fois** : `NUAGE_BACKUP2_DIR`, ou `NUAGE_BACKUP2_S3_BUCKET` et les autres
   `NUAGE_BACKUP2_S3_*`, ajoutent une seconde destination tenue à jour avec la première.
   Chacune reçoit les instantanés et le journal à son propre rythme : celle qui ne répond pas
@@ -602,14 +666,17 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   arrêt. Sur Linux, le service de l'installateur ne peut écrire que dans le dossier des
   données et dans `NUAGE_BACKUP_DIR` : là, prenez un bucket pour la seconde.
 - **Vérifier** : la page *Stockage* de la console, et `/app`, montrent la dernière sauvegarde
-  et ses erreurs.
+  et ses erreurs. Un bucket qui ne répond plus fait échouer le tour au bout de 60 secondes, et
+  le tour suivant réessaie.
 - **Restaurer** sur un nouvel ordinateur : installez, mettez dans le nouveau fichier de
   réglages la `NUAGE_ENCRYPTION_KEY` de l'ancien et les mêmes réglages de sauvegarde, videz le
   dossier des données et redémarrez le service : il restaure le dernier instantané et rejoue
   le journal qui le suit.
 - **Un seul écrivain par sauvegarde** : deux serveurs ne doivent jamais sauvegarder dans le
-  même dossier ni sous le même préfixe de bucket (chacun écraserait l'autre). Un ordinateur à
-  côté d'un serveur Heroku a son propre dossier, son bucket ou son `NUAGE_BACKUP_S3_PREFIX`.
+  même dossier ni sous le même préfixe de bucket. Un serveur qui a une autre base y est refusé
+  (voir plus haut), mais deux copies d'une même base, comme deux dynos restaurés depuis la même
+  sauvegarde, s'écraseraient l'une l'autre. Un ordinateur à côté d'un serveur Heroku a son
+  propre dossier, son bucket ou son `NUAGE_BACKUP_S3_PREFIX`.
 
 ## Démarrage rapide
 
@@ -653,9 +720,22 @@ La racine de ce dépôt se déploie telle quelle : `Procfile`, `RustConfig` et
 - **Fenêtre de perte.** Les commits faits depuis le dernier segment de journal envoyé
   (30 secondes par défaut) ne sont perdus que si le dyno s'arrête sans le `SIGTERM` qu'Heroku
   envoie d'abord : au `SIGTERM`, le serveur fait un checkpoint et envoie le dernier segment.
-- **Déplacer les sauvegardes sans arrêt.** Changer les variables de sauvegarde redémarre le
-  dyno, qui restaure depuis ce que nomment les nouveaux réglages. Pour passer à un autre
-  bucket : (1) ajoutez le nouveau comme seconde destination, en une seule commande
+  Les clés des stockages clé-valeur suivent la même règle avec `NUAGE_KV_STORAGE=database` ;
+  en mémoire, un redémarrage les vide.
+- **Changer un réglage redémarre le dyno.** Chaque `heroku config:set` ou `config:unset` le
+  redémarre : son disque est effacé et la base est restaurée depuis la sauvegarde que nomment
+  les nouveaux réglages. Ne faites donc jamais pointer les variables de sauvegarde, en une
+  commande, vers un endroit qui ne contient pas la sauvegarde : le dyno n'y trouverait rien et
+  démarrerait une base neuve et vide (son journal le dit, et l'ancien endroit garde ses
+  sauvegardes). Déplacez-les comme ci-dessous.
+- **Refuser un démarrage à vide.** Une fois que le serveur contient des données, faites
+  `heroku config:set NUAGE_RESTORE_REQUIRED=true`. Dès lors, un dyno qui ne trouve rien à
+  restaurer (un bucket ou un préfixe mal écrit, les variables de sauvegarde retirées) ne
+  démarre pas, et ne crée ni n'écrit rien. Heroku le montre planté, `heroku logs --tail` dit
+  quoi vérifier, et remettre les réglages le redémarre depuis sa sauvegarde. Pas lors d'un
+  premier déploiement, qui n'a rien à restaurer : `app.json` ne le définit pas.
+- **Déplacer les sauvegardes sans arrêt.** Pour passer à un autre bucket : (1) ajoutez le
+  nouveau comme seconde destination, en une seule commande
   (`heroku config:set NUAGE_BACKUP2_S3_BUCKET=nouveau-bucket NUAGE_BACKUP2_S3_REGION=…
   NUAGE_BACKUP2_S3_ACCESS_KEY_ID=… NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`) : le dyno redémarre
   depuis l'ancien et envoie un instantané complet de chaque application au nouveau ;
@@ -677,7 +757,20 @@ git push heroku master
 ```
 
 Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouvrez ensuite
-`https://mon-nuage.herokuapp.com/admin`.
+`https://mon-nuage.herokuapp.com/admin` : sa page *Stockage* (ou `backup.last_ok` dans
+`/api/status`) doit montrer la première sauvegarde, sans erreur.
+
+Pour déplacer les sauvegardes **avec un arrêt**, quand les outils du stockage copient une
+grosse sauvegarde plus vite que le dyno ne l'envoie :
+
+```bash
+heroku config:set NUAGE_RESTORE_REQUIRED=true        # une fois : désormais un démarrage à vide est refusé
+heroku ps:scale web=0                                # le serveur envoie sa dernière sauvegarde et s'arrête
+aws s3 sync s3://ancien-bucket/nuage/ s3://nouveau-bucket/nuage/   # tous les objets (ou rclone sync)
+heroku config:set NUAGE_BACKUP_S3_BUCKET=nouveau-bucket NUAGE_BACKUP_S3_REGION=… \
+  NUAGE_BACKUP_S3_ACCESS_KEY_ID=… NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…   # toutes, en une seule commande
+heroku ps:scale web=1                                # il restaure depuis le nouveau bucket, ou ne démarre pas
+```
 
 ## Variables d'environnement
 
@@ -710,9 +803,11 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_BACKUP2_S3_BUCKET` | la seconde destination dans ce bucket (avec aussi `NUAGE_BACKUP2_DIR`, ou au même endroit que la première, le serveur ne démarre pas) | |
 | `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | son point d'accès, sa région et son préfixe | comme pour la première |
 | `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | ses identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
+| `NUAGE_RESTORE_REQUIRED` | `true` : un répertoire de données vide doit être restauré depuis la sauvegarde ; sans rien à restaurer, ou sans sauvegarde, le serveur ne démarre pas, et ne crée ni n'écrit rien (il ne sert pas non plus une application enregistrée dont la sauvegarde ne contient rien). Pour un disque effacé à chaque redémarrage, une fois que le serveur contient des données (voir [Déployer sur Heroku](#déployer-sur-heroku)) | `false` : un démarrage à vide est permis, et dit dans le journal |
 | `NUAGE_KV_PORT` | sert aussi le stockage clé-valeur sur un port à lui (`6379`), par le protocole que parlent les clients Redis : on s'y connecte au stockage d'une application, un jeton comme mot de passe | désactivé |
 | `NUAGE_KV_BIND` | son adresse | `NUAGE_BIND` |
-| `NUAGE_KV_MB` | mémoire du stockage clé-valeur de chaque application, en Mio, ou `auto` ; au-delà, les clés les moins récemment utilisées partent | `auto` : un seizième de la mémoire, 4 à 256 Mio |
+| `NUAGE_KV_MB` | mémoire du stockage clé-valeur de chaque application, en Mio, ou `auto` ; au-delà, les clés les moins récemment utilisées partent. Ne sert pas avec `NUAGE_KV_STORAGE=database` | `auto` : un seizième de la mémoire, 4 à 256 Mio |
+| `NUAGE_KV_STORAGE` | où sont gardés les stockages clé-valeur de toutes les applications : `memory` (le plus rapide ; un redémarrage les vide) ou `database` (dans la base de chaque application : gardés d'un redémarrage à l'autre et dans les sauvegardes ; une écriture attend le disque ; voir [Stockage clé-valeur](#stockage-clé-valeur)) | `memory` |
 | `NUAGE_FILES_S3_BUCKET` | garde les fichiers des applications (`/v1/files`) dans ce bucket compatible S3 (voir [Fichiers](#fichiers)) | aucun : pas de fichiers |
 | `NUAGE_FILES_S3_ENDPOINT` | son adresse (`https://<id du compte>.r2.cloudflarestorage.com` sur R2) | `https://s3.<région>.amazonaws.com` |
 | `NUAGE_FILES_S3_REGION` | sa région | `auto` sur R2, sinon `us-east-1` |
@@ -749,7 +844,7 @@ HTTPS.
 |---|---|---|
 | `/v1/*` | le protocole de la base, sur la base de l'application qu'ouvre le jeton | `Authorization: Bearer <jeton d'une application>` |
 | `POST /v1/sql` | SQL avec paramètres `?`, lignes en objets JSON (sites, tout langage) | un jeton de l'application ; un jeton en lecture seule ne fait que lire |
-| `/v1/kv` | le stockage clé-valeur de l'application, en mémoire (voir [Stockage clé-valeur](#stockage-clé-valeur)) | un jeton de l'application ; un jeton en lecture seule lit |
+| `/v1/kv` | le stockage clé-valeur de l'application (voir [Stockage clé-valeur](#stockage-clé-valeur)) | un jeton de l'application ; un jeton en lecture seule lit |
 | `/v1/files` | les fichiers de l'application, par des liens signés vers son bucket (voir [Fichiers](#fichiers)) | un jeton de l'application ; un jeton en lecture seule liste et télécharge |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |

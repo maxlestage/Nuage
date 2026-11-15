@@ -51,6 +51,75 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   and on the console's Server page; the caches, smaller, in megabytes of the same base. The
   dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
 
+### The key-value store in the database, and backups a setting cannot lose
+
+- **The key-value store can live in the database**: `NUAGE_KV_STORAGE=database`, for every
+  application of the server. `memory`, today's store, stays the default; any other value stops
+  the start. The keys are kept in a tree of the application's own page file, written through
+  the same log and group commit as its rows: they survive a restart, are encrypted and are in
+  the backups, behind the same `/v1/kv`, the same commands and the same port. The store's
+  executor runs unchanged on a scratch copy of the keys a command names, and what it changed
+  is written as one log record: a list of commands, or `MULTI` ... `EXEC`, is one commit,
+  with `KEYS`, `DBSIZE` or `FLUSHDB` inside it. A write is answered once it is on disk; a read
+  takes no lock. Nothing is evicted (`NUAGE_KV_MB` is not used; a value is 64 MiB at most).
+  Expiries are dates, so a TTL means the same after a restart, and expired keys leave the
+  tree in batches in the background. A write the disk refuses is the server's storage error
+  (`500` over HTTP, `-ERR storage: …` on the port), never "no such key". Going back to
+  `memory` leaves the keys in the database, found again when `database` comes back: nothing
+  is dropped at start. Branches, SQL and the console's tables do not see the keys.
+- **The figures say where the keys are**: `storage` (`memory` or `database`) in the `stats`
+  of `GET /v1/kv` and in each database's `kv` in `/api/status`. In the database, `max_bytes`
+  is 0 and `INFO` says `maxmemory:0` and `maxmemory_policy:noeviction`. A value too large
+  answers `413` (`ERR` on the port): `the value is larger than the key-value store takes
+  (NUAGE_KV_MB in memory, 64 MiB in the database)`. `openapi.json` describes `storage`, and
+  the `500` every `/v1/kv` request may answer in the database. The startup log says
+  `key-value stores are kept in each application's database`.
+- **A database never writes over another database's backup.** Before every snapshot, the
+  destination's `encryption.json` is compared with the data directory's (kind, salt and check
+  value). A place that holds another database's backup is refused before anything is written
+  or pruned there: `<place> holds the backup of another database (its encryption.json is not
+  this one's): nothing was written there`, and the backup shows failing in the console and
+  `/api/status`. A destination that is only ahead (two dynos overlapping) is never refused.
+  Backups in clear carry no such identity.
+- **Backup rounds run one at a time**: the upkeep's round and the console's **Back up now** no
+  longer tear the snapshot being copied.
+- **A bucket that does not exist is an error** (``GET …: the bucket `x` does not exist (HTTP
+  404 NoSuchBucket)``), at startup and in every round, where it read as an empty backup. A
+  missing object is still read as missing.
+- **S3 requests have time limits**: a request that gets no answer within 60 seconds (an
+  upload has one more second for each 64 KiB it sends), or an answer that stops for 60
+  seconds, fails with `… did not answer within 60 seconds` or `… stopped answering for 60
+  seconds`. A bucket that hangs fails the round, which is tried again, instead of holding the
+  backups, the stop or `/v1/files` without end. A restore is never cut while its bytes keep
+  coming, whatever its speed.
+- **An empty start is said.** When the data directory is empty and the backup holds nothing to
+  restore, the server's log and a `warn` event say `the data directory was empty and <place>
+  holds no backup: this is a NEW, EMPTY database`, with what to check. A registered
+  application whose backup holds nothing gets a line of its own.
+- **`NUAGE_RESTORE_REQUIRED=true` refuses it.** With nothing to restore, or no backup set, the
+  server stops with exit status 1 and says what to check, before it creates a folder, a header
+  or a page file and before anything is sent to a backup. A registered application whose
+  directory is empty and whose backup holds nothing is not served either: it is listed as one
+  that cannot be opened, and comes back once its backup is complete, or is deleted in the
+  console. A new application starts empty. `true`, `1`, `yes`, `false`, `0` and `no` are read;
+  any other value stops the start. Set it once a server on an erased disk (Heroku) holds data:
+  it is off by default and not preset in `app.json`, since a first start has nothing to
+  restore.
+- **Documentation**: the READMEs, in English, French and Spanish, say where the key-value
+  store lives and how to choose, how to change the backup destination on a disk that is not
+  erased and on Heroku (with or without a stop), and what `NUAGE_RESTORE_REQUIRED` does.
+  `nuage.env.example` names every setting the server reads, and `app.json` offers the two new
+  ones, empty. A test (`tests/docs.rs`) keeps the settings tables of `config.rs` and of the
+  three READMEs, the example file and `app.json` in agreement, and the three READMEs with the
+  same headings.
+- **Rust API**: `Engine::open_existing` (an empty directory must be restored),
+  `Engine::restore_required`, `EngineOptions::kv_in_database`, `BackupStatus::started_empty`,
+  `S3Store::with_timeout`; `Config::restore_required`. For an application that embeds the
+  engine: `EngineOptions` and `BackupStatus` have new public fields (build them with
+  `..Default::default()`), a snapshot now refuses a destination that holds another
+  database's backup, and `S3Store::get` answers an error for a bucket that does not exist.
+  `Engine::open` is unchanged.
+
 ### A second backup destination, kept in step
 
 - **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` with

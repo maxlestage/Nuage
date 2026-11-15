@@ -79,9 +79,9 @@ de déploiement ou un terminal, jamais dans une application ni dans une page. Vo
 
 ## Le stockage clé-valeur
 
-Chaque application a aussi un stockage clé-valeur en mémoire (un
-cache, des sessions, des compteurs, des verrous). Tous les langages y accèdent en HTTP, avec
-le même jeton :
+Chaque application a aussi un stockage clé-valeur (un cache, des sessions, des compteurs, des
+verrous), dans la mémoire du serveur ou dans sa base. Tous les langages y accèdent en HTTP,
+avec le même jeton :
 
 ```bash
 curl -X PUT "$NUAGE_URL/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'
