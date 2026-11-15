@@ -16,6 +16,15 @@
 //! | `snapshots/<lsn>.db` | page store files (`.redb`: written by a version up to 0.4, see [`super::legacy`]) |
 //! | `wal/<first lsn>.log` | log segments |
 //! | `before-import/...` | the last backup of a version up to 0.4, as it was when this version took over (see [`keep_aside`]) |
+//!
+//! A location holds the backup of one database. Before each snapshot, the
+//! location's `encryption.json` is compared with the data directory's: when
+//! the location holds another database's, the snapshot is refused and nothing
+//! is written there or removed from it (see [`of_this_database`]). Only the
+//! header is compared, never how far each copy has gone: a location ahead of
+//! the data (another server of the same database still running beside this
+//! one, as when a host starts the new one before stopping the old) is this
+//! database's.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,7 +37,7 @@ use super::legacy::LEGACY_FILE;
 use super::storage_err;
 use super::store::{FILE, Store, now_millis};
 use super::wal::{self, segment_lsn, segment_name};
-use crate::crypto::HEADER_FILE;
+use crate::crypto::{HEADER_FILE, same_database};
 
 /// Where backups go: a directory, object storage...
 ///
@@ -330,12 +339,43 @@ pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u6
     Ok(last)
 }
 
+/// Refuses a location that holds another database's backup: its
+/// `encryption.json` is not the data directory's. A location without one is
+/// empty, holds the start of an encrypted database's first snapshot (the
+/// header is uploaded after the snapshot), or a backup in clear, which has
+/// nothing that tells one database from another (the server's binary always
+/// encrypts): nothing to refuse. A data directory in clear facing a location
+/// that has a header is refused too: nothing goes from an encrypted backup
+/// back to one in clear.
+///
+/// The header is made once, when a data directory is created; a restore
+/// writes the one it downloads and a snapshot uploads the directory's own,
+/// so a database is never refused its own backup.
+fn of_this_database(store: &Store, backup: &dyn BackupStore) -> Result<()> {
+    let Some(theirs) = backup.get(HEADER_FILE)? else { return Ok(()) };
+    let ours = match fs::read(store.dir.join(HEADER_FILE)) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(storage_err(format!("cannot read {HEADER_FILE}: {e}"))),
+    };
+    if ours.is_some_and(|ours| same_database(&ours, &theirs)) {
+        return Ok(());
+    }
+    Err(storage_err(format!(
+        "{} holds the backup of another database (its {HEADER_FILE} is not this one's): nothing was written \
+         there. Give this database a place of its own, or empty that one",
+        backup.describe()
+    )))
+}
+
 /// Takes a snapshot: checkpoint, copy of the page store, upload, manifest.
 /// Older snapshots and the segments before them are pruned, keeping `keep`.
-/// The backup of a version up to 0.4 is first set aside ([`keep_aside`]).
-/// Returns the snapshot's LSN, and whether an earlier version's backup was
-/// set aside now.
+/// A location that holds another database's backup is refused first, with
+/// nothing written ([`of_this_database`]). The backup of a version up to 0.4
+/// is then set aside ([`keep_aside`]). Returns the snapshot's LSN, and
+/// whether an earlier version's backup was set aside now.
 pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> Result<(u64, bool)> {
+    of_this_database(store, backup)?;
     let kept = keep_aside(backup, store.dir.join(HEADER_FILE).exists())?;
     let local = store.dir.join("snapshot.partial");
     let lsn = {

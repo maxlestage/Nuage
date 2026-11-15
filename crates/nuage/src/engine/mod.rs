@@ -194,6 +194,10 @@ pub struct Engine {
     options: EngineOptions,
     events: Mutex<VecDeque<Event>>,
     backup_status: Mutex<BackupStatus>,
+    /// Held for a whole backup round ([`Engine::backup_now`]): two rounds at
+    /// once would write the same `snapshot.partial`, and a torn copy could
+    /// be the one the manifest names.
+    backing_up: Mutex<()>,
     last_compaction: Mutex<Option<(i64, bool)>>,
     started: Instant,
     started_at: SystemTime,
@@ -241,6 +245,7 @@ impl Engine {
             options,
             events: Mutex::new(VecDeque::new()),
             backup_status: Mutex::new(backup_status),
+            backing_up: Mutex::new(()),
             last_compaction: Mutex::new(None),
             started: Instant::now(),
             started_at: SystemTime::now(),
@@ -384,11 +389,15 @@ impl Engine {
     }
 
     /// Ships the sealed log segments, and takes a snapshot when one is due
-    /// (or `force_snapshot`).
+    /// (or `force_snapshot`). Rounds run one at a time: a call made during
+    /// another (the upkeep thread's, the console's Back up now) waits for it
+    /// to end, then makes its own. A location that holds another database's
+    /// backup is refused, and nothing is written there.
     pub fn backup_now(&self, force_snapshot: bool) -> Result<()> {
         let Some(b) = &self.options.backup else {
             return Err(Error::Unsupported("no backup location is configured".into()));
         };
+        let _round = self.backing_up.lock().unwrap_or_else(|e| e.into_inner());
         let status = self.backup_status();
         let due =
             status.last_snapshot_at.is_none_or(|at| store::now_millis() - at >= b.snapshot_every.as_millis() as i64);

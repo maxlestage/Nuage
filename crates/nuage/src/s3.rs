@@ -502,10 +502,19 @@ impl BackupStore for S3Store {
         Self::check(status, &body, &format!("PUT {key}"))
     }
 
+    // A missing object is `None`; a missing bucket is an error, never an
+    // empty backup: a mistyped bucket name must not start an empty database.
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let key = self.key(name);
         let (status, body) = self.block(self.send(Method::GET, &key, &[], Vec::new()))?;
         if status == 404 {
+            let code = xml_values(&String::from_utf8_lossy(&body), "Code").into_iter().next();
+            if code.as_deref() == Some("NoSuchBucket") {
+                return Err(s3_err(format!(
+                    "GET {key}: the bucket `{}` does not exist (HTTP 404 NoSuchBucket)",
+                    self.options.bucket
+                )));
+            }
             return Ok(None);
         }
         Self::check(status, &body, &format!("GET {key}"))?;

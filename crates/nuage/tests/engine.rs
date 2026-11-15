@@ -1,6 +1,7 @@
 //! The engine: durability, crash recovery, data larger than the cache,
 //! branches, backups.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use memoire_orm::prelude::*;
 use memoire_orm::{Query, Value};
-use nuage::{BackupOptions, DirectoryStore, Embedded, EngineOptions};
+use nuage::{BackupOptions, BackupStore, DirectoryStore, Embedded, Encryption, EngineOptions, PrefixedStore};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("nuage-engine-{name}-{}", std::process::id()));
@@ -589,6 +590,281 @@ async fn backup_and_restore_into_an_empty_directory() {
     assert_eq!(Item::count(&db).await.unwrap(), 30);
     assert_eq!(Item::get(&db, 30).await.unwrap().code, "code-00000029");
     assert_eq!(db.engine().branches().len(), 1);
+    drop(db);
+    for d in [dir, target, copy] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Every file under `dir`, by its path from there, with its bytes.
+fn tree(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                out.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Waits until a dropped database is closed: its upkeep thread lets go of it
+/// a moment later, and nothing writes to its backup after that.
+fn closed(engine: std::sync::Weak<nuage::Engine>) {
+    for _ in 0..400 {
+        if engine.upgrade().is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the database is still open");
+}
+
+/// Encrypted with the key made of `key`, backed up to `store`.
+fn backed_up_to(store: Arc<dyn BackupStore>, key: u8) -> EngineOptions {
+    EngineOptions {
+        backup: Some(BackupOptions::new(store)),
+        encryption: Some(Encryption::from_key([key; 32])),
+        sync: false,
+        ..EngineOptions::default()
+    }
+}
+
+/// Encrypted with the key made of `key`, backed up to the folder `target`.
+fn backed_up(target: &std::path::Path, key: u8) -> EngineOptions {
+    backed_up_to(Arc::new(DirectoryStore::new(target)), key)
+}
+
+/// Two databases pointed at one backup folder: the second writes nothing
+/// there and says why, and the first's backup still restores whole.
+#[tokio::test]
+async fn a_backup_is_never_written_over_another_database() {
+    let (a, b) = (temp_dir("other-a"), temp_dir("other-b"));
+    let (target, copy) = (temp_dir("other-backup"), temp_dir("other-copy"));
+    let gone = {
+        let db = Embedded::open_with(&a, backed_up(&target, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..20 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().backup_now(true).unwrap();
+        for n in 20..25 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_now(false).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // B: a database of its own, then pointed at A's folder.
+    let gone = {
+        let db = Embedded::open_with(&b, EngineOptions { backup: None, ..backed_up(&target, 2) }).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        item(1000).insert(&db).await.unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let before = tree(&target);
+    assert!(before.contains_key("manifest.json") && before.contains_key("encryption.json"), "{:?}", before.keys());
+    let gone = {
+        let db = Embedded::open_with(&b, backed_up(&target, 2)).unwrap();
+        let e = db.engine().backup_now(true).unwrap_err().to_string();
+        assert!(e.contains(&format!("{} holds the backup of another database", target.display())), "{e}");
+        assert!(e.contains("nothing was written there"), "{e}");
+        let status = db.engine().backup_status();
+        assert!(!status.last_ok && status.last_error.is_some_and(|m| m.contains("another database")));
+        let (events, _) = db.engine().events();
+        let told = events.iter().any(|e| e.level == "error" && e.message.starts_with("backup failed: "));
+        assert!(told, "{events:?}");
+        assert_eq!(Item::count(&db).await.unwrap(), 1, "B itself goes on");
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    assert_eq!(tree(&target), before, "not a byte of B's in A's folder, nothing of A's removed");
+    // A's backup restores whole into an empty directory.
+    let db = Embedded::open_with(&copy, backed_up(&target, 1)).unwrap();
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(Item::count(&db).await.unwrap(), 25);
+    assert_eq!(Item::get(&db, 25).await.unwrap().code, "code-00000024");
+    drop(db);
+    for d in [a, b, target, copy] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A database restored onto an empty disk is the same database: its backup
+/// goes on in the same place, at the root of a folder as under an
+/// application's prefix next to it.
+#[tokio::test]
+async fn the_same_database_continues_its_backup() {
+    let target = temp_dir("same-backup");
+    let root: Arc<dyn BackupStore> = Arc::new(DirectoryStore::new(&target));
+    let shop: Arc<dyn BackupStore> = Arc::new(PrefixedStore::new(root.clone(), "apps/shop/"));
+    for (name, store) in [("root", root), ("shop", shop)] {
+        let dirs = ["", "-restored", "-again"].map(|end| temp_dir(&format!("same-{name}{end}")));
+        let gone = {
+            let db = Embedded::open_with(&dirs[0], backed_up_to(store.clone(), 1)).unwrap();
+            db.create_table::<Item>().await.unwrap();
+            for n in 0..10 {
+                item(n).insert(&db).await.unwrap();
+            }
+            db.engine().backup_now(true).unwrap();
+            Arc::downgrade(db.engine())
+        };
+        closed(gone);
+        let gone = {
+            let db = Embedded::open_with(&dirs[1], backed_up_to(store.clone(), 1)).unwrap();
+            assert!(db.engine().backup_status().restored, "{name}");
+            item(10).insert(&db).await.unwrap();
+            db.engine().backup_now(true).unwrap();
+            assert!(db.engine().backup_status().last_ok, "{name}");
+            Arc::downgrade(db.engine())
+        };
+        closed(gone);
+        // The latest backup is the restored database's.
+        let db = Embedded::open_with(&dirs[2], backed_up_to(store, 1)).unwrap();
+        assert!(db.engine().backup_status().restored, "{name}");
+        assert_eq!(Item::count(&db).await.unwrap(), 11, "{name}");
+        drop(db);
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+    // Two databases in one folder, each in its own place, with its own header.
+    let header = |at: &str| std::fs::read(target.join(at)).unwrap();
+    assert_ne!(header("encryption.json"), header("apps/shop/encryption.json"));
+    let _ = std::fs::remove_dir_all(&target);
+}
+
+/// A data directory that stays, pointed at a new, empty folder: everything is
+/// there after the first round, and the old folder is left as it was.
+#[tokio::test]
+async fn a_new_backup_folder_gets_everything_at_the_next_start() {
+    let (dir, copy) = (temp_dir("move-data"), temp_dir("move-copy"));
+    let (old, new) = (temp_dir("move-old"), temp_dir("move-new"));
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up(&old, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..20 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().backup_now(true).unwrap();
+        // Written after the snapshot: they reach the old folder as log segments.
+        for n in 20..30 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_now(false).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let before = tree(&old);
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up(&new, 1)).unwrap();
+        assert!(!db.engine().backup_status().restored);
+        db.engine().backup_now(false).unwrap();
+        assert!(db.engine().backup_status().last_snapshot_at.is_some());
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    assert_eq!(tree(&old), before, "the old folder is left as it was");
+    let db = Embedded::open_with(&copy, backed_up(&new, 1)).unwrap();
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(Item::count(&db).await.unwrap(), 30);
+    drop(db);
+    for d in [dir, copy, old, new] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A folder that holds part of another database's backup (its header and a
+/// snapshot, without the manifest: a copy cut short): a new database on an
+/// empty disk, even with the same key, starts but writes nothing there, and
+/// neither does a database in clear.
+#[tokio::test]
+async fn a_partial_copy_is_not_overwritten() {
+    let (first, full) = (temp_dir("partial-first"), temp_dir("partial-full"));
+    let (dir, clear, partial) = (temp_dir("partial-new"), temp_dir("partial-clear"), temp_dir("partial-copy"));
+    let gone = {
+        let db = Embedded::open_with(&first, backed_up(&full, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        item(1).insert(&db).await.unwrap();
+        db.engine().backup_now(true).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let whole = tree(&full);
+    let (snapshot, bytes) = whole.iter().find(|(name, _)| name.starts_with("snapshots/")).unwrap();
+    std::fs::create_dir_all(partial.join("snapshots")).unwrap();
+    std::fs::write(partial.join(snapshot), bytes).unwrap();
+    std::fs::write(partial.join("encryption.json"), &whole["encryption.json"]).unwrap();
+    let before = tree(&partial);
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up(&partial, 1)).unwrap();
+        assert!(!db.engine().backup_status().restored, "no manifest: nothing to restore");
+        let e = db.engine().backup_now(true).unwrap_err().to_string();
+        assert!(e.contains("holds the backup of another database"), "{e}");
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    assert_eq!(tree(&partial), before, "both objects as they were, and nothing else");
+    // A database in clear is refused there too: nothing goes from an
+    // encrypted backup back to one in clear.
+    let gone = {
+        let db = Embedded::open_with(&clear, EngineOptions { encryption: None, ..backed_up(&partial, 1) }).unwrap();
+        let e = db.engine().backup_now(true).unwrap_err().to_string();
+        assert!(e.contains("holds the backup of another database"), "{e}");
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    assert_eq!(tree(&partial), before);
+    for d in [first, full, dir, clear, partial] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The console's Back up now during the upkeep thread's round: rounds take
+/// turns, so neither tears the other's copy of the page store.
+#[tokio::test]
+async fn two_backups_at_once_leave_a_snapshot_that_opens() {
+    let (dir, target, copy) = (temp_dir("twice-data"), temp_dir("twice-backup"), temp_dir("twice-copy"));
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up(&target, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        // A page store of a few megabytes: a copy of it takes a while.
+        let tx = db.begin_now().unwrap();
+        for n in 0..8000 {
+            let it = item(n);
+            tx.sql(
+                "INSERT INTO items (code, group_no, payload, score) VALUES (?, ?, ?, 0.5)",
+                &[it.code.into(), (n % 100).into(), it.payload.into()],
+            )
+            .unwrap();
+        }
+        tx.commit_now().unwrap();
+        let engine = db.engine();
+        for _ in 0..3 {
+            std::thread::scope(|s| {
+                let rounds = [s.spawn(|| engine.backup_now(true)), s.spawn(|| engine.backup_now(true))];
+                for round in rounds {
+                    round.join().unwrap().unwrap();
+                }
+            });
+        }
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let db = Embedded::open_with(&copy, backed_up(&target, 1)).unwrap();
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(Item::count(&db).await.unwrap(), 8000);
+    assert!(db.engine().check_integrity().unwrap());
     drop(db);
     for d in [dir, target, copy] {
         let _ = std::fs::remove_dir_all(&d);

@@ -577,8 +577,8 @@ async fn console() {
     running.shutdown().await;
 }
 
-/// A minimal S3 server in memory (it checks that requests are signed, not
-/// the signatures themselves).
+/// A minimal S3 server in memory with one bucket, `bucket` (it checks that
+/// requests are signed, not the signatures themselves).
 async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
     let objects: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,12 +600,17 @@ async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
                             || req.uri().query().is_some_and(|q| {
                                 q.contains("X-Amz-Credential=key%2F") && q.contains("&X-Amz-Signature=")
                             });
-                        let path = req.uri().path().trim_start_matches("/bucket").trim_start_matches('/').to_owned();
+                        // `/bucket` or `/bucket/<key>`: any other bucket does not exist.
+                        let rest = req.uri().path().strip_prefix("/bucket");
+                        let bucket = rest.is_some_and(|p| p.is_empty() || p.starts_with('/'));
+                        let path = rest.unwrap_or_default().trim_start_matches('/').to_owned();
                         let query = req.uri().query().unwrap_or_default().to_owned();
                         let method = req.method().clone();
                         let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
                         let (status, out) = if !signed {
                             (403, b"<Error><Code>AccessDenied</Code></Error>".to_vec())
+                        } else if !bucket {
+                            (404, b"<Error><Code>NoSuchBucket</Code></Error>".to_vec())
                         } else {
                             let mut objects = store.lock().unwrap();
                             match method.as_str() {
@@ -856,6 +861,99 @@ fn a_slow_bucket_is_not_cut_while_bytes_keep_moving() {
     assert!(e.contains("GET prod/a/half: s3://bucket/prod/ stopped answering for 0.3 seconds"), "{e}");
 }
 
+/// A bucket that does not exist (a mistyped name) is an error, never an empty
+/// backup: an empty disk does not start an empty database from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bucket_that_does_not_exist_is_not_an_empty_backup() {
+    use nuage::{BackupOptions, BackupStore};
+    let (addr, objects) = fake_s3().await;
+    let other = || {
+        nuage::s3::S3Store::new(nuage::s3::S3Options {
+            endpoint: format!("http://{addr}"),
+            bucket: "other".into(),
+            region: "us-east-1".into(),
+            prefix: "prod/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+    };
+    let e = other().get("manifest.json").unwrap_err().to_string();
+    assert!(e.contains("GET prod/manifest.json: the bucket `other` does not exist (HTTP 404 NoSuchBucket)"), "{e}");
+    let dir = temp_dir("no-bucket");
+    let options = EngineOptions { backup: Some(BackupOptions::new(Arc::new(other()))), ..EngineOptions::default() };
+    let e = Engine::open(&dir, options).unwrap_err().to_string();
+    assert!(e.contains("the bucket `other` does not exist"), "{e}");
+    assert!(!dir.join("nuage.db").exists() && !dir.join("encryption.json").exists(), "nothing was created");
+    // In the bucket that exists, a missing object is no error.
+    assert_eq!(s3_at(addr).get("manifest.json").unwrap(), None);
+    assert!(objects.lock().unwrap().is_empty());
+}
+
+/// A place in a bucket holds the backup of one database: the same database,
+/// restored onto an empty disk, goes on backing up there; another one, even
+/// with the same key, writes nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bucket_holds_the_backup_of_one_database() {
+    use nuage::{BackupOptions, Embedded, Encryption};
+    let (addr, objects) = fake_s3().await;
+    let with = || EngineOptions {
+        backup: Some(BackupOptions::new(Arc::new(s3_at(addr)))),
+        encryption: Some(Encryption::from_key([1; 32])),
+        sync: false,
+        ..EngineOptions::default()
+    };
+    // Waits until a dropped database is closed: nothing writes to its backup after that.
+    let closed = |engine: std::sync::Weak<Engine>| {
+        for _ in 0..400 {
+            if engine.upgrade().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the database is still open");
+    };
+    let dirs = ["one", "restored", "again", "other"].map(|name| temp_dir(&format!("s3-db-{name}")));
+    let gone = {
+        let db = Embedded::open_with(&dirs[0], with()).unwrap();
+        db.create_table::<common::User>().await.unwrap();
+        common::user("one@x.dev", "One", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    let gone = {
+        let db = Embedded::open_with(&dirs[1], with()).unwrap();
+        assert!(db.engine().backup_status().restored);
+        common::user("two@x.dev", "Two", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    let before = objects.lock().unwrap().clone();
+    assert!(before.contains_key("prod/encryption.json"));
+    // Another database (a new one, told not to restore), pointed at the same place.
+    let gone = {
+        let backup = BackupOptions { restore_when_empty: false, ..BackupOptions::new(Arc::new(s3_at(addr))) };
+        let db = Embedded::open_with(&dirs[3], EngineOptions { backup: Some(backup), ..with() }).unwrap();
+        let engine = db.engine().clone();
+        let e = tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap_err().to_string();
+        assert!(e.contains("s3://bucket/prod/ holds the backup of another database"), "{e}");
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    assert!(*objects.lock().unwrap() == before, "nothing written, nothing removed");
+    let db = Embedded::open_with(&dirs[2], with()).unwrap();
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(common::User::count(&db).await.unwrap(), 2);
+    drop(db);
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 const NEEDLE: &str = "ONLY-IN-SHOP";
 
 fn files_with(dir: &std::path::Path, needle: &str) -> usize {
@@ -1015,6 +1113,10 @@ async fn applications() {
     for d in [dir.clone(), temp_dir("apps-restored")] {
         let server = Server::new(open(&d), options());
         assert_eq!(server.apps().len(), 3, "{}", d.display());
+        // The same databases: each goes on backing up in its own place.
+        for app in server.apps() {
+            server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+        }
         let running = server.listen("127.0.0.1:0").await.unwrap();
         let shop = NuageDb::connect(&running.url(), &second).await.unwrap();
         assert_eq!(User::count(&shop).await.unwrap(), 5);
