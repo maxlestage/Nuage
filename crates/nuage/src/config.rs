@@ -23,6 +23,12 @@
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+//! | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (Cloudflare R2, AWS S3, MinIO...); the bytes go straight between the clients and the bucket, through signed links | none: no files |
+//! | `NUAGE_FILES_S3_ENDPOINT` | its endpoint URL (`https://<account>.r2.cloudflarestorage.com` for R2) | `https://s3.<region>.amazonaws.com` |
+//! | `NUAGE_FILES_S3_REGION` | its region | `auto` on R2, else `us-east-1` |
+//! | `NUAGE_FILES_S3_PREFIX` | prefix of the objects; each application's files go under `<prefix><application>/` | `files/` |
+//! | `NUAGE_FILES_S3_ACCESS_KEY_ID`, `NUAGE_FILES_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
+//! | `NUAGE_FILES_LINK_MINUTES` | how long a download or upload link works (10080 at most: 7 days) | `60` |
 //! | `NUAGE_KEEP_AWAKE_URL` | the server requests this address (its own `/api/health`) so a host that puts idle servers to sleep (Heroku Eco) keeps it awake | off |
 //! | `NUAGE_KEEP_AWAKE_MINUTES` | minutes between two requests | `20` |
 //! | `NUAGE_KEEP_AWAKE_HOURS` | only in these hours, UTC (`6-22`) | always |
@@ -131,6 +137,43 @@ fn s3_store(
     Err(Error::Validation("NUAGE_BACKUP_S3_BUCKET is set, but this build of Nuage DB has no `s3` feature".into()))
 }
 
+/// The bucket of `/v1/files`, from `NUAGE_FILES_S3_*`.
+#[cfg(feature = "server")]
+fn file_store(get: &impl Fn(&str) -> Option<String>, bucket: String) -> Result<crate::server::FileStore> {
+    let endpoint = get("NUAGE_FILES_S3_ENDPOINT");
+    let on_r2 = endpoint.as_deref().is_some_and(|e| e.contains(".r2.cloudflarestorage.com"));
+    let region = get("NUAGE_FILES_S3_REGION").unwrap_or_else(|| if on_r2 { "auto" } else { "us-east-1" }.into());
+    let key = get("NUAGE_FILES_S3_ACCESS_KEY_ID").or_else(|| get("AWS_ACCESS_KEY_ID")).ok_or_else(|| {
+        Error::Validation("NUAGE_FILES_S3_BUCKET is set: NUAGE_FILES_S3_ACCESS_KEY_ID is missing".into())
+    })?;
+    let secret = get("NUAGE_FILES_S3_SECRET_ACCESS_KEY").or_else(|| get("AWS_SECRET_ACCESS_KEY")).ok_or_else(|| {
+        Error::Validation("NUAGE_FILES_S3_BUCKET is set: NUAGE_FILES_S3_SECRET_ACCESS_KEY is missing".into())
+    })?;
+    let minutes = match get("NUAGE_FILES_LINK_MINUTES") {
+        Some(m) => m
+            .parse::<u64>()
+            .ok()
+            .filter(|m| (1..=7 * 24 * 60).contains(m))
+            .ok_or_else(|| Error::Validation(format!("NUAGE_FILES_LINK_MINUTES=`{m}`: 1 to 10080 minutes")))?,
+        None => 60,
+    };
+    let mut prefix = get("NUAGE_FILES_S3_PREFIX").unwrap_or_else(|| "files/".into());
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    crate::server::FileStore::new(
+        S3Options {
+            endpoint: endpoint.unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
+            bucket,
+            region,
+            prefix,
+            access_key_id: key,
+            secret_access_key: secret,
+        },
+        minutes * 60,
+    )
+}
+
 /// Reads the configuration through `var` (`std::env::var` in the binary).
 #[cfg(feature = "server")]
 pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
@@ -160,7 +203,12 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
             crate::server::MIN_ADMIN_TOKEN
         )));
     }
+    let files = match get("NUAGE_FILES_S3_BUCKET") {
+        Some(bucket) => Some(Arc::new(file_store(&get, bucket)?)),
+        None => None,
+    };
     let server = ServerOptions {
+        files,
         admin_token,
         pg_port,
         pg_tls: tls.is_some(),
@@ -306,6 +354,22 @@ mod tests {
         assert_eq!(key.engine.encryption.unwrap().kind(), "key");
         assert!(from_vars(|k| (k == "NUAGE_ENCRYPTION_KEY").then(|| "short".to_owned())).is_err());
         assert!(from_vars(|k| (k == "NUAGE_BACKUP_S3_BUCKET").then(|| "b".to_owned())).is_err(), "credentials needed");
+        assert!(from_vars(|k| (k == "NUAGE_FILES_S3_BUCKET").then(|| "b".to_owned())).is_err(), "credentials needed");
+        let r2 = |k: &str| {
+            match k {
+                "NUAGE_FILES_S3_BUCKET" => Some("tuiles"),
+                "NUAGE_FILES_S3_ENDPOINT" => Some("https://abc.r2.cloudflarestorage.com"),
+                "NUAGE_FILES_S3_ACCESS_KEY_ID" => Some("id"),
+                "NUAGE_FILES_S3_SECRET_ACCESS_KEY" => Some("secret"),
+                "NUAGE_FILES_LINK_MINUTES" => Some("120"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        let files = format!("{:?}", from_vars(r2).unwrap().server.files.unwrap());
+        assert!(files.contains("region: \"auto\"") && files.contains("prefix: \"files/\""), "{files}");
+        assert!(files.contains("link_seconds: 7200") && !files.contains("secret"), "{files}");
+        assert!(from_vars(|k| if k == "NUAGE_FILES_LINK_MINUTES" { Some("0".into()) } else { r2(k) }).is_err());
     }
 
     #[test]

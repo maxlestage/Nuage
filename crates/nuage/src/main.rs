@@ -131,6 +131,12 @@ fn main() -> ExitCode {
                 "no backup is configured: if this disk is ephemeral (Heroku dynos), set NUAGE_BACKUP_S3_* or NUAGE_BACKUP_DIR, or the data is lost at the next restart",
             ),
         }
+        if let Some(files) = &config.server.files {
+            log(&format!(
+                "files (/v1/files) go to {}: the bytes travel between the clients and the bucket, through signed links",
+                files.describe()
+            ));
+        }
         if config.server.token.is_none() {
             log("NUAGE_TOKEN is not set: the database API (/v1) refuses every request");
         }

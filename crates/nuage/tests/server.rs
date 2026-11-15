@@ -592,10 +592,14 @@ async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let store = store.clone();
                     async move {
+                        // Signed in a header, or in the query (a presigned link).
                         let signed = req
                             .headers()
                             .get("authorization")
-                            .is_some_and(|v| v.to_str().unwrap().starts_with("AWS4-HMAC-SHA256 Credential=key/"));
+                            .is_some_and(|v| v.to_str().unwrap().starts_with("AWS4-HMAC-SHA256 Credential=key/"))
+                            || req.uri().query().is_some_and(|q| {
+                                q.contains("X-Amz-Credential=key%2F") && q.contains("&X-Amz-Signature=")
+                            });
                         let path = req.uri().path().trim_start_matches("/bucket").trim_start_matches('/').to_owned();
                         let query = req.uri().query().unwrap_or_default().to_owned();
                         let method = req.method().clone();
@@ -618,8 +622,15 @@ async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
                                     let mut keys: Vec<&String> =
                                         objects.keys().filter(|k| k.starts_with(&prefix)).collect();
                                     keys.sort();
-                                    let xml: String =
-                                        keys.iter().map(|k| format!("<Contents><Key>{k}</Key></Contents>")).collect();
+                                    let xml: String = keys
+                                        .iter()
+                                        .map(|k| {
+                                            format!(
+                                                "<Contents><Key>{k}</Key><Size>{}</Size><ETag>&quot;e&quot;</ETag></Contents>",
+                                                objects[*k].len()
+                                            )
+                                        })
+                                        .collect();
                                     (
                                         200,
                                         format!(
@@ -1397,5 +1408,103 @@ async fn management_api() {
         assert!(spec["paths"][path].is_object(), "{path}");
     }
     assert_eq!(spec["paths"]["/api/apps"]["post"]["security"][0]["adminToken"], serde_json::json!([]));
+    running.shutdown().await;
+}
+
+/// `/v1/files`: each application's files in a bucket, reached through signed links.
+#[tokio::test]
+async fn files_through_signed_links() {
+    let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
+
+    // Without a bucket, the API says how to set one.
+    let off = Server::new(engine("files-off"), options());
+    let running = off.listen("127.0.0.1:0").await.unwrap();
+    let r = http(running.local_addr(), "GET", "/v1/files", &[("authorization", "Bearer t0ken")], "").await;
+    assert_eq!(r.status, 501, "{}", r.body);
+    assert!(json(&r)["error"]["message"].as_str().unwrap().contains("NUAGE_FILES_S3_BUCKET"));
+    running.shutdown().await;
+
+    let (s3, objects) = fake_s3().await;
+    let files = nuage::server::FileStore::new(
+        nuage::s3::S3Options {
+            endpoint: format!("http://{s3}"),
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            prefix: "files/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        },
+        600,
+    )
+    .unwrap();
+    let server = Server::new(engine("files"), ServerOptions { files: Some(Arc::new(files)), ..options() });
+    let (_, token) = server.create_app("maps", "").unwrap();
+    let read = server.new_app_read_only_token("maps").unwrap();
+    let (_, other) = server.create_app("other", "").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let write = format!("Bearer {token}");
+    let write: &[(&str, &str)] = &[("authorization", &write)];
+    let read = format!("Bearer {read}");
+    let read: &[(&str, &str)] = &[("authorization", &read)];
+    let other = format!("Bearer {other}");
+    let other: &[(&str, &str)] = &[("authorization", &other)];
+    // A link of the fake bucket: its path and query, on `s3`.
+    let on_s3 = |url: &str| url.strip_prefix(&format!("http://{s3}")).unwrap().to_owned();
+
+    let info = http(addr, "GET", "/v1/info", read, "").await;
+    assert_eq!(json(&info)["files"], true);
+
+    // An upload link, then the bytes straight to the bucket.
+    let link = http(addr, "POST", "/v1/files/regions/fr.tar", write, "").await;
+    assert_eq!(link.status, 200, "{}", link.body);
+    let link = json(&link);
+    assert_eq!(link["method"], "PUT");
+    let url = link["url"].as_str().unwrap();
+    assert!(url.contains("/bucket/files/maps/regions/fr.tar?") && url.contains("X-Amz-Expires=600"), "{url}");
+    let put = http(s3, "PUT", &on_s3(url), &[], "des tuiles").await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(objects.lock().unwrap()["files/maps/regions/fr.tar"], b"des tuiles");
+
+    // A read-only token lists, and downloads through a redirect.
+    let list = http(addr, "GET", "/v1/files", read, "").await;
+    assert_eq!(list.status, 200, "{}", list.body);
+    let list = json(&list);
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["bytes"], 10);
+    assert_eq!(list["files"][0]["name"], "regions/fr.tar");
+    assert_eq!(list["files"][0]["size"], 10);
+    assert_eq!(list["files"][0]["etag"], "e");
+    assert_eq!(json(&http(addr, "GET", "/v1/files?prefix=regions%2Ff", read, "").await)["count"], 1);
+    assert_eq!(json(&http(addr, "GET", "/v1/files?prefix=routes", read, "").await)["count"], 0);
+    let get = http(addr, "GET", "/v1/files/regions/fr.tar", read, "").await;
+    assert_eq!(get.status, 307, "{}", get.body);
+    let location = get.headers["location"].to_str().unwrap().to_owned();
+    assert_eq!(http(s3, "GET", &on_s3(&location), &[], "").await.body, "des tuiles");
+    let as_json = json(&http(addr, "GET", "/v1/files/regions/fr.tar?link", read, "").await);
+    assert!(as_json["url"].as_str().unwrap().contains("X-Amz-Signature="));
+    assert!(as_json["expires_at"].as_str().unwrap().ends_with('Z'));
+    let named = json(&http(addr, "GET", "/v1/files/regions/fr.tar?link&download=france.tar", read, "").await);
+    assert!(named["url"].as_str().unwrap().contains("response-content-disposition=attachment"), "{named}");
+
+    // A read-only token neither uploads nor deletes; bad names are refused.
+    assert_eq!(http(addr, "POST", "/v1/files/x", read, "").await.status, 403);
+    assert_eq!(http(addr, "DELETE", "/v1/files/regions/fr.tar", read, "").await.status, 403);
+    for bad in ["/v1/files/a%20b", "/v1/files/../other/x", "/v1/files/a//b"] {
+        let r = http(addr, "POST", bad, write, "").await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
+    // No token: no files.
+    assert_eq!(http(addr, "GET", "/v1/files", &[], "").await.status, 401);
+
+    // Another application sees none of them.
+    assert_eq!(json(&http(addr, "GET", "/v1/files", other, "").await)["count"], 0);
+    assert_eq!(json(&http(addr, "GET", "/v1/files?prefix=..%2Fmaps", other, "").await)["count"], 0);
+
+    // Deleted.
+    let gone = http(addr, "DELETE", "/v1/files/regions/fr.tar", write, "").await;
+    assert_eq!(gone.status, 200, "{}", gone.body);
+    assert!(objects.lock().unwrap().is_empty());
+    assert_eq!(json(&http(addr, "GET", "/v1/files", read, "").await)["count"], 0);
     running.shutdown().await;
 }

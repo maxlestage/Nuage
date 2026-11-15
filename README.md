@@ -35,6 +35,7 @@ server in production, without changing a line.
 | **Transactions** | Snapshot reads, optimistic commits (`Error::Conflict`, retried by `db.transaction(...)`), interactive transactions over HTTP, all-or-nothing batches. |
 | **Branches** | A full copy of the database for a preview, a test or an experiment, made in an instant: it shares its parent's pages and stores only its own changes. |
 | **Backups, restored at boot** | Snapshots plus log segments, to a folder or to S3-compatible storage. An empty data directory is restored automatically at startup, which makes hosts with an ephemeral disk work. |
+| **Files** | Each application keeps files of any size (map tiles, photos, archives) in an S3-compatible bucket such as Cloudflare R2: the server lists them and signs the links, the bytes go straight between the client and the bucket ([Files](#files)). |
 | **Server** | One binary, configured by environment variables: the database protocol (`/v1`), the live status (`/api/status`, `/api/status/stream`), the console (`/admin`) and the website with its live dashboard (`/app`), on one port. |
 | **WebAssembly client** | `memoire_orm::NuageDb` speaks HTTP(S): natively with Tokio, and in the browser through `fetch`. |
 | **Upkeep on its own** | A background thread runs the checkpoints, ships the backups and compacts the file. |
@@ -294,7 +295,7 @@ every PostgreSQL driver connects too: see below.
 
 **Does my connection work?** `GET /v1/ping` answers which application the token opens:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` gives
-`Connected to Nuage DB 0.4.2: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.3: application blog, read and write, branch main, 3 table(s).`,
 and without a token, or with one that opens nothing, it says what is wrong. From any machine:
 `nuage check <url> <token>`. A PostgreSQL connection gets the same line as a notice (psql
 prints it), and each application's page in the console shows its last connection (when, how,
@@ -358,6 +359,45 @@ it. What a visitor feels is mostly the network: pick the host's region closest t
 dyno that never sleeps (Heroku **Basic**, not Eco, whose first request after a pause takes
 seconds).
 
+## Files
+
+Next to its database, an application can keep **files** (map tiles, photos, archives of
+several gigabytes) in an S3-compatible bucket: Cloudflare R2, AWS S3, MinIO, Scaleway...
+The server keeps the list and signs the links; **the bytes go straight between the client and
+the bucket**, never through the server: a small server (a Heroku dyno) hands out terabytes.
+Each application has its own folder, `<prefix><application>/`: its token sees its files only.
+
+| Request | What | Token |
+|---|---|---|
+| `GET /v1/files` (`?prefix=regions/`) | the files: `{"files": [{"name", "size", "updated", "etag"}], "count", "bytes"}` | read-only or read-write |
+| `GET /v1/files/<name>` | `307` to a signed download link (`Range` works: a download resumes where it stopped); `?link`: the link as JSON, `{"url", "expires_at"}`; `?download=<file name>`: saved under that name | read-only or read-write |
+| `POST /v1/files/<name>` | a signed upload link, `{"method": "PUT", "url", "expires_at"}`: `PUT` the bytes to it (5 GB at most each) | read-write |
+| `DELETE /v1/files/<name>` | deletes the file | read-write |
+
+A name is letters, digits, `.`, `_` and `-`, in parts separated by `/` (`regions/fr.tar`). A
+link works an hour (`NUAGE_FILES_LINK_MINUTES`, 7 days at most); ask for a new one after.
+The bucket refuses a link that comes with an `Authorization` header: curl and browsers drop it
+when they follow the redirect; a client that keeps it (some HTTP libraries) takes `?link`, then
+downloads the `url` without the token.
+
+```bash
+# Upload: a link, then the bytes to the bucket
+url=$(curl -s -X POST https://my-nuage.herokuapp.com/v1/files/regions/fr.tar \
+  -H "Authorization: Bearer $NUAGE_TOKEN" | jq -r .url)
+curl -T fr.tar "$url"
+# Download, resumable (-C -), with a read-only token
+curl -L -C - -o fr.tar https://my-nuage.herokuapp.com/v1/files/regions/fr.tar -H "Authorization: Bearer $READ_TOKEN"
+```
+
+On Cloudflare R2 (no fee for the bytes downloaded): **R2 → Create bucket**, then **Manage API
+tokens → Create API token**, *Object Read & Write* on that bucket. Set on the server:
+
+```bash
+heroku config:set NUAGE_FILES_S3_BUCKET=my-files \
+  NUAGE_FILES_S3_ENDPOINT=https://<account id>.r2.cloudflarestorage.com \
+  NUAGE_FILES_S3_ACCESS_KEY_ID=... NUAGE_FILES_S3_SECRET_ACCESS_KEY=...
+```
+
 ## Install on any computer
 
 Nuage DB runs on any computer: a Linux server, a Raspberry Pi, a Mac, a Windows PC, next to
@@ -395,7 +435,7 @@ administrators only, with a firewall rule for the local network.
   but warns that the password travels in clear.
 - **Upgrade**: run the command again; data, key, settings and backups stay.
 - **Options**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: off), `NUAGE_SWAP_MB` (`0`: no swap),
-  `NUAGE_VERSION=v0.4.2`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
+  `NUAGE_VERSION=v0.4.3`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
   cargo). On Windows, set them first: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
   `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
@@ -420,7 +460,7 @@ The `nuage` binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Window
 website and the live dashboard. A lighter server, without them (`/` is then a small home page;
 the console, the API and everything else stay):
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-A release: `--tag v0.4.2`. Upgrade: the same command, with `--force`.
+A release: `--tag v0.4.3`. Upgrade: the same command, with `--force`.
 
 `cargo install` only puts the binary there: no service, no settings, no backups. Hand it to
 the installer, which does the rest (settings, backups, service started with the computer):
@@ -555,6 +595,12 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+| `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (see [Files](#files)) | none: no files |
+| `NUAGE_FILES_S3_ENDPOINT` | its endpoint (`https://<account id>.r2.cloudflarestorage.com` on R2) | `https://s3.<region>.amazonaws.com` |
+| `NUAGE_FILES_S3_REGION` | its region | `auto` on R2, else `us-east-1` |
+| `NUAGE_FILES_S3_PREFIX` | prefix of the objects: an application's files go under `<prefix><application>/` | `files/` |
+| `NUAGE_FILES_S3_ACCESS_KEY_ID`, `NUAGE_FILES_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
+| `NUAGE_FILES_LINK_MINUTES` | how long a download or upload link works (10080 at most) | `60` |
 | `NUAGE_KEEP_AWAKE_URL` | the server requests this address (its own `https://…/api/health`) so a host that puts idle servers to sleep (Heroku Eco) keeps it awake; an awake server only: asleep, the next visitor wakes it | off |
 | `NUAGE_KEEP_AWAKE_MINUTES` | minutes between two requests (under Eco's 30) | `20` |
 | `NUAGE_KEEP_AWAKE_HOURS` | only in these hours, UTC (`6-22`); outside them it may sleep | always |
@@ -583,6 +629,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 |---|---|---|
 | `/v1/*` | the database protocol, on the database of the application the token opens | `Authorization: Bearer <token of an application>` |
 | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects (websites, any language) | a token of the application; a read-only token reads only |
+| `/v1/files` | the application's files, through signed links to its bucket (see [Files](#files)) | a token of the application; a read-only token lists and downloads |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
 | `/api/apps` | the management API: applications and their tokens (see [Create an application in one command](#create-an-application-in-one-command)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
