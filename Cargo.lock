@@ -665,8 +665,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memoire-orm"
-version = "0.2.1"
-source = "git+https://github.com/maxlestage/Memoire?rev=8f7e0cb#8f7e0cb11e4e24786cf52f50250a0d19fc38aa17"
+version = "0.2.4"
+source = "git+https://github.com/maxlestage/Memoire?rev=45f5a23#45f5a23ee6c63437f53d7ab259d48ea3b7e8f2c0"
 dependencies = [
  "chrono",
  "foldhash",
@@ -693,8 +693,8 @@ dependencies = [
 
 [[package]]
 name = "memoire-orm-derive"
-version = "0.2.1"
-source = "git+https://github.com/maxlestage/Memoire?rev=8f7e0cb#8f7e0cb11e4e24786cf52f50250a0d19fc38aa17"
+version = "0.2.4"
+source = "git+https://github.com/maxlestage/Memoire?rev=45f5a23#45f5a23ee6c63437f53d7ab259d48ea3b7e8f2c0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "nuage"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "aes",
  "aes-gcm",

@@ -20,15 +20,19 @@
 
 mod admin;
 pub(crate) mod apps;
+mod fast;
 pub mod files;
 mod i18n;
+mod kv;
 mod manage;
 mod pg;
+mod redis;
 mod status;
 
 pub use files::FileStore;
 pub use manage::MIN_ADMIN_TOKEN;
 pub use pg::{PgOptions, tls_config};
+pub use redis::RedisOptions;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -131,6 +135,9 @@ pub struct ServerOptions {
     /// The bucket of the applications' files (`/v1/files`), if any
     /// (`NUAGE_FILES_S3_*`).
     pub files: Option<Arc<FileStore>>,
+    /// Memory of each application's key-value store (`/v1/kv`, the Redis
+    /// protocol), in bytes (`NUAGE_KV_MB`). Default: 32 MiB.
+    pub kv_bytes: usize,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -144,6 +151,7 @@ impl std::fmt::Debug for ServerOptions {
             .field("pg_port", &self.pg_port)
             .field("pg_tls", &self.pg_tls)
             .field("files", &self.files.as_ref().map(|f| f.describe()))
+            .field("kv_bytes", &self.kv_bytes)
             .finish()
     }
 }
@@ -161,6 +169,7 @@ impl Default for ServerOptions {
             pg_port: None,
             pg_tls: false,
             files: None,
+            kv_bytes: 32 << 20,
         }
     }
 }
@@ -259,6 +268,8 @@ pub(crate) struct State {
     pub(crate) options: ServerOptions,
     pub(crate) metrics: Metrics,
     pub(crate) schemas: SchemaCache,
+    /// How long reads take, by shape: the short ones run where they are.
+    pub(crate) read_costs: Arc<fast::ReadCosts>,
     transactions: Mutex<HashMap<String, Arc<OpenTx>>>,
     pub(crate) admin: admin::Sessions,
 }
@@ -322,11 +333,12 @@ impl Server {
     pub fn new(engine: Arc<Engine>, options: ServerOptions) -> Server {
         Server {
             state: Arc::new(State {
-                apps: apps::Apps::open(engine.clone()),
+                apps: apps::Apps::open(engine.clone(), options.kv_bytes),
                 engine,
                 options,
                 metrics: Metrics::new(),
                 schemas: SchemaCache::default(),
+                read_costs: Arc::new(fast::ReadCosts::new()),
                 transactions: Mutex::new(HashMap::new()),
                 admin: admin::Sessions::default(),
             }),
@@ -419,7 +431,10 @@ impl Server {
             loop {
                 tokio::select! {
                     _ = stopped.notified() => break,
-                    _ = tick.tick() => state.expire_transactions(),
+                    _ = tick.tick() => {
+                        state.expire_transactions();
+                        state.sweep_keys();
+                    }
                     accepted = listener.accept() => {
                         let Ok((stream, peer)) = accepted else { continue };
                         let _ = stream.set_nodelay(true);
@@ -477,11 +492,48 @@ impl Server {
     }
 }
 
+impl Server {
+    /// Binds `addr` and serves the Redis protocol there, in the background:
+    /// every language's Redis client connects to an application's key-value
+    /// store, with a token of the application as its password (see
+    /// [`RedisOptions`]).
+    pub async fn listen_redis(
+        &self,
+        addr: impl tokio::net::ToSocketAddrs,
+        options: RedisOptions,
+    ) -> Result<RunningServer> {
+        let listener = TcpListener::bind(addr).await.map_err(|e| Error::Pool(format!("cannot listen: {e}")))?;
+        let addr = listener.local_addr().map_err(|e| Error::Pool(e.to_string()))?;
+        let stop = Arc::new(Notify::new());
+        let state = self.state.clone();
+        let stopped = stop.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stopped.notified() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, peer)) = accepted else { continue };
+                        tokio::spawn(redis::serve(state.clone(), stream, peer, options.clone()));
+                    }
+                }
+            }
+        });
+        Ok(RunningServer { addr, stop, task })
+    }
+}
+
 impl State {
     fn expire_transactions(&self) {
         let timeout = self.options.transaction_timeout;
         let mut txs = self.transactions.lock().unwrap_or_else(|e| e.into_inner());
         txs.retain(|_, tx| tx.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < timeout);
+    }
+
+    /// Drops the keys of the key-value stores whose time has come.
+    fn sweep_keys(&self) {
+        for app in self.apps.all() {
+            app.kv.sweep();
+        }
     }
 
     pub(crate) fn open_transactions(&self) -> usize {
@@ -718,7 +770,6 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
 /// tenfold, for a fraction of a millisecond). Streams and pages are left as
 /// they are (the site compresses its own files).
 async fn compress(res: Response<HttpBody>) -> Response<HttpBody> {
-    use std::io::Write as _;
     let json = res.headers().get(header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
     if !json || res.headers().contains_key(header::CONTENT_ENCODING) {
         return res;
@@ -730,14 +781,13 @@ async fn compress(res: Response<HttpBody>) -> Response<HttpBody> {
     if bytes.len() < 1024 {
         return Response::from_parts(parts, full(bytes));
     }
-    let mut gz = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::fast());
-    match gz.write_all(&bytes).and_then(|()| gz.finish()) {
-        Ok(packed) => {
+    match fast::gzip(&bytes) {
+        Some(packed) => {
             parts.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             parts.headers.remove(header::CONTENT_LENGTH);
             Response::from_parts(parts, full(packed))
         }
-        Err(_) => Response::from_parts(parts, full(bytes)),
+        None => Response::from_parts(parts, full(bytes)),
     }
 }
 
@@ -806,6 +856,14 @@ async fn protocol(
     Ok((res, origin.map(str::to_owned)))
 }
 
+/// A JSON answer whose text is already written.
+pub(crate) fn json_bytes(status: u16, body: Vec<u8>) -> Response<HttpBody> {
+    let mut res = Response::new(full(body));
+    *res.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    res
+}
+
 const READ_ONLY: &str = "this token only reads: use a read-write token (from your server, never in a page)";
 
 async fn app_protocol(
@@ -830,6 +888,9 @@ async fn app_protocol(
     let tx_id = header(TRANSACTION_HEADER);
     let engine = &app.engine;
 
+    if segments.first() == Some(&"kv") {
+        return kv::route(state, app, read_only, req).await;
+    }
     if segments.first() == Some(&"files") {
         let name = segments[1..].join("/");
         return files::route(state, &app.name, read_only, req, &name).await;
@@ -872,6 +933,8 @@ async fn app_protocol(
                 "schemaRefs": true,
                 // `/v1/files`: the server keeps files (in a bucket).
                 "files": state.options.files.is_some(),
+                // `/v1/kv`: a key-value store in memory, the way Redis is used.
+                "kv": true,
             }),
         )),
         (Method::POST, [op @ ("fetch" | "execute")]) => {
@@ -916,25 +979,41 @@ async fn app_protocol(
                 .map_err(|e| Error::Pool(e.to_string()))??;
                 return Ok(json_response(200, &answer));
             }
+            // A read outside a transaction: where it is while reads of its
+            // shape are short (see `fast::ReadCosts`), its answer written
+            // straight as text.
+            if let (true, None, Some(shape)) = (fetch, &tx, fast::shape(&query)) {
+                let body = state
+                    .read_costs
+                    .read(shape, move || -> Result<Vec<u8>> {
+                        check_branch(&engine, &branch)?;
+                        Ok(wire::rows_to_vec(&embedded::fetch_rows(&engine, &branch, &query.as_query())?))
+                    })
+                    .await??;
+                return Ok(json_bytes(200, body));
+            }
             // The engine blocks on disk: off the async workers.
-            let answer = tokio::task::spawn_blocking(move || -> Result<Json> {
+            let answer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 let q = query.as_query();
+                let done = |r: memoire_orm::ExecResult| {
+                    serde_json::to_vec(&wire::exec_result_to_json(&r)).map_err(|e| Error::Conversion(e.to_string()))
+                };
                 match (tx, fetch) {
-                    (Some(tx), true) => Ok(json!({ "rows": wire::rows_to_json(&tx.tx.fetch_rows(&q)?) })),
-                    (Some(tx), false) => Ok(wire::exec_result_to_json(&tx.tx.execute_now(&q)?)),
+                    (Some(tx), true) => Ok(wire::rows_to_vec(&tx.tx.fetch_rows(&q)?)),
+                    (Some(tx), false) => done(tx.tx.execute_now(&q)?),
                     (None, true) => {
                         check_branch(&engine, &branch)?;
-                        Ok(json!({ "rows": wire::rows_to_json(&embedded::fetch_rows(&engine, &branch, &q)?) }))
+                        Ok(wire::rows_to_vec(&embedded::fetch_rows(&engine, &branch, &q)?))
                     }
                     (None, false) => {
                         check_branch(&engine, &branch)?;
-                        Ok(wire::exec_result_to_json(&embedded::execute_now(&engine, &branch, &q)?))
+                        done(embedded::execute_now(&engine, &branch, &q)?)
                     }
                 }
             })
             .await
             .map_err(|e| Error::Pool(e.to_string()))??;
-            Ok(json_response(200, &answer))
+            Ok(json_bytes(200, answer))
         }
         (Method::POST, ["batch"]) => {
             let body = read_json(state, req).await?;
@@ -1043,15 +1122,44 @@ async fn app_protocol(
             if read_only && batch.iter().any(|(s, _)| s.writes()) {
                 return Ok(forbidden(READ_ONLY));
             }
+            let reads = (!batch.iter().any(|(s, _)| s.writes())).then(|| {
+                let one = body.get("sql").and_then(Json::as_str);
+                let several = body.get("statements").and_then(Json::as_array);
+                let texts = several.into_iter().flatten().filter_map(|s| s.get("sql").and_then(Json::as_str));
+                fast::sql_shape(one.into_iter().chain(texts))
+            });
             let arrays = body.get("arrays").and_then(Json::as_bool).unwrap_or(false);
             let engine = engine.clone();
             let schemas = state.clone();
-            let results =
-                tokio::task::spawn_blocking(move || crate::sql::run(&engine, &branch, &schemas.schemas, &batch, true))
-                    .await
-                    .map_err(|e| Error::Pool(e.to_string()))??;
-            let mut all: Vec<Json> = results.into_iter().flatten().map(|r| sql_json(&r, arrays)).collect();
-            Ok(json_response(200, &if several || all.len() != 1 { json!({ "results": all }) } else { all.remove(0) }))
+            let run = move || crate::sql::run(&engine, &branch, &schemas.schemas, &batch, true);
+            // Statements that only read run where they are while they are
+            // short; the others wait for the disk, off the async workers.
+            let results = match reads {
+                Some(shape) => state.read_costs.read(shape, run).await??,
+                None => tokio::task::spawn_blocking(run).await.map_err(|e| Error::Pool(e.to_string()))??,
+            };
+            let all: Vec<crate::sql::SqlResult> = results.into_iter().flatten().collect();
+            // The answer written straight as its text, when it can be.
+            let mut out = Vec::with_capacity(256);
+            let single = !several && all.len() == 1;
+            if !single {
+                out.extend_from_slice(b"{\"results\":[");
+            }
+            let mut written = true;
+            for (i, r) in all.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                written = written && fast::write_sql_result(&mut out, r, arrays);
+            }
+            if !single {
+                out.extend_from_slice(b"]}");
+            }
+            if written {
+                return Ok(json_bytes(200, out));
+            }
+            let mut all: Vec<Json> = all.iter().map(|r| sql_json(r, arrays)).collect();
+            Ok(json_response(200, &if single { all.remove(0) } else { json!({ "results": all }) }))
         }
         _ => Err(Error::NotFound),
     }
@@ -1079,7 +1187,7 @@ fn script_of(j: &Json) -> Result<(crate::sql::Script, Vec<Json>)> {
 }
 
 /// A statement's result as `/v1/sql` answers it: rows as objects (or arrays).
-fn sql_json(r: &crate::sql::SqlResult, arrays: bool) -> Json {
+pub(crate) fn sql_json(r: &crate::sql::SqlResult, arrays: bool) -> Json {
     use crate::sql::value_to_json as val;
     let mut out = serde_json::Map::new();
     if r.returns_rows {

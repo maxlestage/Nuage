@@ -36,6 +36,7 @@ ligne.
 | **Transactions** | Lectures sur instantané, commits optimistes (`Error::Conflict`, rejoués par `db.transaction(...)`), transactions interactives en HTTP, lots tout-ou-rien. |
 | **Branches** | Une copie complète de la base pour une préversion, un test ou une expérience, créée en un instant : elle partage les pages de son parent et ne stocke que ses propres changements. |
 | **Sauvegardes restaurées au démarrage** | Instantanés et segments de journal, vers un dossier ou un stockage compatible S3. Un répertoire de données vide est restauré automatiquement au démarrage : les hébergeurs à disque éphémère fonctionnent. |
+| **Stockage clé-valeur** | Chaque application a un stockage en mémoire, qui s'utilise comme Redis : valeurs avec expiration, compteurs, verrous, en HTTP (`/v1/kv`) et par le protocole Redis, pour tout client Redis ([Stockage clé-valeur](#stockage-clé-valeur)). |
 | **Fichiers** | Chaque application garde des fichiers de toute taille (tuiles de carte, photos, archives) dans un bucket compatible S3 comme Cloudflare R2 : le serveur les liste et signe les liens, les octets vont directement du client au bucket ([Fichiers](#fichiers)). |
 | **Serveur** | Un seul binaire, configuré par variables d'environnement : le protocole de la base (`/v1`), le statut en direct (`/api/status`, `/api/status/stream`), la console (`/admin`) et le site avec son tableau de bord en direct (`/app`), sur un seul port. |
 | **Client WebAssembly** | `memoire_orm::NuageDb` parle HTTP(S) : en natif avec Tokio, et dans le navigateur via `fetch`. |
@@ -303,7 +304,7 @@ chaque pilote PostgreSQL se connecte aussi : voir plus bas.
 
 **Ma connexion marche-t-elle ?** `GET /v1/ping` répond quelle application le jeton ouvre :
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <jeton>"` donne
-`Connected to Nuage DB 0.4.3: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.4: application blog, read and write, branch main, 3 table(s).`,
 et sans jeton, ou avec un jeton qui n'ouvre rien, il dit ce qui ne va pas. Depuis n'importe
 quelle machine : `nuage check <url> <jeton>`. Une connexion PostgreSQL reçoit la même phrase
 en avis (psql l'affiche), et la page de chaque application dans la console montre sa dernière
@@ -366,12 +367,64 @@ curl https://mon-nuage.herokuapp.com/v1/sql -H "Authorization: Bearer $NUAGE_TOK
 
 Vitesse, mesurée sur la machine du serveur (`cargo run --release -p nuage --example bench`,
 données chiffrées, 20 000 lignes, 4 cœurs) : une ligne par clé ou par colonne unique en
-**0,2 ms**, une page de 20 lignes par un index en **0,5 ms**, une mise à jour durable (fsync)
-en **0,5 ms**, **plus de 13 000 lectures/s**. Les réponses JSON de 1 Kio ou plus sont
+**0,1 ms**, une page de 20 lignes par un index en **0,2 ms**, une mise à jour durable (fsync)
+en **0,5 ms**, **plus de 85 000 lectures/s** avec 32 clients (plus de 140 000 sur le stockage
+clé-valeur). Les réponses JSON de 1 Kio ou plus sont
 compressées en gzip pour les clients qui l'acceptent. Ce que ressent un visiteur, c'est
 surtout le réseau : choisissez la région de l'hébergeur la plus proche de lui, et un dyno qui
 ne se met jamais en veille (Heroku **Basic**, pas Eco, dont la première requête après une
 pause prend plusieurs secondes).
+
+## Stockage clé-valeur
+
+À côté de sa base, chaque application a un **stockage clé-valeur en mémoire**, qui s'utilise
+comme Redis : un cache devant tout ce qui est lent, des sessions, des compteurs, des limites de
+débit, des verrous. Rien ne touche le disque : une lecture ou une écriture coûte un
+aller-retour, et le serveur en traite plus de 140 000 par seconde sur 4 cœurs. Un redémarrage
+le vide ; ce qui doit survivre va dans la base. La mémoire est bornée pour chaque application
+(`NUAGE_KV_MB`) : au-delà, les clés expirées partent d'abord, puis les moins récemment
+utilisées (le `allkeys-lru` de Redis).
+
+**En HTTP**, depuis n'importe quel langage, avec un jeton de l'application (un jeton en lecture
+seule lit) :
+
+| Requête | Quoi |
+|---|---|
+| `GET /v1/kv/<clé>` | la valeur, telle qu'elle a été écrite (`404` s'il n'y en a pas) ; l'en-tête `nuage-ttl-ms` dit combien de temps elle vit encore |
+| `PUT /v1/kv/<clé>` (`?ttl=60`, `&nx`, `&xx`, `&keepttl`) | écrit le corps sous la clé : `{"set": true}` ; `nx` n'écrit qu'une clé qui n'existe pas (un verrou) |
+| `DELETE /v1/kv/<clé>` | la supprime : `{"deleted": 1}` |
+| `POST /v1/kv/<clé>?incr` (`=5`, `&ttl=60`) | ajoute à un compteur : `{"value": 6}` ; `ttl` est l'expiration d'un compteur que cet appel crée (une limite de débit en une requête) |
+| `POST /v1/kv/<clé>?expire=60`, `?persist` | change son expiration |
+| `GET /v1/kv` (`?prefix=`, `&limit=`) | les clés (taille, temps restant) et les chiffres du stockage |
+| `POST /v1/kv` | des commandes de Redis en JSON : `["SET", "k", "v", "EX", 60]` répond `{"result": "OK"}` ; une liste de commandes répond `{"results": [...]}` en un aller-retour |
+| `DELETE /v1/kv` | supprime toutes les clés |
+
+```bash
+curl -X PUT "https://mon-nuage.herokuapp.com/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'
+curl "https://mon-nuage.herokuapp.com/v1/kv/session:42" -H "Authorization: Bearer $NUAGE_TOKEN"        # ada
+curl -X POST "https://mon-nuage.herokuapp.com/v1/kv/visites?incr&ttl=60" -H "Authorization: Bearer $NUAGE_TOKEN"   # {"value":1}
+curl https://mon-nuage.herokuapp.com/v1/kv -H "Authorization: Bearer $NUAGE_TOKEN" -d '[["GET","session:42"],["TTL","session:42"]]'
+```
+
+**Avec n'importe quel client Redis** : avec `NUAGE_REDIS_PORT=6379`, le serveur parle le
+protocole Redis (RESP2 et RESP3), un jeton de l'application comme mot de passe. `redis-cli`,
+redis-py, node-redis, go-redis, Jedis… se connectent tels quels :
+
+```bash
+redis-cli -u redis://default:<jeton>@db.example.com:6379 SET salut bonjour EX 60
+```
+
+Textes et compteurs : `GET`, `SET` (`EX`, `PX`, `NX`, `XX`, `KEEPTTL`, `GET`), `SETNX`, `SETEX`,
+`GETSET`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `APPEND`, `STRLEN`, `INCR`, `DECR`, `INCRBY`,
+`DECRBY`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN`,
+`DBSIZE`, `FLUSHDB`, `INFO`, `PING`, et `MULTI` … `EXEC` (les commandes s'exécutent comme une
+seule). Les listes, les hachages, les ensembles et pub/sub n'y sont pas. Avec `NUAGE_TLS_CERT`
+et `NUAGE_TLS_KEY`, le même port répond aussi en TLS (`rediss://`). Heroku ne route que HTTP :
+là, utilisez `/v1/kv`.
+
+**Depuis Rust**, `NuageKv` de Memoire (`db.kv()`) : `get`, `set_for`, `incr_by`,
+`set_if_absent`, et `remember(clé, durée, || calcul())`, un cache en un appel. En embarqué,
+`nuage::kv::Kv` est le stockage lui-même.
 
 ## Fichiers
 
@@ -453,7 +506,7 @@ SYSTEM, lisible des seuls administrateurs, avec une règle de pare-feu pour le r
   fonctionne, mais prévient que le mot de passe circule en clair.
 - **Mise à jour** : relancez la commande ; données, clé, réglages et sauvegardes restent.
 - **Options** : `NUAGE_PORT`, `NUAGE_PG_PORT` (`0` : coupé), `NUAGE_SWAP_MB` (`0` : pas de
-  swap), `NUAGE_VERSION=v0.4.3`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
+  swap), `NUAGE_VERSION=v0.4.4`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
   (compiler avec cargo). Sur Windows, définissez-les avant : `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Désinstaller** : `... | sudo bash -s uninstall` garde les données, les réglages et les
   sauvegardes ; `... | sudo bash -s purge` efface les données et les réglages, jamais les
@@ -480,7 +533,7 @@ Le binaire `nuage` arrive dans `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` sur Wi
 le site et le tableau de bord en direct. Un serveur plus léger, sans eux (`/` est alors une
 petite page d'accueil ; la console, l'API et tout le reste demeurent) :
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-Une version précise : `--tag v0.4.3`. Mise à jour : la même commande, avec `--force`.
+Une version précise : `--tag v0.4.4`. Mise à jour : la même commande, avec `--force`.
 
 `cargo install` ne pose que le binaire : ni service, ni réglages, ni sauvegardes. Donnez-le à
 l'installateur, qui fait le reste (réglages, sauvegardes, service lancé avec l'ordinateur) :
@@ -620,6 +673,9 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_BACKUP_S3_PREFIX` | préfixe des objets de sauvegarde | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes entre deux instantanés | `60` |
+| `NUAGE_REDIS_PORT` | sert aussi le protocole Redis sur ce port (`6379`) : le client Redis de chaque langage, sur le stockage clé-valeur d'une application, un jeton comme mot de passe | désactivé |
+| `NUAGE_REDIS_BIND` | son adresse | `NUAGE_BIND` |
+| `NUAGE_KV_MB` | mémoire du stockage clé-valeur de chaque application, en Mio, ou `auto` ; au-delà, les clés les moins récemment utilisées partent | `auto` : un seizième de la mémoire, 4 à 256 Mio |
 | `NUAGE_FILES_S3_BUCKET` | garde les fichiers des applications (`/v1/files`) dans ce bucket compatible S3 (voir [Fichiers](#fichiers)) | aucun : pas de fichiers |
 | `NUAGE_FILES_S3_ENDPOINT` | son adresse (`https://<id du compte>.r2.cloudflarestorage.com` sur R2) | `https://s3.<région>.amazonaws.com` |
 | `NUAGE_FILES_S3_REGION` | sa région | `auto` sur R2, sinon `us-east-1` |
@@ -656,6 +712,7 @@ HTTPS.
 |---|---|---|
 | `/v1/*` | le protocole de la base, sur la base de l'application qu'ouvre le jeton | `Authorization: Bearer <jeton d'une application>` |
 | `POST /v1/sql` | SQL avec paramètres `?`, lignes en objets JSON (sites, tout langage) | un jeton de l'application ; un jeton en lecture seule ne fait que lire |
+| `/v1/kv` | le stockage clé-valeur de l'application, en mémoire (voir [Stockage clé-valeur](#stockage-clé-valeur)) | un jeton de l'application ; un jeton en lecture seule lit |
 | `/v1/files` | les fichiers de l'application, par des liens signés vers son bucket (voir [Fichiers](#fichiers)) | un jeton de l'application ; un jeton en lecture seule liste et télécharge |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |

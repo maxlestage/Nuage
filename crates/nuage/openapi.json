@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nuage DB",
-    "version": "0.4.3",
+    "version": "0.4.4",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, the way Redis is used, at `/v1/kv`: values with an expiry, counters, locks, and the commands of Redis as JSON.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -197,6 +197,594 @@
           },
           "500": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/kv": {
+      "get": {
+        "operationId": "kvKeys",
+        "summary": "The keys of the key-value store",
+        "description": "The keys of the application's store, sorted, with the size of their value and the time they have left, and the figures of the store. A read-only token lists too.",
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only the keys that start with it."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1000,
+              "maximum": 10000
+            },
+            "description": "How many keys at most."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The keys and the figures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "key": {
+                            "type": "string"
+                          },
+                          "size": {
+                            "type": "integer",
+                            "description": "Bytes of its value."
+                          },
+                          "ttl_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "description": "Milliseconds it still lives; `null`: it never expires."
+                          }
+                        }
+                      }
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "stats": {
+                      "$ref": "#/components/schemas/KvStats"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "kvCommand",
+        "summary": "Commands of Redis, as JSON",
+        "description": "One command (a list: `[\"SET\", \"k\", \"v\", \"EX\", 60]`) answers `{\"result\": ...}`. Several (a list of lists, or `{\"commands\": [...]}`) answer `{\"results\": [...]}`, in one round trip, each command alone on the store. A read-only token sends the commands that read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/KvCommand"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/KvCommand"
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "commands"
+                    ],
+                    "properties": {
+                      "commands": {
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/components/schemas/KvCommand"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "examples": {
+                "one": {
+                  "value": [
+                    "SET",
+                    "session:42",
+                    "ada",
+                    "EX",
+                    1800
+                  ]
+                },
+                "several": {
+                  "value": [
+                    [
+                      "INCR",
+                      "hits"
+                    ],
+                    [
+                      "GET",
+                      "session:42"
+                    ]
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "`result` for one command, `results` for several.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "result": {
+                      "$ref": "#/components/schemas/KvReply"
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/KvReply"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a command, or one the store refused (one command only: in a list, the refusal is its answer).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token: it reads, and nothing else.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "kvClear",
+        "summary": "Delete every key",
+        "description": "Empties the application's store. A read-write token only.",
+        "responses": {
+          "200": {
+            "description": "How many keys there were.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token: it reads, and nothing else.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/kv/{key}": {
+      "get": {
+        "operationId": "kvGet",
+        "summary": "The value of a key",
+        "description": "The value, as it was written (its bytes, `application/octet-stream`). A read-only token reads too.",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "description": "The key: 1 to 1024 bytes, percent-encoded where the URL needs it (`session%3A42`, or `session:42`); it may hold `/`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The value.",
+            "headers": {
+              "nuage-ttl-ms": {
+                "description": "Milliseconds the key still lives; absent when it never expires.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such key (or it expired).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "kvSet",
+        "summary": "Write a value",
+        "description": "Writes the request body under the key, replacing what was there.",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "description": "The key: 1 to 1024 bytes, percent-encoded where the URL needs it (`session%3A42`, or `session:42`); it may hold `/`."
+          },
+          {
+            "name": "ttl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": "The key expires after this many seconds (`60`, `0.5`)."
+          },
+          {
+            "name": "nx",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only when the key does not exist: a lock."
+          },
+          {
+            "name": "xx",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only when the key exists."
+          },
+          {
+            "name": "keepttl",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Keep the expiry the key already has."
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "`set` is false when `nx` or `xx` held the write back.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "set": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A `ttl` that is not a number of seconds, or a key too long.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token: it reads, and nothing else.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The value is larger than the store (NUAGE_KV_MB).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "kvUpdate",
+        "summary": "Add to a counter, or change an expiry",
+        "description": "`?incr` (`=5`, `&ttl=60`) adds to a counter and answers `{\"value\": n}`: a key that does not exist counts from 0, and `ttl` is the expiry of a counter this call creates (a rate limit in one request). `?expire=60` makes the key expire, `?persist` makes it stay: `{\"set\": true}`, false when there is no such key.",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "description": "The key: 1 to 1024 bytes, percent-encoded where the URL needs it (`session%3A42`, or `session:42`); it may hold `/`."
+          },
+          {
+            "name": "incr",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "What to add (1 when empty; negative to subtract)."
+          },
+          {
+            "name": "ttl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": "With `incr`: the expiry, in seconds, of a counter this call creates."
+          },
+          {
+            "name": "expire",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": "The key expires after this many seconds."
+          },
+          {
+            "name": "persist",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The key never expires."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`value` for a counter, `set` for an expiry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "type": "integer"
+                    },
+                    "set": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The value is not a whole number, or none of `incr`, `expire`, `persist`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token: it reads, and nothing else.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "kvDelete",
+        "summary": "Delete a key",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "description": "The key: 1 to 1024 bytes, percent-encoded where the URL needs it (`session%3A42`, or `session:42`); it may hold `/`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "1 when the key existed, 0 otherwise.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token: it reads, and nothing else.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -1297,6 +1885,54 @@
             "type": "string",
             "format": "date-time",
             "description": "The link works until then (NUAGE_FILES_LINK_MINUTES, an hour by default)."
+          }
+        }
+      },
+      "KvCommand": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ]
+        },
+        "description": "A command of Redis, its name first: `[\"SET\", \"key\", \"value\", \"EX\", 60]`. Strings and counters: GET, SET (EX, PX, NX, XX, KEEPTTL, GET), SETNX, SETEX, PSETEX, GETSET, GETDEL, GETEX, MGET, MSET, MSETNX, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, DEL, UNLINK, EXISTS, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST, TYPE, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, PING, ECHO, INFO."
+      },
+      "KvReply": {
+        "description": "The answer of a command: text (`\"OK\"`, a value), a number, `null` for nothing, a list; in a list of commands, `{\"error\": \"ERR ...\"}` for one that was refused."
+      },
+      "KvStats": {
+        "type": "object",
+        "properties": {
+          "keys": {
+            "type": "integer"
+          },
+          "expiring": {
+            "type": "integer",
+            "description": "Keys that will expire."
+          },
+          "bytes": {
+            "type": "integer",
+            "description": "Memory the keys and values take."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "description": "The limit (NUAGE_KV_MB): past it, the least recently used keys go."
+          },
+          "hits": {
+            "type": "integer"
+          },
+          "misses": {
+            "type": "integer"
+          },
+          "evictions": {
+            "type": "integer",
+            "description": "Keys dropped to make room."
+          },
+          "expired": {
+            "type": "integer"
           }
         }
       }

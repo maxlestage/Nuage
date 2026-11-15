@@ -173,6 +173,71 @@ async fn main() -> memoire_orm::Result<()> {
         println!("{label} {}", summary(samples));
     }
 
+    // The floor (a request that does nothing) and the key-value store, over the
+    // same kept-alive connection.
+    for (label, method, path, body) in [
+        ("http floor ", "GET", "/api/health".to_owned(), ""),
+        ("kv set     ", "PUT", "/v1/kv/session:".to_owned(), "a value of a few dozen bytes, as a session is"),
+        ("kv get     ", "GET", "/v1/kv/session:".to_owned(), ""),
+        ("kv incr    ", "POST", "/v1/kv/hits?incr".to_owned(), ""),
+    ] {
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            let path = if path.ends_with(':') { format!("{path}{}", i % 500) } else { path.clone() };
+            let req = hyper::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("authorization", "Bearer bench")
+                .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                .unwrap();
+            sender.ready().await.map_err(|e| Error::Pool(e.to_string()))?;
+            let t = Instant::now();
+            let res = sender.send_request(req).await.map_err(|e| Error::Pool(e.to_string()))?;
+            assert_eq!(res.status(), 200);
+            http_body_util::BodyExt::collect(res.into_body()).await.map_err(|e| Error::Pool(e.to_string()))?;
+            samples.push(t.elapsed().as_micros() as u64);
+        }
+        println!("{label} {}", summary(samples));
+    }
+
+    // Many clients at once: reads of the key-value store.
+    let done = Arc::new(AtomicU64::new(0));
+    let stop = Instant::now() + Duration::from_secs(seconds);
+    let mut tasks = Vec::new();
+    for c in 0..clients {
+        let stream =
+            tokio::net::TcpStream::connect(running.local_addr()).await.map_err(|e| Error::Pool(e.to_string()))?;
+        let _ = stream.set_nodelay(true);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .map_err(|e| Error::Pool(e.to_string()))?;
+        tokio::spawn(conn);
+        let done = done.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut i = c;
+            while Instant::now() < stop {
+                let req = hyper::Request::get(format!("/v1/kv/session:{}", i % 500))
+                    .header("host", "localhost")
+                    .header("authorization", "Bearer bench")
+                    .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+                    .unwrap();
+                if sender.ready().await.is_err() {
+                    break;
+                }
+                let Ok(res) = sender.send_request(req).await else { break };
+                let _ = http_body_util::BodyExt::collect(res.into_body()).await;
+                done.fetch_add(1, Ordering::Relaxed);
+                i += 1;
+            }
+        }));
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+    let total = done.load(Ordering::Relaxed);
+    println!("kv through. {:.0} reads/s ({clients} clients, {seconds} s)", total as f64 / seconds as f64);
+
     // Many clients at once: reads by id.
     let done = Arc::new(AtomicU64::new(0));
     let stop = Instant::now() + Duration::from_secs(seconds);

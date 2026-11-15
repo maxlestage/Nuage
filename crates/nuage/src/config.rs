@@ -6,7 +6,10 @@
 //! | `NUAGE_BIND` | address to listen on (`127.0.0.1`: only this machine, behind a proxy such as Caddy) | `0.0.0.0` |
 //! | `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver connects, with a token as its password | off |
 //! | `NUAGE_PG_BIND` | address of the PostgreSQL protocol (`0.0.0.0` while the website stays behind a proxy on `127.0.0.1`) | `NUAGE_BIND` |
-//! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) | none: in clear |
+//! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) and the Redis protocol (`rediss://`) | none: in clear |
+//! | `NUAGE_REDIS_PORT` | also serve the Redis protocol on this port (`6379`): every language's Redis client connects to an application's key-value store, with a token as its password | off |
+//! | `NUAGE_REDIS_BIND` | address of the Redis protocol | `NUAGE_BIND` |
+//! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the Redis protocol), in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory (4 to 256 MiB) |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
@@ -58,6 +61,10 @@ pub struct Config {
     pub pg_port: Option<u16>,
     /// Address of the PostgreSQL protocol.
     pub pg_bind: String,
+    /// Port of the Redis protocol, if it is on.
+    pub redis_port: Option<u16>,
+    /// Address of the Redis protocol.
+    pub redis_bind: String,
     /// Certificate and key (PEM files) for TLS on the PostgreSQL protocol.
     pub tls: Option<(PathBuf, PathBuf)>,
     /// Data directory.
@@ -188,6 +195,11 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_PG_PORT", &p))?),
         None => None,
     };
+    let redis_port = match get("NUAGE_REDIS_PORT") {
+        Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_REDIS_PORT", &p))?),
+        None => None,
+    };
+    let kv_bytes = crate::memory::kv_bytes(get("NUAGE_KV_MB").as_deref()).map_err(Error::Validation)?;
     let tls = match (get("NUAGE_TLS_CERT"), get("NUAGE_TLS_KEY")) {
         (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
         (None, None) => None,
@@ -208,6 +220,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         None => None,
     };
     let server = ServerOptions {
+        kv_bytes,
         files,
         admin_token,
         pg_port,
@@ -231,6 +244,8 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         port,
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
         pg_bind: get("NUAGE_PG_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
+        redis_port,
+        redis_bind: get("NUAGE_REDIS_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
         pg_port,
         tls,
         data_dir,

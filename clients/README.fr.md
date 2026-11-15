@@ -51,7 +51,7 @@ chaque jeton n'ouvre que sa propre application.
 
 ```bash
 curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
-# {"ok": true, "message": "Connected to Nuage DB 0.4.3: application `blog`, read and write, ...", ...}
+# {"ok": true, "message": "Connected to Nuage DB 0.4.4: application `blog`, read and write, ...", ...}
 nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # la même chose, en une ligne, depuis n'importe quelle machine
 ```
 
@@ -76,6 +76,22 @@ applications, `POST /api/apps/{nom}/tokens` crée un autre jeton (`{"read_only":
 site). Le jeton de gestion ouvre toutes les applications du serveur : gardez-le dans un script
 de déploiement ou un terminal, jamais dans une application ni dans une page. Voir
 [Créer une application en une commande](../README.fr.md#créer-une-application-en-une-commande).
+
+## Le stockage clé-valeur
+
+Chaque application a aussi un stockage clé-valeur en mémoire, qui s'utilise comme Redis (un
+cache, des sessions, des compteurs, des verrous). Tous les langages y accèdent en HTTP, avec
+le même jeton :
+
+```bash
+curl -X PUT "$NUAGE_URL/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'
+curl "$NUAGE_URL/v1/kv/session:42" -H "Authorization: Bearer $NUAGE_TOKEN"                    # ada
+curl -X POST "$NUAGE_URL/v1/kv/visites?incr&ttl=60" -H "Authorization: Bearer $NUAGE_TOKEN"   # {"value":1}
+```
+
+Ou avec le client Redis du langage, quand le serveur a `NUAGE_REDIS_PORT=6379` : le jeton est
+le mot de passe (`redis://default:<jeton>@hôte:6379`). Voir
+[Stockage clé-valeur](../README.fr.md#stockage-clé-valeur).
 
 ## Le protocole
 

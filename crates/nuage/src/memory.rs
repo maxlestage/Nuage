@@ -95,6 +95,28 @@ pub fn cache_bytes(setting: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// The memory of each application's key-value store for `NUAGE_KV_MB`
+/// (`None` or `auto`: a sixteenth of the memory, between 4 MiB and 256 MiB;
+/// 32 MiB when the memory is unknown).
+pub fn kv_bytes(setting: Option<&str>) -> Result<usize, String> {
+    match setting.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(auto_kv(MemoryInfo::now().total_bytes)),
+        Some(mb) => mb
+            .parse::<usize>()
+            .ok()
+            .filter(|m| *m >= 1)
+            .map(|m| m << 20)
+            .ok_or_else(|| format!("NUAGE_KV_MB=`{mb}` is not a number of MiB (1 or more) or `auto`")),
+    }
+}
+
+fn auto_kv(total: Option<u64>) -> usize {
+    match total {
+        Some(t) => ((t / 16) as usize).clamp(4 << 20, 256 << 20),
+        None => 32 << 20,
+    }
+}
+
 fn auto_cache(total: Option<u64>) -> usize {
     match total {
         Some(t) => ((t / 8) as usize).clamp(8 << 20, 512 << 20),
@@ -112,6 +134,11 @@ mod tests {
         assert_eq!(auto_cache(Some(32 << 20)), 8 << 20, "never under 8 MiB");
         assert_eq!(auto_cache(Some(16 << 30)), 512 << 20, "never over 512 MiB");
         assert_eq!(auto_cache(None), 64 << 20);
+        assert_eq!(auto_kv(Some(512 << 20)), 32 << 20, "a 512 MiB dyno");
+        assert_eq!(auto_kv(Some(16 << 20)), 4 << 20);
+        assert_eq!(auto_kv(Some(64 << 30)), 256 << 20);
+        assert_eq!(kv_bytes(Some("8")), Ok(8 << 20));
+        assert!(kv_bytes(Some("0")).is_err() && kv_bytes(Some("lots")).is_err());
         assert_eq!(cache_bytes(Some("16")), Ok(16 << 20));
         assert!(cache_bytes(Some("lots")).is_err());
         assert!(cache_bytes(Some("auto")).unwrap() >= 8 << 20);
