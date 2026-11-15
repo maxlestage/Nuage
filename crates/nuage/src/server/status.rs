@@ -46,7 +46,7 @@ fn ago(t: SystemTime) -> String {
 
 /// Who may see what.
 pub(crate) enum View {
-    /// A console session: every application.
+    /// A console session, or the management token: every application.
     All,
     /// An application's token: the server, and that application only.
     App(Arc<App>),
@@ -55,7 +55,9 @@ pub(crate) enum View {
 }
 
 fn access(state: &State, req: &Request<Incoming>) -> Option<View> {
-    if state.admin.is_logged_in(req.headers()) {
+    // The management token already makes tokens for any application: seeing
+    // them all gives it nothing more.
+    if state.admin.is_logged_in(req.headers()) || super::manage::has_admin_token(state, req.headers()) {
         Some(View::All)
     } else if let Some((app, _)) = state.app_of(req.headers()) {
         Some(View::App(app))
@@ -257,7 +259,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
 
 pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Response<HttpBody> {
     let Some(view) = access(state, &req) else {
-        return unauthorized("the status needs an application's token or a console session");
+        return unauthorized("the status needs an application's token, the management token or a console session");
     };
     if path == "/api/status" {
         let state = state.clone();

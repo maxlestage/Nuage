@@ -447,6 +447,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Save the websites", "Enregistrer les sites", "Guardar los sitios"),
     (
+        "`{}` is not an origin: write `https://site.fr` (scheme and host, no path), or `*`",
+        "`{}` n'est pas une origine : écrivez `https://site.fr` (schéma et hôte, sans chemin), ou `*`",
+        "`{}` no es un origen: escribe `https://sitio.es` (esquema y host, sin ruta), o `*`",
+    ),
+    (
         "No website: pages cannot call this application.",
         "Aucun site : les pages ne peuvent pas appeler cette application.",
         "Ningún sitio: las páginas no pueden llamar a esta aplicación.",

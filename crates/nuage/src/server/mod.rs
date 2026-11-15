@@ -13,8 +13,8 @@
 //! its application's websites (CORS, preflight cached for a day); JSON
 //! answers are gzip-compressed for clients that accept it.
 //! | `/api/health` | `{"status":"ok"}` | public |
-//! | `/api/status`, `/api/status/stream` | live status, as JSON and as Server-Sent Events | token or console session; a public subset with `public_status` |
-//! | `/api/apps`, `/api/apps/{name}`, `/api/apps/{name}/tokens` | the management API: applications and their tokens, as JSON (see `manage`) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
+//! | `/api/status`, `/api/status/stream` | live status, as JSON and as Server-Sent Events | an application's token (that application), the management token or a console session (all of them); a public subset with `public_status` |
+//! | `/api/apps`, `/api/apps/{name}`, `/api/apps/{name}/tokens`, `/api/apps/{name}/origins` | the management API: applications, their tokens and websites, as JSON (see `manage`) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 //! | `/admin` | the management console | `NUAGE_ADMIN_PASSWORD` |
 //! | anything else (`GET`) | the site handler, if any, else a small home page | public |
 
@@ -500,7 +500,7 @@ impl Server {
     /// browser (CORS): `https://site.fr`, `http://localhost:3000`, or `*`.
     pub fn set_app_origins(&self, name: &str, origins: &[&str]) -> Result<Vec<String>> {
         let app = self.state.apps.get(name).ok_or(Error::NotFound)?;
-        self.state.apps.set_origins(&app, &origins.join("\n"))
+        self.state.apps.set_origins(&app, &origins.join("\n")).map_err(Error::from)
     }
 
     /// Revokes the token `id` of the application `name`.

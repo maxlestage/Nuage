@@ -10,6 +10,7 @@
 //! | `POST` | `/api/apps/{name}/tokens` | a new token `{"read_only"?}` |
 //! | `DELETE` | `/api/apps/{name}/tokens/{id}` | revokes a token |
 //! | `POST` | `/api/apps/{name}/memory` | the memory of one application: `{"cache_mb", "kv_mb"}`, a number of MiB each, or `"auto"` |
+//! | `POST` | `/api/apps/{name}/origins` | the websites whose pages may call it (CORS): `{"origins": ["https://site.fr"]}`, the whole list; `[]` removes them |
 //! | `GET` | `/api/settings` | the settings: each with its value, where it comes from, and what the environment says |
 //! | `POST` | `/api/settings` | saves settings `{"memory.cache_mb": 512, "status.public": true}`, in force at once; `null` gives one back to the environment's value; one that does not fit and nothing is saved |
 //! | `DELETE` | `/api/settings/{key}` | gives a setting back to the environment's value, or the default |
@@ -18,10 +19,11 @@
 //! a secret of its own (32 characters at least, checked at startup), compared
 //! in constant time. Without `NUAGE_ADMIN_TOKEN`, the API is off and answers
 //! 403. An application's token never opens it: a token opens its own
-//! database, and nothing else. Deleting an application, which deletes its
-//! data and backups, stays in the console, behind a typed confirmation.
-//! A token is in the answer that makes it, once: the server keeps only its
-//! digest.
+//! database, and nothing else. The management token also shows the whole
+//! `/api/status`, as a console session does. Deleting an application, which
+//! deletes its data and backups, stays in the console, behind a typed
+//! confirmation. A token is in the answer that makes it, once: the server
+//! keeps only its digest.
 
 use std::sync::Arc;
 
@@ -80,6 +82,12 @@ fn allowed(state: &State, headers: &HeaderMap) -> Result<(), Refus> {
         return Err(error(401, "unauthorized", REFUSED));
     }
     Ok(())
+}
+
+/// The request carries the management token (compared as [`allowed`] does):
+/// `/api/status` then shows every application.
+pub(super) fn has_admin_token(state: &State, headers: &HeaderMap) -> bool {
+    allowed(state, headers).is_ok()
 }
 
 fn token_json(t: &TokenInfo) -> Json {
@@ -429,7 +437,31 @@ async fn answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Resul
                 .map_err(|r| settings_refusal(&r, l))?;
             Ok(json_response(200, &with_warning(app_json(&info(state, &app)), unshipped)))
         }
-        (_, [] | [_] | [_, "tokens"] | [_, "tokens", _] | [_, "memory"]) => {
+        (&Method::POST, [name, "origins"]) => {
+            let app = app_named(name)?;
+            let l = super::i18n::Lang::of(req.headers());
+            let body = read_json(state, req).await.map_err(|e| bad_request(&e))?;
+            // The whole list, each a text: what it does not name is removed.
+            let list: Option<Vec<String>> = body
+                .get("origins")
+                .and_then(Json::as_array)
+                .and_then(|a| a.iter().map(|o| o.as_str().map(str::to_owned)).collect());
+            let Some(list) = list else {
+                return Err(error(
+                    400,
+                    "validation",
+                    "send a JSON object: {\"origins\": [\"https://site.fr\", \"http://localhost:3000\"]}, `[]` for none",
+                ));
+            };
+            let s = state.clone();
+            let a = app.clone();
+            tokio::task::spawn_blocking(move || s.apps.set_origins(&a, &list.join("\n")))
+                .await
+                .map_err(|e| error(500, "internal", &e.to_string()))?
+                .map_err(|r| settings_refusal(&r, l))?;
+            Ok(json_response(200, &app_json(&info(state, &app))))
+        }
+        (_, [] | [_] | [_, "tokens"] | [_, "tokens", _] | [_, "memory"] | [_, "origins"]) => {
             Err(error(405, "method_not_allowed", "method not allowed"))
         }
         _ => Err(error(404, "not_found", "no such route: see /v1/openapi.json")),

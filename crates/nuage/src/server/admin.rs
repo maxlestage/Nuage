@@ -1823,7 +1823,7 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
             let msg = match state.apps.set_origins(&app, &field("origins")) {
                 Ok(o) if o.is_empty() => note(true, cx.t("No website: pages cannot call this application.")),
                 Ok(o) => note(true, &cx.tf("Pages of {} may call this application.", &[&o.join(", ")])),
-                Err(e) => note(false, &e.to_string()),
+                Err(refusal) => note(false, &refusal.said(cx.l)),
             };
             html(
                 200,
