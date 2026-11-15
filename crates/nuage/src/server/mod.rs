@@ -20,11 +20,13 @@
 
 mod admin;
 pub(crate) mod apps;
+pub mod files;
 mod i18n;
 mod manage;
 mod pg;
 mod status;
 
+pub use files::FileStore;
 pub use manage::MIN_ADMIN_TOKEN;
 pub use pg::{PgOptions, tls_config};
 
@@ -126,6 +128,9 @@ pub struct ServerOptions {
     pub pg_port: Option<u16>,
     /// The PostgreSQL protocol has TLS.
     pub pg_tls: bool,
+    /// The bucket of the applications' files (`/v1/files`), if any
+    /// (`NUAGE_FILES_S3_*`).
+    pub files: Option<Arc<FileStore>>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -138,6 +143,7 @@ impl std::fmt::Debug for ServerOptions {
             .field("site", &self.site.is_some())
             .field("pg_port", &self.pg_port)
             .field("pg_tls", &self.pg_tls)
+            .field("files", &self.files.as_ref().map(|f| f.describe()))
             .finish()
     }
 }
@@ -154,6 +160,7 @@ impl Default for ServerOptions {
             site: None,
             pg_port: None,
             pg_tls: false,
+            files: None,
         }
     }
 }
@@ -811,7 +818,7 @@ async fn app_protocol(
     let path = req.uri().path().trim_end_matches('/').to_owned();
     let segments: Vec<&str> = path.trim_start_matches("/v1/").split('/').collect();
     let writes = match (&method, segments.as_slice()) {
-        (&Method::POST, ["execute" | "transactions" | "branches", ..]) | (&Method::DELETE, _) => true,
+        (&Method::POST, ["execute" | "transactions" | "branches" | "files", ..]) | (&Method::DELETE, _) => true,
         // A transaction's statements, even its reads: a read-only token opens none.
         _ => req.headers().contains_key(TRANSACTION_HEADER),
     };
@@ -823,6 +830,10 @@ async fn app_protocol(
     let tx_id = header(TRANSACTION_HEADER);
     let engine = &app.engine;
 
+    if segments.first() == Some(&"files") {
+        let name = segments[1..].join("/");
+        return files::route(state, &app.name, read_only, req, &name).await;
+    }
     match (method, segments.as_slice()) {
         // "Does my connection work?": which application the token opens.
         (Method::GET, ["ping"]) => {
@@ -859,6 +870,8 @@ async fn app_protocol(
                 // A client may send a table's schema once, then its reference
                 // (`memoire_orm::nuage::wire::schema_ref`) in its place.
                 "schemaRefs": true,
+                // `/v1/files`: the server keeps files (in a bucket).
+                "files": state.options.files.is_some(),
             }),
         )),
         (Method::POST, [op @ ("fetch" | "execute")]) => {

@@ -36,6 +36,7 @@ ligne.
 | **Transactions** | Lectures sur instantané, commits optimistes (`Error::Conflict`, rejoués par `db.transaction(...)`), transactions interactives en HTTP, lots tout-ou-rien. |
 | **Branches** | Une copie complète de la base pour une préversion, un test ou une expérience, créée en un instant : elle partage les pages de son parent et ne stocke que ses propres changements. |
 | **Sauvegardes restaurées au démarrage** | Instantanés et segments de journal, vers un dossier ou un stockage compatible S3. Un répertoire de données vide est restauré automatiquement au démarrage : les hébergeurs à disque éphémère fonctionnent. |
+| **Fichiers** | Chaque application garde des fichiers de toute taille (tuiles de carte, photos, archives) dans un bucket compatible S3 comme Cloudflare R2 : le serveur les liste et signe les liens, les octets vont directement du client au bucket ([Fichiers](#fichiers)). |
 | **Serveur** | Un seul binaire, configuré par variables d'environnement : le protocole de la base (`/v1`), le statut en direct (`/api/status`, `/api/status/stream`), la console (`/admin`) et le site avec son tableau de bord en direct (`/app`), sur un seul port. |
 | **Client WebAssembly** | `memoire_orm::NuageDb` parle HTTP(S) : en natif avec Tokio, et dans le navigateur via `fetch`. |
 | **Entretien automatique** | Un fil d'arrière-plan fait les checkpoints, envoie les sauvegardes et compacte le fichier. |
@@ -302,7 +303,7 @@ chaque pilote PostgreSQL se connecte aussi : voir plus bas.
 
 **Ma connexion marche-t-elle ?** `GET /v1/ping` répond quelle application le jeton ouvre :
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <jeton>"` donne
-`Connected to Nuage DB 0.4.2: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.3: application blog, read and write, branch main, 3 table(s).`,
 et sans jeton, ou avec un jeton qui n'ouvre rien, il dit ce qui ne va pas. Depuis n'importe
 quelle machine : `nuage check <url> <jeton>`. Une connexion PostgreSQL reçoit la même phrase
 en avis (psql l'affiche), et la page de chaque application dans la console montre sa dernière
@@ -372,6 +373,47 @@ surtout le réseau : choisissez la région de l'hébergeur la plus proche de lui
 ne se met jamais en veille (Heroku **Basic**, pas Eco, dont la première requête après une
 pause prend plusieurs secondes).
 
+## Fichiers
+
+À côté de sa base, une application peut garder des **fichiers** (des tuiles de carte, des
+photos, des archives de plusieurs gigaoctets) dans un bucket compatible S3 : Cloudflare R2, AWS
+S3, MinIO, Scaleway… Le serveur tient la liste et signe les liens ; **les octets vont
+directement du client au bucket**, jamais par le serveur : un petit serveur (un dyno Heroku)
+distribue des téraoctets. Chaque application a son dossier, `<préfixe><application>/` : son
+jeton ne voit que ses fichiers.
+
+| Requête | Quoi | Jeton |
+|---|---|---|
+| `GET /v1/files` (`?prefix=regions/`) | les fichiers : `{"files": [{"name", "size", "updated", "etag"}], "count", "bytes"}` | lecture seule ou lecture-écriture |
+| `GET /v1/files/<nom>` | `307` vers un lien de téléchargement signé (`Range` marche : un téléchargement reprend où il s'est arrêté) ; `?link` : le lien en JSON, `{"url", "expires_at"}` ; `?download=<nom de fichier>` : enregistré sous ce nom | lecture seule ou lecture-écriture |
+| `POST /v1/files/<nom>` | un lien d'envoi signé, `{"method": "PUT", "url", "expires_at"}` : y envoyer les octets en `PUT` (5 Go au plus chacun) | lecture-écriture |
+| `DELETE /v1/files/<nom>` | supprime le fichier | lecture-écriture |
+
+Un nom, ce sont des lettres, des chiffres, `.`, `_` et `-`, en parties séparées par `/`
+(`regions/fr.tar`). Un lien marche une heure (`NUAGE_FILES_LINK_MINUTES`, 7 jours au plus) ;
+en demander un nouveau ensuite.
+Le bucket refuse un lien accompagné d'un en-tête `Authorization` : curl et les navigateurs le
+retirent en suivant la redirection ; un client qui le garde (certaines bibliothèques HTTP) prend
+`?link`, puis télécharge l'`url` sans le jeton.
+
+```bash
+# Envoi : un lien, puis les octets vers le bucket
+url=$(curl -s -X POST https://mon-nuage.herokuapp.com/v1/files/regions/fr.tar \
+  -H "Authorization: Bearer $NUAGE_TOKEN" | jq -r .url)
+curl -T fr.tar "$url"
+# Téléchargement, qui reprend (-C -), avec un jeton en lecture seule
+curl -L -C - -o fr.tar https://mon-nuage.herokuapp.com/v1/files/regions/fr.tar -H "Authorization: Bearer $READ_TOKEN"
+```
+
+Sur Cloudflare R2 (aucun frais pour les octets téléchargés) : **R2 → Create bucket**, puis
+**Manage API tokens → Create API token**, *Object Read & Write* sur ce bucket. Sur le serveur :
+
+```bash
+heroku config:set NUAGE_FILES_S3_BUCKET=mes-fichiers \
+  NUAGE_FILES_S3_ENDPOINT=https://<id du compte>.r2.cloudflarestorage.com \
+  NUAGE_FILES_S3_ACCESS_KEY_ID=... NUAGE_FILES_S3_SECRET_ACCESS_KEY=...
+```
+
 ## Installer sur n'importe quel ordinateur
 
 Nuage DB tourne sur n'importe quel ordinateur : un serveur Linux, un Raspberry Pi, un Mac, un
@@ -411,7 +453,7 @@ SYSTEM, lisible des seuls administrateurs, avec une règle de pare-feu pour le r
   fonctionne, mais prévient que le mot de passe circule en clair.
 - **Mise à jour** : relancez la commande ; données, clé, réglages et sauvegardes restent.
 - **Options** : `NUAGE_PORT`, `NUAGE_PG_PORT` (`0` : coupé), `NUAGE_SWAP_MB` (`0` : pas de
-  swap), `NUAGE_VERSION=v0.4.2`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
+  swap), `NUAGE_VERSION=v0.4.3`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
   (compiler avec cargo). Sur Windows, définissez-les avant : `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Désinstaller** : `... | sudo bash -s uninstall` garde les données, les réglages et les
   sauvegardes ; `... | sudo bash -s purge` efface les données et les réglages, jamais les
@@ -438,7 +480,7 @@ Le binaire `nuage` arrive dans `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` sur Wi
 le site et le tableau de bord en direct. Un serveur plus léger, sans eux (`/` est alors une
 petite page d'accueil ; la console, l'API et tout le reste demeurent) :
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-Une version précise : `--tag v0.4.2`. Mise à jour : la même commande, avec `--force`.
+Une version précise : `--tag v0.4.3`. Mise à jour : la même commande, avec `--force`.
 
 `cargo install` ne pose que le binaire : ni service, ni réglages, ni sauvegardes. Donnez-le à
 l'installateur, qui fait le reste (réglages, sauvegardes, service lancé avec l'ordinateur) :
@@ -578,6 +620,12 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_BACKUP_S3_PREFIX` | préfixe des objets de sauvegarde | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes entre deux instantanés | `60` |
+| `NUAGE_FILES_S3_BUCKET` | garde les fichiers des applications (`/v1/files`) dans ce bucket compatible S3 (voir [Fichiers](#fichiers)) | aucun : pas de fichiers |
+| `NUAGE_FILES_S3_ENDPOINT` | son adresse (`https://<id du compte>.r2.cloudflarestorage.com` sur R2) | `https://s3.<région>.amazonaws.com` |
+| `NUAGE_FILES_S3_REGION` | sa région | `auto` sur R2, sinon `us-east-1` |
+| `NUAGE_FILES_S3_PREFIX` | préfixe des objets : les fichiers d'une application vont sous `<préfixe><application>/` | `files/` |
+| `NUAGE_FILES_S3_ACCESS_KEY_ID`, `NUAGE_FILES_S3_SECRET_ACCESS_KEY` | ses identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
+| `NUAGE_FILES_LINK_MINUTES` | combien de temps marche un lien de téléchargement ou d'envoi (10080 au plus) | `60` |
 | `NUAGE_KEEP_AWAKE_URL` | le serveur appelle cette adresse (son propre `https://…/api/health`) pour qu'un hébergeur qui endort les serveurs inactifs (Heroku Eco) le garde éveillé ; seulement s'il est éveillé : endormi, le visiteur suivant le réveille | coupé |
 | `NUAGE_KEEP_AWAKE_MINUTES` | minutes entre deux appels (moins que les 30 d'Eco) | `20` |
 | `NUAGE_KEEP_AWAKE_HOURS` | seulement à ces heures, en UTC (`6-22`) ; en dehors, il peut s'endormir | toujours |
@@ -608,6 +656,7 @@ HTTPS.
 |---|---|---|
 | `/v1/*` | le protocole de la base, sur la base de l'application qu'ouvre le jeton | `Authorization: Bearer <jeton d'une application>` |
 | `POST /v1/sql` | SQL avec paramètres `?`, lignes en objets JSON (sites, tout langage) | un jeton de l'application ; un jeton en lecture seule ne fait que lire |
+| `/v1/files` | les fichiers de l'application, par des liens signés vers son bucket (voir [Fichiers](#fichiers)) | un jeton de l'application ; un jeton en lecture seule liste et télécharge |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |
 | `/api/apps` | l'API de gestion : les applications et leurs jetons (voir [Créer une application en une commande](#créer-une-application-en-une-commande)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |

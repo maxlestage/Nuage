@@ -101,21 +101,26 @@ pub(crate) struct ToSign<'a> {
     pub service: &'a str,
 }
 
-/// The `Authorization` header of AWS Signature Version 4.
-pub(crate) fn authorization(s: &ToSign<'_>, access_key_id: &str, secret: &str) -> String {
+/// The canonical query string of SigV4: encoded pairs, sorted.
+fn canonical_query(query: &[(&str, &str)]) -> String {
     let mut query: Vec<(String, String)> =
-        s.query.iter().map(|(k, v)| (uri_encode(k, false), uri_encode(v, false))).collect();
+        query.iter().map(|(k, v)| (uri_encode(k, false), uri_encode(v, false))).collect();
     query.sort();
-    let canonical_query = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+}
+
+/// The scope, the signed header names and the signature of a request.
+fn signature(s: &ToSign<'_>, secret: &str) -> (String, String, String) {
     let mut headers: Vec<(String, String)> =
         s.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned())).collect();
     headers.sort();
     let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
     let canonical = format!(
-        "{}\n{}\n{canonical_query}\n{canonical_headers}\n{signed}\n{}",
+        "{}\n{}\n{}\n{canonical_headers}\n{signed}\n{}",
         s.method,
         uri_encode(s.path, true),
+        canonical_query(s.query),
         s.payload_sha256
     );
     let date = &s.amz_date[..8];
@@ -125,8 +130,67 @@ pub(crate) fn authorization(s: &ToSign<'_>, access_key_id: &str, secret: &str) -
     for part in [s.region, s.service, "aws4_request"] {
         key = hmac_sha256(&key, part.as_bytes());
     }
-    let signature = hex(&hmac_sha256(&key, to_sign.as_bytes()));
+    (scope, signed, hex(&hmac_sha256(&key, to_sign.as_bytes())))
+}
+
+/// The `Authorization` header of AWS Signature Version 4.
+pub(crate) fn authorization(s: &ToSign<'_>, access_key_id: &str, secret: &str) -> String {
+    let (scope, signed, signature) = signature(s, secret);
     format!("AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed}, Signature={signature}")
+}
+
+/// A presigned request (SigV4 in the query string): what goes after `?` in
+/// the URL of `method path` on `host`, valid `expires` seconds from
+/// `amz_date`. Only `host` is signed, with an unsigned payload: whoever holds
+/// the URL sends the bytes, without any key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn presign(
+    method: &str,
+    host: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    amz_date: &str,
+    expires: u64,
+    region: &str,
+    access_key_id: &str,
+    secret: &str,
+) -> String {
+    let credential = format!("{access_key_id}/{}/{region}/s3/aws4_request", &amz_date[..8]);
+    let expires = expires.to_string();
+    let mut query: Vec<(&str, &str)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", &credential),
+        ("X-Amz-Date", amz_date),
+        ("X-Amz-Expires", &expires),
+        ("X-Amz-SignedHeaders", "host"),
+    ];
+    query.extend_from_slice(extra);
+    let (_, _, signature) = signature(
+        &ToSign {
+            method,
+            path,
+            query: &query,
+            headers: &[("host", host)],
+            payload_sha256: "UNSIGNED-PAYLOAD",
+            amz_date,
+            region,
+            service: "s3",
+        },
+        secret,
+    );
+    format!("{}&X-Amz-Signature={signature}", canonical_query(&query))
+}
+
+/// An object of a bucket listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectInfo {
+    /// Its key, without the store's prefix.
+    pub key: String,
+    pub size: u64,
+    /// `2026-11-15T07:16:00.000Z`.
+    pub last_modified: String,
+    /// The ETag, without its quotes.
+    pub etag: String,
 }
 
 fn s3_err(e: impl std::fmt::Display) -> Error {
@@ -149,6 +213,20 @@ fn xml_values(xml: &str, tag: &str) -> Vec<String> {
                 .replace("&quot;", "\"")
                 .replace("&apos;", "'"),
         );
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
+/// The raw text between `<tag>` and `</tag>`, each time (entities kept).
+fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        out.push(&after[..end]);
         rest = &after[end + close.len()..];
     }
     out
@@ -190,6 +268,71 @@ impl S3Store {
         } else {
             format!("{}:{}", self.host, self.port)
         }
+    }
+
+    /// The URL of `method` on the object `name` (under the prefix), signed
+    /// for `expires` seconds (7 days at most, the limit of SigV4), with the
+    /// `extra` query parameters (`response-content-disposition`...).
+    pub(crate) fn presigned_url(&self, method: &str, name: &str, expires: u64, extra: &[(&str, &str)]) -> String {
+        let path = format!("/{}/{}", self.options.bucket, self.key(name));
+        let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let query = presign(
+            method,
+            &self.host_header(),
+            &path,
+            extra,
+            &amz_date,
+            expires.clamp(1, 7 * 24 * 3600),
+            &self.options.region,
+            &self.options.access_key_id,
+            &self.options.secret_access_key,
+        );
+        let scheme = if self.https { "https" } else { "http" };
+        format!("{scheme}://{}{}?{query}", self.host_header(), uri_encode(&path, true))
+    }
+
+    /// The objects whose name (under the prefix) starts with `prefix`, sorted.
+    pub(crate) async fn objects(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
+        let full = self.key(prefix);
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut query = vec![("list-type", "2"), ("prefix", full.as_str())];
+            if let Some(t) = &token {
+                query.push(("continuation-token", t.as_str()));
+            }
+            let (status, body) = self.send(Method::GET, "", &query, Vec::new()).await?;
+            Self::check(status, &body, "LIST")?;
+            let xml = String::from_utf8_lossy(&body);
+            for block in xml_blocks(&xml, "Contents") {
+                let value = |tag: &str| xml_values(block, tag).into_iter().next().unwrap_or_default();
+                let Some(key) = value("Key").strip_prefix(&self.options.prefix).map(str::to_owned) else {
+                    continue;
+                };
+                out.push(ObjectInfo {
+                    key,
+                    size: value("Size").parse().unwrap_or(0),
+                    last_modified: value("LastModified"),
+                    etag: value("ETag").trim_matches('"').to_owned(),
+                });
+            }
+            token = xml_values(&xml, "NextContinuationToken").into_iter().next();
+            if token.is_none() || xml_values(&xml, "IsTruncated").first().map(String::as_str) != Some("true") {
+                break;
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    /// Deletes the object `name` (under the prefix); a missing one is no error.
+    pub(crate) async fn remove(&self, name: &str) -> Result<()> {
+        let key = self.key(name);
+        let (status, body) = self.send(Method::DELETE, &key, &[], Vec::new()).await?;
+        if status == 404 {
+            return Ok(());
+        }
+        Self::check(status, &body, &format!("DELETE {key}"))
     }
 
     /// Sends one signed request; returns the status and the body.
@@ -292,38 +435,11 @@ impl BackupStore for S3Store {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let full = self.key(prefix);
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut query = vec![("list-type", "2"), ("prefix", full.as_str())];
-            if let Some(t) = &token {
-                query.push(("continuation-token", t.as_str()));
-            }
-            let (status, body) = self.block(self.send(Method::GET, "", &query, Vec::new()))?;
-            Self::check(status, &body, "LIST")?;
-            let xml = String::from_utf8_lossy(&body);
-            out.extend(
-                xml_values(&xml, "Key")
-                    .into_iter()
-                    .filter_map(|k| k.strip_prefix(&self.options.prefix).map(str::to_owned)),
-            );
-            token = xml_values(&xml, "NextContinuationToken").into_iter().next();
-            if token.is_none() || xml_values(&xml, "IsTruncated").first().map(String::as_str) != Some("true") {
-                break;
-            }
-        }
-        out.sort();
-        Ok(out)
+        Ok(self.block(self.objects(prefix))?.into_iter().map(|o| o.key).collect())
     }
 
     fn delete(&self, name: &str) -> Result<()> {
-        let key = self.key(name);
-        let (status, body) = self.block(self.send(Method::DELETE, &key, &[], Vec::new()))?;
-        if status == 404 {
-            return Ok(());
-        }
-        Self::check(status, &body, &format!("DELETE {key}"))
+        self.block(self.remove(name))
     }
 }
 
@@ -358,6 +474,40 @@ mod tests {
              SignedHeaders=content-type;host;x-amz-date, \
              Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
         );
+    }
+
+    /// The presigned URL example of the S3 documentation ("Authenticating
+    /// Requests: Using Query Parameters").
+    #[test]
+    fn presigned_url_matches_the_aws_example() {
+        let query = presign(
+            "GET",
+            "examplebucket.s3.amazonaws.com",
+            "/test.txt",
+            &[],
+            "20130524T000000Z",
+            86400,
+            "us-east-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+        assert_eq!(
+            query,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
+    }
+
+    #[test]
+    fn listing_blocks() {
+        let xml = "<ListBucketResult><Contents><Key>files/a/x.tar</Key><Size>12</Size>\
+                   <LastModified>2026-11-15T07:00:00.000Z</LastModified><ETag>&quot;e1&quot;</ETag></Contents>\
+                   <Contents><Key>files/a/y</Key><Size>3</Size></Contents></ListBucketResult>";
+        let blocks = xml_blocks(xml, "Contents");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(xml_values(blocks[0], "ETag"), vec!["\"e1\""]);
+        assert_eq!(xml_values(blocks[1], "Size"), vec!["3"]);
     }
 
     #[test]
