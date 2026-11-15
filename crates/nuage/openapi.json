@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nuage DB",
-    "version": "0.4.2",
+    "version": "0.4.3",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -197,6 +197,340 @@
           },
           "500": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/files": {
+      "get": {
+        "operationId": "listFiles",
+        "summary": "The application's files",
+        "description": "The files of the application the token opens, sorted by name. A read-only token lists too.",
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only the names that start with it (`regions/`)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The files.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "files",
+                    "count",
+                    "bytes"
+                  ],
+                  "properties": {
+                    "files": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/File"
+                      }
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "bytes": {
+                      "type": "integer",
+                      "description": "Their total size."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This server keeps no files: NUAGE_FILES_S3_BUCKET is not set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The bucket did not answer as it should (kind `storage`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/files/{name}": {
+      "get": {
+        "operationId": "downloadFile",
+        "summary": "Download a file",
+        "description": "A `307` redirect to a signed download link: the bytes come from the bucket, which answers `Range` requests (a download resumes where it stopped) and `404` for a missing file. A read-only token downloads too.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+            },
+            "description": "The file's name: letters, digits, `.`, `_` and `-`, in parts separated by `/` (`regions/fr.tar`); no `.` or `..` part. In the path it stays as it is: `/v1/files/regions/fr.tar`."
+          },
+          {
+            "name": "link",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Present (`?link`): the link as JSON instead of a redirect, for clients that keep the `Authorization` header on redirects."
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The bucket answers with `Content-Disposition: attachment`, under this file name (the last part of the name when empty)."
+          }
+        ],
+        "responses": {
+          "307": {
+            "description": "To the signed link (`Location`)."
+          },
+          "200": {
+            "description": "With `?link`: the link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a file name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This server keeps no files: NUAGE_FILES_S3_BUCKET is not set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "uploadFileLink",
+        "summary": "A link to upload a file",
+        "description": "A signed upload link: `PUT` the bytes to `url`, with their `Content-Length` (5 GB at most). An existing file of that name is replaced. A read-write token only.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+            },
+            "description": "The file's name: letters, digits, `.`, `_` and `-`, in parts separated by `/` (`regions/fr.tar`); no `.` or `..` part. In the path it stays as it is: `/v1/files/regions/fr.tar`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upload link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Link"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "method": {
+                          "const": "PUT"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a file name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This server keeps no files: NUAGE_FILES_S3_BUCKET is not set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteFile",
+        "summary": "Delete a file",
+        "description": "A missing file is no error. A read-write token only.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+            },
+            "description": "The file's name: letters, digits, `.`, `_` and `-`, in parts separated by `/` (`regions/fr.tar`); no `.` or `..` part. In the path it stays as it is: `/v1/files/regions/fr.tar`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "deleted": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a file name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No token, or one that opens no application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A read-only token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This server keeps no files: NUAGE_FILES_S3_BUCKET is not set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The bucket did not answer as it should (kind `storage`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -823,7 +1157,7 @@
             "properties": {
               "kind": {
                 "type": "string",
-                "description": "`validation` (bad SQL or values), `unique_violation`, `constraint`, `no_such_table`, `table_exists`, `conversion`, `unsupported`, `unauthorized`, `forbidden` (a read-only token writing), `not_found`, `conflict` (another commit came first: retry), `transaction_finished`, `database`; on `/api/apps`, also `method_not_allowed`."
+                "description": "`validation` (bad SQL or values), `unique_violation`, `constraint`, `no_such_table`, `table_exists`, `conversion`, `unsupported`, `unauthorized`, `forbidden` (a read-only token writing), `not_found`, `conflict` (another commit came first: retry), `transaction_finished`, `database`; on `/api/apps`, also `method_not_allowed`; on `/v1/files`, also `not_configured` (no bucket) and `storage` (the bucket failed)."
               },
               "message": {
                 "type": "string"
@@ -913,6 +1247,56 @@
           },
           "NUAGE_TOKEN": {
             "type": "string"
+          }
+        }
+      },
+      "File": {
+        "type": "object",
+        "required": [
+          "name",
+          "size",
+          "updated",
+          "etag"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Its name in the application's folder."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Bytes."
+          },
+          "updated": {
+            "type": "string",
+            "description": "When it was last written, as the bucket says (`2026-11-15T07:16:00.000Z`)."
+          },
+          "etag": {
+            "type": "string",
+            "description": "Changes when the file changes (an MD5 of its bytes for a single upload)."
+          }
+        }
+      },
+      "Link": {
+        "type": "object",
+        "required": [
+          "name",
+          "url",
+          "expires_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "The signed link, to the bucket itself. Send it without an `Authorization` header."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The link works until then (NUAGE_FILES_LINK_MINUTES, an hour by default)."
           }
         }
       }

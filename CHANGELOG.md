@@ -4,6 +4,27 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.3 (2026-11-15)
+
+### Files, in a bucket, through signed links
+
+- **`/v1/files`**: each application keeps files of any size (map tiles, photos, archives of
+  several gigabytes) in an S3-compatible bucket (Cloudflare R2, AWS S3, MinIO...), in a folder of
+  its own. The server lists them (`GET /v1/files`, `?prefix=`) and signs the links: a download
+  (`GET /v1/files/<name>`, a `307` to the bucket, `?link` for the link as JSON, `?download=` for
+  a file name), an upload (`POST /v1/files/<name>`, then `PUT` the bytes to the link), and it
+  deletes them (`DELETE`). **The bytes never go through the server**: a Heroku dyno hands out
+  terabytes, and a download resumes where it stopped (`Range`). A read-only token lists and
+  downloads; uploading and deleting take a read-write token.
+- Set with `NUAGE_FILES_S3_BUCKET`, `NUAGE_FILES_S3_ENDPOINT`, `NUAGE_FILES_S3_REGION` (`auto`
+  on R2), `NUAGE_FILES_S3_PREFIX` (`files/`), `NUAGE_FILES_S3_ACCESS_KEY_ID`,
+  `NUAGE_FILES_S3_SECRET_ACCESS_KEY` and `NUAGE_FILES_LINK_MINUTES` (60). `/v1/info` says
+  `"files": true` when the server keeps files; without a bucket, `/v1/files` answers `501`.
+- The S3 client signs links (SigV4 in the query string, checked against the example of the AWS
+  documentation) and reads the size, date and ETag of the objects it lists.
+- `openapi.json` describes `/v1/files`; the READMEs (English, French, Spanish) have a **Files**
+  section, with the setup of Cloudflare R2.
+
 ## 0.4.2 (2026-11-15)
 
 ### Install on any computer, backups where you choose
