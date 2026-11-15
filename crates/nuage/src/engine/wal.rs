@@ -433,6 +433,12 @@ pub(crate) fn recover_after(dir: &Path, key: Option<&WalKey>, after: u64) -> Res
 }
 
 /// Makes a file creation or removal in `dir` durable (Unix; a no-op elsewhere).
+/// Flushes the file at `path` to the disk. It is opened for writing: Windows refuses to flush a
+/// file opened read-only (`FlushFileBuffers` needs write access: "Access is denied").
+pub(crate) fn sync_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
 pub(crate) fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = File::open(dir) {

@@ -1262,6 +1262,25 @@ impl Pages {
         self.disk.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Copies the page file, byte for byte (encrypted as it is), to `dest`, through the handle
+    /// this store holds: the file is locked for it alone, and Windows refuses to let another
+    /// handle read a locked file (Unix only advises). A snapshot of the backups.
+    pub(crate) fn copy_file_to(&self, dest: &Path) -> Result<()> {
+        let disk = self.disk();
+        let fail = |e: std::io::Error| err(format!("cannot copy {} to {}: {e}", disk.path.display(), dest.display()));
+        let len = disk.len()?;
+        let mut out = File::create(dest).map_err(fail)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut offset = 0u64;
+        while offset < len {
+            let n = (len - offset).min(buf.len() as u64) as usize;
+            read_at(&disk.file, &mut buf[..n], offset).map_err(fail)?;
+            std::io::Write::write_all(&mut out, &buf[..n]).map_err(fail)?;
+            offset += n as u64;
+        }
+        out.sync_all().map_err(fail)
+    }
+
     /// The trees as of the last commit.
     pub(crate) fn version(&self) -> Arc<Version> {
         self.current.read().unwrap_or_else(|e| e.into_inner()).clone()

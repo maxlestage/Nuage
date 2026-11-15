@@ -22,7 +22,7 @@ PGPASSWORD=$NUAGE_TOKEN
 PORT=$http NUAGE_PG_PORT=$pg NUAGE_BIND=127.0.0.1 NUAGE_DATA_DIR=$dir/data NUAGE_ENCRYPTION_KEY=$("$bin" genkey) \
 	NUAGE_TLS_CERT=$dir/cert.pem NUAGE_TLS_KEY=$dir/key.pem "$bin" >"$dir/server.log" 2>&1 &
 server=$!
-trap 'kill $server 2>/dev/null; rm -rf "$dir"' EXIT
+trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$dir"' EXIT
 up=""
 for _ in $(seq 1 100); do
 	if pg_isready -q -h 127.0.0.1 -p "$pg" 2>/dev/null || (exec 3<>"/dev/tcp/127.0.0.1/$pg") 2>/dev/null; then

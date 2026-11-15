@@ -22,7 +22,6 @@
 //! each page carries, inside the encryption, catches damaged pages. Log
 //! records, written once, get authenticated encryption.
 
-use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -268,7 +267,7 @@ impl Header {
         let io = |e: io::Error| crate::engine::storage_err(format!("cannot write {HEADER_FILE}: {e}"));
         let tmp = dir.join(format!("{HEADER_FILE}.partial"));
         std::fs::write(&tmp, self.to_json()).map_err(io)?;
-        File::open(&tmp).and_then(|f| f.sync_all()).map_err(io)?;
+        crate::engine::wal::sync_file(&tmp).map_err(io)?;
         std::fs::rename(&tmp, dir.join(HEADER_FILE)).map_err(io)?;
         crate::engine::wal::sync_dir(dir);
         Ok(())

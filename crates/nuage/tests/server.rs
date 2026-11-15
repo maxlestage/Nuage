@@ -1268,3 +1268,134 @@ async fn console_in_three_languages() {
     }
     running.shutdown().await;
 }
+
+/// The management API: `/api/apps` creates applications and their tokens with
+/// `NUAGE_ADMIN_TOKEN`, and nothing else opens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn management_api() {
+    use common::{User, user};
+    let admin = "a".repeat(nuage::server::MIN_ADMIN_TOKEN);
+    let bearer = format!("Bearer {admin}");
+    let auth: &[(&str, &str)] = &[("authorization", &bearer)];
+    let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
+
+    // Without NUAGE_ADMIN_TOKEN, the API is off, and says how to turn it on.
+    let off = Server::new(engine("manage-off"), options());
+    let running = off.listen("127.0.0.1:0").await.unwrap();
+    let r = http(running.local_addr(), "GET", "/api/apps", &[("authorization", "Bearer t0ken")], "").await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(json(&r)["error"]["message"].as_str().unwrap().contains("NUAGE_ADMIN_TOKEN"));
+    running.shutdown().await;
+
+    let server = Server::new(engine("manage"), ServerOptions { admin_token: Some(admin.clone()), ..options() });
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+
+    // No token, a wrong one, an application's token: refused.
+    for headers in [&[][..], &[("authorization", "Bearer nope")][..], &[("authorization", "Bearer t0ken")][..]] {
+        let r = http(addr, "GET", "/api/apps", headers, "").await;
+        assert_eq!(r.status, 401, "{headers:?}: {}", r.body);
+        assert_eq!(json(&r)["error"]["kind"], "unauthorized");
+    }
+
+    // A new application: 201, its token once, and what to paste in its configuration.
+    let made = http(addr, "POST", "/api/apps", auth, r#"{"name": "shop", "description": "La boutique"}"#).await;
+    assert_eq!(made.status, 201, "{}", made.body);
+    let made = json(&made);
+    let token = made["token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("nuage_"));
+    assert_eq!(made["application"]["name"], "shop");
+    assert_eq!(made["application"]["description"], "La boutique");
+    assert_eq!(made["env"]["NUAGE_TOKEN"], token.as_str());
+    assert_eq!(made["env"]["NUAGE_URL"], running.url().trim_end_matches('/'));
+    assert_eq!(made["application"]["tokens"].as_array().unwrap().len(), 1);
+    assert!(!made.to_string().contains("digest"));
+
+    // The token opens the new database, and only it.
+    let shop = NuageDb::connect(&running.url(), &token).await.unwrap();
+    shop.create_table::<User>().await.unwrap();
+    let mut ada = user("ada@shop.fr", "Ada", None, 1.0);
+    ada.insert(&shop).await.unwrap();
+    let first = NuageDb::connect(&running.url(), "t0ken").await.unwrap();
+    assert!(first.create_table_if_not_exists::<User>().await.is_ok());
+    assert_eq!(User::query().count(&first).await.unwrap(), 0);
+    assert_eq!(User::query().count(&shop).await.unwrap(), 1);
+
+    // A name already taken: what Memoire reads as `Error::UniqueViolation`.
+    let taken = json(&http(addr, "POST", "/api/apps", auth, r#"{"name": "shop"}"#).await);
+    assert_eq!(taken["error"]["kind"], "unique_violation");
+    assert_eq!(
+        (taken["error"]["table"].as_str(), taken["error"]["column"].as_str()),
+        (Some("applications"), Some("name"))
+    );
+
+    // Refusals, with a reason.
+    for (body, status, words) in [
+        (r#"{"name": "shop"}"#, 409, "already an application"),
+        (r#"{"name": "Not Valid"}"#, 400, "invalid application name"),
+        (r#"{"description": "x"}"#, 400, "`name` is required"),
+        (r#"{"name": 7}"#, 400, "`name` is a string"),
+        ("[]", 400, "JSON object"),
+        ("{", 400, "invalid JSON"),
+    ] {
+        let r = http(addr, "POST", "/api/apps", auth, body).await;
+        assert_eq!(r.status, status, "{body}: {}", r.body);
+        assert!(json(&r)["error"]["message"].as_str().unwrap().contains(words), "{body}: {}", r.body);
+    }
+
+    // The list, and one application.
+    let list = json(&http(addr, "GET", "/api/apps", auth, "").await);
+    let names: Vec<&str> =
+        list["applications"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["nuage", "shop"]);
+    assert_eq!(list["applications"][0]["first"], true);
+    assert_eq!(list["applications"][0]["env_token"], true);
+    let one = http(addr, "GET", "/api/apps/shop", auth, "").await;
+    assert_eq!((one.status, json(&one)["name"].as_str()), (200, Some("shop")));
+    assert_eq!(http(addr, "GET", "/api/apps/nothing", auth, "").await.status, 404);
+    assert_eq!(http(addr, "DELETE", "/api/apps/shop", auth, "").await.status, 405);
+
+    // More tokens: a read-only one reads and never writes; revoked, it opens nothing.
+    let r = http(addr, "POST", "/api/apps/shop/tokens", auth, r#"{"read_only": true}"#).await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    let reader = json(&r)["token"].as_str().unwrap().to_owned();
+    assert_eq!(json(&r)["read_only"], true);
+    let read = NuageDb::connect(&running.url(), &reader).await.unwrap();
+    assert_eq!(User::query().count(&read).await.unwrap(), 1);
+    assert!(user("bob@shop.fr", "Bob", None, 2.0).insert(&read).await.is_err());
+    let r = http(addr, "POST", "/api/apps/shop/tokens", auth, "").await;
+    assert_eq!((r.status, json(&r)["read_only"].as_bool()), (201, Some(false)));
+    let tokens = json(&http(addr, "GET", "/api/apps/shop", auth, "").await)["tokens"].clone();
+    assert_eq!(tokens.as_array().unwrap().len(), 3);
+    let id =
+        tokens.as_array().unwrap().iter().find(|t| t["read_only"] == true).unwrap()["id"].as_str().unwrap().to_owned();
+    assert!(reader.contains(&id));
+    let gone = http(addr, "DELETE", &format!("/api/apps/shop/tokens/{id}"), auth, "").await;
+    assert_eq!(gone.status, 200, "{}", gone.body);
+    assert_eq!(http(addr, "DELETE", &format!("/api/apps/shop/tokens/{id}"), auth, "").await.status, 404);
+    let r = http(addr, "GET", "/v1/ping", &[("authorization", &format!("Bearer {reader}"))], "").await;
+    assert_eq!(r.status, 401);
+    assert_eq!(http(addr, "POST", "/api/apps/nothing/tokens", auth, "").await.status, 404);
+
+    // `nuage apps create` and `nuage apps list`, over the same API.
+    let lines = nuage::keepawake::create_app(&running.url(), &admin, "blog", "Le blog").await.unwrap();
+    let blog_token = lines.lines().find_map(|l| l.strip_prefix("NUAGE_TOKEN=")).unwrap().to_owned();
+    assert!(lines.starts_with(&format!("NUAGE_URL={}", running.url().trim_end_matches('/'))), "{lines}");
+    assert!(NuageDb::connect(&running.url(), &blog_token).await.is_ok());
+    let listed = nuage::keepawake::list_apps(&running.url(), &admin).await.unwrap();
+    assert!(listed.contains("blog\t1 token(s)\tLe blog"), "{listed}");
+    assert!(listed.starts_with("nuage\t1 token(s)"), "NUAGE_TOKEN counts: {listed}");
+    let refused = nuage::keepawake::create_app(&running.url(), "wrong", "x", "").await.unwrap_err();
+    assert!(refused.contains("NUAGE_ADMIN_TOKEN"), "{refused}");
+    let twice = nuage::keepawake::create_app(&running.url(), &admin, "blog", "").await.unwrap_err();
+    assert!(twice.contains("already an application"), "{twice}");
+
+    // Described for code generators, with a security scheme of its own.
+    let spec: serde_json::Value =
+        serde_json::from_str(&http(addr, "GET", "/v1/openapi.json", &[], "").await.body).unwrap();
+    for path in ["/api/apps", "/api/apps/{name}", "/api/apps/{name}/tokens", "/api/apps/{name}/tokens/{id}"] {
+        assert!(spec["paths"][path].is_object(), "{path}");
+    }
+    assert_eq!(spec["paths"]["/api/apps"]["post"]["security"][0]["adminToken"], serde_json::json!([]));
+    running.shutdown().await;
+}

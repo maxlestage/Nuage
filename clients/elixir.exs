@@ -1,6 +1,7 @@
 # Nuage DB from Elixir 1.18+ (JSON is built in; the HTTP client is Erlang's :httpc, or use
 # Req / Finch in an application).
 #   NUAGE_URL=https://db.example.com NUAGE_TOKEN=... elixir elixir.exs
+#   Without NUAGE_TOKEN, with the server's NUAGE_ADMIN_TOKEN: it makes its own application first.
 :inets.start()
 :ssl.start()
 
@@ -19,6 +20,23 @@ defmodule Nuage do
       result -> result
     end
   end
+
+  @doc "Makes an application (a database of its own) with the management token; returns its token."
+  def create_app(name, admin_token) do
+    headers = [{~c"authorization", ~c"Bearer " ++ String.to_charlist(admin_token)}]
+    request = {String.to_charlist(@url <> "/api/apps"), headers, ~c"application/json", JSON.encode!(%{name: name})}
+    {:ok, {_status, _headers, answer}} = :httpc.request(:post, request, [], body_format: :binary)
+
+    case JSON.decode!(answer) do
+      %{"error" => %{"kind" => kind, "message" => message}} -> raise "#{kind}: #{message}"
+      %{"token" => token} -> token
+    end
+  end
+end
+
+if System.get_env("NUAGE_TOKEN", "") == "" and System.get_env("NUAGE_ADMIN_TOKEN", "") != "" do
+  System.put_env("NUAGE_TOKEN", Nuage.create_app("notes-elixir", System.get_env("NUAGE_ADMIN_TOKEN")))
+  IO.puts("created the application notes-elixir")
 end
 
 Nuage.sql("CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, text TEXT NOT NULL)")

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Bytes;
 use hyper::client::conn::http1;
@@ -105,6 +105,11 @@ async fn get(url: &str) -> Result<u16> {
 
 /// `GET url`, with a bearer token: its status and body.
 pub(crate) async fn fetch(url: &str, token: Option<&str>) -> Result<(u16, Vec<u8>)> {
+    send("GET", url, token, None).await
+}
+
+/// `method url`, with a bearer token and a JSON body: its status and body.
+async fn send(method: &str, url: &str, token: Option<&str>, json: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
     let err = |e: &dyn std::fmt::Display| Error::Pool(format!("cannot reach {url}: {e}"));
     let (https, rest) = match url.split_once("://") {
         Some(("https", r)) => (true, r),
@@ -116,12 +121,18 @@ pub(crate) async fn fetch(url: &str, token: Option<&str>) -> Result<(u16, Vec<u8
         Some((h, p)) => (h, p.parse().map_err(|_| err(&"invalid port"))?),
         None => (authority, if https { 443 } else { 80 }),
     };
-    let mut request =
-        Request::get(path).header("host", authority).header("user-agent", concat!("nuage/", env!("CARGO_PKG_VERSION")));
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", authority)
+        .header("user-agent", concat!("nuage/", env!("CARGO_PKG_VERSION")));
     if let Some(t) = token {
         request = request.header("authorization", format!("Bearer {t}"));
     }
-    let request = request.body(Empty::<Bytes>::new()).map_err(|e| err(&e))?;
+    if json.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let request = request.body(Full::new(Bytes::from(json.unwrap_or_default()))).map_err(|e| err(&e))?;
     let tcp = TcpStream::connect((host, port)).await.map_err(|e| err(&e))?;
     let response = if https {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -146,6 +157,70 @@ pub(crate) async fn fetch(url: &str, token: Option<&str>) -> Result<(u16, Vec<u8
     let status = response.status().as_u16();
     let body = response.into_body().collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
     Ok((status, body))
+}
+
+/// The error message of an answer of the management API, or its status.
+fn refusal(base: &str, status: u16, json: &serde_json::Value) -> String {
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    match status {
+        401 => format!("{base} refused the token: use the server's NUAGE_ADMIN_TOKEN. {message}"),
+        403 => format!("{base}: {message}"),
+        404 if message.is_empty() => {
+            format!("{base} answered 404: it is not a Nuage DB server of version 0.4.2 or later, or not this address.")
+        }
+        s => format!("{base} answered {s}: {message}"),
+    }
+}
+
+/// `nuage apps create <name> [description]`: a new application on the server
+/// at `url`, with the management token. The lines to paste in the
+/// application's configuration, `NUAGE_URL=…` and `NUAGE_TOKEN=…`.
+pub async fn create_app(
+    url: &str,
+    admin_token: &str,
+    name: &str,
+    description: &str,
+) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let body = serde_json::json!({ "name": name, "description": description }).to_string().into_bytes();
+    let (status, answer) =
+        send("POST", &format!("{base}/api/apps"), Some(admin_token), Some(body)).await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 201 {
+        return Err(refusal(base, status, &json));
+    }
+    let env = &json["env"];
+    Ok(format!(
+        "NUAGE_URL={}\nNUAGE_TOKEN={}",
+        env["NUAGE_URL"].as_str().unwrap_or(base),
+        env["NUAGE_TOKEN"].as_str().unwrap_or_default()
+    ))
+}
+
+/// `nuage apps list`: the applications of the server at `url`, one per line
+/// (name, tokens, description).
+pub async fn list_apps(url: &str, admin_token: &str) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let (status, answer) = fetch(&format!("{base}/api/apps"), Some(admin_token)).await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(refusal(base, status, &json));
+    }
+    let apps = json["applications"].as_array().cloned().unwrap_or_default();
+    Ok(apps
+        .iter()
+        .map(|a| {
+            // The first application also opens with NUAGE_TOKEN, which is not in its list.
+            let tokens = a["tokens"].as_array().map_or(0, Vec::len) + usize::from(a["env_token"] == true);
+            let description = a["description"].as_str().unwrap_or_default();
+            let mut line = format!("{}\t{tokens} token(s)", a["name"].as_str().unwrap_or_default());
+            if !description.is_empty() {
+                line.push_str(&format!("\t{description}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// `nuage check [url] [token]`: does a connection to a Nuage DB server work?

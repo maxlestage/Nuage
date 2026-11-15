@@ -167,7 +167,8 @@ One server holds several applications, each with a database of its own:
 
 - the **first application** is the server's own database (`NUAGE_NAME`, data at the root of
   `NUAGE_DATA_DIR`, token `NUAGE_TOKEN`): an existing deployment keeps its data as is;
-- the **others** are made in the console (`/admin`, **New application**): a database in
+- the **others** are made in the console (`/admin`, **New application**), or with one
+  request to the management API (`nuage apps create`, see below): a database in
   `apps/<name>/`, encrypted under keys of its own, backed up under `apps/<name>/`, and a first
   token, shown once (the server keeps only its SHA-256 digest);
 - the **token** an application sends picks its database: `NuageDb::connect(url, token)` does
@@ -177,6 +178,90 @@ One server holds several applications, each with a database of its own:
 
 `Server::create_app`, `new_app_token`, `revoke_app_token`, `delete_app` and `apps` do the
 same from Rust.
+
+### Create an application in one command
+
+The management API, `/api/apps`, makes applications and their tokens with one HTTP
+request: from a script, a CI job, a deploy step, without the console's form. It opens with
+a token of its own, `NUAGE_ADMIN_TOKEN`.
+
+1. **Turn it on** once, on the server: `NUAGE_ADMIN_TOKEN=$(nuage genkey)` (32 characters at
+   least; a shorter one stops the server at startup, with why). The installers set one
+   already. On Heroku: the server's app → **Settings** → **Config Vars**. The startup log says
+   `the management API (/api/apps) is on`.
+2. **Create an application**. On the server's computer, nothing else is needed: `nuage`
+   reads the token and the port in the installer's settings file (hence `sudo`; on Windows,
+   a PowerShell as administrator), and shows `SITE_URL` as the address when the file has it:
+
+   ```bash
+   sudo nuage apps create shop "The shop"
+   # NUAGE_URL=http://127.0.0.1:8080
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   ```
+
+   From anywhere else, give it the server and its management token:
+
+   ```bash
+   export NUAGE_URL=https://my-nuage.herokuapp.com NUAGE_ADMIN_TOKEN=…
+   nuage apps create shop "The shop"
+   # NUAGE_URL=https://my-nuage.herokuapp.com
+   # NUAGE_TOKEN=nuage_3f9a12c0…
+   nuage apps list
+   # nuage   1 token(s)
+   # shop    1 token(s)   The shop
+   ```
+
+   or with any HTTP client:
+
+   ```bash
+   curl https://my-nuage.herokuapp.com/api/apps \
+     -H "Authorization: Bearer $NUAGE_ADMIN_TOKEN" \
+     -d '{"name": "shop", "description": "The shop"}'
+   ```
+
+   ```json
+   {
+     "application": { "name": "shop", "description": "The shop", "first": false, "created_at": 1794690000000,
+                      "tokens": [{ "id": "3f9a12c0", "created_at": 1794690000000, "read_only": false }],
+                      "env_token": false, "origins": [] },
+     "token": "nuage_3f9a12c0…",
+     "env": { "NUAGE_URL": "https://my-nuage.herokuapp.com", "NUAGE_TOKEN": "nuage_3f9a12c0…" },
+     "message": "Application `shop` created, with its own encrypted database. Copy its token now: it is not shown again."
+   }
+   ```
+
+3. **Connect the application**: set the two lines of `env` in its configuration (on Heroku,
+   its Config Vars). It connects, and makes its tables at its first start.
+
+From Rust, `memoire_orm::NuageAdmin` (Memoire's `nuage` feature) does the same:
+`NuageAdmin::new(url, admin_token)?.create_app("shop", "The shop").await?` gives the token and
+`env()`, the two lines. In a [Paquets](https://github.com/maxlestage/Paquets) project,
+`paquets nuage create shop` makes the application and writes the two lines in `.env`.
+
+| Method | Path | Body | Answer |
+|---|---|---|---|
+| `GET` | `/api/apps` | | `200 {"applications": [...]}`, the first one first, then by name |
+| `POST` | `/api/apps` | `{"name": "shop", "description": "…"}` (description optional) | `201` the application, its `token` and `env`; `409` the name is taken; `400` an invalid name (1 to 63 of `a-z 0-9 - _`) |
+| `GET` | `/api/apps/{name}` | | `200` the application; `404` |
+| `POST` | `/api/apps/{name}/tokens` | `{"read_only": true}` (optional, `false` by default) | `201 {"application", "token", "read_only", "env"}` |
+| `DELETE` | `/api/apps/{name}/tokens/{id}` | | `200 {"revoked": true}`; `404` no such token |
+
+A refusal is JSON, `{"error": {"kind", "message"}}`, with a message that says what to do:
+`401` without the management token or with a wrong one, `403` when `NUAGE_ADMIN_TOKEN` is
+not set, `400`, `404`, `405`, `409`. The whole description is in
+[`/v1/openapi.json`](crates/nuage/openapi.json).
+
+What protects it:
+
+- **A secret of its own**, not the console's password (a password is typed, so guessable) and
+  not an application's token: a token opens its own database and nothing else, the first
+  application's `NUAGE_TOKEN` included. It is compared in constant time.
+- **A token is shown once**, in the answer that makes it: the server keeps only its SHA-256
+  digest, and the list shows tokens by their id (their first characters).
+- **No deletion**: deleting an application deletes its data and its backups, so it stays in
+  the console, behind its name typed again.
+- Keep `NUAGE_ADMIN_TOKEN` with the server's other secrets, never in an application or a
+  page. To change it, set a new value: the old one stops working at the next start.
 
 ## SQL
 
@@ -209,7 +294,7 @@ every PostgreSQL driver connects too: see below.
 
 **Does my connection work?** `GET /v1/ping` answers which application the token opens:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` gives
-`Connected to Nuage DB 0.4.1: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.2: application blog, read and write, branch main, 3 table(s).`,
 and without a token, or with one that opens nothing, it says what is wrong. From any machine:
 `nuage check <url> <token>`. A PostgreSQL connection gets the same line as a notice (psql
 prints it), and each application's page in the console shows its last connection (when, how,
@@ -273,36 +358,120 @@ it. What a visitor feels is mostly the network: pick the host's region closest t
 dyno that never sleeps (Heroku **Basic**, not Eco, whose first request after a pause takes
 seconds).
 
-## Install on a server
+## Install on any computer
 
-On any Linux server (Debian, Ubuntu, Fedora, Rocky, Alpine..., x86_64 or ARM64, from 512 MiB
-of memory), one command:
+Nuage DB runs on any computer: a Linux server, a Raspberry Pi, a Mac, a Windows PC, next to
+(or instead of) a server on a host like Heroku. One command installs it as a service started
+with the computer, and asks where the backups go.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo bash
-```
+| | One command | Service |
+|---|---|---|
+| **Linux** (Debian, Ubuntu, Fedora, Rocky, Alpine, Raspberry Pi OS..., x86_64 or ARM64, from 512 MiB) | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | systemd `nuage` |
+| **macOS** (Apple silicon or Intel), in Terminal | `curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh \| sudo bash` | launchd, as your user |
+| **Windows** 10, 11, Server, in PowerShell **as administrator** | `irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 \| iex` | scheduled task `Nuage DB`, as SYSTEM |
+| **cargo**, anywhere Rust runs | `cargo install --locked --git https://github.com/maxlestage/Nuage nuage` (see [With cargo](#with-cargo)) | none: hand it to the installer |
+| **Docker**, anywhere | `docker compose up -d` in this repository (settings in `.env`) | the container |
 
-It installs the `nuage` binary (a static build: no dependency), **creates swap** when the
-server has none (the size of the memory, 1 to 4 GiB; `vm.swappiness=10`, so the memory goes
-to the database), a `nuage` user, the data in `/var/lib/nuage`, the settings in
-`/etc/nuage/nuage.env` with a generated key, token and console password, and a systemd
-service started at boot. It prints the address, the token and the password once: **copy
-`/etc/nuage/nuage.env` somewhere safe**, nobody can read the data without its key.
+Each one installs the `nuage` binary (a static build: no dependency), generates the settings
+file with a key, a token, a console password and a management token, makes the data folder,
+sets up the backups, starts the service and checks that it answers. It prints the address,
+the token and the password once: **copy the settings file somewhere safe, away from this
+computer**: nobody can read the data, nor its backups, without its key.
 
-- **HTTPS**: point a domain name to the server, then
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| settings | `/etc/nuage/nuage.env` | `/usr/local/etc/nuage/nuage.env` | `C:\ProgramData\Nuage\nuage.env` |
+| data | `/var/lib/nuage` | `/usr/local/var/nuage` | `C:\ProgramData\Nuage\data` |
+| logs | `journalctl -u nuage -f` | `tail -f /usr/local/var/log/nuage.log` | `Get-Content -Wait C:\ProgramData\Nuage\nuage.log` |
+
+On Linux it also **creates swap** when the server has none (the size of the memory, 1 to 4
+GiB; `vm.swappiness=10`, so the memory goes to the database) and a `nuage` system user. On
+macOS the service runs as the person who ran `sudo`; on Windows, as SYSTEM, readable by
+administrators only, with a firewall rule for the local network.
+
+- **HTTPS** (Linux): point a domain name to the server, then
   `curl -fsSL .../install.sh | sudo NUAGE_DOMAIN=db.example.com bash` (Caddy, with a free
   certificate; Nuage DB then listens on `127.0.0.1` only). Without HTTPS the console works,
   but warns that the password travels in clear.
-- **Upgrade**: run the command again; data, key and settings stay.
-- **Options**: `NUAGE_PORT`, `NUAGE_SWAP_MB` (`0`: no swap), `NUAGE_VERSION=v0.3.0`,
-  `NUAGE_FROM_SOURCE=1` (build with cargo).
-- **Remove**: `... | sudo bash -s uninstall` (keeps the data), `... | sudo bash -s purge`.
+- **Upgrade**: run the command again; data, key, settings and backups stay.
+- **Options**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: off), `NUAGE_SWAP_MB` (`0`: no swap),
+  `NUAGE_VERSION=v0.4.2`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
+  cargo). On Windows, set them first: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
+- **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
+  `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
+  `$env:NUAGE_ACTION = 'uninstall'` (or `'purge'`), then the same command.
 - **Memory**: each application's page cache is `NUAGE_CACHE_MB=auto`, an eighth of the
   memory (8 to 512 MiB); the rest stays on disk. The console's *Server* page shows the memory
   Nuage DB uses, the free memory and the swap.
+- **By hand**: binaries for Linux, macOS and Windows are on the
+  [releases page](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
+  starts the server with the settings of a file (`KEY=value` lines; the environment wins).
 
-Binaries for Linux, macOS and Windows are on the
-[releases page](https://github.com/maxlestage/Nuage/releases).
+### With cargo
+
+With Rust installed ([rustup.rs](https://rustup.rs)), on Linux, macOS or Windows:
+
+```bash
+cargo install --locked --git https://github.com/maxlestage/Nuage nuage
+nuage --version
+```
+
+The `nuage` binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows), with the
+website and the live dashboard. A lighter server, without them (`/` is then a small home page;
+the console, the API and everything else stay):
+`cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
+A release: `--tag v0.4.2`. Upgrade: the same command, with `--force`.
+
+`cargo install` only puts the binary there: no service, no settings, no backups. Hand it to
+the installer, which does the rest (settings, backups, service started with the computer):
+
+```bash
+# Linux, macOS: `command -v nuage` finds it before sudo, whose PATH has no ~/.cargo/bin
+curl -fsSL https://raw.githubusercontent.com/maxlestage/Nuage/master/install.sh | sudo NUAGE_BINARY="$(command -v nuage)" bash
+```
+
+```powershell
+# Windows, PowerShell as administrator
+$env:NUAGE_BINARY = (Get-Command nuage).Source; irm https://raw.githubusercontent.com/maxlestage/Nuage/master/install.ps1 | iex
+```
+
+Or start it yourself, with a settings file: `nuage genkey` makes the key,
+`nuage --env-file nuage.env` starts the server (see [`nuage.env.example`](nuage.env.example)).
+On Linux and macOS, `NUAGE_FROM_SOURCE=1` makes the installer itself build with cargo.
+
+### Backups: you choose where
+
+The data folder is only one copy. With a backup, Nuage DB sends a **snapshot** of each
+database (every hour, `NUAGE_BACKUP_SNAPSHOT_MINUTES`) and the **write-ahead log** since then
+(at every checkpoint, every 30 seconds), all encrypted with the key; and when it starts with
+an **empty data folder** (a new disk, a new computer), it **restores itself** from the backup
+before it serves. The installer asks where they go; or say it in the command:
+
+| Where | Command (Linux, macOS) | Windows |
+|---|---|---|
+| a folder on **another disk**: an external disk, a NAS | `curl ... \| sudo NUAGE_BACKUP_DIR=/Volumes/MyDisk/nuage bash` | `$env:NUAGE_BACKUP_DIR = 'E:\Nuage'; irm ... \| iex` |
+| **S3-compatible storage**: AWS S3, Cloudflare R2, Scaleway, Backblaze B2, MinIO | `NUAGE_BACKUP_S3_BUCKET=… NUAGE_BACKUP_S3_REGION=… NUAGE_BACKUP_S3_ENDPOINT=… NUAGE_BACKUP_S3_ACCESS_KEY_ID=… NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…` | the same, with `$env:` |
+| none (not recommended) | `NUAGE_BACKUP=none` | `$env:NUAGE_BACKUP = 'none'` |
+
+- **Another disk, or off-site.** A backup on the disk of the data dies with it: the installer
+  and the server warn when the backup folder is on the same disk. A copy at home does not
+  survive a fire or a theft: S3-compatible storage does (R2 and B2 cost little for this
+  size). The settings file's key must be kept away from the backups' bucket too.
+- **An external disk that is not plugged in**: the installer makes only the last folder of
+  `NUAGE_BACKUP_DIR` (`/Volumes/MyDisk` must exist), and the server warns at startup when the
+  folder turns out to be on the computer's own disk. On macOS, if the backups to an external
+  disk fail (in the log), add `/usr/local/bin/nuage` in System Settings → Privacy & Security
+  → Full Disk Access. On Windows, a NAS share (`\\nas\backup\nuage`) must let the computer's
+  account (`COMPUTER$`) write.
+- **Change** where they go: run the installer again with the new option; it replaces the old
+  one in the settings file and restarts the service. Without an option, it keeps them.
+- **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors.
+- **Restore** on a new computer: install, put the old settings file's
+  `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
+  and restart the service: it restores the last snapshot and replays the log after it.
+- **One writer per backup**: two servers must never back up to the same folder or bucket
+  prefix (each would overwrite the other's). A computer next to a Heroku server uses a
+  folder, bucket or `NUAGE_BACKUP_S3_PREFIX` of its own.
 
 ## Quick start
 
@@ -375,9 +544,11 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`, `nuage genkey`), base64 of 32 bytes, or a passphrase of 12 characters or more | **required**: the binary does not start without it |
 | `NUAGE_TOKEN` | a token of the first application (named `NUAGE_NAME`); the console makes the other applications and their tokens | none |
 | `NUAGE_ADMIN_PASSWORD` | password of the console (and of the dashboard) | none: the console is off |
+| `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` and `/app` show a public subset without signing in | `false` |
 | `NUAGE_CACHE_MB` | page cache of each application, in MiB, or `auto` | `auto`: an eighth of the memory, 8 to 512 MiB |
-| `NUAGE_BACKUP_DIR` | back up to this folder | |
+| `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); the environment wins over the file | none |
+| `NUAGE_BACKUP_DIR` | back up to this folder, on another disk (the server warns when it is on the data's disk) | |
 | `NUAGE_BACKUP_S3_BUCKET` | back up to this bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | endpoint of S3-compatible storage | `https://s3.<region>.amazonaws.com` |
 | `NUAGE_BACKUP_S3_REGION` | region | `us-east-1` |
@@ -414,6 +585,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects (websites, any language) | a token of the application; a read-only token reads only |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
+| `/api/apps` | the management API: applications and their tokens (see [Create an application in one command](#create-an-application-in-one-command)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | the console | `NUAGE_ADMIN_PASSWORD` |
 | everything else | the website, `/app` included | public |
 
