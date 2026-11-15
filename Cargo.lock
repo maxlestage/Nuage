@@ -1414,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "vitesse"
 version = "0.2.0"
-source = "git+https://github.com/maxlestage/Vitesse#09f86f2017cd77bc5a0ac50d88f8bb9e3ace8f10"
+source = "git+https://github.com/maxlestage/Vitesse#77c42416e6e67ace81e934e3e2b1adc51d893c6e"
 dependencies = [
  "brotli",
  "bytes",
