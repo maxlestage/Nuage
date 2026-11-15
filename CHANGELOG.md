@@ -4,6 +4,68 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.4 (2026-11-15)
+
+### A key-value store, the way Redis is used
+
+- **`/v1/kv`**: each application has a key-value store in memory, next to its database:
+  values with an expiry, counters, locks, a cache in front of anything slow. `GET`, `PUT`
+  (`?ttl=`, `&nx`, `&xx`, `&keepttl`) and `DELETE /v1/kv/<key>` read, write and delete a value
+  as its bytes; `POST /v1/kv/<key>?incr` adds to a counter (`&ttl=` is the expiry of a counter
+  it creates: a rate limit in one request), `?expire=` and `?persist` change an expiry;
+  `GET /v1/kv` lists the keys and gives the figures; `POST /v1/kv` takes the commands of Redis
+  as JSON, one or several in one round trip. A read-only token reads. Nothing touches the
+  disk: a restart empties it.
+- **The Redis protocol** (`NUAGE_REDIS_PORT=6379`, RESP2 and RESP3): every language's Redis
+  client connects as is, a token of the application as its password
+  (`redis://default:<token>@host:6379`); with `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY` the same
+  port also answers TLS (`rediss://`). Strings and counters (`GET`, `SET` with `EX`, `PX`,
+  `NX`, `XX`, `KEEPTTL`, `GET`; `SETNX`, `SETEX`, `GETSET`, `GETDEL`, `GETEX`, `MGET`, `MSET`,
+  `APPEND`, `STRLEN`, `INCR`, `DECR`, `INCRBY`, `DECRBY`), keys (`DEL`, `EXISTS`, `EXPIRE`,
+  `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`), `PING`,
+  `INFO`, pipelines, and `MULTI` ... `EXEC` (the commands run as one). Tried with `redis-cli`
+  and redis-py. Lists, hashes, sets and pub/sub are not there.
+- Memory is bounded for each application (`NUAGE_KV_MB`, by default a sixteenth of the memory,
+  4 to 256 MiB): past the limit the keys that expired go first, then the least recently used
+  ones. `/api/status` gives the figures of each store (keys, bytes, hits, misses, evictions).
+- `nuage::kv::Kv` is the store itself, for an application that embeds the engine; Memoire's
+  `NuageKv` (0.2.4) is its client: `db.kv()`, `set_for`, `incr_by`, `set_if_absent`,
+  `remember`.
+
+### Faster
+
+Measured with `cargo run --release -p nuage --example bench` before (0.4.3) and after, on the
+same idle machine (4 cores, 20 000 rows, encrypted, the client and the server on one machine):
+
+| | 0.4.3 | 0.4.4 |
+|---|---|---|
+| reads by key, 32 clients | 44 300 /s | **89 900 /s** |
+| a row by key (Memoire's client) | 0.151 ms | 0.094 ms |
+| a row by a unique column | 0.177 ms | 0.112 ms |
+| a page of 20 rows | 0.441 ms | 0.241 ms |
+| a page of 20 rows, `/v1/sql` | 0.307 ms | 0.177 ms |
+| the same, gzip | 0.353 ms | 0.214 ms |
+| a durable update | 0.53 ms | 0.48 ms |
+
+- **Reads run where they are.** A read served from the page cache takes a few microseconds;
+  handing it to another thread and waiting for its answer cost more than the read. A read now
+  runs on its connection's own task while reads of its shape (the same table, the same
+  clauses) stay short; a shape that turns out slow (a scan, a cold disk) goes to the blocking
+  pool, where it holds up nobody, and comes back when it is short again. Writes still go to the
+  pool: they wait for the disk.
+- **Answers are written straight as their text**, for `/v1/fetch` (Memoire 0.2.4's
+  `wire::rows_to_vec`) and `/v1/sql`, instead of as a JSON tree built, serialized and dropped
+  (for `/v1/sql`, one map per row, each column name copied for each value). The same answers:
+  tested against the JSON they replace.
+- **gzip reuses its compressor**: making one for each answer allocated and cleared a few
+  hundred kilobytes, more work than compressing a page of rows.
+- **A token is checked with two SHA-256 instead of two for each token of each application**:
+  digests are compared as they are (every byte, so the time taken tells nothing).
+- The server is built on Memoire 0.2.4 (it was on a revision before 0.2.2): statements are
+  read and written without copying what they build.
+- The bench measures the key-value store too: 144 000 reads/s over HTTP with 32 clients, a
+  read in 0.07 ms.
+
 ## 0.4.3 (2026-11-15)
 
 ### Files, in a bucket, through signed links

@@ -58,6 +58,7 @@ pub mod engine;
 pub mod hash;
 #[cfg(feature = "server")]
 pub mod keepawake;
+pub mod kv;
 pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -79,7 +80,8 @@ pub use engine::{
 pub use memoire_orm::nuage::Branch;
 #[cfg(feature = "server")]
 pub use server::{
-    AppInfo, PgOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo, tls_config,
+    AppInfo, PgOptions, RedisOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo,
+    tls_config,
 };
 #[cfg(feature = "site")]
 pub use site::site;
