@@ -1151,7 +1151,16 @@
       "get": {
         "operationId": "status",
         "summary": "Live status: requests, latency, storage, memory, backups",
-        "description": "With the token of an application: its own figures. Without credentials, a public subset when the server allows it (`NUAGE_PUBLIC_STATUS`).",
+        "description": "With the token of an application: the server and that application. With the management token (`NUAGE_ADMIN_TOKEN`) or a console session: every application. Without credentials, a public subset when the server allows it (`status.public`, `NUAGE_PUBLIC_STATUS`), without `version`. `/api/status/stream` sends the same as Server-Sent Events, every second.",
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "adminToken": []
+          },
+          {}
+        ],
         "responses": {
           "200": {
             "description": "The status.",
@@ -1713,6 +1722,110 @@
         }
       }
     },
+    "/api/apps/{name}/origins": {
+      "post": {
+        "operationId": "setAppOrigins",
+        "summary": "The websites of one application",
+        "description": "The websites whose pages may call this application from the browser (CORS): the scheme and the host, such as `https://site.fr` or `http://localhost:3000`, or `*` for any. The body is the whole new list; `[]` removes them all. In force at once. A refusal says why in the language of `Accept-Language` (English, French or Spanish).",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,63}$"
+            },
+            "description": "The application's name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "origins"
+                ],
+                "properties": {
+                  "origins": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Each one `https://host`, `http://host:port`, or `*`: no path."
+                  }
+                }
+              },
+              "example": {
+                "origins": [
+                  "https://site.fr",
+                  "http://localhost:3000"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The application, with its `origins`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Application"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a list of texts, or one of them is not an origin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such application.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one (an application's token never opens this API).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The management API is off (`NUAGE_ADMIN_TOKEN` is not set).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/settings": {
       "get": {
         "operationId": "listSettings",
@@ -1908,7 +2021,7 @@
       "adminToken": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The server's NUAGE_ADMIN_TOKEN (32 characters at least): it opens the management API, `/api/apps`, and nothing else."
+        "description": "The server's NUAGE_ADMIN_TOKEN (32 characters at least): it opens the management API, `/api/apps` and `/api/settings`, and shows the whole `/api/status`; it opens no database."
       }
     },
     "schemas": {
