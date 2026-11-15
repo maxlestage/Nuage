@@ -15,7 +15,8 @@
 //! * the container's limit and usage (cgroup v2, then v1); a host that gives
 //!   the limit but not the usage (Heroku) is counted from this process's own
 //!   memory, which is what the container holds;
-//! * the machine (`/proc/meminfo`).
+//! * the machine: `/proc/meminfo` on Linux, the system's own calls on macOS
+//!   and Windows (a computer at home counts too).
 //!
 //! The swap is the container's when it has a limit of its own; a container
 //! whose host says nothing of it reports none, rather than the swap of the
@@ -53,6 +54,111 @@ struct Raw {
     /// `NUAGE_MEMORY_MB`, in bytes.
     declared: Option<u64>,
     cgroup: Cgroup,
+    /// What the system says where there is no `/proc` (macOS, Windows).
+    native: Native,
+}
+
+/// Memory figures asked from the system itself, where there is no `/proc`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Native {
+    /// The machine's memory.
+    total: Option<u64>,
+    /// What new uses may take of it.
+    available: Option<u64>,
+    /// What this process holds.
+    process: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+fn native() -> Native {
+    use std::mem::{size_of, zeroed};
+    let mut n = Native::default();
+    // SAFETY: each call fills a buffer of the size it is told, and nothing else.
+    unsafe {
+        let mut total: u64 = 0;
+        let mut len = size_of::<u64>();
+        if libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut total).cast(), &mut len, std::ptr::null_mut(), 0) == 0
+            && total > 0
+        {
+            n.total = Some(total);
+        }
+        let page = libc::sysconf(libc::_SC_PAGESIZE);
+        let mut stats: libc::vm_statistics64 = zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        #[allow(deprecated)]
+        let host = libc::mach_host_self();
+        if page > 0
+            && libc::host_statistics64(host, libc::HOST_VM_INFO64, (&raw mut stats).cast(), &mut count)
+                == libc::KERN_SUCCESS
+        {
+            // Free pages, and those the system takes back at once (files it keeps in memory).
+            n.available = Some((u64::from(stats.free_count) + u64::from(stats.inactive_count)) * page as u64);
+        }
+        let mut info: libc::proc_taskinfo = zeroed();
+        let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+        if libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) == size {
+            n.process = Some(info.pti_resident_size);
+        }
+    }
+    n
+}
+
+#[cfg(windows)]
+fn native() -> Native {
+    /// `MEMORYSTATUSEX`.
+    #[repr(C)]
+    struct MemoryStatus {
+        length: u32,
+        load: u32,
+        total_physical: u64,
+        available_physical: u64,
+        total_page_file: u64,
+        available_page_file: u64,
+        total_virtual: u64,
+        available_virtual: u64,
+        available_extended_virtual: u64,
+    }
+    /// `PROCESS_MEMORY_COUNTERS`.
+    #[repr(C)]
+    struct ProcessMemory {
+        size: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatus) -> i32;
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(process: *mut std::ffi::c_void, counters: *mut ProcessMemory, size: u32) -> i32;
+    }
+    let mut n = Native::default();
+    // SAFETY: each call fills a structure of the size it is told, and nothing else.
+    unsafe {
+        let mut status: MemoryStatus = std::mem::zeroed();
+        status.length = size_of::<MemoryStatus>() as u32;
+        if GlobalMemoryStatusEx(&mut status) != 0 && status.total_physical > 0 {
+            n.total = Some(status.total_physical);
+            n.available = Some(status.available_physical);
+        }
+        let mut process: ProcessMemory = std::mem::zeroed();
+        process.size = size_of::<ProcessMemory>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut process, process.size) != 0 {
+            n.process = Some(process.working_set_size as u64);
+        }
+    }
+    n
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn native() -> Native {
+    Native::default()
 }
 
 /// The container's memory controller.
@@ -144,24 +250,64 @@ fn cgroup_of(proc_cgroup: &str, file: impl Fn(&str) -> Option<String>) -> Cgroup
     best.unwrap_or_default()
 }
 
+/// The memory said by hand once the server runs (see [`declare`]): a number
+/// of bytes, `DETECT` for the memory the system reports, or `FOLLOW_ENV`
+/// while nobody said (`NUAGE_MEMORY_MB` then counts).
+static DECLARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(FOLLOW_ENV);
+const FOLLOW_ENV: u64 = u64::MAX;
+const DETECT: u64 = 0;
+
+/// Says the memory to count on from now on: `Some(bytes)`, or `None` for the
+/// one the system reports (the container's limit, else the machine's). It
+/// takes the place of `NUAGE_MEMORY_MB`: a server calls it when its owner
+/// changes the setting, so the figures and the budgets follow at once.
+pub fn declare(bytes: Option<u64>) {
+    DECLARED.store(bytes.map_or(DETECT, |b| b.clamp(1, FOLLOW_ENV - 1)), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Forgets what [`declare`] said: `NUAGE_MEMORY_MB` counts again.
+pub fn follow_environment() {
+    DECLARED.store(FOLLOW_ENV, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The memory said by hand, if any: what [`declare`] said last, else
+/// `NUAGE_MEMORY_MB`.
+pub fn declared() -> Option<u64> {
+    match DECLARED.load(std::sync::atomic::Ordering::Relaxed) {
+        FOLLOW_ENV => std::env::var("NUAGE_MEMORY_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|m| m << 20),
+        DETECT => None,
+        bytes => Some(bytes),
+    }
+}
+
+/// The memory the system reports, whatever was said by hand: what the
+/// console shows next to the setting ("detected: 0.5 GiB").
+pub fn detected() -> MemoryInfo {
+    figures(&Raw { declared: None, ..read() })
+}
+
 fn read() -> Raw {
     let text = |path: &str| std::fs::read_to_string(path).ok();
     Raw {
         meminfo: text("/proc/meminfo").unwrap_or_default(),
         status: text("/proc/self/status").unwrap_or_default(),
-        declared: std::env::var("NUAGE_MEMORY_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|m| m << 20),
+        declared: declared(),
         cgroup: cgroup_of(&text("/proc/self/cgroup").unwrap_or_default(), text),
+        native: native(),
     }
 }
 
 fn figures(raw: &Raw) -> MemoryInfo {
-    let machine_total = meminfo_field(&raw.meminfo, "MemTotal");
-    let machine_available = meminfo_field(&raw.meminfo, "MemAvailable");
-    let process = meminfo_field(&raw.status, "VmRSS");
+    let machine_total = meminfo_field(&raw.meminfo, "MemTotal").or(raw.native.total);
+    let machine_available = meminfo_field(&raw.meminfo, "MemAvailable").or(raw.native.available);
+    let process = meminfo_field(&raw.status, "VmRSS").or(raw.native.process);
     let machine_swap = (meminfo_field(&raw.meminfo, "SwapTotal"), meminfo_field(&raw.meminfo, "SwapFree"));
     // A limit counts when it is under what the machine has.
     let under = |limit: Option<u64>| limit.filter(|l| machine_total.is_none_or(|t| *l < t));
-    let (limit, by_hand) = match under(raw.declared) {
+    // Saying the memory by hand is for lowering it: a figure above the
+    // container's limit would get the server killed for believing it.
+    let declared = raw.declared.filter(|d| raw.cgroup.limit.is_none_or(|l| *d < l));
+    let (limit, by_hand) = match under(declared) {
         Some(l) => (Some(l), true),
         None => (under(raw.cgroup.limit), false),
     };
@@ -240,17 +386,18 @@ pub fn kv_bytes(setting: Option<&str>) -> Result<usize, String> {
     }
 }
 
-/// What the key-value stores of all the applications may hold together, when
-/// `NUAGE_KV_MB` is `auto`: an eighth of the memory (and one store's part at
-/// least). Each store then has the smaller of its own limit and its equal part
-/// of this. `None` when the limit of each was set by hand: it is kept as said.
+/// What the key-value stores of all the applications may hold together.
+/// With `NUAGE_KV_MB` on `auto`: an eighth of the memory (and one store's part
+/// at least). With an amount for each: a quarter of the memory (and one
+/// store's amount at least), so that many applications do not multiply it
+/// past what the server has. Each store then has the smaller of its own limit
+/// and its equal part of this. `None` when the memory is unknown and the
+/// amount of each was set by hand: it is kept as said.
 pub fn kv_budget(setting: Option<&str>) -> Option<usize> {
+    let total = MemoryInfo::now().total_bytes;
     match setting.map(str::trim) {
-        None | Some("") | Some("auto") => {
-            let total = MemoryInfo::now().total_bytes;
-            Some(total.map_or(64 << 20, |t| (t / 8) as usize).max(auto_kv(total)))
-        }
-        Some(_) => None,
+        None | Some("") | Some("auto") => Some(total.map_or(64 << 20, |t| (t / 8) as usize).max(auto_kv(total))),
+        Some(each) => total.map(|t| ((t / 4) as usize).max(each.parse::<usize>().map_or(0, |mib| mib << 20))),
     }
 }
 
@@ -434,6 +581,25 @@ mod tests {
         move |path: &str| list.iter().find(|(k, _)| k == path).map(|(_, v)| v.clone())
     }
 
+    /// macOS and Windows: the machine's figures come from the system itself.
+    #[test]
+    fn a_computer_without_proc() {
+        let native = Native { total: Some(16 << 30), available: Some(6 << 30), process: Some(200 << 20) };
+        let m = figures(&Raw { native, ..Raw::default() });
+        assert_eq!((m.total_bytes, m.used_bytes, m.available_bytes), (Some(16 << 30), Some(10 << 30), Some(6 << 30)));
+        assert_eq!((m.process_bytes, m.limited, m.swap_total_bytes), (Some(200 << 20), false, None));
+        assert_eq!(m.pressure(), Some(0.625));
+        // Said by hand (4 GiB for Nuage DB on that computer): counted from this process.
+        let m = figures(&Raw { native, declared: Some(4 << 30), ..Raw::default() });
+        assert_eq!((m.total_bytes, m.used_bytes, m.limited), (Some(4 << 30), Some(200 << 20), true));
+        // The figures of the machine this test runs on.
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            let now = MemoryInfo::now();
+            assert!(now.total_bytes.is_some_and(|t| t > 64 << 20), "{now:?}");
+            assert!(now.process_bytes.is_some_and(|p| p > 0) && now.pressure().is_some(), "{now:?}");
+        }
+    }
+
     #[test]
     fn budgets() {
         assert_eq!(auto_cache(Some(512 << 20)), 128 << 20, "a 512 MiB dyno: a quarter");
@@ -506,7 +672,8 @@ mod tests {
         // What a dyno shows: the limit, no usage, the host's meminfo and swap.
         let cgroup = cgroup_of("0::/\n", files(&[("/sys/fs/cgroup/memory/memory.limit_in_bytes", "536870912\n")]));
         assert_eq!(cgroup, Cgroup { limit: Some(512 << 20), ..Cgroup::default() });
-        let m = figures(&Raw { meminfo: MACHINE.into(), status: STATUS.into(), declared: None, cgroup });
+        let m =
+            figures(&Raw { meminfo: MACHINE.into(), status: STATUS.into(), declared: None, cgroup, ..Raw::default() });
         assert_eq!(m.total_bytes, Some(512 << 20));
         assert_eq!(m.process_bytes, Some(126_000 * 1024));
         assert_eq!(m.used_bytes, m.process_bytes, "the dyno holds this process");
@@ -528,7 +695,13 @@ mod tests {
                 ("/sys/fs/cgroup/memory.swap.current", "1048576\n"),
             ]),
         );
-        let m = figures(&Raw { meminfo: MACHINE.into(), status: STATUS.into(), declared: None, cgroup: v2 });
+        let m = figures(&Raw {
+            meminfo: MACHINE.into(),
+            status: STATUS.into(),
+            declared: None,
+            cgroup: v2,
+            ..Raw::default()
+        });
         assert_eq!((m.total_bytes, m.used_bytes), (Some(1 << 30), Some(200_000_000)));
         assert_eq!(m.available_bytes, Some((1 << 30) - 200_000_000));
         assert_eq!((m.swap_total_bytes, m.swap_free_bytes), (Some(512 << 20), Some((512 << 20) - (1 << 20))));
@@ -552,14 +725,44 @@ mod tests {
             "0::/system.slice/nuage.service\n",
             files(&[("/sys/fs/cgroup/system.slice/nuage.service/memory.max", "max\n")]),
         );
-        let m = figures(&Raw { meminfo: MACHINE.into(), status: STATUS.into(), declared: None, cgroup: none });
+        let m = figures(&Raw {
+            meminfo: MACHINE.into(),
+            status: STATUS.into(),
+            declared: None,
+            cgroup: none,
+            ..Raw::default()
+        });
         assert!(!m.limited);
         assert_eq!(m.total_bytes, Some(64_776_276 * 1024));
         assert_eq!(m.available_bytes, Some(41_251_408 * 1024));
         assert_eq!(m.swap_total_bytes, Some(127_926_268 * 1024));
 
         // Said by hand: it wins, counted from this process.
-        let m = figures(&Raw { meminfo: MACHINE.into(), status: STATUS.into(), declared: Some(256 << 20), cgroup: v2 });
+        // Said by hand above the container's limit: the limit stands.
+        let above = figures(&Raw {
+            meminfo: MACHINE.into(),
+            status: STATUS.into(),
+            declared: Some(8 << 30),
+            cgroup: v2,
+            ..Raw::default()
+        });
+        assert_eq!(
+            above,
+            figures(&Raw {
+                meminfo: MACHINE.into(),
+                status: STATUS.into(),
+                declared: None,
+                cgroup: v2,
+                ..Raw::default()
+            })
+        );
+        let m = figures(&Raw {
+            meminfo: MACHINE.into(),
+            status: STATUS.into(),
+            declared: Some(256 << 20),
+            cgroup: v2,
+            ..Raw::default()
+        });
         assert_eq!((m.total_bytes, m.used_bytes, m.limited), (Some(256 << 20), Some(126_000 * 1024), true));
         assert_eq!(m.swap_total_bytes, None);
 

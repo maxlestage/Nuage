@@ -4,6 +4,49 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Settings: yours to choose, and to change later
+
+- **A Settings page in the console** (`/admin/settings`, in English, French and Spanish):
+  whoever runs the server chooses how it works and changes it later, on their own computer
+  or online. What is saved there is in force at once, with no restart, and kept with the
+  data (encrypted, backed up and restored with it). It wins over the environment (the
+  settings file, the host's variables), which wins over the default; each setting says where
+  its value comes from, and one click gives it back to the environment.
+- **The same from a terminal and over HTTP**: `nuage settings`, `nuage settings set
+  memory.cache_mb 2G`, `nuage settings unset memory.cache_mb`; `GET` and `POST /api/settings`,
+  `DELETE /api/settings/{key}`, with the management token. A change of several settings is
+  all or nothing.
+- **The settings**: `memory.total_mb` (the memory to count on), `memory.cache_mb` (the page
+  caches of all the applications), `memory.kv_mb` (each key-value store),
+  `postgres.connections`, `status.public`. Amounts are written `auto`, `512 MiB`, `2 GiB`
+  (`2G`, `2 Go`, `1,5 Gio`); a number alone is in MiB.
+- **Memory by database.** An application shares the server's memory with the others, by use,
+  or has an amount of its own, set apart: for its page cache and for its key-value store. In
+  its Settings tab, in the table *Memory by application* of the Settings page, with `nuage
+  apps memory <name> <cache> [key-value]`, or `POST /api/apps/{name}/memory`. `/api/apps`
+  gives each application's `memory`.
+- **Checked before it is saved**, with the figures when it is refused: what is set by hand
+  (a cache budget, amounts set apart, key-value amounts) stays within three quarters of the
+  memory, the key-value stores within a quarter; a memory said by hand may only lower the one
+  the system reports, and not under what the server already uses. When memory runs short the
+  guard keeps the last word: what is set apart shrinks with the rest, and comes back.
+- **`NUAGE_SETTINGS=environment`**: the environment is the only source. What was saved is
+  ignored, shown on the page, and can be removed there. At startup the log names each saved
+  value that wins over a different value of the environment.
+- What is read once, when the server starts (ports, addresses, data directory, key, password,
+  tokens, certificates, backup destination), stays in the environment: the page lists it (a
+  secret shows as set, never its value) and says how to change it on this host.
+- **The memory of a Mac or of a Windows computer is read from the system** (it was known on
+  Linux only: elsewhere `auto` was a fixed 64 MiB and there was no guard): a server at home
+  uses the memory of its machine and steps back when the other programs need it.
+  `NUAGE_MEMORY_MB` written in the installers' settings file is honoured (it was read from
+  the process environment only).
+- `NUAGE_KV_MB=<number>`: the stores together keep to a quarter of the memory, however many
+  applications there are (it was that number for each, without end).
+- The installers say where the settings change later, and their settings file calls its
+  memory and visibility lines starting values. `ServerOptions::settings_env`,
+  `settings_read_only`, `startup`; `memory::declare`, `detected`.
+
 ### Memory you can count on, and a steadier server
 
 - **The right figures.** The memory shown is the one this server may use: its container's
@@ -32,6 +75,9 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   budget halved (16 MiB at least) and the freed memory returned to the system, while requests
   go on; for five minutes the budget does not grow again, and for an hour it stays under
   three quarters of the one that did not fit. Said in the event log and in the server's log.
+  It first returns what the allocator keeps of freed memory, which is often all there was;
+  and when the caches hold less than a tenth of the memory, they are not what fills it
+  (statements or answers in progress are): they keep their pages and only take no more.
 - **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
   memory held under load, for a few percent of throughput.
 - **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them

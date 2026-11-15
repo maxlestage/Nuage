@@ -56,6 +56,12 @@ impl Lang {
     }
 }
 
+/// `en` has its French and its Spanish.
+#[cfg(test)]
+pub(crate) fn translated(en: &str) -> bool {
+    table().contains_key(en)
+}
+
 /// `en` in the language `l`.
 pub(crate) fn t(l: Lang, en: &'static str) -> &'static str {
     if l == Lang::En {
@@ -492,6 +498,300 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Swap", "Swap", "Swap"),
     ("none", "aucun", "ninguno"),
     ("{} free of {}", "{} libres sur {}", "{} libres de {}"),
+    // The Settings page.
+    (
+        "What you save here applies at once and is kept with the data. It wins over the environment (the settings file, the host's variables); each line says where its value comes from, and one button gives it back.",
+        "Ce que vous enregistrez ici s'applique tout de suite et se conserve avec les données. Cela l'emporte sur l'environnement (le fichier de réglages, les variables de l'hébergeur) ; chaque ligne dit d'où vient sa valeur, et un bouton la rend.",
+        "Lo que guardas aquí se aplica al momento y se conserva con los datos. Tiene prioridad sobre el entorno (el archivo de ajustes, las variables del alojamiento); cada línea dice de dónde viene su valor, y un botón lo devuelve.",
+    ),
+    (
+        "The settings of this server are those of its environment (<code>NUAGE_SETTINGS=environment</code>): they are shown here, and change there.",
+        "Les réglages de ce serveur sont ceux de son environnement (<code>NUAGE_SETTINGS=environment</code>) : ils s'affichent ici et se changent là-bas.",
+        "Los ajustes de este servidor son los de su entorno (<code>NUAGE_SETTINGS=environment</code>): se muestran aquí y se cambian allí.",
+    ),
+    (
+        "Saved here: it wins over the environment (<code>{}={}</code>).",
+        "Enregistré ici : il l'emporte sur l'environnement (<code>{}={}</code>).",
+        "Guardado aquí: tiene prioridad sobre el entorno (<code>{}={}</code>).",
+    ),
+    (
+        "Saved here (<code>{}</code> is not set in the environment).",
+        "Enregistré ici (<code>{}</code> n'est pas réglé dans l'environnement).",
+        "Guardado aquí (<code>{}</code> no está definido en el entorno).",
+    ),
+    (
+        "From the environment (<code>{}={}</code>).",
+        "Vient de l'environnement (<code>{}={}</code>).",
+        "Viene del entorno (<code>{}={}</code>).",
+    ),
+    (
+        "Default (<code>{}</code> is not set).",
+        "Valeur par défaut (<code>{}</code> n'est pas réglé).",
+        "Valor por defecto (<code>{}</code> no está definido).",
+    ),
+    ("Back to the environment's value", "Revenir à la valeur de l'environnement", "Volver al valor del entorno"),
+    ("Back to the default", "Revenir à la valeur par défaut", "Volver al valor por defecto"),
+    (
+        "This server may use {}: {} used, {} free.",
+        "Ce serveur peut utiliser {} : {} utilisés, {} libres.",
+        "Este servidor puede usar {}: {} usados, {} libres.",
+    ),
+    (
+        "This system does not tell Nuage DB its memory: say how much it may count on.",
+        "Ce système ne dit pas sa mémoire à Nuage DB : indiquez sur combien il peut compter.",
+        "Este sistema no le dice su memoria a Nuage DB: indica con cuánta puede contar.",
+    ),
+    (
+        "Memory Nuage DB may count on",
+        "Mémoire sur laquelle Nuage DB peut compter",
+        "Memoria con la que Nuage DB puede contar",
+    ),
+    (
+        "<code>auto</code>: what the system reports ({}).",
+        "<code>auto</code> : ce que le système annonce ({}).",
+        "<code>auto</code>: lo que indica el sistema ({}).",
+    ),
+    (
+        "Page caches, all the applications together",
+        "Caches de pages, toutes les applications ensemble",
+        "Cachés de páginas, todas las aplicaciones juntas",
+    ),
+    (
+        "<code>auto</code> follows the memory: a quarter of it at first, up to six tenths while there is room, less when it gets tight. An amount is a maximum. Now: {} (up to {}).",
+        "<code>auto</code> suit la mémoire : un quart au départ, jusqu'à six dixièmes tant qu'il y a de la place, moins quand elle se resserre. Une quantité est un maximum. En ce moment : {} (jusqu'à {}).",
+        "<code>auto</code> sigue la memoria: un cuarto al principio, hasta seis décimos mientras haya sitio, menos cuando escasea. Una cantidad es un máximo. Ahora: {} (hasta {}).",
+    ),
+    (
+        "Key-value store of each application",
+        "Stockage clé-valeur de chaque application",
+        "Almacén clave-valor de cada aplicación",
+    ),
+    (
+        "<code>auto</code>: a sixteenth of the memory each, an eighth for all of them together. Lowering it drops the least recently used keys at once. Now: {} each.",
+        "<code>auto</code> : un seizième de la mémoire chacun, un huitième pour tous ensemble. Le baisser retire tout de suite les clés les moins récemment utilisées. En ce moment : {} chacun.",
+        "<code>auto</code>: un dieciseisavo de la memoria cada uno, un octavo para todos juntos. Bajarlo quita al momento las claves usadas hace más tiempo. Ahora: {} cada uno.",
+    ),
+    ("Save the memory", "Enregistrer la mémoire", "Guardar la memoria"),
+    ("Memory by application", "Mémoire par application", "Memoria por aplicación"),
+    (
+        "Each application shares the page caches of the server by use (<code>auto</code>), or has an amount set apart for it alone.",
+        "Chaque application partage les caches de pages du serveur selon l'usage (<code>auto</code>), ou dispose d'une part réservée pour elle seule.",
+        "Cada aplicación comparte los cachés de páginas del servidor según el uso (<code>auto</code>), o tiene una parte reservada solo para ella.",
+    ),
+    ("Its cache holds", "Son cache contient", "Su caché contiene"),
+    ("may hold", "peut contenir", "puede contener"),
+    ("Page cache", "Cache de pages", "Caché de páginas"),
+    ("Key-value store", "Stockage clé-valeur", "Almacén clave-valor"),
+    (
+        "Amounts are written <code>auto</code>, <code>512 MiB</code> or <code>2 GiB</code> (a number alone is in MiB).",
+        "Les quantités s'écrivent <code>auto</code>, <code>512 Mio</code> ou <code>2 Gio</code> (<code>2 Go</code> convient aussi ; un nombre seul est en Mio).",
+        "Las cantidades se escriben <code>auto</code>, <code>512 MiB</code> o <code>2 GiB</code> (un número solo va en MiB).",
+    ),
+    (
+        "Set apart: {} of the {} the caches may take; the others share the rest by use. When memory runs short, what is set apart shrinks with the rest, and comes back.",
+        "Réservé : {} sur les {} que les caches peuvent prendre ; les autres se partagent le reste selon l'usage. Quand la mémoire manque, ce qui est réservé diminue avec le reste, puis revient.",
+        "Reservado: {} de los {} que los cachés pueden ocupar; las demás comparten el resto según el uso. Cuando falta memoria, lo reservado se reduce con el resto, y luego vuelve.",
+    ),
+    (
+        "Memory is short: what is set apart is cut to {} of {} for now.",
+        "La mémoire manque : ce qui est réservé est réduit à {} sur {} pour le moment.",
+        "Falta memoria: lo reservado se reduce a {} de {} por ahora.",
+    ),
+    ("Limits", "Limites", "Límites"),
+    ("Memory of one statement", "Mémoire d'une instruction", "Memoria de una sentencia"),
+    (
+        "What one SQL statement may hold at once (the rows it sorts, joins or returns); past it, the statement fails with a clear error instead of filling the memory. <code>auto</code>: an eighth of the memory.",
+        "Ce qu'une instruction SQL peut garder en mémoire à la fois (les lignes qu'elle trie, joint ou renvoie) ; au-delà, elle échoue avec une erreur claire au lieu de remplir la mémoire. <code>auto</code> : un huitième de la mémoire.",
+        "Lo que una sentencia SQL puede retener a la vez (las filas que ordena, une o devuelve); más allá, falla con un error claro en lugar de llenar la memoria. <code>auto</code>: un octavo de la memoria.",
+    ),
+    ("Seconds a statement may run", "Secondes qu'une instruction peut durer", "Segundos que puede durar una sentencia"),
+    (
+        "Past it, the statement stops with an error and its changes are undone. <code>0</code>: no limit.",
+        "Au-delà, l'instruction s'arrête avec une erreur et ses changements sont annulés. <code>0</code> : pas de limite.",
+        "Más allá, la sentencia se detiene con un error y sus cambios se deshacen. <code>0</code>: sin límite.",
+    ),
+    ("PostgreSQL connections at once", "Connexions PostgreSQL simultanées", "Conexiones PostgreSQL simultáneas"),
+    (
+        "Each has a thread; the next ones are refused as PostgreSQL does.",
+        "Chacune a un thread ; les suivantes sont refusées, comme le fait PostgreSQL.",
+        "Cada una tiene un hilo; las siguientes se rechazan, como hace PostgreSQL.",
+    ),
+    ("Save the limits", "Enregistrer les limites", "Guardar los límites"),
+    ("Visibility", "Visibilité", "Visibilidad"),
+    (
+        "Public status: <code>/api/status</code> and the dashboard show a public subset without signing in",
+        "État public : <code>/api/status</code> et le tableau de bord montrent une partie publique sans connexion",
+        "Estado público: <code>/api/status</code> y el panel muestran una parte pública sin iniciar sesión",
+    ),
+    ("Save the visibility", "Enregistrer la visibilité", "Guardar la visibilidad"),
+    ("Set when the server starts", "Réglés au démarrage du serveur", "Definidos al arrancar el servidor"),
+    (
+        "The server reads these before it opens its data, or they are what it listens on and what opens it: a wrong value saved from here could lock you out. They change in the environment, then the server restarts.",
+        "Le serveur les lit avant d'ouvrir ses données, ou bien ce sont ses ports et ce qui lui donne accès : une mauvaise valeur enregistrée d'ici pourrait vous en fermer la porte. Ils se changent dans l'environnement, puis le serveur redémarre.",
+        "El servidor los lee antes de abrir sus datos, o son sus puertos y lo que da acceso a él: un valor erróneo guardado desde aquí podría dejarte fuera. Se cambian en el entorno, y luego el servidor se reinicia.",
+    ),
+    (
+        "On this computer: edit <code>{}</code>, then restart the service.",
+        "Sur cet ordinateur : modifiez <code>{}</code>, puis redémarrez le service.",
+        "En este equipo: edita <code>{}</code> y reinicia el servicio.",
+    ),
+    (
+        "On Heroku: <code>heroku config:set NAME=value</code> (the server restarts).",
+        "Sur Heroku : <code>heroku config:set NOM=valeur</code> (le serveur redémarre).",
+        "En Heroku: <code>heroku config:set NOMBRE=valor</code> (el servidor se reinicia).",
+    ),
+    (
+        "Change the variables of the environment (Docker: <code>.env</code>), then restart the server.",
+        "Changez les variables de l'environnement (Docker : <code>.env</code>), puis redémarrez le serveur.",
+        "Cambia las variables del entorno (Docker: <code>.env</code>) y reinicia el servidor.",
+    ),
+    ("Variable", "Variable", "Variable"),
+    ("Value", "Valeur", "Valor"),
+    ("set (a secret: not shown)", "réglé (un secret : non affiché)", "definido (un secreto: no se muestra)"),
+    ("Nothing changed.", "Rien n'a changé.", "Nada ha cambiado."),
+    (
+        "{} is given back: the value in force is shown below.",
+        "{} est rendu : la valeur en vigueur s'affiche ci-dessous.",
+        "{} se ha devuelto: el valor en vigor se muestra abajo.",
+    ),
+    (
+        "Settings saved: in force now.",
+        "Réglages enregistrés : en vigueur dès maintenant.",
+        "Ajustes guardados: en vigor desde ahora.",
+    ),
+    (
+        "This application shares the server's memory with the others (<code>auto</code>), or has an amount of its own (<code>64 MiB</code>, <code>2 GiB</code>). Its cache holds {} of {} now.",
+        "Cette application partage la mémoire du serveur avec les autres (<code>auto</code>), ou dispose de sa propre part (<code>64 Mio</code>, <code>2 Gio</code>). Son cache contient {} sur {} en ce moment.",
+        "Esta aplicación comparte la memoria del servidor con las demás (<code>auto</code>), o tiene una parte propia (<code>64 MiB</code>, <code>2 GiB</code>). Su caché contiene {} de {} ahora.",
+    ),
+    ("All the memory settings", "Tous les réglages de mémoire", "Todos los ajustes de memoria"),
+    (
+        "Memory of {} saved: in force now.",
+        "Mémoire de {} enregistrée : en vigueur dès maintenant.",
+        "Memoria de {} guardada: en vigor desde ahora.",
+    ),
+    // Why a setting is refused.
+    (
+        "`{}`: {} MiB is more than any server has: a number alone is in MiB",
+        "`{}` : {} Mio, c'est plus que n'importe quel serveur : un nombre seul est en Mio",
+        "`{}`: {} MiB es más de lo que tiene cualquier servidor: un número solo va en MiB",
+    ),
+    (
+        "`{}`: {} MiB is too little: {} MiB at least, or `auto`",
+        "`{}` : {} Mio, c'est trop peu : {} Mio au moins, ou `auto`",
+        "`{}`: {} MiB es demasiado poco: {} MiB como mínimo, o `auto`",
+    ),
+    (
+        "`{}`: `{}` is not an amount of memory: write `auto`, `512 MiB` or `2 GiB` (a number alone is in MiB)",
+        "`{}` : `{}` n'est pas une quantité de mémoire : écrivez `auto`, `512 Mio` ou `2 Gio` (un nombre seul est en Mio)",
+        "`{}`: `{}` no es una cantidad de memoria: escribe `auto`, `512 MiB` o `2 GiB` (un número solo va en MiB)",
+    ),
+    ("`{}`: {} is not between {} and {}", "`{}` : {} n'est pas entre {} et {}", "`{}`: {} no está entre {} y {}"),
+    ("`{}`: `{}` is not a whole number", "`{}` : `{}` n'est pas un nombre entier", "`{}`: `{}` no es un número entero"),
+    (
+        "`{}`: `{}` is not `true` or `false`",
+        "`{}` : `{}` n'est ni `true` ni `false`",
+        "`{}`: `{}` no es `true` ni `false`",
+    ),
+    (
+        "there is no setting `{}`: the settings are {}",
+        "il n'y a pas de réglage `{}` : les réglages sont {}",
+        "no hay ningún ajuste `{}`: los ajustes son {}",
+    ),
+    (
+        "the settings of this server are those of its environment (NUAGE_SETTINGS=environment): change them there",
+        "les réglages de ce serveur sont ceux de son environnement (NUAGE_SETTINGS=environment) : changez-les là-bas",
+        "los ajustes de este servidor son los de su entorno (NUAGE_SETTINGS=environment): cámbialos allí",
+    ),
+    (
+        "`memory.total_mb`: {} MiB is more than this server has ({} MiB): it would be killed for using it",
+        "`memory.total_mb` : {} Mio, c'est plus que ce serveur n'en a ({} Mio) : il serait tué en les utilisant",
+        "`memory.total_mb`: {} MiB es más de lo que tiene este servidor ({} MiB): lo matarían por usarla",
+    ),
+    (
+        "`memory.cache_mb`: {} MiB is less than what is set apart for single databases ({} MiB, and {} MiB for the others to share): {} MiB at least, or lower their amounts first",
+        "`memory.cache_mb` : {} Mio, c'est moins que ce qui est réservé à des bases ({} Mio, plus {} Mio que les autres se partagent) : {} Mio au moins, ou baissez d'abord leurs parts",
+        "`memory.cache_mb`: {} MiB es menos de lo reservado para bases concretas ({} MiB, más {} MiB que comparten las demás): {} MiB como mínimo, o baja antes sus partes",
+    ),
+    (
+        "a page cache needs {} MiB at least",
+        "un cache de pages a besoin d'au moins {} Mio",
+        "un caché de páginas necesita al menos {} MiB",
+    ),
+    (
+        "{} MiB for `{}` is more than is left: the page caches of this server may take {} MiB in all, {} MiB of it are set apart for other databases and {} MiB stay for those that share: {} MiB at most",
+        "{} Mio pour `{}`, c'est plus que ce qui reste : les caches de pages de ce serveur peuvent prendre {} Mio en tout, dont {} Mio réservés à d'autres bases et {} Mio pour celles qui partagent : {} Mio au plus",
+        "{} MiB para `{}` es más de lo que queda: los cachés de páginas de este servidor pueden ocupar {} MiB en total, de los cuales {} MiB están reservados para otras bases y {} MiB quedan para las que comparten: {} MiB como máximo",
+    ),
+    (
+        "a key-value store needs {} MiB at least",
+        "un stockage clé-valeur a besoin d'au moins {} Mio",
+        "un almacén clave-valor necesita al menos {} MiB",
+    ),
+    (
+        "`memory.total_mb`: this server already uses {} MiB without its caches: {} MiB at least",
+        "`memory.total_mb` : ce serveur utilise déjà {} Mio sans ses caches : {} Mio au moins",
+        "`memory.total_mb`: este servidor ya usa {} MiB sin sus cachés: {} MiB como mínimo",
+    ),
+    (
+        "{}: the key-value stores would take {} MiB in all: more than a quarter of the {} MiB this server counts on ({} MiB at most)",
+        "{} : les stockages clé-valeur prendraient {} Mio en tout : plus qu'un quart des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
+        "{}: los almacenes clave-valor ocuparían {} MiB en total: más de un cuarto de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
+    ),
+    (
+        "{}: {} MiB would be set by hand ({} MiB for the page caches, {} MiB for the key-value stores): more than three quarters of the {} MiB this server counts on ({} MiB at most)",
+        "{} : {} Mio seraient fixés à la main ({} Mio pour les caches de pages, {} Mio pour les stockages clé-valeur) : plus que trois quarts des {} Mio sur lesquels ce serveur compte ({} Mio au plus)",
+        "{}: se fijarían a mano {} MiB ({} MiB para los cachés de páginas, {} MiB para los almacenes clave-valor): más de tres cuartos de los {} MiB con los que cuenta este servidor ({} MiB como máximo)",
+    ),
+    ("Saved, and ignored", "Enregistrés, et ignorés", "Guardados, e ignorados"),
+    ("Remove", "Retirer", "Quitar"),
+    // The second copy of the backups.
+    (
+        "the second copy is a folder (`dir`) or S3-compatible storage (`s3`)",
+        "la copie de secours est un dossier (`dir`) ou un stockage compatible S3 (`s3`)",
+        "la segunda copia es una carpeta (`dir`) o un almacenamiento compatible con S3 (`s3`)",
+    ),
+    (
+        "`{}` is not the full path of a folder: write it from the root (`/mnt/backup/nuage`, `E:\\Backup\\nuage`)",
+        "`{}` n'est pas le chemin complet d'un dossier : écrivez-le depuis la racine (`/mnt/backup/nuage`, `E:\\Backup\\nuage`)",
+        "`{}` no es la ruta completa de una carpeta: escríbela desde la raíz (`/mnt/backup/nuage`, `E:\\Backup\\nuage`)",
+    ),
+    (
+        "the folder that would hold `{}` does not exist: a disk that is not plugged in, or a mistyped path (only the last folder is made for you)",
+        "le dossier qui contiendrait `{}` n'existe pas : un disque non branché, ou un chemin mal tapé (seul le dernier dossier est créé pour vous)",
+        "la carpeta que contendría `{}` no existe: un disco sin conectar, o una ruta mal escrita (solo se crea la última carpeta)",
+    ),
+    (
+        "`{}` is inside the data directory: a copy on the disk of the data is lost with it, choose another disk",
+        "`{}` est dans le dossier des données : une copie sur le disque des données se perd avec lui, choisissez un autre disque",
+        "`{}` está dentro del directorio de datos: una copia en el disco de los datos se pierde con él, elige otro disco",
+    ),
+    (
+        "S3-compatible storage needs `{}`",
+        "un stockage compatible S3 a besoin de `{}`",
+        "un almacenamiento compatible con S3 necesita `{}`",
+    ),
+    (
+        "`{}` is where the backups already go: a second copy is somewhere else",
+        "`{}` est déjà la destination des sauvegardes : une copie de secours va ailleurs",
+        "`{}` ya es el destino de las copias: una segunda copia va a otro sitio",
+    ),
+    ("nothing could be written to {}: {}", "rien n'a pu être écrit dans {} : {}", "no se pudo escribir nada en {}: {}"),
+    (
+        "on this host the disk is erased at each restart, and the server could not find this place again by itself: name the destination of the backups in the environment (NUAGE_BACKUP_S3_*); a second copy can be added here once there is one",
+        "sur cet hébergement le disque est effacé à chaque redémarrage, et le serveur ne retrouverait pas cet endroit tout seul : indiquez la destination des sauvegardes dans l'environnement (NUAGE_BACKUP_S3_*) ; une copie de secours pourra s'ajouter ici ensuite",
+        "en este alojamiento el disco se borra en cada reinicio, y el servidor no volvería a encontrar este sitio por sí solo: indica el destino de las copias en el entorno (NUAGE_BACKUP_S3_*); después se podrá añadir aquí una segunda copia",
+    ),
+    (
+        "this build of Nuage DB has no `s3` feature: the second copy is a folder",
+        "cette version de Nuage DB n'a pas la fonction `s3` : la copie de secours est un dossier",
+        "esta compilación de Nuage DB no tiene la función `s3`: la segunda copia es una carpeta",
+    ),
+    (
+        "Not yet in the backup ({}): a restart of the server now would bring the earlier value back.",
+        "Pas encore dans la sauvegarde ({}) : un redémarrage du serveur maintenant ferait revenir l'ancienne valeur.",
+        "Aún no está en la copia ({}): un reinicio del servidor ahora devolvería el valor anterior.",
+    ),
 ];
 
 #[cfg(test)]

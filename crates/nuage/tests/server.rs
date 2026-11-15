@@ -1204,8 +1204,36 @@ async fn console_in_three_languages() {
     );
 
     for (code, words) in [
-        ("fr", ["Applications", "Nouvelle application", "Jetons", "Réglages", "Sites web"]),
-        ("es", ["Aplicaciones", "Nueva aplicación", "Tokens", "Ajustes", "Sitios web"]),
+        (
+            "fr",
+            [
+                "Applications",
+                "Nouvelle application",
+                "Jetons",
+                "Réglages",
+                "Sites web",
+                "Mémoire par application",
+                "trop peu : 16 Mio au moins",
+                "pas une quantité de mémoire",
+                "en vigueur dès maintenant",
+                "Réglés au démarrage du serveur",
+            ],
+        ),
+        (
+            "es",
+            [
+                "Aplicaciones",
+                "Nueva aplicación",
+                "Tokens",
+                "Ajustes",
+                "Sitios web",
+                "Memoria por aplicación",
+                "es demasiado poco",
+                "no es una cantidad de memoria",
+                "en vigor desde ahora",
+                "Definidos al arrancar el servidor",
+            ],
+        ),
     ] {
         let mut c = Console { addr, cookies: HashMap::new() };
         // `?lang=` sets the language, for every page after.
@@ -1222,6 +1250,7 @@ async fn console_in_three_languages() {
         let mut all = list.body.clone();
         for path in [
             "/admin/server",
+            "/admin/settings",
             "/admin/apps/shop",
             "/admin/apps/shop/tables",
             "/admin/apps/shop/tables/users",
@@ -1264,6 +1293,25 @@ async fn console_in_three_languages() {
             ("/admin/apps/shop/description", f(&[("description", "Boutique")])),
             ("/admin/apps/blog/delete", f(&[("confirm", "no")])),
             ("/admin/apps/blog/delete", f(&[("confirm", "blog")])),
+            // The settings: saved, refused in the console's language, given back.
+            (
+                "/admin/settings/memory",
+                f(&[("memory.total_mb", "auto"), ("memory.cache_mb", "64 Mio"), ("memory.kv_mb", "auto")]),
+            ),
+            ("/admin/settings/memory", f(&[("memory.cache_mb", "1")])),
+            ("/admin/settings/memory", f(&[("memory.cache_mb", "64 MiB")])),
+            (
+                "/admin/settings/limits",
+                f(&[("statement.memory_mb", "auto"), ("statement.seconds", "30"), ("postgres.connections", "50")]),
+            ),
+            ("/admin/settings/visibility", f(&[("status.public", "true")])),
+            ("/admin/settings/visibility", f(&[])),
+            ("/admin/settings/reset", f(&[("key", "memory.cache_mb")])),
+            ("/admin/settings/reset", f(&[("key", "nothing")])),
+            ("/admin/settings/nothing", f(&[])),
+            ("/admin/apps/shop/memory", f(&[("cache_mb", "8 Mio"), ("kv_mb", "auto"), ("back", "settings")])),
+            ("/admin/apps/shop/memory", f(&[("cache_mb", "beaucoup"), ("kv_mb", "")])),
+            ("/admin/apps/shop/memory", f(&[("cache_mb", "auto"), ("kv_mb", "auto")])),
         ] {
             let res = c.request("POST", path, &form).await;
             assert!(res.status < 500, "{code} POST {path}: {}", res.body);
@@ -1272,7 +1320,17 @@ async fn console_in_three_languages() {
         for w in words {
             assert!(all.contains(w), "{code}: {w}");
         }
-        for english in ["Log out", "New application", "Size on disk", "Save the websites", "Checkpoint now"] {
+        for english in [
+            "Log out",
+            "New application",
+            "Size on disk",
+            "Save the websites",
+            "Checkpoint now",
+            "Save the memory",
+            "Set when the server starts",
+            "Nothing changed.",
+            "is too little",
+        ] {
             assert!(!all.contains(english), "{code}: `{english}` left in English");
         }
         c.request("POST", "/admin/logout", &[("csrf", &token)]).await;
@@ -1761,5 +1819,174 @@ async fn applications_share_one_cache_budget() {
             memory["available_bytes"].as_u64().unwrap(),
         );
         assert!(used > 0 && free < total && used + free <= total + (64 << 20), "{memory}");
+    }
+}
+
+/// The settings an owner changes while the server runs (`/api/settings`,
+/// the memory of one application): in force at once, kept with the data,
+/// given back to the environment's value, and left alone when the
+/// environment is said to rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_change_while_the_server_runs() {
+    let admin = "a".repeat(40);
+    let dir = temp_dir("settings");
+    let open = || {
+        let options = || EngineOptions { sync: false, ..EngineOptions::default() };
+        // A server that just stopped lets go of its engine within moments
+        // (its upkeep thread, its last connections).
+        for _ in 0..200 {
+            match Engine::open(&dir, options()) {
+                Ok(engine) => return engine,
+                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        Engine::open(&dir, options()).unwrap()
+    };
+    // A server as the binary builds it: its environment says the cache budget.
+    let env = HashMap::from([("NUAGE_CACHE_MB".to_owned(), "48".to_owned())]);
+    let opts = || ServerOptions {
+        admin_token: Some(admin.clone()),
+        cache_budget: Some(48 << 20),
+        cache_ceiling: Some(48 << 20),
+        settings_env: Some(env.clone()),
+        ..options()
+    };
+    let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_else(|_| panic!("{}", r.body));
+    let setting = |list: &serde_json::Value, key: &str| {
+        list["settings"].as_array().unwrap().iter().find(|s| s["key"] == key).cloned().unwrap()
+    };
+    let bearer = format!("Bearer {admin}");
+    let auth: &[(&str, &str)] = &[("authorization", &bearer), ("content-type", "application/json")];
+    const MIB: usize = 1 << 20;
+    {
+        let server = Server::new(open(), opts());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        let addr = running.local_addr();
+        server.create_app("shop", "").unwrap();
+        server.create_app("blog", "").unwrap();
+        let capacity = |name: &str| server.app_engine(name).unwrap().cache_capacity();
+        let total = || ["nuage", "shop", "blog"].iter().map(|n| capacity(n)).sum::<usize>();
+        let budget = || server.status()["memory"]["cache_budget_bytes"].as_u64().unwrap() as usize;
+
+        // An application's token does not open the settings; the management token does.
+        let refused = http(addr, "GET", "/api/settings", &[("authorization", "Bearer t0ken")], "").await;
+        assert_eq!(refused.status, 401, "{}", refused.body);
+        let list = json(&http(addr, "GET", "/api/settings", auth, "").await);
+        let cache = setting(&list, "memory.cache_mb");
+        assert_eq!(
+            (&cache["value"], &cache["source"], &cache["variable"]),
+            (&"48".into(), &"environment".into(), &"NUAGE_CACHE_MB".into())
+        );
+        assert_eq!(setting(&list, "status.public")["source"], "default");
+        assert_eq!(list["read_only"], false);
+
+        // Saved: in force at once, without a restart.
+        assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 401, "the status is not public yet");
+        let saved =
+            http(addr, "POST", "/api/settings", auth, r#"{"memory.cache_mb": 32, "status.public": true}"#).await;
+        assert_eq!(saved.status, 200, "{}", saved.body);
+        let cache = setting(&json(&saved), "memory.cache_mb");
+        assert_eq!(
+            (&cache["value"], &cache["source"], &cache["environment"]),
+            (&"32".into(), &"saved".into(), &"48".into())
+        );
+        assert_eq!(budget(), 32 * MIB);
+        assert!(total() <= 32 * MIB && total() > 30 * MIB, "{}", total());
+        assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 200, "public at once");
+
+        // One value that does not fit: nothing is saved.
+        for (body, said) in [
+            (r#"{"memory.cache_mb": 40, "memory.kv_mb": 0}"#, "memory.kv_mb"),
+            (r#"{"memory.cache_mb": 40, "nothing": 1}"#, "there is no setting `nothing`"),
+            (r#"{"memory.cache_mb": "many"}"#, "not an amount of memory"),
+            (r#"{"memory.total_mb": 16000000}"#, "memory.total_mb"),
+            (r#"[1]"#, "JSON object"),
+        ] {
+            let r = http(addr, "POST", "/api/settings", auth, body).await;
+            assert_eq!(r.status, 400, "{body}: {}", r.body);
+            assert!(r.body.contains(said), "{body}: {}", r.body);
+            assert_eq!(budget(), 32 * MIB, "{body}");
+        }
+
+        // Memory by database: 12 MiB set apart for the shop, the others share the rest.
+        let apart = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"cache_mb": 12, "kv_mb": 2}"#).await;
+        assert_eq!(apart.status, 200, "{}", apart.body);
+        assert_eq!(json(&apart)["memory"], serde_json::json!({ "cache_mb": 12, "kv_mb": 2 }));
+        assert_eq!(capacity("shop"), 12 * MIB);
+        assert_eq!(capacity("nuage") + capacity("blog"), 20 * MIB, "the rest of the 32");
+        assert_eq!(budget(), 32 * MIB);
+        // What the body does not name stays as it is.
+        let kv = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"kv_mb": "auto"}"#).await;
+        assert_eq!(json(&kv)["memory"], serde_json::json!({ "cache_mb": 12, "kv_mb": "auto" }));
+        // More than is left once the others have their floor (32 - 16): refused, with the figures.
+        let much = http(addr, "POST", "/api/apps/blog/memory", auth, r#"{"cache_mb": 8}"#).await;
+        assert_eq!(much.status, 400, "{}", much.body);
+        assert!(much.body.contains("4 MiB at most"), "{}", much.body);
+        // The budget cannot be lowered under what is set apart.
+        let low = http(addr, "POST", "/api/settings", auth, r#"{"memory.cache_mb": 24}"#).await;
+        assert_eq!(low.status, 400, "{}", low.body);
+        assert!(low.body.contains("28 MiB at least"), "{}", low.body);
+        assert_eq!(http(addr, "POST", "/api/apps/nothing/memory", auth, "{}").await.status, 404);
+        running.shutdown().await;
+    }
+
+    // Started again: what was saved is still in force (it is kept with the data).
+    {
+        let server = Server::new(open(), opts());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        let addr = running.local_addr();
+        let capacity = |name: &str| server.app_engine(name).unwrap().cache_capacity();
+        let budget = || server.status()["memory"]["cache_budget_bytes"].as_u64().unwrap() as usize;
+        assert_eq!((budget(), capacity("shop")), (32 * MIB, 12 * MIB));
+        assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 200);
+        let apps = json(&http(addr, "GET", "/api/apps/shop", auth, "").await);
+        assert_eq!(apps["memory"]["cache_mb"], 12);
+        // Given back: the environment's value is in force again, at once.
+        let back = http(addr, "DELETE", "/api/settings/memory.cache_mb", auth, "").await;
+        assert_eq!(back.status, 200, "{}", back.body);
+        assert_eq!(setting(&json(&back), "memory.cache_mb")["source"], "environment");
+        assert_eq!(budget(), 48 * MIB);
+        assert_eq!(capacity("shop"), 12 * MIB, "what is set apart stays");
+        assert_eq!(capacity("nuage") + capacity("blog"), 36 * MIB);
+        // An application back on the shared budget.
+        let auto = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"cache_mb": null}"#).await;
+        assert_eq!(json(&auto)["memory"]["cache_mb"], "auto");
+        assert_eq!(capacity("shop"), 16 * MIB, "a third of the 48");
+        let again = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"cache_mb": "12 MiB"}"#).await;
+        assert_eq!(json(&again)["memory"]["cache_mb"], 12);
+        running.shutdown().await;
+    }
+
+    // `NUAGE_SETTINGS=environment`: what was saved is ignored, and nothing can be saved.
+    {
+        let server = Server::new(open(), ServerOptions { settings_read_only: true, ..opts() });
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        let addr = running.local_addr();
+        assert_eq!(http(addr, "GET", "/api/status", &[], "").await.status, 401, "the saved `status.public` is ignored");
+        let list = json(&http(addr, "GET", "/api/settings", auth, "").await);
+        assert_eq!((&list["read_only"], &setting(&list, "status.public")["source"]), (&true.into(), &"default".into()));
+        let r = http(addr, "POST", "/api/settings", auth, r#"{"status.public": true}"#).await;
+        assert_eq!(r.status, 403, "{}", r.body);
+        let r = http(addr, "POST", "/api/apps/shop/memory", auth, r#"{"cache_mb": 12}"#).await;
+        assert_eq!(r.status, 403, "{}", r.body);
+        // The amount of the shop is not in force either; it stays in its record.
+        assert_eq!(server.app_engine("shop").unwrap().cache_capacity(), 16 * MIB);
+        server.new_app_token("shop").unwrap();
+        // What was saved is shown, and can be removed from there.
+        assert_eq!(list["ignored"], serde_json::json!({ "status.public": "true" }));
+        let removed = http(addr, "DELETE", "/api/settings/status.public", auth, "").await;
+        assert_eq!(removed.status, 200, "{}", removed.body);
+        assert_eq!(json(&removed)["ignored"], serde_json::json!({}));
+        running.shutdown().await;
+    }
+
+    // The environment no longer rules alone: the shop's amount is in force again,
+    // and what was removed stays removed.
+    {
+        let server = Server::new(open(), opts());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        assert_eq!(server.app_engine("shop").unwrap().cache_capacity(), 12 * MIB);
+        assert_eq!(http(running.local_addr(), "GET", "/api/status", &[], "").await.status, 401);
+        running.shutdown().await;
     }
 }

@@ -27,6 +27,8 @@ mod kv;
 mod kv_port;
 mod manage;
 mod pg;
+mod second_copy;
+pub(crate) mod settings;
 mod status;
 
 pub use files::FileStore;
@@ -152,6 +154,37 @@ pub struct ServerOptions {
     /// PostgreSQL connections served at once (each has a thread); the next
     /// ones are refused as PostgreSQL does (`too_many_connections`).
     pub pg_max_connections: usize,
+    /// What the environment (or the settings file) says for the settings the
+    /// owner may change while the server runs, by variable (`NUAGE_CACHE_MB`
+    /// → `auto`): the console shows it next to what was saved, and a value
+    /// goes back to it. `None`: a server built by hand, whose options above
+    /// say everything.
+    pub settings_env: Option<HashMap<String, String>>,
+    /// The environment is the only source of the settings: what was saved
+    /// from the console is ignored and nothing can be saved
+    /// (`NUAGE_SETTINGS=environment`).
+    pub settings_read_only: bool,
+    /// The settings read once at startup, for the console to show: each
+    /// with its variable and its value (a secret: only whether it is set).
+    pub startup: Vec<StartupSetting>,
+    /// The settings file the server was started with, if any.
+    pub settings_file: Option<String>,
+}
+
+/// A setting read once, when the server starts (a port, the data directory,
+/// a password...): the console shows it and where it comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupSetting {
+    /// Its variable (`PORT`).
+    pub var: &'static str,
+    /// Its value, as it can be shown: `None` when nothing was said (the
+    /// default applies). A secret shows as [`StartupSetting::SECRET`].
+    pub value: Option<String>,
+}
+
+impl StartupSetting {
+    /// What stands for the value of a secret that is set.
+    pub const SECRET: &'static str = "***";
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -168,6 +201,7 @@ impl std::fmt::Debug for ServerOptions {
             .field("kv_bytes", &self.kv_bytes)
             .field("cache_budget", &self.cache_budget)
             .field("pg_max_connections", &self.pg_max_connections)
+            .field("settings_read_only", &self.settings_read_only)
             .finish()
     }
 }
@@ -190,6 +224,10 @@ impl Default for ServerOptions {
             cache_budget: None,
             cache_ceiling: None,
             pg_max_connections: 100,
+            settings_env: None,
+            settings_read_only: false,
+            startup: Vec::new(),
+            settings_file: None,
         }
     }
 }
@@ -286,6 +324,10 @@ pub(crate) struct State {
     pub(crate) engine: Arc<Engine>,
     pub(crate) apps: apps::Apps,
     pub(crate) options: ServerOptions,
+    /// What the owner changes while the server runs.
+    pub(crate) settings: settings::Settings,
+    /// One change of the settings at a time.
+    settings_changes: Mutex<()>,
     pub(crate) metrics: Metrics,
     pub(crate) schemas: SchemaCache,
     /// How long reads take, by shape: the short ones run where they are.
@@ -300,6 +342,9 @@ pub(crate) struct State {
     memory_last_relief: AtomicU64,
     /// What the budget may grow back to since that cut (0: its ceiling).
     memory_learned: AtomicU64,
+    /// The tick, plus one, at which the guard last said that memory is
+    /// short without the caches being the cause (0: never).
+    memory_noted: AtomicU64,
 }
 
 /// Seconds between two looks at the memory.
@@ -369,17 +414,19 @@ impl Server {
     /// A server for `engine`, its first application, and every other
     /// application `engine` lists (opened from `<engine dir>/apps/<name>`).
     pub fn new(engine: Arc<Engine>, options: ServerOptions) -> Server {
+        // What the owner saved comes first: the memory to count on, then the
+        // budgets that follow from it.
+        let settings =
+            settings::Settings::open(engine.clone(), options.settings_env.clone(), options.settings_read_only);
+        settings.declare_memory();
+        let plan = settings.memory_plan(&options);
         Server {
             state: Arc::new(State {
-                apps: apps::Apps::open(
-                    engine.clone(),
-                    options.kv_bytes,
-                    options.kv_budget,
-                    options.cache_budget,
-                    options.cache_ceiling,
-                ),
+                apps: apps::Apps::open(engine.clone(), plan, options.settings_read_only),
                 engine,
                 options,
+                settings,
+                settings_changes: Mutex::new(()),
                 metrics: Metrics::new(),
                 schemas: SchemaCache::default(),
                 read_costs: Arc::new(fast::ReadCosts::new()),
@@ -390,8 +437,15 @@ impl Server {
                 memory_reliefs: AtomicU64::new(0),
                 memory_last_relief: AtomicU64::new(0),
                 memory_learned: AtomicU64::new(0),
+                memory_noted: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// The settings saved from the console that win over a different value
+    /// of the environment, one sentence each (for the log at startup).
+    pub fn setting_overrides(&self) -> Vec<String> {
+        self.state.settings.overrides()
     }
 
     /// The engine of the first application (the server's own).
@@ -531,7 +585,7 @@ impl Server {
                         // told so (a short-lived thread), and far past it,
                         // dropped, so that a flood cannot use up the threads.
                         let open = state.pg_connections.load(Ordering::Relaxed);
-                        let max = state.options.pg_max_connections.max(1);
+                        let max = state.pg_max_connections();
                         if open >= max + 16 {
                             continue;
                         }
@@ -610,6 +664,7 @@ impl State {
         let since = if last == 0 { u64::MAX } else { tick.saturating_sub(last - 1) };
         if since >= MEMORY_LESSON {
             self.memory_learned.store(0, Ordering::Relaxed);
+            self.apps.set_cache_lesson(0);
         }
         let learned = self.memory_learned.load(Ordering::Relaxed);
         let hard = self.apps.cache_ceiling().unwrap_or(budget);
@@ -625,6 +680,39 @@ impl State {
         let committed = pressure + unfilled / total as f64;
         match crate::memory::cache_move(budget, ceiling, total, pressure, committed, demand, since >= MEMORY_COOL) {
             CacheMove::Relieve(to) => {
+                // First what the allocator keeps of memory freed since (a
+                // large answer, a burst of statements): often that is all
+                // there was, and the caches have nothing to do with it.
+                crate::memory::release_free_memory();
+                let pressure = crate::memory::MemoryInfo::now().pressure().unwrap_or(pressure);
+                if pressure < crate::memory::MEMORY_HIGH {
+                    return;
+                }
+                let held = self.apps.cache_used();
+                if (held as u64) < total / 10 {
+                    // The caches are not what fills the memory (statements
+                    // or answers in progress are): emptying them would slow
+                    // every read and free little. They keep what they hold
+                    // and take no more while memory is short.
+                    // (A quarter above it: a cache sits a little under its limit.)
+                    let frozen = (held + held / 4).max((16 << 20).min(hard));
+                    if frozen < budget {
+                        self.apps.set_cache_budget(frozen);
+                    }
+                    // Said once a minute, not every two seconds.
+                    let noted = self.memory_noted.load(Ordering::Relaxed);
+                    if noted == 0 || tick.saturating_sub(noted - 1) >= 60 {
+                        self.memory_noted.store(tick + 1, Ordering::Relaxed);
+                        let message = format!(
+                            "memory: {:.0} % of {gib:.2} GiB in use, of which the page caches hold {} MiB: statements or answers in progress hold the rest; the caches take no more for now",
+                            pressure * 100.0,
+                            held >> 20
+                        );
+                        // An event: the binary prints warnings in its log too.
+                        self.engine.event("warn", message);
+                    }
+                    return;
+                }
                 self.apps.set_cache_budget(to);
                 self.apps.drop_caches();
                 crate::memory::release_free_memory();
@@ -635,6 +723,7 @@ impl State {
                     return;
                 }
                 self.memory_learned.store((budget / 4 * 3).max(to) as u64, Ordering::Relaxed);
+                self.apps.set_cache_lesson((budget / 4 * 3).max(to));
                 self.memory_last_relief.store(tick + 1, Ordering::Relaxed);
                 self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
                 let message = format!(
@@ -643,8 +732,7 @@ impl State {
                     budget >> 20,
                     to >> 20
                 );
-                // In the event log, and in the server's own log.
-                println!("nuage: {message}");
+                // An event: the binary prints warnings in its log too.
                 self.engine.event("warn", message);
             }
             CacheMove::Shrink(to) if slow => {
@@ -659,6 +747,143 @@ impl State {
             // to the caches.
             _ if slow && (demand || pressure >= crate::memory::MEMORY_ROOM) => crate::memory::release_free_memory(),
             _ => {}
+        }
+    }
+
+    /// Puts the settings in force again, after one was saved or removed:
+    /// the memory to count on, the budgets that follow from it, shared anew
+    /// among the applications. When the memory to count on changed, the guard
+    /// forgets what it learned under the earlier one.
+    pub(crate) fn apply_settings(&self) {
+        let before = crate::memory::MemoryInfo::now().total_bytes;
+        self.settings.declare_memory();
+        if crate::memory::MemoryInfo::now().total_bytes != before {
+            self.memory_last_relief.store(0, Ordering::Relaxed);
+            self.memory_learned.store(0, Ordering::Relaxed);
+            self.apps.set_cache_lesson(0);
+        }
+        self.apps.set_plan(self.settings.memory_plan(&self.options));
+    }
+
+    /// Saves settings and puts them in force at once: `(key, value)` pairs,
+    /// `None` giving a setting back to the environment's value (or the
+    /// default). All are checked first, one by one and together with what
+    /// stays as it is: one that does not fit, and nothing is saved. Returns
+    /// what kept them from reaching the backup yet, if anything did.
+    pub(crate) fn save_settings(
+        &self,
+        changes: &[(&str, Option<&str>)],
+    ) -> std::result::Result<Option<String>, settings::Refusal> {
+        use settings::{Refusal, refused};
+        let _guard = self.settings_changes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut checked: Vec<(&str, Option<String>)> = Vec::new();
+        for (key, value) in changes {
+            checked.push((key, self.settings.check(key, *value)?));
+        }
+        // The amounts of memory are checked together when one of them changes.
+        if let Some(changed) = checked.iter().map(|(key, _)| *key).find(|key| key.starts_with("memory.")) {
+            // What would be in force: the change, else what is now.
+            let would = |key: &str| match checked.iter().rev().find(|(k, _)| *k == key) {
+                Some((_, Some(v))) => Some(v.clone()),
+                Some((_, None)) => self.settings.environment(key),
+                None => self.settings.value(key).0,
+            };
+            let mib = |key: &str| would(key).and_then(|v| v.parse::<u64>().ok());
+            // Saying the memory is for lowering it: under what the system
+            // reports, and under the environment's figure when it gives one
+            // (a host that limits the memory without saying so).
+            let detected = crate::memory::detected().total_bytes.map(|b| b >> 20);
+            let saving_total = checked.iter().any(|(key, value)| *key == "memory.total_mb" && value.is_some());
+            let has = match (detected, self.settings.environment_memory().filter(|_| saving_total)) {
+                (Some(d), Some(e)) => Some(d.min(e)),
+                (d, e) => d.or(e),
+            };
+            if let (Some(said), Some(has)) = (mib("memory.total_mb"), has)
+                && said > has
+            {
+                return Err(Refusal::new(refused::MORE_THAN_THE_SERVER, &[&said, &has]));
+            }
+            if let Some(said) = mib("memory.total_mb").filter(|_| saving_total) {
+                // Under what it already uses without its caches, the guard would cut for ever.
+                let now = crate::memory::MemoryInfo::now();
+                let held = self.apps.cache_used() as u64;
+                let uses = now.process_bytes.map_or(0, |p| p.saturating_sub(held));
+                if said < (uses / 3 * 4) >> 20 {
+                    return Err(Refusal::new(refused::MEMORY_TOO_LITTLE, &[&(uses >> 20), &((uses / 3 * 4) >> 20)]));
+                }
+            }
+            let all = self.apps.all();
+            let now = self.apps.by_hand(&all, &self.apps.plan());
+            let mut then = now;
+            then.total = mib("memory.total_mb").or(detected).map(|mib| mib << 20);
+            then.cache = mib("memory.cache_mb").map(|mib| (mib as usize) << 20);
+            then.kv_each = mib("memory.kv_mb").map(|mib| (mib as usize) << 20);
+            if let Some(cache) = then.cache
+                && cache < then.apart + then.floor
+                && now.cache.is_none_or(|before| cache < before)
+            {
+                return Err(Refusal::new(
+                    refused::CACHE_UNDER_WHAT_IS_APART,
+                    &[&(cache >> 20), &(then.apart >> 20), &(then.floor >> 20), &((then.apart + then.floor) >> 20)],
+                ));
+            }
+            // What does not fit already is not refused a change that lowers it.
+            if let Err(refusal) = then.check(&format!("`{changed}`"))
+                && (now.check("").is_ok() || then.amount() > now.amount() || then.total < now.total)
+            {
+                return Err(refusal);
+            }
+        }
+        let list: Vec<(&str, Option<&str>)> = checked.iter().map(|(key, value)| (*key, value.as_deref())).collect();
+        self.settings.save(&list)?;
+        self.apply_settings();
+        Ok(self.ship_settings())
+    }
+
+    /// Sets the memory of one application (see [`apps::Apps::set_memory`]),
+    /// one change of the settings at a time. Returns what kept it from
+    /// reaching the backup yet, if anything did.
+    pub(crate) fn set_app_memory(
+        &self,
+        app: &apps::App,
+        cache: Option<usize>,
+        kv: Option<usize>,
+    ) -> std::result::Result<Option<String>, settings::Refusal> {
+        let _guard = self.settings_changes.lock().unwrap_or_else(|e| e.into_inner());
+        if self.settings.read_only() {
+            return Err(settings::Refusal {
+                forbidden: true,
+                ..settings::Refusal::new(settings::refused::READ_ONLY, &[])
+            });
+        }
+        self.apps.set_memory(app, cache, kv)?;
+        Ok(self.ship_settings())
+    }
+
+    /// Sends what was just saved (a setting, an application's memory) to the
+    /// backup at once: on a disk the host erases at each restart, a restart
+    /// in the next half minute would bring the earlier value back. Returns
+    /// why it could not, when there is a backup and it failed.
+    fn ship_settings(&self) -> Option<String> {
+        self.engine.options().backup.as_ref()?;
+        self.engine.checkpoint().and_then(|_| self.engine.backup_now(false)).err().map(|e| e.to_string())
+    }
+
+    /// Status without credentials shows the public subset.
+    pub(crate) fn public_status(&self) -> bool {
+        self.settings.flag("status.public").unwrap_or(self.options.public_status)
+    }
+
+    /// PostgreSQL connections served at once.
+    pub(crate) fn pg_max_connections(&self) -> usize {
+        match self.settings.count("postgres.connections") {
+            // Each has a thread: a saved number keeps to half of what the
+            // system lets this user start, whatever server it was saved on.
+            Some(saved) => {
+                let most = crate::memory::thread_limit().map_or(usize::MAX, |limit| (limit / 2).max(8));
+                (saved as usize).clamp(1, most)
+            }
+            None => self.options.pg_max_connections.max(1),
         }
     }
 
@@ -806,7 +1031,11 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
     if path == "/api/status" || path == "/api/status/stream" {
         return status::route(state, req, &path).await;
     }
-    if path == "/api/apps" || path.starts_with("/api/apps/") {
+    if path == "/api/apps"
+        || path.starts_with("/api/apps/")
+        || path == "/api/settings"
+        || path.starts_with("/api/settings/")
+    {
         return manage::route(state, req, &path).await;
     }
     if path == "/admin" || path.starts_with("/admin/") {

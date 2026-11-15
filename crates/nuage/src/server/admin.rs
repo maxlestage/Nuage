@@ -31,6 +31,9 @@ use super::{HttpBody, State, full, random_token, read_body, same_secret};
 use crate::embedded::Embedded;
 use crate::engine::MAIN;
 
+#[path = "admin_settings.rs"]
+mod settings_page;
+
 const SESSION_COOKIE: &str = "nuage_session";
 const LOGIN_COOKIE: &str = "nuage_login";
 /// The console's language (`fr`, `en`, `es`), chosen with `?lang=`.
@@ -164,6 +167,7 @@ tbody tr:hover{background:var(--card2)}
 .mini{display:grid;grid-template-columns:repeat(3,1fr);gap:.35rem .75rem;margin:.6rem 0 0}.mini dt{color:var(--muted);font-size:.78rem}.mini dd{margin:0;font-variant-numeric:tabular-nums}
 .reveal pre{user-select:all}
 details.lang{border-bottom:1px solid var(--line)}details.lang summary{cursor:pointer;padding:.45rem 0;font-weight:600}
+.set{margin:.9rem 0;max-width:46rem}.set label{font-weight:600}.set input:not([type=checkbox]){display:block;max-width:14rem;margin:.25rem 0;font-weight:400}.set small{display:block}.check{font-weight:400!important}.check input{width:auto;margin-right:.35rem}
 "#;
 
 /// English, French, Spanish, or as the device (the browser's language): the one in use
@@ -252,10 +256,11 @@ pub(crate) async fn prefs(headers: &HeaderMap, res: Response<HttpBody>) -> Respo
 fn page(l: Lang, here: &str, title: &str, csrf: Option<&str>, body: &str) -> String {
     let nav = match csrf {
         Some(csrf) => format!(
-            r#"<nav><a href="/admin">{apps}</a><a href="/admin/server">{server}</a></nav><span class="prefs">{langs}{themes}</span>
+            r#"<nav><a href="/admin">{apps}</a><a href="/admin/server">{server}</a><a href="/admin/settings">{settings}</a></nav><span class="prefs">{langs}{themes}</span>
 <form method="post" action="/admin/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{c}"><button class="plain">{out}</button></form>"#,
             apps = t(l, "Applications"),
             server = t(l, "Server"),
+            settings = t(l, "Settings"),
             langs = lang_switch(l, here),
             themes = theme_switch(l, here),
             c = esc(csrf),
@@ -1359,6 +1364,7 @@ fn get(state: &State, path: &str, cx: &Cx, page_no: u64, origin: &str) -> Respon
     match path {
         "/admin" | "/admin/apps" => return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, None))),
         "/admin/server" => return html(200, cx.page(cx.t("Server"), &server_body(state, cx))),
+        "/admin/settings" => return html(200, cx.page(cx.t("Settings"), &settings_page::body(state, cx, None))),
         _ => {}
     }
     let Some((name, sub)) = split_app(path) else { return not_found(cx, "Not found") };
@@ -1378,7 +1384,7 @@ fn get(state: &State, path: &str, cx: &Cx, page_no: u64, origin: &str) -> Respon
         "/branches" => ("/branches", "Branches", Ok(branches_body(cx, &app, None))),
         "/storage" => ("/storage", "Storage", Ok(storage_body(cx, &app, None))),
         "/tokens" => ("/tokens", "Tokens", Ok(tokens_body(state, cx, &app, None))),
-        "/settings" => ("/settings", "Settings", Ok(settings_body(cx, &app, None))),
+        "/settings" => ("/settings", "Settings", Ok(settings_body(state, cx, &app, None))),
         _ => return not_found(cx, "Not found"),
     };
     match body {
@@ -1579,7 +1585,7 @@ fn tokens_body(state: &State, cx: &Cx, app: &App, message: Option<String>) -> St
     body
 }
 
-fn settings_body(cx: &Cx, app: &App, message: Option<String>) -> String {
+fn settings_body(state: &State, cx: &Cx, app: &App, message: Option<String>) -> String {
     let base = app_base(&app.name);
     let mut body = message.unwrap_or_default();
     let description = app.description.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1603,6 +1609,7 @@ fn settings_body(cx: &Cx, app: &App, message: Option<String>) -> String {
         o = esc(&app.origins().join("\n")),
         save = cx.t("Save the websites")
     );
+    body.push_str(&settings_page::app_memory(state, cx, app));
     if app.first {
         let _ = write!(
             body,
@@ -1679,6 +1686,11 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
         };
         return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
     }
+    if let Some(sub) = path.strip_prefix("/admin/settings") {
+        let (ok, msg) = settings_page::post(state, sub, form, cx);
+        let body = settings_page::body(state, cx, Some(msg));
+        return html(if ok { 200 } else { 400 }, cx.page(cx.t("Settings"), &body));
+    }
     let Some((name, sub)) = split_app(path) else { return not_found(cx, "Not found") };
     if sub == "/delete" {
         if field("confirm").trim() != name {
@@ -1686,7 +1698,14 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
             return match state.apps.get(&name) {
                 Some(app) => html(
                     400,
-                    app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))),
+                    app_page(
+                        state,
+                        cx,
+                        &app,
+                        "/settings",
+                        cx.t("Settings"),
+                        &settings_body(state, cx, &app, Some(msg)),
+                    ),
                 ),
                 None => html(400, cx.page(cx.t("Settings"), &format!("{msg}{}", failed_settings(cx, &name)))),
             };
@@ -1779,14 +1798,29 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
                 Ok(o) => note(true, &cx.tf("Pages of {} may call this application.", &[&o.join(", ")])),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))))
+            html(
+                200,
+                app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(state, cx, &app, Some(msg))),
+            )
+        }
+        "/memory" => {
+            let (ok, msg) = settings_page::post_app_memory(state, cx, &app, form);
+            let status = if ok { 200 } else { 400 };
+            if field("back") == "settings" {
+                return html(status, cx.page(cx.t("Settings"), &settings_page::body(state, cx, Some(msg))));
+            }
+            let body = settings_body(state, cx, &app, Some(msg));
+            html(status, app_page(state, cx, &app, "/settings", cx.t("Settings"), &body))
         }
         "/description" => {
             let msg = match state.apps.set_description(&app, &field("description")) {
                 Ok(()) => note(true, cx.t("Description saved.")),
                 Err(e) => note(false, &e.to_string()),
             };
-            html(200, app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(cx, &app, Some(msg))))
+            html(
+                200,
+                app_page(state, cx, &app, "/settings", cx.t("Settings"), &settings_body(state, cx, &app, Some(msg))),
+            )
         }
         _ => not_found(cx, "Not found"),
     }

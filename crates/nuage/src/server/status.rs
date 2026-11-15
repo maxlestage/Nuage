@@ -59,7 +59,7 @@ fn access(state: &State, req: &Request<Incoming>) -> Option<View> {
         Some(View::All)
     } else if let Some((app, _)) = state.app_of(req.headers()) {
         Some(View::App(app))
-    } else if state.options.public_status {
+    } else if state.public_status() {
         Some(View::Public)
     } else {
         None

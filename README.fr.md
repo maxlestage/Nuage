@@ -657,6 +657,59 @@ git push heroku master
 Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouvrez ensuite
 `https://mon-nuage.herokuapp.com/admin`.
 
+## Réglages : à vous de choisir, et de changer d'avis
+
+Celui qui fait tourner un serveur Nuage DB, sur son ordinateur ou en ligne, choisit comment
+il fonctionne et le change plus tard, sans redémarrage :
+
+- **la page Réglages de la console** (`/admin/settings`), en français, anglais et espagnol ;
+- **`nuage settings`** dans un terminal : `nuage settings` les liste, `nuage settings set
+  memory.cache_mb 2G` en change un, `nuage settings unset memory.cache_mb` le rend ;
+- **`/api/settings`**, avec le jeton de gestion (`GET` ; `POST {"memory.cache_mb": 2048}` ;
+  `DELETE /api/settings/memory.cache_mb`).
+
+Ce qui est enregistré est **en vigueur tout de suite** et **conservé avec les données** :
+chiffré, sauvegardé et restauré avec elles. Cela l'emporte sur l'environnement (le fichier de
+réglages, les variables de l'hébergeur), qui l'emporte sur la valeur par défaut ; chaque
+réglage dit d'où vient sa valeur, et un clic la rend à l'environnement. Avec
+`NUAGE_SETTINGS=environment`, l'environnement est la seule source : ce qui avait été
+enregistré est ignoré (la page le montre, et le retire si vous le demandez).
+
+| Réglage | Quoi | Valeur de départ |
+|---|---|---|
+| `memory.total_mb` | la mémoire sur laquelle Nuage DB peut compter : `auto` (la limite du conteneur, sinon toute la mémoire de la machine : Linux, macOS, Windows), ou une quantité qui laisse le reste aux autres programmes | `NUAGE_MEMORY_MB` |
+| `memory.cache_mb` | les caches de pages de toutes les applications ensemble : `auto` (il suit la mémoire) ou un maximum | `NUAGE_CACHE_MB` |
+| `memory.kv_mb` | le stockage clé-valeur de chaque application : `auto` ou une quantité | `NUAGE_KV_MB` |
+| `statement.memory_mb` | ce qu'une instruction SQL peut garder en mémoire à la fois (`auto` : un huitième de la mémoire) | `NUAGE_STATEMENT_MB` |
+| `statement.seconds` | combien de temps une instruction peut durer (`0` : pas de limite) | `NUAGE_STATEMENT_SECONDS` |
+| `postgres.connections` | connexions PostgreSQL servies à la fois | `NUAGE_PG_MAX_CONNECTIONS` |
+| `status.public` | l'état public (`true`, `false`) | `NUAGE_PUBLIC_STATUS` |
+
+Une quantité s'écrit `auto`, `512 Mio` ou `2 Gio` (`2G`, `2 Go`, `1,5 Go`) ; un nombre seul
+est en Mio.
+
+**La mémoire : celle du serveur, ou par base de données.** Par défaut, un serveur utilise la
+mémoire qu'il a : un seul budget pour les caches de pages de toutes ses applications, qui
+suit la mémoire et va aux applications qui s'en servent. Une application (une base de
+données) peut à la place avoir **sa propre part**, réservée : dans son onglet Réglages, dans
+le tableau *Mémoire par application* de la page Réglages, avec `nuage apps memory shop 2G`
+(puis `auto` pour partager de nouveau), ou `POST /api/apps/shop/memory {"cache_mb": 2048,
+"kv_mb": "auto"}`. Son cache dispose alors de cette quantité quoi que fassent les autres, qui
+se partagent le reste. Il en va de même pour son stockage clé-valeur.
+
+Nuage DB vérifie ce qui est fixé à la main avant de l'enregistrer, et donne les chiffres
+quand il refuse : les stockages clé-valeur dans un quart de la mémoire, et avec les caches
+de pages fixés à la main dans trois quarts ; une mémoire dite à la main ne peut que baisser
+celle que le système annonce. Quand la mémoire manque, le garde-fou garde le dernier mot :
+ce qui est réservé diminue avec le reste, puis revient.
+
+**Ce qui reste dans l'environnement.** Ce que le serveur lit avant de pouvoir ouvrir ses
+données (la clé de chiffrement, le dossier des données), ce sur quoi il écoute (ports,
+adresses, certificats), ce qui y donne accès (mot de passe, jetons) et la destination de ses
+sauvegardes se lisent une fois, au démarrage : une mauvaise valeur enregistrée depuis la
+console pourrait vous en fermer la porte. La page Réglages les liste (un secret s'affiche
+comme réglé, jamais sa valeur) et dit comment les changer sur cet hébergement.
+
 ## Variables d'environnement
 
 | Variable | Rôle | Par défaut |
@@ -677,6 +730,9 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_MEMORY_MB` | la mémoire sur laquelle compter, en Mio, pour un hébergeur qui la limite sans le dire | la limite du conteneur, sinon la mémoire de la machine |
 | `NUAGE_PG_MAX_CONNECTIONS` | connexions PostgreSQL servies à la fois (chacune a un thread) | `100`, moins là où le système autorise peu de threads |
 | `NUAGE_ENV_FILE` | lit aussi les réglages de ce fichier (lignes `CLÉ=valeur` ; `nuage --env-file <fichier>` fait de même) ; l'environnement l'emporte sur le fichier | aucun |
+| `NUAGE_SETTINGS` | `environment` : les réglages sont ceux de l'environnement seulement ; ce qui a été enregistré depuis la page Réglages de la console, `nuage settings` ou `/api/settings` est ignoré, et rien ne s'y enregistre (voir [Réglages](#réglages--à-vous-de-choisir-et-de-changer-davis)) | les réglages enregistrés l'emportent sur l'environnement |
+| `NUAGE_STATEMENT_MB` | mémoire qu'une instruction SQL peut garder à la fois (les lignes qu'elle trie, joint ou renvoie), en Mio, ou `auto` ; au-delà, l'instruction échoue avec une erreur claire | `auto` : un huitième de la mémoire (32 Mio à 2 Gio) |
+| `NUAGE_STATEMENT_SECONDS` | secondes qu'une instruction peut durer avant d'être arrêtée et ses changements annulés ; `0` : pas de limite | `60` |
 | `NUAGE_BACKUP_DIR` | sauvegarde vers ce dossier, sur un autre disque (le serveur prévient quand il est sur le disque des données) | |
 | `NUAGE_BACKUP_S3_BUCKET` | sauvegarde vers ce bucket | |
 | `NUAGE_BACKUP_S3_ENDPOINT` | point d'accès du stockage compatible S3 | `https://s3.<region>.amazonaws.com` |

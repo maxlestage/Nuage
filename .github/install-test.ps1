@@ -54,6 +54,16 @@ if (-not $token) { Fail "no token: $lines" }
 & $Binary check "http://127.0.0.1:$Port" $token
 if ($LASTEXITCODE -ne 0) { Fail 'the new token does not connect' }
 
+Step 'nuage settings: the memory of this computer, and a setting changed from a terminal, with no restart'
+$settings = & $Binary settings
+Write-Host ($settings -join "`n")
+if (-not ($settings -match '^memory\.cache_mb')) { Fail "no settings: $settings" }
+$api = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/settings" -Headers @{ Authorization = "Bearer $admin" }
+if (-not ($api.memory.detected_bytes -gt 10000000)) { Fail 'the server does not know the memory of this computer' }
+$saved = & $Binary settings set status.public true
+if (-not ($saved -match 'saved')) { Fail "the setting was not saved: $saved" }
+try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/api/status" -TimeoutSec 5 | Out-Null } catch { Fail 'the saved setting is not in force' }
+
 Step "nuage apps create on the server's computer, with nothing else: the settings file says it all"
 Remove-Item env:NUAGE_URL, env:NUAGE_ADMIN_TOKEN
 $lines = & $Binary apps create sans-reglage
@@ -68,6 +78,8 @@ $again = & .\install.ps1 *>&1 | Out-String
 Write-Host $again
 if ($again -notmatch 'Backups: kept as they are') { Fail 'the backup setting was not kept' }
 if (-not (Healthy)) { Fail 'the service does not answer after the upgrade' }
+$kept = & $Binary settings
+if (-not ($kept -match '^status\.public\s+true\s+saved')) { Fail "the saved setting is gone: $kept" }
 if (-not ((& $Binary apps list) -match '^essai')) { Fail 'the application is gone' }
 
 Step 'uninstall: the service stops, the backups and the settings stay'

@@ -173,7 +173,9 @@ if (-not (Test-Path $EnvFile)) {
         "NUAGE_ADMIN_PASSWORD=$password",
         '# The management API: `nuage apps create <name>` makes an application with it.',
         "NUAGE_ADMIN_TOKEN=$adminToken",
-        '# Page cache of each application, in MiB; auto: an eighth of the memory (8 to 512 MiB).',
+        '# Starting values of the settings that change later with no restart: the console''s Settings',
+        '# page (/admin/settings) and `nuage settings`. What they save wins over this file.',
+        '# Memory the page caches of all the applications share, in MiB; auto: it follows the memory.',
         'NUAGE_CACHE_MB=auto',
         'NUAGE_PUBLIC_STATUS=false',
         '# Backups: run the installer again with NUAGE_BACKUP_DIR or NUAGE_BACKUP_S3_* to change.'
@@ -329,6 +331,8 @@ $backups = if (Get-Var 'NUAGE_BACKUP_DIR') { "the folder $(Get-Var 'NUAGE_BACKUP
 Write-Host ''
 Say "Nuage DB is running: $url"
 Write-Host "    console:      $url/admin"
+Write-Host "    change later: $url/admin/settings (memory of the server and of each application, limits,"
+Write-Host "                  visibility: in force at once, with no restart; or ``nuage settings``)"
 Write-Host "    SQL:          POST $url/v1/sql   (Authorization: Bearer <token>)"
 if ($PgPort -ne '0') { Write-Host "    PostgreSQL:   postgresql://app:<token>@$(if ($ip) { $ip } else { 'localhost' }):$PgPort/nuage" }
 Write-Host "    backups:      $backups"

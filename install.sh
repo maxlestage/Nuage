@@ -342,6 +342,8 @@ NUAGE_TOKEN=$token
 NUAGE_ADMIN_PASSWORD=$password
 # The management API: \`nuage apps create <name>\` makes an application with it.
 NUAGE_ADMIN_TOKEN=$admin_token
+# Starting values of the settings that change later with no restart: the console's Settings
+# page (/admin/settings) and \`nuage settings\`. What they save wins over this file.
 # Memory the page caches of all the applications share, in MiB; auto: it follows the memory.
 NUAGE_CACHE_MB=auto
 NUAGE_PUBLIC_STATUS=false
@@ -699,6 +701,8 @@ fi
 echo
 if [ -n "$running" ]; then say "Nuage DB is running: $url"; else say "Nuage DB is installed: $url (once started)"; fi
 echo "    console:      $url/admin"
+echo "    change later: $url/admin/settings (memory of the server and of each application, limits,"
+echo "                  visibility: in force at once, with no restart; or \`nuage settings\`)"
 echo "    SQL:          POST $url/v1/sql   (Authorization: Bearer <token>)"
 if [ "$PG_PORT" != 0 ]; then
 	pg_host=${DOMAIN:-${ip:-localhost}}

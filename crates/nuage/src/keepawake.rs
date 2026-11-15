@@ -197,6 +197,120 @@ pub async fn create_app(
     ))
 }
 
+/// `nuage settings`: the settings of a server, one a line (its name, its
+/// value, where it comes from), then the memory of each application.
+pub async fn list_settings(url: &str, admin_token: &str) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let (status, answer) =
+        fetch(&format!("{base}/api/settings"), Some(admin_token)).await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(settings_refusal(base, status, &json));
+    }
+    Ok(settings_lines(&json))
+}
+
+/// The answer of `/api/settings`, as `nuage settings` prints it.
+fn settings_lines(json: &serde_json::Value) -> String {
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "-".to_owned(),
+        other => other.to_string(),
+    };
+    let mut lines = Vec::new();
+    for s in json["settings"].as_array().into_iter().flatten() {
+        let source = match s["source"].as_str().unwrap_or_default() {
+            "saved" => "saved".to_owned(),
+            "environment" => format!("environment ({})", text(&s["variable"])),
+            _ => "default".to_owned(),
+        };
+        // Nothing said: the default.
+        let value = if s["value"].is_null() { text(&s["default"]) } else { text(&s["value"]) };
+        lines.push(format!("{}\t{value}\t{source}", text(&s["key"])));
+    }
+    for (key, value) in json["ignored"].as_object().into_iter().flatten() {
+        lines.push(format!("{key}\t{}\tsaved, ignored (NUAGE_SETTINGS=environment)", text(value)));
+    }
+    for a in json["applications"].as_array().into_iter().flatten() {
+        let amount = |v: &serde_json::Value| match v.as_u64() {
+            Some(mib) => format!("{mib} MiB"),
+            None => "auto".to_owned(),
+        };
+        lines.push(format!(
+            "application {}\tpage cache {}\tkey-value store {}",
+            text(&a["name"]),
+            amount(&a["cache_mb"]),
+            amount(&a["kv_mb"])
+        ));
+    }
+    lines.join("\n")
+}
+
+/// `nuage settings set <key> <value>` and `nuage settings unset <key>`
+/// (`value` `None`): saves a setting, in force at once, or gives it back to
+/// the environment's value. Answers the line of the setting as it is now.
+pub async fn set_setting(
+    url: &str,
+    admin_token: &str,
+    key: &str,
+    value: Option<&str>,
+) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let sent = match value {
+        Some(value) => {
+            let body = serde_json::json!({ key: value }).to_string().into_bytes();
+            send("POST", &format!("{base}/api/settings"), Some(admin_token), Some(body)).await
+        }
+        None => send("DELETE", &format!("{base}/api/settings/{key}"), Some(admin_token), None).await,
+    };
+    let (status, answer) = sent.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(settings_refusal(base, status, &json));
+    }
+    let line = settings_lines(&json).lines().find(|l| l.split('\t').next() == Some(key)).unwrap_or(key).to_owned();
+    Ok(format!("{line}\n(in force now, with no restart)"))
+}
+
+/// `nuage apps memory <name> <page cache> [key-value store]`: the memory of
+/// one application, each an amount (`256`, `2G`) or `auto`.
+pub async fn set_app_memory(
+    url: &str,
+    admin_token: &str,
+    name: &str,
+    cache: &str,
+    kv: Option<&str>,
+) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let mut body = serde_json::json!({ "cache_mb": cache });
+    if let Some(kv) = kv {
+        body["kv_mb"] = serde_json::json!(kv);
+    }
+    let (status, answer) =
+        send("POST", &format!("{base}/api/apps/{name}/memory"), Some(admin_token), Some(body.to_string().into_bytes()))
+            .await
+            .map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(settings_refusal(base, status, &json));
+    }
+    let amount = |v: &serde_json::Value| v.as_u64().map_or("auto".to_owned(), |mib| format!("{mib} MiB"));
+    Ok(format!(
+        "application {name}\tpage cache {}\tkey-value store {}\n(in force now, with no restart)",
+        amount(&json["memory"]["cache_mb"]),
+        amount(&json["memory"]["kv_mb"])
+    ))
+}
+
+/// A refusal of the settings routes: an older server does not have them.
+fn settings_refusal(base: &str, status: u16, json: &serde_json::Value) -> String {
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    if matches!(status, 404 | 405) && (message.is_empty() || message.starts_with("no such route")) {
+        return format!("{base} has no settings to change: they came with Nuage DB 0.4.7.");
+    }
+    refusal(base, status, json)
+}
+
 /// `nuage apps list`: the applications of the server at `url`, one per line
 /// (name, tokens, description).
 pub async fn list_apps(url: &str, admin_token: &str) -> std::result::Result<String, String> {

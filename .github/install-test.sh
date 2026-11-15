@@ -2,8 +2,9 @@
 # CI: install.sh end to end on Linux (systemd) and macOS (launchd), with a backup folder.
 #   .github/install-test.sh <nuage binary> <backup folder>
 # It installs the binary as a service, checks that it answers, that its first backup lands in
-# the folder, that `nuage apps create` makes an application, that a run without options keeps
-# the backup setting, then uninstalls, checks the backups stay, and purges.
+# the folder, that `nuage apps create` makes an application, that `nuage settings` changes a
+# setting with no restart, that a run without options keeps the backup setting and what was
+# saved, then uninstalls, checks the backups stay, and purges.
 set -euo pipefail
 
 binary=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -40,6 +41,17 @@ token=$(printf '%s\n' "$lines" | sed -n 's/^NUAGE_TOKEN=//p')
 [ -n "$token" ] || fail "no token: $lines"
 "$binary" check "http://127.0.0.1:$port" "$token" || fail "the new token does not connect"
 
+step "nuage settings: the memory of this computer, and a setting changed from a terminal, with no restart"
+settings=$(NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings)
+printf '%s\n' "$settings"
+printf '%s\n' "$settings" | grep -q '^memory.cache_mb' || fail "no settings: $settings"
+curl -fsS -H "Authorization: Bearer $admin" "http://127.0.0.1:$port/api/settings" | grep -Eq '"detected_bytes":[0-9]{8,}' ||
+	fail "the server does not know the memory of this computer"
+! curl -fsS "http://127.0.0.1:$port/api/status" >/dev/null 2>&1 || fail "the status is public before it is said so"
+NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings set status.public true | grep -q 'saved' ||
+	fail "the setting was not saved"
+curl -fsS "http://127.0.0.1:$port/api/status" >/dev/null || fail "the saved setting is not in force"
+
 step "nuage apps create on the server's computer, with nothing else: the settings file says it all"
 lines=$(sudo env -u NUAGE_URL -u NUAGE_ADMIN_TOKEN "$binary" apps create sans-reglage)
 printf '%s\n' "$lines" | grep -q '^NUAGE_TOKEN=nuage_' || fail "no token without settings: $lines"
@@ -50,6 +62,8 @@ sudo env CI=1 NUAGE_BINARY="$binary" NUAGE_SWAP_MB=0 bash install.sh | tee "$RUN
 grep -q "Backups: kept as they are" "$RUNNER_TEMP/again.txt" || fail "the backup setting was not kept"
 health || fail "the service does not answer after the upgrade"
 NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" apps list | grep -q '^essai' || fail "the application is gone"
+NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings | grep -Eq '^status\.public[[:space:]]+true[[:space:]]+saved' ||
+	fail "the saved setting is gone (the file says NUAGE_PUBLIC_STATUS=false: what was saved wins)"
 
 step "uninstall: the service stops, the backups and the settings stay"
 sudo bash install.sh uninstall
