@@ -80,8 +80,7 @@ pub use engine::{
 pub use memoire_orm::nuage::Branch;
 #[cfg(feature = "server")]
 pub use server::{
-    AppInfo, PgOptions, RedisOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo,
-    tls_config,
+    AppInfo, KvOptions, PgOptions, Server, ServerOptions, SiteHandler, SiteRequest, SiteResponse, TokenInfo, tls_config,
 };
 #[cfg(feature = "site")]
 pub use site::site;

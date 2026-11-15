@@ -50,7 +50,7 @@ each token opens only its own application.
 
 ```bash
 curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
-# {"ok": true, "message": "Connected to Nuage DB 0.4.4: application `blog`, read and write, ...", ...}
+# {"ok": true, "message": "Connected to Nuage DB 0.4.5: application `blog`, read and write, ...", ...}
 nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # the same, as one line, from any machine
 ```
 
@@ -77,7 +77,7 @@ See [Create an application in one command](../README.md#create-an-application-in
 
 ## The key-value store
 
-Each application also has a key-value store in memory, the way Redis is used (a cache,
+Each application also has a key-value store in memory (a cache,
 sessions, counters, locks). Every language reaches it over HTTP, with the same token:
 
 ```bash
@@ -86,8 +86,9 @@ curl "$NUAGE_URL/v1/kv/session:42" -H "Authorization: Bearer $NUAGE_TOKEN"      
 curl -X POST "$NUAGE_URL/v1/kv/hits?incr&ttl=60" -H "Authorization: Bearer $NUAGE_TOKEN"      # {"value":1}
 ```
 
-Or with the language's own Redis client, when the server has `NUAGE_REDIS_PORT=6379`: the
-token is the password (`redis://default:<token>@host:6379`). See
+Or on the store's own port, when the server has `NUAGE_KV_PORT=6379`: its wire is the one
+Redis clients speak, so the language's Redis client connects as it is, the token as its
+password (`redis://default:<token>@host:6379`). See
 [Key-value store](../README.md#key-value-store).
 
 ## The protocol

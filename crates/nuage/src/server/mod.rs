@@ -24,15 +24,15 @@ mod fast;
 pub mod files;
 mod i18n;
 mod kv;
+mod kv_port;
 mod manage;
 mod pg;
-mod redis;
 mod status;
 
 pub use files::FileStore;
+pub use kv_port::KvOptions;
 pub use manage::MIN_ADMIN_TOKEN;
 pub use pg::{PgOptions, tls_config};
-pub use redis::RedisOptions;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -135,8 +135,8 @@ pub struct ServerOptions {
     /// The bucket of the applications' files (`/v1/files`), if any
     /// (`NUAGE_FILES_S3_*`).
     pub files: Option<Arc<FileStore>>,
-    /// Memory of each application's key-value store (`/v1/kv`, the Redis
-    /// protocol), in bytes (`NUAGE_KV_MB`). Default: 32 MiB.
+    /// Memory of each application's key-value store (`/v1/kv`, the key-value
+    /// port), in bytes (`NUAGE_KV_MB`). Default: 32 MiB.
     pub kv_bytes: usize,
 }
 
@@ -493,15 +493,11 @@ impl Server {
 }
 
 impl Server {
-    /// Binds `addr` and serves the Redis protocol there, in the background:
-    /// every language's Redis client connects to an application's key-value
+    /// Binds `addr` and serves the key-value stores there, in the background,
+    /// over the protocol Redis clients speak: one connects to an application's
     /// store, with a token of the application as its password (see
-    /// [`RedisOptions`]).
-    pub async fn listen_redis(
-        &self,
-        addr: impl tokio::net::ToSocketAddrs,
-        options: RedisOptions,
-    ) -> Result<RunningServer> {
+    /// [`KvOptions`]).
+    pub async fn listen_kv(&self, addr: impl tokio::net::ToSocketAddrs, options: KvOptions) -> Result<RunningServer> {
         let listener = TcpListener::bind(addr).await.map_err(|e| Error::Pool(format!("cannot listen: {e}")))?;
         let addr = listener.local_addr().map_err(|e| Error::Pool(e.to_string()))?;
         let stop = Arc::new(Notify::new());
@@ -513,7 +509,7 @@ impl Server {
                     _ = stopped.notified() => break,
                     accepted = listener.accept() => {
                         let Ok((stream, peer)) = accepted else { continue };
-                        tokio::spawn(redis::serve(state.clone(), stream, peer, options.clone()));
+                        tokio::spawn(kv_port::serve(state.clone(), stream, peer, options.clone()));
                     }
                 }
             }
@@ -933,7 +929,7 @@ async fn app_protocol(
                 "schemaRefs": true,
                 // `/v1/files`: the server keeps files (in a bucket).
                 "files": state.options.files.is_some(),
-                // `/v1/kv`: a key-value store in memory, the way Redis is used.
+                // `/v1/kv`: a key-value store in memory.
                 "kv": true,
             }),
         )),

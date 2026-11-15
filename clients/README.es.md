@@ -50,7 +50,7 @@ que cada token solo abre su propia aplicación.
 
 ```bash
 curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
-# {"ok": true, "message": "Connected to Nuage DB 0.4.4: application `blog`, read and write, ...", ...}
+# {"ok": true, "message": "Connected to Nuage DB 0.4.5: application `blog`, read and write, ...", ...}
 nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # lo mismo, en una línea, desde cualquier máquina
 ```
 
@@ -78,7 +78,7 @@ de despliegue o un terminal, nunca en una aplicación ni en una página. Ver
 
 ## El almacén clave-valor
 
-Cada aplicación tiene también un almacén clave-valor en memoria, que se usa como Redis (una
+Cada aplicación tiene también un almacén clave-valor en memoria (una
 caché, sesiones, contadores, cerrojos). Todos los lenguajes llegan a él por HTTP, con el mismo
 token:
 
@@ -88,8 +88,9 @@ curl "$NUAGE_URL/v1/kv/session:42" -H "Authorization: Bearer $NUAGE_TOKEN"      
 curl -X POST "$NUAGE_URL/v1/kv/visitas?incr&ttl=60" -H "Authorization: Bearer $NUAGE_TOKEN"   # {"value":1}
 ```
 
-O con el cliente Redis del lenguaje, cuando el servidor tiene `NUAGE_REDIS_PORT=6379`: el token
-es la contraseña (`redis://default:<token>@host:6379`). Ver
+O en el puerto del almacén, cuando el servidor tiene `NUAGE_KV_PORT=6379`: su protocolo es el
+que hablan los clientes Redis, así que el cliente Redis del lenguaje se conecta tal cual, el
+token como contraseña (`redis://default:<token>@host:6379`). Ver
 [Almacén clave-valor](../README.es.md#almacén-clave-valor).
 
 ## El protocolo

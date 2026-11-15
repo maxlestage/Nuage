@@ -36,7 +36,7 @@ Nuage DB en producción, sin cambiar una línea.
 | **Transacciones** | Lecturas sobre una instantánea, commits optimistas (`Error::Conflict`, reintentados por `db.transaction(...)`), transacciones interactivas por HTTP, lotes todo o nada. |
 | **Ramas** | Una copia completa de la base para una vista previa, una prueba o un experimento, creada al instante: comparte las páginas de su padre y solo guarda sus propios cambios. |
 | **Copias de seguridad restauradas al arrancar** | Instantáneas y segmentos del registro, hacia una carpeta o un almacenamiento compatible con S3. Un directorio de datos vacío se restaura automáticamente al arrancar: los alojamientos con disco efímero funcionan. |
-| **Almacén clave-valor** | Cada aplicación tiene un almacén en memoria, que se usa como Redis: valores con caducidad, contadores, cerrojos, por HTTP (`/v1/kv`) y por el protocolo Redis, para cualquier cliente Redis ([Almacén clave-valor](#almacén-clave-valor)). |
+| **Almacén clave-valor** | Cada aplicación tiene un almacén en memoria: valores con caducidad, contadores, cerrojos, caché, por HTTP (`/v1/kv`) y en un puerto propio ([Almacén clave-valor](#almacén-clave-valor)). |
 | **Archivos** | Cada aplicación guarda archivos de cualquier tamaño (teselas de mapa, fotos, archivos comprimidos) en un bucket compatible con S3 como Cloudflare R2: el servidor los lista y firma los enlaces, los bytes van directamente entre el cliente y el bucket ([Archivos](#archivos)). |
 | **Servidor** | Un solo binario, configurado con variables de entorno: el protocolo de la base (`/v1`), el estado en directo (`/api/status`, `/api/status/stream`), la consola (`/admin`) y el sitio web con su panel en directo (`/app`), en un solo puerto. |
 | **Cliente WebAssembly** | `memoire_orm::NuageDb` habla HTTP(S): de forma nativa con Tokio, y en el navegador mediante `fetch`. |
@@ -304,7 +304,7 @@ cada driver PostgreSQL se conecta también: ver abajo.
 
 **¿Funciona mi conexión?** `GET /v1/ping` responde qué aplicación abre el token:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` da
-`Connected to Nuage DB 0.4.4: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.5: application blog, read and write, branch main, 3 table(s).`,
 y sin token, o con uno que no abre nada, dice qué falla. Desde cualquier máquina:
 `nuage check <url> <token>`. Una conexión PostgreSQL recibe la misma frase como aviso (psql
 la muestra), y la página de cada aplicación en la consola muestra su última conexión (cuándo,
@@ -374,13 +374,12 @@ la red: elige la región del proveedor más cercana a él, y un dyno que nunca s
 
 ## Almacén clave-valor
 
-Junto a su base, cada aplicación tiene un **almacén clave-valor en memoria**, que se usa como
-Redis: una caché delante de todo lo lento, sesiones, contadores, límites de peticiones,
+Junto a su base, cada aplicación tiene un **almacén clave-valor en memoria**:
+una caché delante de todo lo lento, sesiones, contadores, límites de peticiones,
 cerrojos. Nada toca el disco: una lectura o una escritura cuesta un viaje de ida y vuelta, y el
 servidor atiende más de 140 000 por segundo en 4 núcleos. Un reinicio lo vacía; lo que debe
 sobrevivir va en la base. La memoria está limitada para cada aplicación (`NUAGE_KV_MB`): pasado
-el límite, las claves caducadas salen primero, luego las menos usadas recientemente (el
-`allkeys-lru` de Redis).
+el límite, las claves caducadas salen primero, luego las menos usadas recientemente.
 
 **Por HTTP**, desde cualquier lenguaje, con un token de la aplicación (un token de solo lectura
 lee):
@@ -393,7 +392,7 @@ lee):
 | `POST /v1/kv/<clave>?incr` (`=5`, `&ttl=60`) | suma a un contador: `{"value": 6}`; `ttl` es la caducidad de un contador que esta llamada crea (un límite de peticiones en una sola) |
 | `POST /v1/kv/<clave>?expire=60`, `?persist` | cambia su caducidad |
 | `GET /v1/kv` (`?prefix=`, `&limit=`) | las claves (tamaño, tiempo restante) y las cifras del almacén |
-| `POST /v1/kv` | comandos de Redis en JSON: `["SET", "k", "v", "EX", 60]` responde `{"result": "OK"}`; una lista de comandos responde `{"results": [...]}` en un viaje |
+| `POST /v1/kv` | comandos en JSON: `["SET", "k", "v", "EX", 60]` responde `{"result": "OK"}`; una lista de comandos responde `{"results": [...]}` en un viaje |
 | `DELETE /v1/kv` | borra todas las claves |
 
 ```bash
@@ -403,9 +402,10 @@ curl -X POST "https://mi-nuage.herokuapp.com/v1/kv/visitas?incr&ttl=60" -H "Auth
 curl https://mi-nuage.herokuapp.com/v1/kv -H "Authorization: Bearer $NUAGE_TOKEN" -d '[["GET","session:42"],["TTL","session:42"]]'
 ```
 
-**Con cualquier cliente Redis**: con `NUAGE_REDIS_PORT=6379`, el servidor habla el protocolo
-Redis (RESP2 y RESP3), un token de la aplicación como contraseña. `redis-cli`, redis-py,
-node-redis, go-redis, Jedis… se conectan tal cual:
+**En un puerto propio**: con `NUAGE_KV_PORT=6379`, el almacén responde también en una conexión
+que sigue abierta, un token de la aplicación como contraseña. Su protocolo es RESP (2 y 3), el
+que hablan los clientes Redis: ningún cliente que escribir, `redis-cli`, redis-py, node-redis,
+go-redis, Jedis… se conectan tal cual:
 
 ```bash
 redis-cli -u redis://default:<token>@db.example.com:6379 SET saludo hola EX 60
@@ -416,7 +416,7 @@ Textos y contadores: `GET`, `SET` (`EX`, `PX`, `NX`, `XX`, `KEEPTTL`, `GET`), `S
 `DECRBY`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN`,
 `DBSIZE`, `FLUSHDB`, `INFO`, `PING`, y `MULTI` … `EXEC` (los comandos se ejecutan como uno
 solo). Las listas, los hashes, los conjuntos y pub/sub no están. Con `NUAGE_TLS_CERT` y
-`NUAGE_TLS_KEY`, el mismo puerto responde también con TLS (`rediss://`). Heroku solo enruta
+`NUAGE_TLS_KEY`, el mismo puerto responde también con TLS. Heroku solo enruta
 HTTP: allí, use `/v1/kv`.
 
 **Desde Rust**, `NuageKv` de Memoire (`db.kv()`): `get`, `set_for`, `incr_by`,
@@ -501,7 +501,7 @@ legible solo por los administradores, con una regla de cortafuegos para la red l
   funciona, pero avisa de que la contraseña viaja en claro.
 - **Actualizar**: vuelva a ejecutar el comando; datos, clave, ajustes y copias se conservan.
 - **Opciones**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: desactivado), `NUAGE_SWAP_MB` (`0`: sin
-  swap), `NUAGE_VERSION=v0.4.4`, `NUAGE_BINARY=/ruta/a/nuage`, `NUAGE_FROM_SOURCE=1`
+  swap), `NUAGE_VERSION=v0.4.5`, `NUAGE_BINARY=/ruta/a/nuage`, `NUAGE_FROM_SOURCE=1`
   (compilar con cargo). En Windows, defínalas antes: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Desinstalar**: `... | sudo bash -s uninstall` conserva los datos, los ajustes y las
   copias; `... | sudo bash -s purge` borra los datos y los ajustes, nunca las copias. En
@@ -526,7 +526,7 @@ El binario `nuage` queda en `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` en Window
 sitio y el panel en directo. Un servidor más ligero, sin ellos (`/` es entonces una pequeña
 página de inicio; la consola, la API y todo lo demás se mantienen):
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-Una versión concreta: `--tag v0.4.4`. Actualizar: el mismo comando, con `--force`.
+Una versión concreta: `--tag v0.4.5`. Actualizar: el mismo comando, con `--force`.
 
 `cargo install` solo coloca el binario: ni servicio, ni ajustes, ni copias. Páselo al
 instalador, que hace el resto (ajustes, copias, servicio que arranca con el ordenador):
@@ -664,8 +664,8 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `NUAGE_BACKUP_S3_PREFIX` | prefijo de los objetos de copia | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credenciales (si no, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutos entre dos instantáneas | `60` |
-| `NUAGE_REDIS_PORT` | sirve también el protocolo Redis en este puerto (`6379`): el cliente Redis de cada lenguaje, sobre el almacén clave-valor de una aplicación, un token como contraseña | desactivado |
-| `NUAGE_REDIS_BIND` | su dirección | `NUAGE_BIND` |
+| `NUAGE_KV_PORT` | sirve también el almacén clave-valor en un puerto propio (`6379`), por el protocolo que hablan los clientes Redis: uno se conecta al almacén de una aplicación, un token como contraseña | desactivado |
+| `NUAGE_KV_BIND` | su dirección | `NUAGE_BIND` |
 | `NUAGE_KV_MB` | memoria del almacén clave-valor de cada aplicación, en MiB, o `auto`; pasado el límite, salen las claves menos usadas recientemente | `auto`: un dieciseisavo de la memoria, 4 a 256 MiB |
 | `NUAGE_FILES_S3_BUCKET` | guarda los archivos de las aplicaciones (`/v1/files`) en este bucket compatible con S3 (ver [Archivos](#archivos)) | ninguno: sin archivos |
 | `NUAGE_FILES_S3_ENDPOINT` | su dirección (`https://<id de la cuenta>.r2.cloudflarestorage.com` en R2) | `https://s3.<región>.amazonaws.com` |
