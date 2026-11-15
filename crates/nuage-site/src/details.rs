@@ -434,6 +434,8 @@ fn app_body(tx: &'static Texts, db: &Database, history: &[f64], now: f64, log: &
         (tx.db_rows, status::group(db.rows)),
         (tx.detail_data, status::bytes(db.bytes)),
         (tx.detail_file, status::bytes(db.file_bytes)),
+        (tx.app_files, db.files_text().unwrap_or_else(|| DASH.to_string())),
+        (tx.app_kv, db.kv_text().unwrap_or_else(|| DASH.to_string())),
         (
             tx.app_tokens,
             if db.read_only_tokens > 0 {

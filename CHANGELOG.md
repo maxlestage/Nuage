@@ -4,6 +4,20 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.6 (2026-11-15)
+
+### The dashboard shows what an application keeps besides its tables
+
+- Each application's card of `/app`, and its details, show its **files** (how many, and their
+  size in the bucket) and its **key-value store** (keys, memory), next to its tables, rows and
+  size: an application whose database is small but which keeps gigabytes of files no longer
+  looks empty. In English, French and Spanish.
+- `/api/status` gives `files` (`{"count", "bytes"}`) for each application, next to `kv`. The
+  files are counted in the background, by one listing of the application's folder, at most
+  every two minutes while the status is watched (and again after an upload link or a
+  deletion): the status itself never waits for the bucket. `files` is `null` without a bucket,
+  or until the first count is back.
+
 ## 0.4.5 (2026-11-15)
 
 ### The key-value store has names of its own

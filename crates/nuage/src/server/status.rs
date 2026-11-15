@@ -83,7 +83,7 @@ fn requests_json(metrics: &super::Metrics) -> Json {
 }
 
 /// One application, as `databases[]` lists it.
-fn app_json(app: &App, env_token: bool) -> Json {
+fn app_json(state: &State, app: &App, env_token: bool) -> Json {
     let engine = &app.engine;
     let stats = engine.stats();
     let backup = engine.backup_status();
@@ -131,6 +131,14 @@ fn app_json(app: &App, env_token: bool) -> Json {
         })),
         "requests": requests_json(&app.metrics),
         "kv": kv,
+        // What it keeps in the bucket (`/v1/files`), as last counted: null
+        // without a bucket, or until the first count is back.
+        "files": state
+            .options
+            .files
+            .as_ref()
+            .and_then(|f| f.usage(&app.name))
+            .map(|(count, bytes)| json!({ "count": count, "bytes": bytes })),
         "branches": branches,
     })
 }
@@ -193,7 +201,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
     }
 
     let env_token = state.options.token.is_some();
-    let databases: Vec<Json> = view.apps(state).iter().map(|a| app_json(a, env_token)).collect();
+    let databases: Vec<Json> = view.apps(state).iter().map(|a| app_json(state, a, env_token)).collect();
     let sum = |f: fn(&crate::engine::StorageStats) -> u64| every.iter().map(|(s, _)| f(s)).sum::<u64>();
     let first = &every[0].0;
     let m = crate::memory::MemoryInfo::now();

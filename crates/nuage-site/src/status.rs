@@ -199,6 +199,48 @@ pub struct Database {
     pub bytes: u64,
     #[serde(default)]
     pub branches: Vec<Branch>,
+    /// What it keeps in the bucket (`/v1/files`): absent without a bucket, or
+    /// until it was counted.
+    #[serde(default)]
+    pub files: Option<Files>,
+    /// Its key-value store, in memory.
+    #[serde(default)]
+    pub kv: Option<KeyValue>,
+}
+
+/// The files of an application.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Files {
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// The key-value store of an application.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyValue {
+    #[serde(default)]
+    pub keys: u64,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// A count and its weight, as a card says them: `540 · 47.1 GB`, or `0`.
+fn count_and_bytes(count: u64, weight: u64) -> String {
+    if count == 0 { "0".to_owned() } else { format!("{} · {}", group(count), bytes(weight)) }
+}
+
+impl Database {
+    /// Its files: `540 · 47.1 GB`.
+    pub fn files_text(&self) -> Option<String> {
+        self.files.map(|f| count_and_bytes(f.count, f.bytes))
+    }
+
+    /// Its key-value store: `12 · 3.4 kB`.
+    pub fn kv_text(&self) -> Option<String> {
+        self.kv.map(|k| count_and_bytes(k.keys, k.bytes))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -423,7 +465,8 @@ mod tests {
           "branches": [ { "name": "preview-42", "parent": "nuage", "created_at": "2026-11-13T09:00:00Z",
                           "own_bytes": 65536 } ] },
         { "name": "shop", "description": "La boutique", "encrypted": true, "tables": 3, "rows": 120,
-          "bytes": 65536, "tokens": 2, "last_request_at": "2026-11-13T11:59:58Z", "branches": [] }
+          "bytes": 65536, "tokens": 2, "last_request_at": "2026-11-13T11:59:58Z", "branches": [],
+          "files": { "count": 540, "bytes": 47100000000 }, "kv": { "keys": 12, "bytes": 3400 } }
       ],
       "services": [
         { "name": "engine", "status": "ok", "detail": "12 800 pages, cache 97 %" },
@@ -439,7 +482,14 @@ mod tests {
         let status: Status = serde_json::from_str(SAMPLE).unwrap();
         assert_eq!(status.requests.as_ref().unwrap().p99_ms, 4.2);
         assert_eq!(status.databases.as_ref().unwrap()[0].branches[0].own_bytes, 65536);
-        assert_eq!(status.databases.as_ref().unwrap()[1].description.as_deref(), Some("La boutique"));
+        let shop = &status.databases.as_ref().unwrap()[1];
+        assert_eq!(shop.description.as_deref(), Some("La boutique"));
+        // What an application keeps besides its tables: files and its key-value store.
+        assert_eq!(shop.files_text().as_deref(), Some("540 · 47.1 GB"));
+        assert_eq!(shop.kv_text().as_deref(), Some("12 · 3.40 kB"));
+        let first = &status.databases.as_ref().unwrap()[0];
+        assert_eq!((first.files_text(), first.kv_text()), (None, None), "an older server says nothing");
+        assert_eq!(count_and_bytes(0, 0), "0");
         assert!(status.encryption.as_ref().unwrap().enabled);
         assert_eq!(status.applications, Some(2));
         assert_eq!(status.services.len(), 5);
