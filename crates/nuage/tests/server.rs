@@ -1469,6 +1469,152 @@ async fn management_api() {
     running.shutdown().await;
 }
 
+/// The management token: the whole status, as a console session sees it, and
+/// the websites of an application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn management_token_status_and_websites() {
+    let admin = "m".repeat(nuage::server::MIN_ADMIN_TOKEN);
+    let bearer = format!("Bearer {admin}");
+    let auth: &[(&str, &str)] = &[("authorization", &bearer)];
+    let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
+    let names = |j: &serde_json::Value| -> Vec<String> {
+        j["databases"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_owned()).collect()
+    };
+
+    // Without NUAGE_ADMIN_TOKEN, no bearer opens the whole status.
+    let off = Server::new(engine("manage-status-off"), options());
+    let running = off.listen("127.0.0.1:0").await.unwrap();
+    assert_eq!(http(running.local_addr(), "GET", "/api/status", auth, "").await.status, 401);
+    running.shutdown().await;
+
+    let server = Server::new(engine("manage-status"), ServerOptions { admin_token: Some(admin.clone()), ..options() });
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let (_, shop_token) = server.create_app("shop", "").unwrap();
+    let shop_bearer = format!("Bearer {shop_token}");
+    let shop_auth: &[(&str, &str)] = &[("authorization", &shop_bearer)];
+
+    // The management token sees every application, with the version.
+    let all = http(addr, "GET", "/api/status", auth, "").await;
+    assert_eq!(all.status, 200, "{}", all.body);
+    let all = json(&all);
+    assert_eq!(all["version"], nuage::VERSION);
+    assert_eq!(all["applications"], 2);
+    assert_eq!(names(&all), ["nuage", "shop"]);
+    // An application's token still sees that application only.
+    let own = http(addr, "GET", "/api/status", shop_auth, "").await;
+    assert_eq!((own.status, names(&json(&own))), (200, vec!["shop".to_owned()]));
+    let first = json(&http(addr, "GET", "/api/status", &[("authorization", "Bearer t0ken")], "").await);
+    assert_eq!(names(&first), ["nuage"]);
+    // A wrong token, one character short or one too many: refused.
+    let (short, long) = (format!("Bearer {}", &admin[1..]), format!("Bearer {admin}x"));
+    for wrong in ["Bearer nope", short.as_str(), long.as_str()] {
+        let r = http(addr, "GET", "/api/status", &[("authorization", wrong)], "").await;
+        assert_eq!(r.status, 401, "{wrong}: {}", r.body);
+        assert!(json(&r)["error"]["message"].as_str().unwrap().contains("management token"), "{}", r.body);
+    }
+    // The stream too.
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let req = Request::get("/api/status/stream")
+        .header("host", addr.to_string())
+        .header("authorization", &bearer)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let mut body = res.into_body();
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !text.contains("event: status\ndata: ") || !text.ends_with("\n\n") {
+        let frame =
+            tokio::time::timeout_at(deadline, body.frame()).await.expect("a status within 10 s").unwrap().unwrap();
+        if let Some(data) = frame.data_ref() {
+            text.push_str(&String::from_utf8_lossy(data));
+        }
+    }
+    let event = text.split("event: status\ndata: ").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert_eq!(names(&serde_json::from_str(event).unwrap()), ["nuage", "shop"]);
+    drop(body);
+
+    // The websites of an application: set, read back, refused, removed.
+    let site = "https://shop.example";
+    let set = http(
+        addr,
+        "POST",
+        "/api/apps/shop/origins",
+        auth,
+        r#"{"origins": ["https://Shop.example/", "http://localhost:3000", "http://localhost:3000"]}"#,
+    )
+    .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    let both = serde_json::json!([site, "http://localhost:3000"]);
+    assert_eq!((json(&set)["name"].as_str(), &json(&set)["origins"]), (Some("shop"), &both));
+    assert_eq!(json(&http(addr, "GET", "/api/apps/shop", auth, "").await)["origins"], both);
+    let status = json(&http(addr, "GET", "/api/status", shop_auth, "").await);
+    assert_eq!(status["databases"][0]["websites"], both);
+
+    // A page of the site may call the application from the browser.
+    let pre = [
+        ("origin", site),
+        ("access-control-request-method", "POST"),
+        ("access-control-request-headers", "authorization,content-type"),
+    ];
+    let res = http(addr, "OPTIONS", "/v1/sql", &pre, "").await;
+    assert_eq!((res.status, res.headers["access-control-allow-origin"].to_str().unwrap()), (204, site));
+    let from_site =
+        http(addr, "POST", "/v1/sql", &[shop_auth[0], ("origin", site)], r#"{"sql": "SELECT 1 AS one"}"#).await;
+    assert_eq!(from_site.status, 200, "{}", from_site.body);
+    assert_eq!(from_site.headers["access-control-allow-origin"], site);
+
+    // Refusals say why, in the language asked for; what was there stays.
+    for (body, words) in [
+        (r#"{"origins": ["shop.example/path"]}"#, "`shop.example/path` is not an origin"),
+        (r#"{"origins": ["https://shop.example/fr"]}"#, "scheme and host, no path"),
+        (r#"{"origins": "https://shop.example"}"#, "JSON object"),
+        (r#"{"origins": [7]}"#, "JSON object"),
+        (r#"{"websites": []}"#, "JSON object"),
+        ("[]", "JSON object"),
+        ("", "JSON object"),
+    ] {
+        let r = http(addr, "POST", "/api/apps/shop/origins", auth, body).await;
+        assert_eq!(r.status, 400, "{body}: {}", r.body);
+        assert_eq!(json(&r)["error"]["kind"], "validation");
+        assert!(json(&r)["error"]["message"].as_str().unwrap().contains(words), "{body}: {}", r.body);
+    }
+    let french = [auth[0], ("accept-language", "fr-FR,fr;q=0.9")];
+    let r = http(addr, "POST", "/api/apps/shop/origins", &french, r#"{"origins": ["ftp://shop.example"]}"#).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(
+        json(&r)["error"]["message"],
+        "`ftp://shop.example` n'est pas une origine : écrivez `https://site.fr` (schéma et hôte, sans chemin), ou `*`"
+    );
+    assert_eq!(json(&http(addr, "GET", "/api/apps/shop", auth, "").await)["origins"], both);
+    assert_eq!(http(addr, "POST", "/api/apps/nothing/origins", auth, r#"{"origins": []}"#).await.status, 404);
+    assert_eq!(http(addr, "GET", "/api/apps/shop/origins", auth, "").await.status, 405);
+    assert_eq!(http(addr, "DELETE", "/api/apps/shop/origins", auth, "").await.status, 405);
+    let r = http(addr, "POST", "/api/apps/shop/origins", shop_auth, r#"{"origins": ["*"]}"#).await;
+    assert_eq!(r.status, 401, "an application's token never opens it: {}", r.body);
+
+    // The console says the same refusal in its language.
+    let mut c = Console { addr, cookies: HashMap::from([("nuage_lang".to_owned(), "es".to_owned())]) };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let token = csrf(&c.request("GET", "/admin/apps/shop/settings", &[]).await.body);
+    let res = c.request("POST", "/admin/apps/shop/origins", &[("csrf", &token), ("origins", "shop.example/x")]).await;
+    assert!(res.body.contains("no es un origen"), "{}", res.body);
+
+    // An empty list removes them: the browser is refused again.
+    let none = http(addr, "POST", "/api/apps/shop/origins", auth, r#"{"origins": []}"#).await;
+    assert_eq!((none.status, &json(&none)["origins"]), (200, &serde_json::json!([])));
+    assert_eq!(http(addr, "OPTIONS", "/v1/sql", &pre, "").await.status, 403);
+    let spec: serde_json::Value =
+        serde_json::from_str(&http(addr, "GET", "/v1/openapi.json", &[], "").await.body).unwrap();
+    assert_eq!(spec["paths"]["/api/apps/{name}/origins"]["post"]["security"][0]["adminToken"], serde_json::json!([]));
+    running.shutdown().await;
+}
+
 /// `/v1/files`: each application's files in a bucket, reached through signed links.
 #[tokio::test]
 async fn files_through_signed_links() {

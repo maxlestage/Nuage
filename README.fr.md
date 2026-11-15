@@ -253,6 +253,8 @@ jeton et `env()`, les deux lignes. Dans un projet [Paquets](https://github.com/m
 | `GET` | `/api/apps/{nom}` | | `200` l'application ; `404` |
 | `POST` | `/api/apps/{nom}/tokens` | `{"read_only": true}` (facultatif, `false` par défaut) | `201 {"application", "token", "read_only", "env"}` |
 | `DELETE` | `/api/apps/{nom}/tokens/{id}` | | `200 {"revoked": true}` ; `404` pas de tel jeton |
+| `POST` | `/api/apps/{nom}/origins` | `{"origins": ["https://site.fr", "http://localhost:3000"]}`, la liste entière ; `[]` les retire | `200` l'application, avec ses `origins` ; `400` pas une origine (schéma et hôte, sans chemin, ou `*`) |
+| `GET` | `/api/status` | | `200` le statut en direct de toutes les applications, comme une session de la console le voit |
 
 Un refus est du JSON, `{"error": {"kind", "message"}}`, avec un message qui dit quoi faire :
 `401` sans le jeton de gestion ou avec un mauvais, `403` quand `NUAGE_ADMIN_TOKEN` n'est pas
@@ -344,9 +346,9 @@ Tout site peut utiliser la base d'une application, depuis son serveur ou depuis 
   Plusieurs instructions (séparées par `;`, ou `"statements": [...]`) forment une seule
   transaction, tout ou rien.
 - **Depuis le navigateur** : ajoutez le site dans la console (**Settings → Websites** :
-  `https://site.fr`, `http://localhost:3000`, ou `*`) et ses pages peuvent appeler `/v1`
-  (CORS). La requête préalable du navigateur est mise en cache un jour : un aller-retour, une
-  seule fois.
+  `https://site.fr`, `http://localhost:3000`, ou `*`), ou avec `POST /api/apps/{nom}/origins`
+  et le jeton de gestion, et ses pages peuvent appeler `/v1` (CORS). La requête préalable du
+  navigateur est mise en cache un jour : un aller-retour, une seule fois.
 - **Jetons en lecture seule** (**Tokens → New read-only token**) : un jeton dans une page est
   public, les pages reçoivent donc un jeton qui lit sans jamais écrire ; gardez les jetons
   lecture-écriture sur des serveurs.
@@ -825,7 +827,7 @@ HTTPS.
 | `/v1/kv` | le stockage clé-valeur de l'application, en mémoire (voir [Stockage clé-valeur](#stockage-clé-valeur)) | un jeton de l'application ; un jeton en lecture seule lit |
 | `/v1/files` | les fichiers de l'application, par des liens signés vers son bucket (voir [Fichiers](#fichiers)) | un jeton de l'application ; un jeton en lecture seule liste et télécharge |
 | `/api/health` | `{"status":"ok"}` | public |
-| `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application) ou session de la console (toutes) |
+| `/api/status`, `/api/status/stream` | statut en direct, en JSON et en Server-Sent Events | jeton d'une application (cette application), jeton de gestion ou session de la console (toutes) |
 | `/api/apps` | l'API de gestion : les applications et leurs jetons (voir [Créer une application en une commande](#créer-une-application-en-une-commande)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | la console | `NUAGE_ADMIN_PASSWORD` |
 | tout le reste | le site, `/app` compris | public |

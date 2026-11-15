@@ -97,10 +97,12 @@ pub(crate) mod refused {
     pub(crate) const CACHE_MORE_THAN_LEFT: &str = "{} MiB for `{}` is more than is left: the page caches of this server may take {} MiB in all, {} MiB of it are set apart for other databases and {} MiB stay for those that share: {} MiB at most";
     pub(crate) const KV_TOO_SMALL: &str = "a key-value store needs {} MiB at least";
     pub(crate) const UNREADABLE: &str = "the saved settings were written by another version of Nuage DB and cannot be read by this one: nothing is saved over them (start the version that wrote them, or NUAGE_SETTINGS=environment)";
+    pub(crate) const NOT_AN_ORIGIN: &str =
+        "`{}` is not an origin: write `https://site.fr` (scheme and host, no path), or `*`";
 
     /// Every sentence above.
     #[cfg(test)]
-    pub(crate) const ALL: [&str; 19] = [
+    pub(crate) const ALL: [&str; 20] = [
         UNREADABLE,
         TOO_MUCH_FOR_ANY,
         TOO_LITTLE,
@@ -120,6 +122,7 @@ pub(crate) mod refused {
         CACHE_TOO_SMALL,
         CACHE_MORE_THAN_LEFT,
         KV_TOO_SMALL,
+        NOT_AN_ORIGIN,
     ];
 }
 

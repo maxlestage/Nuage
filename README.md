@@ -247,6 +247,8 @@ From Rust, `memoire_orm::NuageAdmin` (Memoire's `nuage` feature) does the same:
 | `GET` | `/api/apps/{name}` | | `200` the application; `404` |
 | `POST` | `/api/apps/{name}/tokens` | `{"read_only": true}` (optional, `false` by default) | `201 {"application", "token", "read_only", "env"}` |
 | `DELETE` | `/api/apps/{name}/tokens/{id}` | | `200 {"revoked": true}`; `404` no such token |
+| `POST` | `/api/apps/{name}/origins` | `{"origins": ["https://site.fr", "http://localhost:3000"]}`, the whole list; `[]` removes them | `200` the application, with its `origins`; `400` not an origin (scheme and host, no path, or `*`) |
+| `GET` | `/api/status` | | `200` the live status of every application, as a console session sees it |
 
 A refusal is JSON, `{"error": {"kind", "message"}}`, with a message that says what to do:
 `401` without the management token or with a wrong one, `403` when `NUAGE_ADMIN_TOKEN` is
@@ -333,7 +335,8 @@ Any website can use an application's database, from its server or from its pages
   arrays), an insert gives its `last_insert_id`. Several statements (separated by `;`, or
   `"statements": [...]`) run in one transaction, all or nothing.
 - **From the browser**: list the website in the console (**Settings → Websites**:
-  `https://site.fr`, `http://localhost:3000`, or `*`) and its pages may call `/v1` (CORS).
+  `https://site.fr`, `http://localhost:3000`, or `*`), or with `POST /api/apps/{name}/origins`
+  and the management token, and its pages may call `/v1` (CORS).
   The browser's preflight is cached for a day, so it costs one round trip, once.
 - **Read-only tokens** (**Tokens → New read-only token**): a token in a page is public, so
   pages get one that reads and never writes; keep read-and-write tokens on servers.
@@ -784,7 +787,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 | `/v1/kv` | the application's key-value store, in memory (see [Key-value store](#key-value-store)) | a token of the application; a read-only token reads |
 | `/v1/files` | the application's files, through signed links to its bucket (see [Files](#files)) | a token of the application; a read-only token lists and downloads |
 | `/api/health` | `{"status":"ok"}` | public |
-| `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |
+| `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application), the management token or a console session (all of them) |
 | `/api/apps` | the management API: applications and their tokens (see [Create an application in one command](#create-an-application-in-one-command)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | the console | `NUAGE_ADMIN_PASSWORD` |
 | everything else | the website, `/app` included | public |
