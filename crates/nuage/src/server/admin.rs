@@ -340,6 +340,24 @@ fn bytes(l: Lang, n: u64) -> String {
     if l == Lang::En { s } else { s.replace('.', ",") }
 }
 
+/// Memory, always in gigabytes (of 1024³ bytes): `0,48 Gio`, `0.48 GiB`.
+fn gigas(l: Lang, n: u64) -> String {
+    let unit = if l == Lang::Fr { "Gio" } else { "GiB" };
+    let v = n as f64 / (1u64 << 30) as f64;
+    let s = if n == 0 {
+        format!("0 {unit}")
+    } else if v < 0.005 {
+        format!("< 0.01 {unit}")
+    } else if v < 10.0 {
+        format!("{v:.2} {unit}")
+    } else if v < 100.0 {
+        format!("{v:.1} {unit}")
+    } else {
+        format!("{v:.0} {unit}")
+    };
+    if l == Lang::En { s } else { s.replace('.', ",") }
+}
+
 fn duration(l: Lang, d: Duration) -> String {
     let s = d.as_secs();
     let day = if l == Lang::En { "d" } else { "j" };
@@ -1275,7 +1293,7 @@ fn server_body(state: &State, cx: &Cx) -> String {
             "Memory",
             match (memory.used_bytes, memory.available_bytes, memory.total_bytes) {
                 (Some(u), Some(a), Some(t)) => {
-                    let text = cx.tf("{} used, {} free of {}", &[&bytes(l, u), &bytes(l, a), &bytes(l, t)]);
+                    let text = cx.tf("{} used, {} free of {}", &[&gigas(l, u), &gigas(l, a), &gigas(l, t)]);
                     if memory.limited { format!("{text} ({})", cx.t("the limit of this server")) } else { text }
                 }
                 _ => cx.t("unknown").into(),
@@ -1285,7 +1303,7 @@ fn server_body(state: &State, cx: &Cx) -> String {
             "Swap",
             match (memory.swap_total_bytes, memory.swap_free_bytes) {
                 (Some(0), _) => cx.t("none").into(),
-                (Some(t), Some(f)) => cx.tf("{} free of {}", &[&bytes(l, f), &bytes(l, t)]),
+                (Some(t), Some(f)) => cx.tf("{} free of {}", &[&gigas(l, f), &gigas(l, t)]),
                 _ if memory.limited => cx.t("not reported by the host").into(),
                 _ => cx.t("unknown").into(),
             },

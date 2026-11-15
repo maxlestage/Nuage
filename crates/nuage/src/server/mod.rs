@@ -592,9 +592,9 @@ impl State {
         crate::memory::release_free_memory();
         self.memory_reliefs.fetch_add(1, Ordering::Relaxed);
         let message = format!(
-            "memory: {:.0} % of {} MiB in use: the page caches were emptied{} and the freed memory returned to the system",
+            "memory: {:.0} % of {:.2} GiB in use: the page caches were emptied{} and the freed memory returned to the system",
             pressure * 100.0,
-            m.total_bytes.unwrap_or(0) >> 20,
+            m.total_bytes.unwrap_or(0) as f64 / (1u64 << 30) as f64,
             budget.map(|b| format!(", their budget set to {} MiB", b >> 20)).unwrap_or_default()
         );
         // In the event log, and in the server's own log.

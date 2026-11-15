@@ -312,14 +312,11 @@ pub fn body(
                     .child(span().class("bar-fill").style(format!("width:{:.1}%", s.bytes as f64 / total * 100.0)))
                     .into(),
                 facts(vec![
-                    (tx.storage_data, status::bytes(s.bytes)),
-                    (tx.storage_free, status::bytes(s.disk_free_bytes)),
+                    (tx.storage_data, tx.bytes(s.bytes)),
+                    (tx.storage_free, tx.bytes(s.disk_free_bytes)),
                     (tx.storage_pages, status::group(s.pages)),
                     (tx.cache_hit, status::percent(s.cache_hit_rate)),
-                    (
-                        tx.cache_size,
-                        format!("{} / {}", status::bytes(s.cache_bytes), status::bytes(s.cache_capacity_bytes)),
-                    ),
+                    (tx.cache_size, format!("{} / {}", tx.megas(s.cache_bytes), tx.megas(s.cache_capacity_bytes))),
                 ]),
                 help(tx.help_storage),
             ];
@@ -329,10 +326,7 @@ pub fn body(
                 vec![tx.apps_title, tx.detail_data, tx.detail_file, tx.db_rows],
                 dbs.iter()
                     .map(|db| {
-                        (
-                            db.name.clone(),
-                            vec![status::bytes(db.bytes), status::bytes(db.file_bytes), status::group(db.rows)],
-                        )
+                        (db.name.clone(), vec![tx.bytes(db.bytes), tx.bytes(db.file_bytes), status::group(db.rows)])
                     })
                     .collect(),
             ));
@@ -342,19 +336,20 @@ pub fn body(
             let Some(m) = &d.memory else {
                 return vec![p().class("muted").text(DASH).into()];
             };
-            let b = |v: Option<u64>| v.map_or(DASH.to_string(), status::bytes);
+            let b = |v: Option<u64>| v.map_or(DASH.to_string(), |n| tx.gigas(n));
+            let c = |v: Option<u64>| v.map_or(DASH.to_string(), |n| tx.megas(n));
             let pct = match (m.used_bytes, m.total_bytes) {
                 (Some(u), Some(t)) if t > 0 => u as f64 / t as f64 * 100.0,
                 _ => 0.0,
             };
             let used = match m.used_bytes {
-                Some(u) => format!("{} · {pct:.0} %", status::bytes(u)),
+                Some(u) => format!("{} · {pct:.0} %", tx.gigas(u)),
                 None => DASH.to_string(),
             };
             let swap = match (m.swap_free_bytes, m.swap_total_bytes) {
                 (_, Some(0)) => tx.detail_none.to_string(),
-                (Some(f), Some(t)) => format!("{} / {}", status::bytes(f), status::bytes(t)),
-                (None, Some(t)) => status::bytes(t),
+                (Some(f), Some(t)) => format!("{} / {}", tx.gigas(f), tx.gigas(t)),
+                (None, Some(t)) => tx.gigas(t),
                 (_, None) if m.limited => tx.mem_swap_unknown.to_string(),
                 (_, None) => tx.detail_none.to_string(),
             };
@@ -375,9 +370,9 @@ pub fn body(
                 help(tx.help_memory),
                 heading(tx.cache_size),
                 facts(vec![
-                    (tx.mem_cache_budget, b(m.cache_budget_bytes)),
-                    (tx.detail_cache_app, b(m.cache_per_app_bytes)),
-                    (tx.mem_cache_used, b(cache_used)),
+                    (tx.mem_cache_budget, c(m.cache_budget_bytes)),
+                    (tx.detail_cache_app, c(m.cache_per_app_bytes)),
+                    (tx.mem_cache_used, c(cache_used)),
                     (tx.mem_reliefs, m.reliefs.to_string()),
                 ]),
             ]
@@ -387,7 +382,7 @@ pub fn body(
             vec![
                 facts(vec![
                     (tx.last_checkpoint, when_and_ago(tx, now, w.last_checkpoint_at.as_deref())),
-                    (tx.wal_size, status::bytes(w.bytes)),
+                    (tx.wal_size, tx.bytes(w.bytes)),
                 ]),
                 help(tx.help_wal),
             ]
@@ -459,10 +454,10 @@ fn app_body(tx: &'static Texts, db: &Database, history: &[f64], now: f64, log: &
         ("p99", status::millis(r.p99_ms)),
         (tx.db_tables, db.tables.to_string()),
         (tx.db_rows, status::group(db.rows)),
-        (tx.detail_data, status::bytes(db.bytes)),
-        (tx.detail_file, status::bytes(db.file_bytes)),
-        (tx.app_files, db.files_text().unwrap_or_else(|| DASH.to_string())),
-        (tx.app_kv, db.kv_text().unwrap_or_else(|| DASH.to_string())),
+        (tx.detail_data, tx.bytes(db.bytes)),
+        (tx.detail_file, tx.bytes(db.file_bytes)),
+        (tx.app_files, db.files_text(&tx.byte_units).unwrap_or_else(|| DASH.to_string())),
+        (tx.app_kv, db.kv_text(&tx.byte_units).unwrap_or_else(|| DASH.to_string())),
         (
             tx.app_tokens,
             if db.read_only_tokens > 0 {
@@ -484,7 +479,7 @@ fn app_body(tx: &'static Texts, db: &Database, history: &[f64], now: f64, log: &
                     db.branches
                         .iter()
                         .map(|b| {
-                            let mut line = format!(" · {} {}", status::bytes(b.own_bytes), tx.db_branch_own);
+                            let mut line = format!(" · {} {}", tx.bytes(b.own_bytes), tx.db_branch_own);
                             if let Some(parent) = &b.parent {
                                 line.push_str(&format!(" · {} {parent}", tx.detail_from));
                             }
