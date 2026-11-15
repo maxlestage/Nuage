@@ -28,6 +28,7 @@
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+//! | `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; when the backup holds nothing to restore, or no backup is set, the server refuses to start, and creates and writes nothing. For a disk erased at each restart (Heroku), once the server holds data: a first start has nothing to restore. `1`, `yes`, `0`, `no` too; any other value stops the start | `false`: an empty start is allowed, and said |
 //! | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (Cloudflare R2, AWS S3, MinIO...); the bytes go straight between the clients and the bucket, through signed links | none: no files |
 //! | `NUAGE_FILES_S3_ENDPOINT` | its endpoint URL (`https://<account>.r2.cloudflarestorage.com` for R2) | `https://s3.<region>.amazonaws.com` |
 //! | `NUAGE_FILES_S3_REGION` | its region | `auto` on R2, else `us-east-1` |
@@ -79,6 +80,10 @@ pub struct Config {
     pub keep_awake: Option<crate::keepawake::KeepAwake>,
     /// The backup folder (`NUAGE_BACKUP_DIR`), if the backups go to one.
     pub backup_dir: Option<PathBuf>,
+    /// An empty data directory must be restored from the backup
+    /// (`NUAGE_RESTORE_REQUIRED`): the binary opens it with
+    /// [`Engine::open_existing`](crate::Engine::open_existing).
+    pub restore_required: bool,
 }
 
 /// The data directory and the engine settings, through `var`: `NUAGE_DATA_DIR`,
@@ -243,6 +248,15 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         public_status: get("NUAGE_PUBLIC_STATUS").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
         ..ServerOptions::default()
     };
+    // A safety setting: a value mistyped must not mean `off`.
+    let restore_required = match get("NUAGE_RESTORE_REQUIRED") {
+        None => false,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => return Err(Error::Validation(format!("NUAGE_RESTORE_REQUIRED=`{v}`: `true` or `false`"))),
+        },
+    };
     let keep_awake = match get("NUAGE_KEEP_AWAKE_URL") {
         Some(url) => Some(crate::keepawake::KeepAwake::from_vars(
             &url,
@@ -253,6 +267,7 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
     };
     Ok(Config {
         backup_dir: get("NUAGE_BACKUP_DIR").map(PathBuf::from),
+        restore_required,
         keep_awake,
         port,
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
@@ -442,6 +457,27 @@ mod tests {
         assert_eq!(same_disk(&tmp, &tmp.join("not/yet/made")), Some(true), "a folder to come is where its parent is");
         #[cfg(target_os = "linux")]
         assert_eq!(same_disk(&tmp, std::path::Path::new("/proc")), Some(false), "/proc is a disk of its own");
+    }
+
+    /// A safety setting is read strictly: a value mistyped stops the start
+    /// instead of meaning `false`.
+    #[test]
+    fn restore_required_is_true_or_false() {
+        let with = |v: &str| {
+            let v = v.to_owned();
+            from_vars(move |k| (k == "NUAGE_RESTORE_REQUIRED").then(|| v.clone()))
+        };
+        assert!(!from_vars(|_| None).unwrap().restore_required, "off by default");
+        for off in ["false", "0", "no", "", " "] {
+            assert!(!with(off).unwrap().restore_required, "{off}");
+        }
+        for on in ["true", "1", "yes", " TRUE ", "Yes"] {
+            assert!(with(on).unwrap().restore_required, "{on}");
+        }
+        for bad in ["ture", "on", "2", "y"] {
+            let e = with(bad).unwrap_err().to_string();
+            assert!(e.contains(&format!("NUAGE_RESTORE_REQUIRED=`{bad}`: `true` or `false`")), "{e}");
+        }
     }
 
     #[test]

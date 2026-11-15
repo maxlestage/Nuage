@@ -10,6 +10,33 @@ fn log(message: &str) {
     println!("nuage: {message}");
 }
 
+/// The end of the engine's error when `Engine::open_existing` refuses an
+/// empty data directory.
+const EMPTY_REFUSED: &str = "an empty database is not started here";
+
+/// What to do when NUAGE_RESTORE_REQUIRED refused an empty start: where the
+/// backup was looked for, and how to get out.
+fn restore_required_help(backup: bool, folder: bool) -> String {
+    let check = match (backup, folder) {
+        (false, _) => {
+            "No backup destination is set: put the backup settings (NUAGE_BACKUP_DIR or NUAGE_BACKUP_S3_*) back as \
+             they were"
+        }
+        (true, true) => {
+            "Check NUAGE_BACKUP_DIR (an external disk must be plugged in: without it, its folder is missing or \
+             empty), or put the backup settings back as they were"
+        }
+        (true, false) => {
+            "Check NUAGE_BACKUP_S3_BUCKET and NUAGE_BACKUP_S3_PREFIX (used as written: `nuage` and `nuage/` are two \
+             places), or put the backup settings back as they were"
+        }
+    };
+    format!(
+        "NUAGE_RESTORE_REQUIRED is set. Nothing was created and nothing was written. {check}; for the first start \
+         of a new server, remove NUAGE_RESTORE_REQUIRED"
+    )
+}
+
 fn main() -> ExitCode {
     // `nuage genkey`: a new encryption key, for NUAGE_ENCRYPTION_KEY.
     if std::env::args().nth(1).as_deref() == Some("genkey") {
@@ -102,10 +129,19 @@ fn main() -> ExitCode {
     }
     runtime.block_on(async move {
         let backup = config.engine.backup.as_ref().map(|b| b.store.describe());
-        let engine = match Engine::open(&config.data_dir, config.engine) {
+        let opened = if config.restore_required {
+            Engine::open_existing(&config.data_dir, config.engine)
+        } else {
+            Engine::open(&config.data_dir, config.engine)
+        };
+        let engine = match opened {
             Ok(e) => e,
             Err(e) => {
+                let e = e.to_string();
                 eprintln!("nuage: cannot open the data directory {}: {e}", config.data_dir.display());
+                if config.restore_required && e.contains(EMPTY_REFUSED) {
+                    eprintln!("nuage: {}", restore_required_help(backup.is_some(), config.backup_dir.is_some()));
+                }
                 return ExitCode::FAILURE;
             }
         };
@@ -131,8 +167,17 @@ fn main() -> ExitCode {
                         folder.display()
                     ));
                 }
-                if engine.backup_status().restored {
+                let status = engine.backup_status();
+                if status.restored {
                     log("the data directory was empty: restored from the backup");
+                }
+                // Printed here: the log of the engines' events below starts after it.
+                if status.started_empty {
+                    log(&format!(
+                        "warning: the data directory was empty and {target} holds no backup: this is a NEW, EMPTY \
+                         database. If this server had data, stop it now and check NUAGE_BACKUP_*: its backups are \
+                         still where they were. NUAGE_RESTORE_REQUIRED=true refuses to start in this case"
+                    ));
                 }
             }
             None => log(
@@ -166,6 +211,15 @@ fn main() -> ExitCode {
             let tables = nuage::Embedded::from_engine(e.clone()).tables().unwrap_or_default();
             let rows: i64 = tables.iter().map(|t| t.rows).sum();
             log(&format!("application `{}`: {} table(s), {rows} row(s)", app.name, tables.len()));
+            // The first application is the server's own engine, said above.
+            let status = e.backup_status();
+            if !app.first && status.started_empty {
+                log(&format!(
+                    "warning: application `{}` is registered but its backup ({}) holds nothing: it starts empty",
+                    app.name,
+                    status.target.unwrap_or_default()
+                ));
+            }
             if let Some(i) = e.imported() {
                 log(&format!(
                     "application `{}`: its data was written by an earlier version; it was imported and compared \

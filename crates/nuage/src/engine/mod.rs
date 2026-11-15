@@ -154,6 +154,12 @@ pub struct BackupStatus {
     pub last_snapshot_at: Option<i64>,
     /// The data directory was restored from the backup at startup.
     pub restored: bool,
+    /// A backup is configured, the data directory was empty at startup and
+    /// the backup held nothing to restore: this is a new, empty database
+    /// (also said by a `warn` event). What a first start looks like, and what
+    /// a backup setting that points at the wrong place looks like too
+    /// ([`Engine::open_existing`] refuses it).
+    pub started_empty: bool,
 }
 
 /// Disk and cache figures.
@@ -220,16 +226,48 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// Opens (or creates) the database in `dir`: restores the backup if the
     /// directory is empty and a backup is configured, replays the log, then
-    /// starts the upkeep thread.
+    /// starts the upkeep thread. An empty directory whose backup holds
+    /// nothing to restore starts a new, empty database, and says so
+    /// ([`BackupStatus::started_empty`] and a `warn` event).
     pub fn open(dir: impl AsRef<Path>, options: EngineOptions) -> Result<Arc<Engine>> {
-        let dir: PathBuf = dir.as_ref().to_owned();
+        Self::open_with(dir.as_ref(), options, false)
+    }
+
+    /// Like [`open`](Self::open), but an empty directory must be restored
+    /// from the backup: when the backup holds nothing to restore, or no
+    /// backup is configured, it returns an error, and nothing is created in
+    /// `dir` or written to the backup. A directory that holds a database
+    /// opens as with `open`. For a disk erased at each restart, once the
+    /// database holds data: a backup setting that points at the wrong place
+    /// then stops the start instead of starting an empty database that backs
+    /// itself up there (`NUAGE_RESTORE_REQUIRED` of the server).
+    pub fn open_existing(dir: impl AsRef<Path>, options: EngineOptions) -> Result<Arc<Engine>> {
+        Self::open_with(dir.as_ref(), options, true)
+    }
+
+    fn open_with(dir: &Path, options: EngineOptions, must_restore: bool) -> Result<Arc<Engine>> {
+        let dir: PathBuf = dir.to_owned();
+        let empty = backup::is_empty(&dir);
+        let restoring = options.backup.as_ref().filter(|b| b.restore_when_empty);
         let mut restored = false;
-        if let Some(b) = &options.backup
-            && b.restore_when_empty
-            && backup::is_empty(&dir)
-        {
+        if empty && let Some(b) = restoring {
             restored = backup::restore(&dir, b.store.as_ref())?;
         }
+        if empty && !restored && must_restore {
+            // Before `unlock`: no folder, header or page file is made, and no
+            // upkeep thread uploads an empty snapshot.
+            let why = match (&options.backup, restoring) {
+                (_, Some(b)) => format!("{} holds no backup to restore", b.store.describe()),
+                (Some(b), None) => {
+                    format!("restoring from {} is turned off (`restore_when_empty`)", b.store.describe())
+                }
+                (None, None) => "no backup destination is set".to_owned(),
+            };
+            return Err(storage_err(format!(
+                "this directory is empty and {why}: an empty database is not started here"
+            )));
+        }
+        let started_empty = empty && !restored && restoring.is_some();
         let Unlocked { keys, migrated, imported } = unlock(&dir, &options)?;
         let encryption = options.encryption.as_ref().filter(|_| keys.is_some()).map(Encryption::kind);
         let store = Store::open(&dir, options.cache_bytes, options.sync, keys.as_ref())?;
@@ -237,6 +275,7 @@ impl Engine {
             target: options.backup.as_ref().map(|b| b.store.describe()),
             last_ok: true,
             restored,
+            started_empty,
             shipped_lsn: store.applied_lsn(),
             ..BackupStatus::default()
         };
@@ -257,6 +296,13 @@ impl Engine {
         });
         if restored {
             engine.event("info", "data restored from the backup");
+        }
+        if started_empty {
+            let target = engine.backup_status().target.unwrap_or_default();
+            engine.event(
+                "warn",
+                format!("the data directory was empty and {target} holds no backup: this is a new, empty database"),
+            );
         }
         if let Some(i) = imported {
             engine.event(

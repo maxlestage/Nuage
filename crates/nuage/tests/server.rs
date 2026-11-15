@@ -954,6 +954,287 @@ async fn a_bucket_holds_the_backup_of_one_database() {
     }
 }
 
+/// Waits until every engine is closed: nothing writes to their backups after that.
+fn all_closed(engines: &[std::sync::Weak<Engine>]) {
+    for _ in 0..400 {
+        if engines.iter().all(|e| e.upgrade().is_none()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("a database is still open");
+}
+
+/// With a restore required, a place in a bucket that holds no backup (an
+/// empty prefix, or `prod` written for `prod/`) does not start an empty
+/// database: nothing is made on the disk and nothing is sent to the bucket.
+/// The place that holds the backup restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_required_finds_the_backup_or_starts_nothing() {
+    use nuage::{BackupOptions, Embedded, Encryption};
+    let (addr, objects) = fake_s3().await;
+    let with = |prefix: &str| {
+        let store = nuage::s3::S3Store::new(nuage::s3::S3Options {
+            endpoint: format!("http://{addr}"),
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            prefix: prefix.into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap();
+        EngineOptions {
+            backup: Some(BackupOptions::new(Arc::new(store))),
+            encryption: Some(Encryption::from_key([1; 32])),
+            sync: false,
+            ..EngineOptions::default()
+        }
+    };
+    let (src, dir) = (temp_dir("required-s3-src"), temp_dir("required-s3-dir"));
+    let e = Engine::open_existing(&dir, with("prod/")).unwrap_err().to_string();
+    assert!(e.contains("s3://bucket/prod/ holds no backup to restore: an empty database is not started here"), "{e}");
+    assert!(!dir.exists() && objects.lock().unwrap().is_empty(), "nothing made, nothing sent");
+    let gone = {
+        let db = Embedded::open_with(&src, with("prod/")).unwrap();
+        db.create_table::<common::User>().await.unwrap();
+        common::user("one@x.dev", "One", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+    let before = objects.lock().unwrap().clone();
+    let e = Engine::open_existing(&dir, with("prod")).unwrap_err().to_string();
+    assert!(e.contains("s3://bucket/prod holds no backup to restore"), "{e}");
+    assert!(!dir.exists() && *objects.lock().unwrap() == before, "nothing made, nothing sent");
+    let db = Embedded::from_engine(Engine::open_existing(&dir, with("prod/")).unwrap());
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(common::User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for d in [src, dir] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The `nuage` binary with the settings `vars`, and none of the variables of
+/// the tests' own environment that it reads.
+fn nuage_binary(vars: &[(&str, &str)]) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_nuage"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("NUAGE_") || name.starts_with("AWS_") || name == "PORT" || name == "SITE_URL" {
+            command.env_remove(&key);
+        }
+    }
+    command.envs(vars.iter().copied()).stdin(std::process::Stdio::null());
+    command
+}
+
+/// Runs the binary, which must stop by itself: its exit code and what it
+/// wrote to standard error.
+fn stopped(mut command: std::process::Command) -> (Option<i32>, String) {
+    use std::io::Read;
+    let mut child = command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the server started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    (status.code(), err)
+}
+
+/// Starts the binary and returns what it printed until it listened, then
+/// stops it.
+fn started(mut command: std::process::Command) -> Vec<String> {
+    use std::io::{BufRead, Read};
+    let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(line) => {
+                let listening = line.contains("listening on");
+                out.push(line);
+                if listening {
+                    break;
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let mut err = String::new();
+                let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+                panic!("the server did not start: {out:#?}\n{err}");
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    out
+}
+
+/// NUAGE_RESTORE_REQUIRED: an empty data directory with nothing to restore
+/// stops the binary (exit 1) with what to check, and nothing is made or sent,
+/// whether the backup goes to a folder, to a bucket or nowhere. A value
+/// mistyped stops it too, and another error says nothing of the setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_refuses_an_empty_start_when_a_restore_is_required() {
+    let (addr, objects) = fake_s3().await;
+    // The runs wait for the binary: off the threads that serve the bucket.
+    tokio::task::spawn_blocking(move || refused_runs(addr, &objects)).await.unwrap();
+}
+
+fn refused_runs(addr: SocketAddr, objects: &Mutex<HashMap<String, Vec<u8>>>) {
+    let (data, folder, other) = (temp_dir("bin-required-data"), temp_dir("bin-required-folder"), temp_dir("bin-other"));
+    std::fs::create_dir_all(&folder).unwrap();
+    let key = "07".repeat(32);
+    let (data_dir, folder_dir) = (data.display().to_string(), folder.display().to_string());
+    let endpoint = format!("http://{addr}");
+    let base = [
+        ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+        ("NUAGE_DATA_DIR", data_dir.as_str()),
+        ("NUAGE_RESTORE_REQUIRED", "true"),
+        ("PORT", "0"),
+        ("NUAGE_BIND", "127.0.0.1"),
+    ];
+    let s3 = [
+        ("NUAGE_BACKUP_S3_BUCKET", "bucket"),
+        ("NUAGE_BACKUP_S3_ENDPOINT", endpoint.as_str()),
+        ("NUAGE_BACKUP_S3_PREFIX", "prod"),
+        ("NUAGE_BACKUP_S3_ACCESS_KEY_ID", "key"),
+        ("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+    ];
+    let run = |extra: &[(&str, &str)]| {
+        let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        let (code, err) = stopped(nuage_binary(&vars));
+        assert!(!data.exists(), "nothing was made in the data directory: {err}");
+        (code, err)
+    };
+    let (code, err) = run(&[("NUAGE_BACKUP_DIR", folder_dir.as_str())]);
+    assert_eq!(code, Some(1), "{err}");
+    let refused = format!(
+        "Nuage DB storage: this directory is empty and {folder_dir} holds no backup to restore: an empty database \
+         is not started here"
+    );
+    assert!(err.starts_with(&format!("nuage: cannot open the data directory {data_dir}: ")), "{err}");
+    assert!(err.contains(&refused), "{err}");
+    assert!(
+        err.contains(
+            "nuage: NUAGE_RESTORE_REQUIRED is set. Nothing was created and nothing was written. Check NUAGE_BACKUP_DIR"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("for the first start of a new server, remove NUAGE_RESTORE_REQUIRED"), "{err}");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing was written to the backup");
+    let (code, err) = run(&s3);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("s3://bucket/prod holds no backup to restore"), "{err}");
+    assert!(err.contains("Check NUAGE_BACKUP_S3_BUCKET and NUAGE_BACKUP_S3_PREFIX (used as written"), "{err}");
+    assert!(objects.lock().unwrap().is_empty(), "nothing was sent to the bucket");
+    let (code, err) = run(&[]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("this directory is empty and no backup destination is set"), "{err}");
+    assert!(err.contains("No backup destination is set: put the backup settings"), "{err}");
+    let (code, err) = run(&[("NUAGE_RESTORE_REQUIRED", "ture"), ("NUAGE_BACKUP_DIR", folder_dir.as_str())]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.starts_with("nuage: configuration error: "), "{err}");
+    assert!(err.contains("NUAGE_RESTORE_REQUIRED=`ture`: `true` or `false`"), "{err}");
+    // A data directory that holds a database the key does not open: the error
+    // is the key's, and the setting has nothing to say about it.
+    let options = EngineOptions {
+        encryption: Some(nuage::Encryption::from_key([9; 32])),
+        sync: false,
+        ..EngineOptions::default()
+    };
+    let gone = Arc::downgrade(&Engine::open(&other, options).unwrap());
+    all_closed(&[gone]);
+    let other_dir = other.display().to_string();
+    let vars = [base[0], ("NUAGE_DATA_DIR", other_dir.as_str()), base[2], base[3], base[4]];
+    let (code, err) = stopped(nuage_binary(&vars));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("cannot open the data directory") && !err.contains("Nothing was created"), "{err}");
+    for d in [data, folder, other] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Without NUAGE_RESTORE_REQUIRED, an empty start is allowed and said: a new,
+/// empty database in the log, and a registered application whose backup
+/// holds nothing.
+#[test]
+fn the_server_says_when_it_starts_empty() {
+    let (data, folder) = (temp_dir("bin-empty-data"), temp_dir("bin-empty-folder"));
+    let (first, restored) = (temp_dir("bin-apps-first"), temp_dir("bin-apps-restored"));
+    let backups = temp_dir("bin-apps-backup");
+    std::fs::create_dir_all(&folder).unwrap();
+    let key = "07".repeat(32);
+    let binary = |data: &std::path::Path, folder: &std::path::Path| {
+        let (data, folder) = (data.display().to_string(), folder.display().to_string());
+        nuage_binary(&[
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_BACKUP_DIR", folder.as_str()),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ])
+    };
+    let out = started(binary(&data, &folder)).join("\n");
+    let new = format!(
+        "nuage: warning: the data directory was empty and {} holds no backup: this is a NEW, EMPTY database. \
+         If this server had data, stop it now and check NUAGE_BACKUP_*",
+        folder.display()
+    );
+    assert!(out.contains(&new), "{out}");
+    assert!(out.contains("NUAGE_RESTORE_REQUIRED=true refuses to start in this case"), "{out}");
+
+    // A server with an application, backed up; then the application's backup
+    // loses its manifest, and the server starts on an empty disk.
+    let options = EngineOptions {
+        sync: false,
+        encryption: Some(nuage::Encryption::from_key([7; 32])),
+        backup: Some(nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(&backups)))),
+        ..EngineOptions::default()
+    };
+    let engines = {
+        let server = Server::new(Engine::open(&first, options).unwrap(), ServerOptions::default());
+        server.create_app("shop", "").unwrap();
+        let engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
+        for engine in &engines {
+            engine.backup_now(true).unwrap();
+        }
+        engines.iter().map(Arc::downgrade).collect::<Vec<_>>()
+    };
+    all_closed(&engines);
+    std::fs::remove_file(backups.join("apps/shop/manifest.json")).unwrap();
+    let out = started(binary(&restored, &backups)).join("\n");
+    assert!(out.contains("nuage: the data directory was empty: restored from the backup"), "{out}");
+    let shop = format!(
+        "nuage: warning: application `shop` is registered but its backup ({}/apps/shop) holds nothing: it starts empty",
+        backups.display()
+    );
+    assert!(out.contains(&shop), "{out}");
+    assert!(!out.contains("NEW, EMPTY"), "{out}");
+    for d in [data, folder, first, restored, backups] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 const NEEDLE: &str = "ONLY-IN-SHOP";
 
 fn files_with(dir: &std::path::Path, needle: &str) -> usize {

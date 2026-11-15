@@ -871,6 +871,149 @@ async fn two_backups_at_once_leave_a_snapshot_that_opens() {
     }
 }
 
+/// The warning an empty start records, if any.
+fn empty_start_warning(engine: &nuage::Engine) -> Option<String> {
+    let (events, _) = engine.events();
+    events.into_iter().find(|e| e.level == "warn" && e.message.contains("empty database")).map(|e| e.message)
+}
+
+/// An empty data directory whose backup holds nothing starts a new, empty
+/// database and says so; a start that restored, or that found its data,
+/// says nothing of the kind.
+#[tokio::test]
+async fn an_empty_start_says_so() {
+    let (dir, copy, plain) = (temp_dir("empty-start"), temp_dir("empty-start-copy"), temp_dir("empty-start-plain"));
+    let target = temp_dir("empty-start-backup");
+    std::fs::create_dir_all(&target).unwrap();
+    let gone = {
+        let engine = nuage::Engine::open(&dir, backed_up(&target, 1)).unwrap();
+        let status = engine.backup_status();
+        assert!(status.started_empty && !status.restored, "{status:?}");
+        let warning = empty_start_warning(&engine).expect("a warn event");
+        assert_eq!(
+            warning,
+            format!(
+                "the data directory was empty and {} holds no backup: this is a new, empty database",
+                target.display()
+            )
+        );
+        let db = Embedded::from_engine(engine);
+        db.create_table::<Item>().await.unwrap();
+        item(1).insert(&db).await.unwrap();
+        db.engine().backup_now(true).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // Restored onto an empty disk: neither.
+    let gone = {
+        let engine = nuage::Engine::open(&copy, backed_up(&target, 1)).unwrap();
+        let status = engine.backup_status();
+        assert!(status.restored && !status.started_empty, "{status:?}");
+        assert_eq!(empty_start_warning(&engine), None);
+        Arc::downgrade(&engine)
+    };
+    closed(gone);
+    // A directory that holds its data: neither.
+    let engine = nuage::Engine::open(&dir, backed_up(&target, 1)).unwrap();
+    let status = engine.backup_status();
+    assert!(!status.restored && !status.started_empty, "{status:?}");
+    assert_eq!(empty_start_warning(&engine), None);
+    let gone = Arc::downgrade(&engine);
+    drop(engine);
+    closed(gone);
+    // Without a backup, an empty directory is simply a new database: there
+    // was nowhere to look.
+    let engine = nuage::Engine::open(&plain, EngineOptions { backup: None, ..backed_up(&target, 1) }).unwrap();
+    assert!(!engine.backup_status().started_empty && empty_start_warning(&engine).is_none());
+    let gone = Arc::downgrade(&engine);
+    drop(engine);
+    closed(gone);
+    for d in [dir, copy, plain, target] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// `Engine::open_existing`: an empty directory is restored from the backup,
+/// or not opened at all. Refused, it creates nothing in the directory and
+/// writes nothing to the backup.
+#[tokio::test]
+async fn an_empty_directory_must_be_restored_when_required() {
+    let (src, dir) = (temp_dir("required-src"), temp_dir("required-dir"));
+    let (empty, nowhere, full, partial) = (
+        temp_dir("required-empty"),
+        temp_dir("required-nowhere"),
+        temp_dir("required-full"),
+        temp_dir("required-partial"),
+    );
+    std::fs::create_dir_all(&empty).unwrap();
+    let refused = |options: EngineOptions| {
+        let e = nuage::Engine::open_existing(&dir, options).unwrap_err().to_string();
+        assert!(!dir.exists(), "nothing was created in {}", dir.display());
+        e
+    };
+    // An empty backup folder, and one that does not exist (a disk not plugged in).
+    let e = refused(backed_up(&empty, 1));
+    let expected = format!(
+        "this directory is empty and {} holds no backup to restore: an empty database is not started here",
+        empty.display()
+    );
+    assert!(e.contains(&expected), "{e}");
+    assert!(tree(&empty).is_empty(), "nothing was written to the backup");
+    let e = refused(backed_up(&nowhere, 1));
+    assert!(e.contains("holds no backup to restore"), "{e}");
+    assert!(!nowhere.exists());
+    // No backup at all (its settings were removed), or restoring turned off.
+    let e = refused(EngineOptions { backup: None, ..backed_up(&empty, 1) });
+    assert!(e.contains("this directory is empty and no backup destination is set: an empty database"), "{e}");
+    let off = BackupOptions { restore_when_empty: false, ..BackupOptions::new(Arc::new(DirectoryStore::new(&empty))) };
+    let e = refused(EngineOptions { backup: Some(off), ..backed_up(&empty, 1) });
+    assert!(e.contains("is turned off (`restore_when_empty`): an empty database is not started here"), "{e}");
+    assert!(tree(&empty).is_empty());
+
+    // A real backup: restored.
+    let gone = {
+        let db = Embedded::open_with(&src, backed_up(&full, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..10 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().backup_now(true).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // A copy without its manifest (cut short): nothing to restore, and left as it was.
+    for (name, bytes) in tree(&full).into_iter().filter(|(name, _)| name != "manifest.json") {
+        let path = partial.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let before = tree(&partial);
+    let e = refused(backed_up(&partial, 1));
+    assert!(e.contains("holds no backup to restore"), "{e}");
+    assert_eq!(tree(&partial), before);
+    let gone = {
+        let engine = nuage::Engine::open_existing(&dir, backed_up(&full, 1)).unwrap();
+        assert!(engine.backup_status().restored && !engine.backup_status().started_empty);
+        let db = Embedded::from_engine(engine);
+        assert_eq!(Item::count(&db).await.unwrap(), 10);
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // A directory that holds a database opens, whatever the backup holds.
+    for options in [backed_up(&empty, 1), EngineOptions { backup: None, ..backed_up(&empty, 1) }] {
+        let engine = nuage::Engine::open_existing(&src, options).unwrap();
+        assert!(!engine.backup_status().restored && !engine.backup_status().started_empty);
+        let db = Embedded::from_engine(engine);
+        assert_eq!(Item::count(&db).await.unwrap(), 10);
+        let gone = Arc::downgrade(db.engine());
+        drop(db);
+        closed(gone);
+    }
+    for d in [src, dir, empty, nowhere, full, partial] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// `WHERE indexed = ? ORDER BY id [DESC] LIMIT n [OFFSET m]` stops reading
 /// early: it still gives exactly what reading everything gives.
 #[tokio::test]
