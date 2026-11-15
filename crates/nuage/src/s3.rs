@@ -1,13 +1,24 @@
 //! Backups to S3-compatible object storage (AWS S3, Cloudflare R2, MinIO,
 //! Scaleway, OVHcloud...): a small client signing its requests with AWS
 //! Signature Version 4, over HTTP/1.1 and rustls.
+//!
+//! Every request has a time limit, so a bucket that takes the connection and
+//! then says nothing cannot hold a backup round, a restore, the shutdown or
+//! `/v1/files` for ever. The connection, the TLS handshake, sending the
+//! request and receiving the head of the answer must be done within the
+//! store's timeout (60 seconds) plus one second per 64 KiB of body sent; the
+//! body of the answer is then read piece by piece, and a wait of more than
+//! the timeout for the next piece is an error too. A large snapshot sent at
+//! 64 KiB/s or more, or received at any speed while bytes keep coming, is
+//! never cut.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1;
-use hyper::{Method, Request};
+use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use memoire_orm::{Error, Result};
 use tokio::net::TcpStream;
@@ -44,6 +55,14 @@ impl std::fmt::Debug for S3Options {
     }
 }
 
+/// How long a request may wait for the bucket, unless set otherwise with
+/// [`S3Store::with_timeout`].
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The time a request may take on top of the timeout for each 64 KiB of the
+/// body it sends: the upload of a large snapshot needs it on a slow line.
+const BYTES_PER_EXTRA_SECOND: u64 = 64 * 1024;
+
 /// A [`BackupStore`] in an S3 bucket (path-style requests:
 /// `<endpoint>/<bucket>/<key>`, which every S3-compatible service accepts).
 pub struct S3Store {
@@ -52,11 +71,12 @@ pub struct S3Store {
     host: String,
     port: u16,
     tls: tokio_rustls::TlsConnector,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for S3Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3Store").field("options", &self.options).finish()
+        f.debug_struct("S3Store").field("options", &self.options).field("timeout", &self.timeout).finish()
     }
 }
 
@@ -255,7 +275,22 @@ impl S3Store {
             .with_root_certificates(roots)
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(S3Store { options, https, host, port, tls: tokio_rustls::TlsConnector::from(Arc::new(config)) })
+        Ok(S3Store {
+            options,
+            https,
+            host,
+            port,
+            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            timeout: TIMEOUT,
+        })
+    }
+
+    /// The same store with another time limit (60 seconds by default): how
+    /// long the bucket may take to answer a request with no body, and the
+    /// longest wait for the next piece of an answer. A request that sends a
+    /// body has one more second per 64 KiB of it to be answered.
+    pub fn with_timeout(self, timeout: Duration) -> S3Store {
+        S3Store { timeout, ..self }
     }
 
     fn key(&self, name: &str) -> String {
@@ -335,8 +370,40 @@ impl S3Store {
         Self::check(status, &body, &format!("DELETE {key}"))
     }
 
-    /// Sends one signed request; returns the status and the body.
+    /// Sends one signed request; returns the status and the body. It fails
+    /// when the bucket does not answer in time (see the module's text).
     async fn send(&self, method: Method, key: &str, query: &[(&str, &str)], body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        let what = if key.is_empty() { "LIST".to_owned() } else { format!("{method} {key}") };
+        let late = |how: &str, after: Duration| {
+            s3_err(format!("{what}: {} {how} {} seconds", self.describe(), after.as_secs_f64()))
+        };
+        let limit = self.timeout + Duration::from_millis(body.len() as u64 * 1000 / BYTES_PER_EXTRA_SECOND);
+        let request = self.request(method, key, query, body)?;
+        let response = tokio::time::timeout(limit, self.open(request))
+            .await
+            .map_err(|_| late("did not answer within", limit))??;
+        let status = response.status().as_u16();
+        let mut answer = response.into_body();
+        let mut body = Vec::new();
+        while let Some(frame) = tokio::time::timeout(self.timeout, answer.frame())
+            .await
+            .map_err(|_| late("stopped answering for", self.timeout))?
+        {
+            if let Ok(data) = frame.map_err(s3_err)?.into_data() {
+                body.extend_from_slice(&data);
+            }
+        }
+        Ok((status, body))
+    }
+
+    /// The signed request `method` on `key` (the bucket itself when empty).
+    fn request(
+        &self,
+        method: Method,
+        key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<Request<Full<Bytes>>> {
         let path = if key.is_empty() {
             format!("/{}", self.options.bucket)
         } else {
@@ -365,7 +432,7 @@ impl S3Store {
                 query.iter().map(|(k, v)| format!("{}={}", uri_encode(k, false), uri_encode(v, false))).collect();
             uri = format!("{uri}?{}", q.join("&"));
         }
-        let request = Request::builder()
+        Request::builder()
             .method(method)
             .uri(uri)
             .header("host", &host)
@@ -374,31 +441,42 @@ impl S3Store {
             .header("authorization", auth)
             .header("content-length", body.len())
             .body(Full::new(Bytes::from(body)))
-            .map_err(s3_err)?;
+            .map_err(s3_err)
+    }
+
+    /// Connects to the bucket, sends `request` and waits for the head of the
+    /// answer; its body comes after. A request given up (its future or its
+    /// body dropped) closes the connection: hyper's connection task stops
+    /// when nobody waits for the answer any more.
+    async fn open(&self, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port)).await.map_err(s3_err)?;
-        let response = if self.https {
+        if self.https {
             let name = rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(s3_err)?;
             let stream = self.tls.connect(name, tcp).await.map_err(s3_err)?;
             let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.map_err(s3_err)?;
             tokio::spawn(conn);
-            sender.send_request(request).await.map_err(s3_err)?
+            sender.send_request(request).await.map_err(s3_err)
         } else {
             let (mut sender, conn) = http1::handshake(TokioIo::new(tcp)).await.map_err(s3_err)?;
             tokio::spawn(conn);
-            sender.send_request(request).await.map_err(s3_err)?
-        };
-        let status = response.status().as_u16();
-        let body = response.into_body().collect().await.map_err(s3_err)?.to_bytes().to_vec();
-        Ok((status, body))
+            sender.send_request(request).await.map_err(s3_err)
+        }
     }
 
     /// Runs `f` on a private runtime, on its own thread: backups are called
     /// from synchronous code, which may itself run inside another runtime.
+    /// The runtime is shut down without waiting for its blocking pool, so a
+    /// name lookup that hangs cannot hold the caller past the time limit.
     fn block<T: Send>(&self, f: impl std::future::Future<Output = Result<T>> + Send) -> Result<T> {
         std::thread::scope(|s| {
-            s.spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(s3_err)?.block_on(f))
-                .join()
-                .unwrap_or_else(|_| Err(s3_err("the request panicked")))
+            s.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(s3_err)?;
+                let out = runtime.block_on(f);
+                runtime.shutdown_background();
+                out
+            })
+            .join()
+            .unwrap_or_else(|_| Err(s3_err("the request panicked")))
         })
     }
 
@@ -508,6 +586,53 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(xml_values(blocks[0], "ETag"), vec!["\"e1\""]);
         assert_eq!(xml_values(blocks[1], "Size"), vec!["3"]);
+    }
+
+    /// A bucket that takes connections and never answers: it reads what it
+    /// is sent, and says on the channel each time a client hangs up.
+    fn stalled_bucket() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (hung_up, closed) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (mut stream, hung_up) = (stream.unwrap(), hung_up.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0; 4096];
+                    while stream.read(&mut buf).is_ok_and(|n| n > 0) {}
+                    let _ = hung_up.send(());
+                });
+            }
+        });
+        (endpoint, closed)
+    }
+
+    /// `/v1/files` asks the bucket from the server's own runtime: a bucket
+    /// that stalls fails the request in time, and the connection is closed.
+    #[tokio::test]
+    async fn a_stalled_bucket_times_out_inside_a_runtime() {
+        let (endpoint, mut closed) = stalled_bucket();
+        let store = S3Store::new(S3Options {
+            endpoint,
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            prefix: "files/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let e = store.objects("app/").await.unwrap_err().to_string();
+        assert!(e.contains("LIST: s3://bucket/files/ did not answer within 0.2 seconds"), "{e}");
+        let e = store.remove("app/a.txt").await.unwrap_err().to_string();
+        assert!(e.contains("DELETE files/app/a.txt: s3://bucket/files/ did not answer within 0.2 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        for _ in 0..2 {
+            let hung_up = tokio::time::timeout(Duration::from_secs(1), closed.recv()).await;
+            assert_eq!(hung_up, Ok(Some(())), "the connection of a request that timed out is closed");
+        }
     }
 
     #[test]

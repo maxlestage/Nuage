@@ -723,6 +723,139 @@ async fn s3_backup_and_restore() {
     assert_eq!(common::User::count(&db).await.unwrap(), 2);
 }
 
+/// A store in the bucket `bucket` at `addr`, under `prod/`.
+fn s3_at(addr: SocketAddr) -> nuage::s3::S3Store {
+    nuage::s3::S3Store::new(nuage::s3::S3Options {
+        endpoint: format!("http://{addr}"),
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        prefix: "prod/".into(),
+        access_key_id: "key".into(),
+        secret_access_key: "secret".into(),
+    })
+    .unwrap()
+}
+
+/// A bucket that takes connections and never answers. It reads what it is
+/// sent, and says on the channel each time a client hangs up.
+fn stalled_s3() -> (SocketAddr, std::sync::mpsc::Receiver<()>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (hung_up, closed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let (mut stream, hung_up) = (stream.unwrap(), hung_up.clone());
+            std::thread::spawn(move || {
+                let mut buf = [0; 4096];
+                while stream.read(&mut buf).is_ok_and(|n| n > 0) {}
+                let _ = hung_up.send(());
+            });
+        }
+    });
+    (addr, closed)
+}
+
+/// A bucket that accepts the connection and then says nothing cannot hold a
+/// backup round, a restore or the shutdown: every request fails once the
+/// store's timeout has passed, and gives its connection up.
+#[test]
+fn a_stalled_bucket_times_out() {
+    use nuage::BackupStore;
+    let (addr, closed) = stalled_s3();
+    let store = s3_at(addr).with_timeout(Duration::from_millis(200));
+    let calls: [(&str, &dyn Fn() -> Option<String>); 4] = [
+        ("GET prod/a/one", &|| store.get("a/one").err().map(|e| e.to_string())),
+        ("PUT prod/a/one", &|| store.put("a/one", b"1").err().map(|e| e.to_string())),
+        ("LIST", &|| store.list("a/").err().map(|e| e.to_string())),
+        ("DELETE prod/a/one", &|| store.delete("a/one").err().map(|e| e.to_string())),
+    ];
+    for (what, call) in calls {
+        let started = std::time::Instant::now();
+        let e = call().unwrap_or_else(|| panic!("{what}: a bucket that does not answer is an error"));
+        assert!(started.elapsed() < Duration::from_secs(1), "{what} took {:?}", started.elapsed());
+        assert!(e.contains(&format!("{what}: s3://bucket/prod/ did not answer within 0.2 seconds")), "{e}");
+        closed.recv_timeout(Duration::from_secs(1)).expect("the connection of a request that timed out is closed");
+    }
+}
+
+/// A bucket on a slow line: it reads the body of a request 16 KiB at a time
+/// and sends its answer (1000 bytes) 100 bytes at a time, `pause` before each
+/// piece. For a key ending in `half`, it stops after half the answer and keeps
+/// the connection.
+fn slow_s3(pause: Duration) -> SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let half = head.lines().next().is_some_and(|line| line.contains("half "));
+                let mut left: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |n| n.trim().parse().unwrap());
+                let mut piece = [0; 16 * 1024];
+                while left > 0 {
+                    std::thread::sleep(pause);
+                    match stream.read(&mut piece[..left.min(16 * 1024)]) {
+                        Ok(n) if n > 0 => left -= n,
+                        _ => return,
+                    }
+                }
+                if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n").is_err() {
+                    return;
+                }
+                for (i, piece) in [b'x'; 1000].chunks(100).enumerate() {
+                    if half && i == 5 {
+                        while stream.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
+                        return;
+                    }
+                    std::thread::sleep(pause);
+                    if stream.write_all(piece).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The time limit cuts a bucket that has stopped, never one that is slow
+/// while bytes keep moving: an upload has one more second per 64 KiB, and an
+/// answer may take as long as it needs while each piece comes in time.
+#[test]
+fn a_slow_bucket_is_not_cut_while_bytes_keep_moving() {
+    use nuage::BackupStore;
+    let store = s3_at(slow_s3(Duration::from_millis(60))).with_timeout(Duration::from_millis(300));
+
+    // 256 KiB taken 16 KiB at a time: about a second before the answer starts,
+    // more than the timeout and less than its 4 extra seconds.
+    let started = std::time::Instant::now();
+    store.put("a/big", &vec![7; 256 * 1024]).unwrap();
+    assert!(started.elapsed() > Duration::from_millis(900), "{:?}", started.elapsed());
+
+    // Ten pieces 60 ms apart: twice the timeout in all.
+    let started = std::time::Instant::now();
+    assert_eq!(store.get("a/big").unwrap(), Some(vec![b'x'; 1000]));
+    assert!(started.elapsed() > Duration::from_millis(550), "{:?}", started.elapsed());
+
+    // An answer that stops halfway is an error, and says so.
+    let e = store.get("a/half").unwrap_err().to_string();
+    assert!(e.contains("GET prod/a/half: s3://bucket/prod/ stopped answering for 0.3 seconds"), "{e}");
+}
+
 const NEEDLE: &str = "ONLY-IN-SHOP";
 
 fn files_with(dir: &std::path::Path, needle: &str) -> usize {
