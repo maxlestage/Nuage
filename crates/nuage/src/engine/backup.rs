@@ -829,7 +829,8 @@ mod tests {
                 db.engine().backup_now(true).unwrap();
                 let dst = temp(&format!("live-dst-{round}"));
                 assert!(restore(&dst, store.as_ref()).unwrap());
-                let copy = Embedded::open_with(&dst, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+                let copy =
+                    Embedded::open_with(&dst, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
                 assert!(copy.engine().check_integrity().unwrap(), "round {round}: {:?}", copy.engine().events());
                 let newest = copy.sql("SELECT max(id) FROM t", &[]).unwrap()[0].rows[0][0].to_string();
                 let newest: i64 = newest.parse().unwrap();
