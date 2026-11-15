@@ -581,6 +581,17 @@ el comando:
   (`\\nas\copias\nuage`) debe dejar escribir a la cuenta del ordenador (`ORDENADOR$`).
 - **Cambiar** de destino: vuelva a ejecutar el instalador con la nueva opción; reemplaza la
   anterior en el fichero de ajustes y reinicia el servicio. Sin opción, las conserva.
+- **Dos lugares a la vez**: `NUAGE_BACKUP2_DIR`, o `NUAGE_BACKUP2_S3_BUCKET` y los demás
+  `NUAGE_BACKUP2_S3_*`, añaden un segundo destino que se mantiene al día con el primero. Cada
+  uno recibe las instantáneas y el registro a su propio ritmo: el que no responde nunca
+  retiene al otro, y recibe una instantánea completa cuando vuelve a responder. Una carpeta
+  de datos vacía se restaura desde uno solo de los dos, entero: el que llega más lejos. El
+  servidor no arranca cuando el primero no responde (quítelo de los ajustes para arrancar
+  desde el segundo solo), ni cuando los dos guardan bases distintas. Sin el primero,
+  `NUAGE_BACKUP2_*` es el único destino: añadir el segundo, esperar a que lo tenga todo y
+  luego quitar el primero mueve las copias sin detener nada. En Linux, el servicio del
+  instalador solo puede escribir en la carpeta de datos y en `NUAGE_BACKUP_DIR`: allí, use
+  un bucket para el segundo.
 - **Comprobar**: la página *Almacenamiento* de la consola, y `/app`, muestran la última copia
   y sus errores.
 - **Restaurar** en un ordenador nuevo: instale, ponga en el nuevo fichero de ajustes la
@@ -632,6 +643,16 @@ La raíz de este repositorio se despliega tal cual: `Procfile`, `RustConfig` y
 - **Ventana de pérdida.** Los commits hechos desde el último segmento del registro enviado
   (30 segundos por defecto) solo se pierden si el dyno se detiene sin el `SIGTERM` que Heroku
   envía antes: con `SIGTERM`, el servidor hace un checkpoint y envía el último segmento.
+- **Mover las copias sin detener nada.** Cambiar las variables de copia reinicia el dyno, que
+  restaura desde lo que nombran los nuevos ajustes. Para pasar a otro bucket: (1) añade el
+  nuevo como segundo destino, en un solo comando (`heroku config:set
+  NUAGE_BACKUP2_S3_BUCKET=nuevo-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
+  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`): el dyno se reinicia desde el antiguo y envía una
+  instantánea completa de cada aplicación al nuevo; (2) espera a que la página
+  *Almacenamiento* de la consola, o `/app`, muestre la última copia de cada aplicación sin
+  errores; (3) quita el antiguo, en un solo comando (`heroku config:unset
+  NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION …`): el dyno que se detiene envía sus últimos
+  segundos a los dos, y el siguiente restaura desde el nuevo bucket, ahora el único destino.
 
 A mano:
 
@@ -673,7 +694,11 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `NUAGE_BACKUP_S3_REGION` | región | `us-east-1` |
 | `NUAGE_BACKUP_S3_PREFIX` | prefijo de los objetos de copia | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credenciales (si no, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
-| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutos entre dos instantáneas | `60` |
+| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutos entre dos instantáneas (de cada destino) | `60` |
+| `NUAGE_BACKUP2_DIR` | un segundo destino de copia, al día con el primero: esta carpeta (vea las copias más arriba); solo, es el único destino | |
+| `NUAGE_BACKUP2_S3_BUCKET` | el segundo destino en este bucket (con `NUAGE_BACKUP2_DIR` también, o en el mismo lugar que el primero, el servidor no arranca) | |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | su endpoint, su región y su prefijo | como para el primero |
+| `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | sus credenciales (si no, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_KV_PORT` | sirve también el almacén clave-valor en un puerto propio (`6379`), por el protocolo que hablan los clientes Redis: uno se conecta al almacén de una aplicación, un token como contraseña | desactivado |
 | `NUAGE_KV_BIND` | su dirección | `NUAGE_BIND` |
 | `NUAGE_KV_MB` | memoria del almacén clave-valor de cada aplicación, en MiB, o `auto`; pasado el límite, salen las claves menos usadas recientemente | `auto`: un dieciseisavo de la memoria, 4 a 256 MiB |

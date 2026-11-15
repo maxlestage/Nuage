@@ -32,7 +32,7 @@ use memoire_orm::{Error, Result};
 
 use crate::crypto::{Encryption, Header, Keys};
 
-pub use backup::{BackupStore, DirectoryStore, PrefixedStore};
+pub use backup::{BackupInfo, BackupStore, DirectoryStore, MirrorStore, PrefixedStore};
 pub use legacy::Imported;
 use store::Store;
 pub(crate) use store::{FILE, MAIN};
@@ -53,10 +53,22 @@ pub(crate) fn storage_err(msg: impl Into<String>) -> Error {
     Error::Database(Box::new(StorageError(msg.into())))
 }
 
+/// What an error says, without the `database error: Nuage DB storage: ` of a
+/// storage error: to put it inside a sentence of another error.
+pub(crate) fn reason(e: &Error) -> String {
+    match e {
+        Error::Database(inner) => {
+            inner.downcast_ref::<StorageError>().map_or_else(|| inner.to_string(), |s| s.0.clone())
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Backup settings of an [`Engine`].
 #[derive(Clone)]
 pub struct BackupOptions {
-    /// Where backups go.
+    /// Where backups go: one place, or two kept in step ([`MirrorStore`]),
+    /// each with its own progress.
     pub store: Arc<dyn BackupStore>,
     /// Time between two snapshots of the page store. Default: 1 hour.
     pub snapshot_every: Duration,
@@ -146,16 +158,21 @@ pub struct Event {
     pub message: String,
 }
 
-/// State of the backups.
+/// State of the backups. With two destinations ([`MirrorStore`]), `target`,
+/// `last_at`, `last_ok` and `last_error` tell both; `shipped_lsn` and
+/// `last_snapshot_at` are the first's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackupStatus {
-    /// Where they go (`None`: backups are off).
+    /// Where they go (`None`: backups are off); `A and B` with two
+    /// destinations.
     pub target: Option<String>,
-    /// Last successful shipment or snapshot (Unix ms).
+    /// Last successful shipment or snapshot (Unix ms). With two destinations,
+    /// it moves only while the last attempt of each one succeeded.
     pub last_at: Option<i64>,
-    /// Last attempt succeeded.
+    /// Last attempt succeeded (of every destination).
     pub last_ok: bool,
-    /// Error of the last failed attempt.
+    /// Error of the last failed attempt: the first destination's, then the
+    /// second's (`second destination (<place>): ...`).
     pub last_error: Option<String>,
     /// Last LSN known to be in the backup.
     pub shipped_lsn: u64,
@@ -163,6 +180,9 @@ pub struct BackupStatus {
     pub last_snapshot_at: Option<i64>,
     /// The data directory was restored from the backup at startup.
     pub restored: bool,
+    /// Where it was restored from: with two destinations, the one that
+    /// reached furthest.
+    pub restored_from: Option<String>,
     /// A backup is configured, the data directory was empty at startup and
     /// the backup held nothing to restore: this is a new, empty database
     /// (also said by a `warn` event). What a first start looks like, and what
@@ -202,6 +222,39 @@ pub struct StorageStats {
     pub last_checkpoint: Option<SystemTime>,
 }
 
+/// How far one backup destination has got, and how its last attempt went.
+#[derive(Clone, Debug, Default)]
+struct Progress {
+    /// Last LSN known to be there.
+    shipped_lsn: u64,
+    /// Its last snapshot (Unix ms).
+    last_snapshot_at: Option<i64>,
+    /// The error of its last attempt, as the status tells it.
+    error: Option<String>,
+}
+
+/// The start of the `warn` event of a restore that skipped the second
+/// destination (the binary prints it at startup: keep them alike).
+const SECOND_SKIPPED: &str = "the second backup destination did not answer";
+
+/// Where `b` was looked for, said of an empty backup: `<place> holds no
+/// backup`, or `neither <first> nor <second> holds a backup`.
+fn holds_no_backup(b: &BackupOptions) -> String {
+    match b.store.parts() {
+        Some((first, second)) => format!("neither {} nor {} holds a backup", first.describe(), second.describe()),
+        None => format!("{} holds no backup", b.store.describe()),
+    }
+}
+
+/// The places a backup goes to, in order: the two of a [`MirrorStore`], or
+/// the store itself.
+fn destinations(b: &BackupOptions) -> Vec<Arc<dyn BackupStore>> {
+    match b.store.parts() {
+        Some((first, second)) => vec![first, second],
+        None => vec![b.store.clone()],
+    }
+}
+
 /// An open Nuage DB database: the page store, the log, the branches and the
 /// background upkeep. Shared by the embedded handle and the server.
 pub struct Engine {
@@ -209,10 +262,14 @@ pub struct Engine {
     options: EngineOptions,
     events: Mutex<VecDeque<Event>>,
     backup_status: Mutex<BackupStatus>,
-    /// Held for a whole backup round ([`Engine::backup_now`]): two rounds at
-    /// once would write the same `snapshot.partial`, and a torn copy could
-    /// be the one the manifest names.
-    backing_up: Mutex<()>,
+    /// The places the backup goes to ([`destinations`]); none without one.
+    places: Vec<Arc<dyn BackupStore>>,
+    /// Held for a whole backup round ([`Engine::backup_now`],
+    /// [`Engine::backup_to`]): two rounds at once would write the same
+    /// `snapshot.partial`, and a torn copy could be the one the manifest
+    /// names. It holds each destination's progress: the first's is copied to
+    /// the status, which tells both.
+    backing_up: Mutex<[Progress; 2]>,
     last_compaction: Mutex<Option<(i64, bool)>>,
     started: Instant,
     started_at: SystemTime,
@@ -262,15 +319,23 @@ impl Engine {
         let dir: PathBuf = dir.to_owned();
         let empty = backup::is_empty(&dir);
         let restoring = options.backup.as_ref().filter(|b| b.restore_when_empty);
-        let mut restored = false;
+        let places = options.backup.as_ref().map(destinations).unwrap_or_default();
+        let (mut restored_from, mut skipped) = (None, None);
         if empty && let Some(b) = restoring {
-            restored = backup::restore(&dir, b.store.as_ref())?;
+            if let [first, second] = places.as_slice() {
+                // Two places: from the one that reaches furthest, whole.
+                let best = backup::restore_best(&dir, first.as_ref(), second.as_ref())?;
+                (restored_from, skipped) = (best.from, best.skipped);
+            } else if backup::restore(&dir, b.store.as_ref())? {
+                restored_from = Some(b.store.describe());
+            }
         }
+        let restored = restored_from.is_some();
         if empty && !restored && must_restore {
             // Before `unlock`: no folder, header or page file is made, and no
             // upkeep thread uploads an empty snapshot.
             let why = match (&options.backup, restoring) {
-                (_, Some(b)) => format!("{} holds no backup to restore", b.store.describe()),
+                (_, Some(b)) => format!("{} to restore", holds_no_backup(b)),
                 (Some(b), None) => {
                     format!("restoring from {} is turned off (`restore_when_empty`)", b.store.describe())
                 }
@@ -288,16 +353,21 @@ impl Engine {
             target: options.backup.as_ref().map(|b| b.store.describe()),
             last_ok: true,
             restored,
+            restored_from: restored_from.clone(),
             started_empty,
             shipped_lsn: store.applied_lsn(),
             ..BackupStatus::default()
         };
+        // Every destination starts where the data is: none has had a snapshot
+        // of this run yet, so the first round sends one to each.
+        let progress = Progress { shipped_lsn: store.applied_lsn(), ..Progress::default() };
         let engine = Arc::new(Engine {
             store,
             options,
             events: Mutex::new(VecDeque::new()),
             backup_status: Mutex::new(backup_status),
-            backing_up: Mutex::new(()),
+            places,
+            backing_up: Mutex::new([progress.clone(), progress]),
             last_compaction: Mutex::new(None),
             started: Instant::now(),
             started_at: SystemTime::now(),
@@ -308,14 +378,27 @@ impl Engine {
             imported,
             restore_required: must_restore,
         });
-        if restored {
-            engine.event("info", "data restored from the backup");
+        match (&restored_from, engine.places.as_slice()) {
+            (Some(from), [_, _]) => {
+                engine.event("info", format!("data restored from the backup in {from}, the one that reaches furthest"));
+            }
+            (Some(_), _) => engine.event("info", "data restored from the backup"),
+            (None, _) => {}
         }
-        if started_empty {
-            let target = engine.backup_status().target.unwrap_or_default();
+        if let (Some(why), [first, second]) = (&skipped, engine.places.as_slice()) {
             engine.event(
                 "warn",
-                format!("the data directory was empty and {target} holds no backup: this is a new, empty database"),
+                format!(
+                    "{SECOND_SKIPPED} ({}: {why}): the data was restored from the first, {}",
+                    second.describe(),
+                    first.describe()
+                ),
+            );
+        }
+        if started_empty && let Some(b) = &engine.options.backup {
+            engine.event(
+                "warn",
+                format!("the data directory was empty and {}: this is a new, empty database", holds_no_backup(b)),
             );
         }
         if let Some(i) = imported {
@@ -335,11 +418,13 @@ impl Engine {
         }
         if migrated {
             engine.event("warn", "the data was stored in clear: it is now encrypted");
-            if let Some(b) = &engine.options.backup {
-                // The backup in clear is replaced by an encrypted one.
-                match engine.backup_now(true).and_then(|()| backup::purge_older(b.store.as_ref())) {
-                    Ok(()) => engine.event("info", "the backup in clear was replaced by an encrypted one"),
-                    Err(e) => engine.event("error", format!("could not replace the backup in clear: {e}")),
+            // The backup in clear is replaced by an encrypted one, in each place.
+            let two = engine.places.len() == 2;
+            for (i, place) in engine.places.iter().enumerate() {
+                let at = if two { format!(" in {}", place.describe()) } else { String::new() };
+                match engine.backup_to(i, true).and_then(|()| backup::purge_older(place.as_ref())) {
+                    Ok(()) => engine.event("info", format!("the backup in clear{at} was replaced by an encrypted one")),
+                    Err(e) => engine.event("error", format!("could not replace the backup in clear{at}: {e}")),
                 }
             }
         }
@@ -420,7 +505,9 @@ impl Engine {
     }
 
     /// Makes every commit durable in the page store and starts a new log
-    /// segment.
+    /// segment. The segments the backup does not have yet are kept: those of
+    /// the first destination only, so that a second one that does not answer
+    /// never fills the disk (it gets a snapshot instead).
     pub fn checkpoint(&self) -> Result<u64> {
         let keep = self.options.backup.as_ref().map(|_| self.backup_status().shipped_lsn);
         let lsn = self.store.checkpoint(keep)?;
@@ -463,55 +550,133 @@ impl Engine {
     /// another (the upkeep thread's, the console's Back up now) waits for it
     /// to end, then makes its own. A location that holds another database's
     /// backup is refused, and nothing is written there.
+    ///
+    /// With two destinations ([`MirrorStore`]), the round goes to the first,
+    /// then to the second ([`backup_to`](Self::backup_to)): one that fails
+    /// never holds the other back, and when both are due for a snapshot, the
+    /// page store is copied once and sent to each. It returns the first
+    /// error, if any.
     pub fn backup_now(&self, force_snapshot: bool) -> Result<()> {
         let Some(b) = &self.options.backup else {
             return Err(Error::Unsupported("no backup location is configured".into()));
         };
-        let _round = self.backing_up.lock().unwrap_or_else(|e| e.into_inner());
-        let status = self.backup_status();
+        let mut progress = self.backing_up.lock().unwrap_or_else(|e| e.into_inner());
+        // The copy of the page store of this round, sent to each destination
+        // that is due; removed from the disk when the round ends.
+        let mut taken = None;
+        let mut failed = None;
+        for i in 0..self.places.len() {
+            if let Err(e) = self.round(b, i, &mut progress, force_snapshot, &mut taken) {
+                failed.get_or_insert(e);
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// A backup round to one destination: `0`, the first (the only one, with
+    /// one), or `1`, the second of a [`MirrorStore`]. Each destination has its
+    /// own progress: the second gets a snapshot when one is due, when
+    /// `force_snapshot`, and when it lacks log segments that are no longer on
+    /// this disk (they are kept for the first destination only, so a second
+    /// that does not answer never fills the disk); it never receives a
+    /// segment after a hole. A server's stop sends to the first destination
+    /// of every database before any second one, so that a slow second cannot
+    /// take the first's last seconds.
+    pub fn backup_to(&self, destination: usize, force_snapshot: bool) -> Result<()> {
+        let Some(b) = &self.options.backup else {
+            return Err(Error::Unsupported("no backup location is configured".into()));
+        };
+        if destination >= self.places.len() {
+            return Err(Error::Unsupported(format!(
+                "there is no backup destination {destination}: the backup goes to {}",
+                b.store.describe()
+            )));
+        }
+        let mut progress = self.backing_up.lock().unwrap_or_else(|e| e.into_inner());
+        self.round(b, destination, &mut progress, force_snapshot, &mut None)
+    }
+
+    /// One destination's part of a round, under [`backing_up`](Self::backing_up).
+    /// `taken`: the copy of the page store already made in this round, or
+    /// where to keep the one made here.
+    fn round(
+        &self,
+        b: &BackupOptions,
+        i: usize,
+        progress: &mut [Progress; 2],
+        force_snapshot: bool,
+        taken: &mut Option<backup::Taken>,
+    ) -> Result<()> {
+        let place = self.places[i].as_ref();
+        let before = progress[i].clone();
         let due =
-            status.last_snapshot_at.is_none_or(|at| store::now_millis() - at >= b.snapshot_every.as_millis() as i64);
+            before.last_snapshot_at.is_none_or(|at| store::now_millis() - at >= b.snapshot_every.as_millis() as i64);
         let result = (|| -> Result<(u64, bool)> {
-            if force_snapshot || due {
-                let (lsn, kept) = backup::snapshot(&self.store, b.store.as_ref(), b.keep_snapshots)?;
+            if force_snapshot || due || !backup::can_continue(&self.store, before.shipped_lsn)? {
+                let kept = backup::prepare(&self.store, place)?;
                 if kept {
                     self.event(
                         "info",
                         format!(
                             "the backup of the earlier version is kept at {}: delete it once the data has been checked",
-                            b.store.describe_aside(backup::BEFORE_IMPORT)
+                            place.describe_aside(backup::BEFORE_IMPORT)
                         ),
                     );
                 }
-                let shipped = backup::ship_segments(&self.store, b.store.as_ref(), lsn)?;
-                Ok((shipped.max(lsn), true))
+                let copy = match taken.take() {
+                    Some(copy) => copy,
+                    None => backup::take(&self.store)?,
+                };
+                let sent = backup::send(&self.store, place, &copy, b.keep_snapshots)
+                    .and_then(|()| backup::ship_segments(&self.store, place, copy.lsn));
+                let lsn = copy.lsn;
+                // Kept for the next destination of this round, whatever happened here.
+                *taken = Some(copy);
+                Ok((sent?.max(lsn), true))
             } else {
-                Ok((backup::ship_segments(&self.store, b.store.as_ref(), status.shipped_lsn)?, false))
+                Ok((backup::ship_segments(&self.store, place, before.shipped_lsn)?, false))
             }
         })();
-        let mut s = self.backup_status.lock().unwrap_or_else(|e| e.into_inner());
-        match result {
+        // The second's errors say which destination they are.
+        let result = result.map_err(|e| match i {
+            0 => e,
+            _ => storage_err(format!("second destination ({}): {}", place.describe(), reason(&e))),
+        });
+        let now = store::now_millis();
+        let moved = match &result {
             Ok((shipped, snap)) => {
-                let moved = shipped != s.shipped_lsn || snap;
-                s.shipped_lsn = shipped;
-                s.last_ok = true;
-                s.last_error = None;
-                if moved {
-                    s.last_at = Some(store::now_millis());
+                let p = &mut progress[i];
+                let moved = *shipped != p.shipped_lsn || *snap;
+                p.shipped_lsn = *shipped;
+                p.error = None;
+                if *snap {
+                    p.last_snapshot_at = Some(now);
                 }
+                moved
+            }
+            Err(e) => {
+                progress[i].error = Some(e.to_string());
+                false
+            }
+        };
+        let errors: Vec<&str> = progress[..self.places.len()].iter().filter_map(|p| p.error.as_deref()).collect();
+        let mut s = self.backup_status.lock().unwrap_or_else(|e| e.into_inner());
+        s.shipped_lsn = progress[0].shipped_lsn;
+        s.last_snapshot_at = progress[0].last_snapshot_at;
+        s.last_ok = errors.is_empty();
+        s.last_error = (!errors.is_empty()).then(|| errors.join("; "));
+        if moved && s.last_ok {
+            s.last_at = Some(now);
+        }
+        drop(s);
+        match result {
+            Ok((_, snap)) => {
                 if snap {
-                    s.last_snapshot_at = Some(store::now_millis());
-                }
-                drop(s);
-                if snap {
-                    self.event("info", format!("backup snapshot sent to {}", b.store.describe()));
+                    self.event("info", format!("backup snapshot sent to {}", place.describe()));
                 }
                 Ok(())
             }
             Err(e) => {
-                s.last_ok = false;
-                s.last_error = Some(e.to_string());
-                drop(s);
                 self.event("error", format!("backup failed: {e}"));
                 Err(e)
             }

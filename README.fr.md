@@ -590,6 +590,17 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   compte de l'ordinateur (`ORDINATEUR$`).
 - **Changer** de destination : relancez l'installateur avec la nouvelle option ; il remplace
   l'ancienne dans le fichier de réglages et redémarre le service. Sans option, il les garde.
+- **Deux endroits à la fois** : `NUAGE_BACKUP2_DIR`, ou `NUAGE_BACKUP2_S3_BUCKET` et les autres
+  `NUAGE_BACKUP2_S3_*`, ajoutent une seconde destination tenue à jour avec la première.
+  Chacune reçoit les instantanés et le journal à son propre rythme : celle qui ne répond pas
+  ne retient jamais l'autre, et reçoit un instantané complet quand elle répond de nouveau. Un
+  dossier de données vide est restauré depuis une seule des deux, en entier : celle qui va le
+  plus loin. Le serveur ne démarre pas quand la première ne répond pas (retirez-la des
+  réglages pour démarrer depuis la seconde seule), ni quand les deux tiennent des bases
+  différentes. Sans la première, `NUAGE_BACKUP2_*` est l'unique destination : ajouter la
+  seconde, attendre qu'elle ait tout, puis retirer la première déplace les sauvegardes sans
+  arrêt. Sur Linux, le service de l'installateur ne peut écrire que dans le dossier des
+  données et dans `NUAGE_BACKUP_DIR` : là, prenez un bucket pour la seconde.
 - **Vérifier** : la page *Stockage* de la console, et `/app`, montrent la dernière sauvegarde
   et ses erreurs.
 - **Restaurer** sur un nouvel ordinateur : installez, mettez dans le nouveau fichier de
@@ -642,6 +653,17 @@ La racine de ce dépôt se déploie telle quelle : `Procfile`, `RustConfig` et
 - **Fenêtre de perte.** Les commits faits depuis le dernier segment de journal envoyé
   (30 secondes par défaut) ne sont perdus que si le dyno s'arrête sans le `SIGTERM` qu'Heroku
   envoie d'abord : au `SIGTERM`, le serveur fait un checkpoint et envoie le dernier segment.
+- **Déplacer les sauvegardes sans arrêt.** Changer les variables de sauvegarde redémarre le
+  dyno, qui restaure depuis ce que nomment les nouveaux réglages. Pour passer à un autre
+  bucket : (1) ajoutez le nouveau comme seconde destination, en une seule commande
+  (`heroku config:set NUAGE_BACKUP2_S3_BUCKET=nouveau-bucket NUAGE_BACKUP2_S3_REGION=…
+  NUAGE_BACKUP2_S3_ACCESS_KEY_ID=… NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`) : le dyno redémarre
+  depuis l'ancien et envoie un instantané complet de chaque application au nouveau ;
+  (2) attendez que la page *Stockage* de la console, ou `/app`, montre la dernière sauvegarde
+  de chaque application sans erreur ; (3) retirez l'ancien, en une seule commande
+  (`heroku config:unset NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION …`) : le dyno qui
+  s'arrête envoie ses dernières secondes aux deux, et le suivant restaure depuis le nouveau
+  bucket, désormais l'unique destination.
 
 À la main :
 
@@ -683,7 +705,11 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 | `NUAGE_BACKUP_S3_REGION` | région | `us-east-1` |
 | `NUAGE_BACKUP_S3_PREFIX` | préfixe des objets de sauvegarde | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
-| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes entre deux instantanés | `60` |
+| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes entre deux instantanés (de chaque destination) | `60` |
+| `NUAGE_BACKUP2_DIR` | une seconde destination de sauvegarde, tenue à jour avec la première : ce dossier (voir les sauvegardes plus haut) ; seule, c'est l'unique destination | |
+| `NUAGE_BACKUP2_S3_BUCKET` | la seconde destination dans ce bucket (avec aussi `NUAGE_BACKUP2_DIR`, ou au même endroit que la première, le serveur ne démarre pas) | |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | son point d'accès, sa région et son préfixe | comme pour la première |
+| `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | ses identifiants (sinon `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_KV_PORT` | sert aussi le stockage clé-valeur sur un port à lui (`6379`), par le protocole que parlent les clients Redis : on s'y connecte au stockage d'une application, un jeton comme mot de passe | désactivé |
 | `NUAGE_KV_BIND` | son adresse | `NUAGE_BIND` |
 | `NUAGE_KV_MB` | mémoire du stockage clé-valeur de chaque application, en Mio, ou `auto` ; au-delà, les clés les moins récemment utilisées partent | `auto` : un seizième de la mémoire, 4 à 256 Mio |

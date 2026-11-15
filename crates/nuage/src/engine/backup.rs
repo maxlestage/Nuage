@@ -25,6 +25,13 @@
 //! the data (another server of the same database still running beside this
 //! one, as when a host starts the new one before stopping the old) is this
 //! database's.
+//!
+//! A backup can go to two places at once ([`MirrorStore`]). The engine ships
+//! to each one in turn, each with its own progress: one that does not answer
+//! never holds the other back, and one that missed log segments the data
+//! directory no longer has gets a whole snapshot before anything else
+//! ([`can_continue`]). An empty data directory is restored from ONE of them,
+//! whole, never a mix: the one that reaches furthest ([`restore_best`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +96,107 @@ pub trait BackupStore: Send + Sync {
     /// Where what is set aside under `dir` is, as [`describe`](Self::describe) tells a place.
     fn describe_aside(&self, dir: &str) -> String {
         format!("{}/{}", self.describe().trim_end_matches('/'), dir.trim_end_matches('/'))
+    }
+
+    /// The two places of a store that backs up to two ([`MirrorStore`]), each
+    /// as a store of its own: the engine ships to each one with its own
+    /// progress, and restores from one of them. `None` (the default): one
+    /// place.
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        None
+    }
+}
+
+/// Backups to two places, kept in step: what an engine is given to back up
+/// to both. It is only the pair: the engine ships to each place
+/// ([`parts`](BackupStore::parts)) with its own progress, so a place that does
+/// not answer never holds the other back, and an empty data directory is
+/// restored from one place, whole (the one that reaches furthest).
+///
+/// Used as a store by itself, it writes and deletes in both places (trying
+/// both, and returning the first error), lists what either holds, and reads
+/// from the first place, then from the second.
+pub struct MirrorStore {
+    first: Arc<dyn BackupStore>,
+    second: Arc<dyn BackupStore>,
+}
+
+impl MirrorStore {
+    /// Backups to `first` and to `second`. An empty data directory whose two
+    /// places hold the same backup is restored from `first`.
+    pub fn new(first: Arc<dyn BackupStore>, second: Arc<dyn BackupStore>) -> Self {
+        MirrorStore { first, second }
+    }
+
+    /// `f` on both places: both are tried, and the first error is returned.
+    fn both(&self, f: impl Fn(&dyn BackupStore) -> Result<()>) -> Result<()> {
+        let first = f(self.first.as_ref());
+        let second = f(self.second.as_ref());
+        first.and(second)
+    }
+}
+
+/// The names of both lists, sorted, each once.
+fn union(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    a.extend(b);
+    a.sort();
+    a.dedup();
+    a
+}
+
+impl BackupStore for MirrorStore {
+    fn describe(&self) -> String {
+        format!("{} and {}", self.first.describe(), self.second.describe())
+    }
+
+    fn put(&self, name: &str, data: &[u8]) -> Result<()> {
+        self.both(|s| s.put(name, data))
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.both(|s| s.put_file(name, path))
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.first.get(name)? {
+            Some(data) => Ok(Some(data)),
+            None => self.second.get(name),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(union(self.first.list(prefix)?, self.second.list(prefix)?))
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.both(|s| s.delete(name))
+    }
+
+    fn put_aside(&self, dir: &str, name: &str, data: &[u8]) -> Result<()> {
+        self.both(|s| s.put_aside(dir, name, data))
+    }
+
+    fn get_aside(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.first.get_aside(dir, name)? {
+            Some(data) => Ok(Some(data)),
+            None => self.second.get_aside(dir, name),
+        }
+    }
+
+    fn list_aside(&self, dir: &str, prefix: &str) -> Result<Vec<String>> {
+        Ok(union(self.first.list_aside(dir, prefix)?, self.second.list_aside(dir, prefix)?))
+    }
+
+    fn delete_aside(&self, dir: &str, name: &str) -> Result<()> {
+        self.both(|s| s.delete_aside(dir, name))
+    }
+
+    fn describe_aside(&self, dir: &str) -> String {
+        format!("{} and {}", self.first.describe_aside(dir), self.second.describe_aside(dir))
+    }
+
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        Some((self.first.clone(), self.second.clone()))
     }
 }
 
@@ -195,7 +303,10 @@ impl PrefixedStore {
 
 impl BackupStore for PrefixedStore {
     fn describe(&self) -> String {
-        format!("{}/{}", self.inner.describe().trim_end_matches('/'), self.prefix.trim_end_matches('/'))
+        match self.parts() {
+            Some((first, second)) => format!("{} and {}", first.describe(), second.describe()),
+            None => format!("{}/{}", self.inner.describe().trim_end_matches('/'), self.prefix.trim_end_matches('/')),
+        }
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<()> {
@@ -246,13 +357,30 @@ impl BackupStore for PrefixedStore {
     }
 
     fn describe_aside(&self, dir: &str) -> String {
-        format!("{}/{}", self.inner.describe_aside(dir), self.prefix.trim_end_matches('/'))
+        match self.parts() {
+            Some((first, second)) => format!("{} and {}", first.describe_aside(dir), second.describe_aside(dir)),
+            None => format!("{}/{}", self.inner.describe_aside(dir), self.prefix.trim_end_matches('/')),
+        }
+    }
+
+    // The same prefix in each place: an application backs up under
+    // `apps/<name>/` of both.
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        let (first, second) = self.inner.parts()?;
+        let part = |inner| -> Arc<dyn BackupStore> { Arc::new(PrefixedStore::new(inner, self.prefix.clone())) };
+        Some((part(first), part(second)))
     }
 }
 
-/// Removes every object of a backup (a deleted application's).
+/// Removes every object of a backup (a deleted application's). A backup to two
+/// places is emptied in each, one after the other: a place that does not
+/// answer does not keep the other's objects.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
+    if let Some((first, second)) = backup.parts() {
+        let first = delete_all(first.as_ref());
+        return first.and(delete_all(second.as_ref()));
+    }
     for prefix in ["snapshots/", "wal/"] {
         for name in backup.list(prefix)? {
             backup.delete(&name)?;
@@ -322,8 +450,12 @@ pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bo
     Ok(true)
 }
 
-/// Ships the sealed log segments not shipped yet. Returns the last LSN they
-/// cover (everything up to it is in the backup).
+/// Ships the sealed log segments not shipped yet, oldest first. Returns the
+/// last LSN they cover (everything up to it is in the backup). A segment is
+/// sent only when the backup holds the log up to the commit before it: when
+/// the segment that follows `shipped` is no longer on this disk (a second
+/// destination that was away while the first's were removed), nothing is
+/// sent, and the destination needs a snapshot ([`can_continue`]).
 pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u64) -> Result<u64> {
     let segments = wal::segments(&store.dir.join("wal"))?;
     let current = store.writer().wal.first_lsn;
@@ -333,10 +465,28 @@ pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u6
         if *first == current || next_first - 1 <= shipped {
             continue;
         }
+        if *first > last + 1 {
+            return Err(storage_err(format!(
+                "{}: the log after commit {last} is no longer on this disk, nothing after it was sent (a whole \
+                 snapshot goes there next)",
+                backup.describe()
+            )));
+        }
         backup.put_file(&format!("wal/{}", segment_name(*first)), path)?;
         last = last.max(next_first - 1);
     }
     Ok(last)
+}
+
+/// `true` when a destination that holds the log up to `shipped` can go on
+/// with log segments: this disk still has the segment that follows (its
+/// oldest one starts at or before `shipped + 1`). `false`: the commits after
+/// `shipped` are only in the page store now (the segments are kept until the
+/// first destination has them, never for the second), and the destination
+/// needs a whole snapshot before any further segment.
+pub(crate) fn can_continue(store: &Store, shipped: u64) -> Result<bool> {
+    let segments = wal::segments(&store.dir.join("wal"))?;
+    Ok(segments.first().is_none_or(|(first, _)| *first <= shipped + 1))
 }
 
 /// Refuses a location that holds another database's backup: its
@@ -368,28 +518,54 @@ fn of_this_database(store: &Store, backup: &dyn BackupStore) -> Result<()> {
     )))
 }
 
-/// Takes a snapshot: checkpoint, copy of the page store, upload, manifest.
-/// Older snapshots and the segments before them are pruned, keeping `keep`.
-/// A location that holds another database's backup is refused first, with
-/// nothing written ([`of_this_database`]). The backup of a version up to 0.4
-/// is then set aside ([`keep_aside`]). Returns the snapshot's LSN, and
-/// whether an earlier version's backup was set aside now.
-pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> Result<(u64, bool)> {
+/// A snapshot is taken in three steps, so that a round in which both places
+/// of a [`MirrorStore`] are due copies the page store once: [`prepare`] each
+/// place, [`take`] the copy, [`send`] it to each place.
+///
+/// The first step, before anything is written to `backup`: a location that
+/// holds another database's backup is refused, with nothing written
+/// ([`of_this_database`]); the backup of a version up to 0.4 is then set
+/// aside ([`keep_aside`]). Returns whether it was set aside now.
+pub(crate) fn prepare(store: &Store, backup: &dyn BackupStore) -> Result<bool> {
     of_this_database(store, backup)?;
-    let kept = keep_aside(backup, store.dir.join(HEADER_FILE).exists())?;
-    let local = store.dir.join("snapshot.partial");
-    let lsn = {
-        // No commit may land while the file is copied.
-        let mut w = store.writer();
-        let lsn = store.checkpoint_locked(&mut w, Some(0))?;
-        // Through the store's own handle: Windows lets no other handle read the locked file.
-        store.pages.copy_file_to(&local)?;
-        lsn
-    };
+    keep_aside(backup, store.dir.join(HEADER_FILE).exists())
+}
+
+/// A copy of the page store for a snapshot ([`take`]), removed from the disk
+/// when it is dropped.
+pub(crate) struct Taken {
+    /// The LSN the copy holds everything up to.
+    pub(crate) lsn: u64,
+    path: PathBuf,
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The second step of a snapshot: a checkpoint, then a copy of the page
+/// store beside it, with no commit in between.
+pub(crate) fn take(store: &Store) -> Result<Taken> {
+    let path = store.dir.join("snapshot.partial");
+    // No commit may land while the file is copied.
+    let mut w = store.writer();
+    let lsn = store.checkpoint_locked(&mut w, Some(0))?;
+    // Made before the copy: what a copy that fails part way leaves is removed.
+    let taken = Taken { lsn, path };
+    // Through the store's own handle: Windows lets no other handle read the locked file.
+    store.pages.copy_file_to(&taken.path)?;
+    Ok(taken)
+}
+
+/// The last step of a snapshot: the copy is uploaded, then the header and the
+/// manifest. Older snapshots and the segments before them are pruned,
+/// keeping `keep`.
+pub(crate) fn send(store: &Store, backup: &dyn BackupStore, taken: &Taken, keep: usize) -> Result<()> {
+    let lsn = taken.lsn;
     let name = format!("snapshots/{lsn:020}.db");
-    let uploaded = backup.put_file(&name, &local);
-    let _ = fs::remove_file(&local);
-    uploaded?;
+    backup.put_file(&name, &taken.path)?;
     // An encrypted snapshot needs its header (salt, check value) to be read.
     let header = fs::read(store.dir.join(HEADER_FILE)).ok();
     if let Some(h) = &header {
@@ -422,7 +598,7 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
             }
         }
     }
-    Ok((lsn, kept))
+    Ok(())
 }
 
 /// The LSN in the name of a snapshot (`snapshots/<lsn>.db`, or `.redb` for one
@@ -491,6 +667,113 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
     Ok(true)
 }
 
+/// What a backup location holds, read without restoring it ([`inspect`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// The latest snapshot (`snapshots/<lsn>.db`).
+    pub snapshot: String,
+    /// The LSN that snapshot holds everything up to.
+    pub lsn: u64,
+    /// When it was written (Unix ms; 0 when the manifest does not say).
+    pub at: i64,
+    /// The snapshot is encrypted.
+    pub encrypted: bool,
+    /// The `encryption.json` of the location, if it has one: what tells one
+    /// database from another.
+    pub header: Option<Vec<u8>>,
+    /// How far the backup reaches in the log: the larger of the snapshot's
+    /// LSN and the first LSN of the latest log segment after it. Two copies
+    /// of one database get their segments from the same data directory, and
+    /// a snapshot is taken where a segment ends, so the larger reach is the
+    /// copy that holds more.
+    pub reach: u64,
+}
+
+/// What `backup` holds: its manifest, its header and how far its log
+/// segments go. `None` when it holds no backup (no manifest).
+pub fn inspect(backup: &dyn BackupStore) -> Result<Option<BackupInfo>> {
+    let Some(manifest) = backup.get(MANIFEST)? else { return Ok(None) };
+    let j: Json = serde_json::from_slice(&manifest).map_err(|e| storage_err(format!("backup manifest: {e}")))?;
+    let snapshot = j.get("snapshot").and_then(Json::as_str).ok_or_else(|| storage_err("backup manifest"))?.to_owned();
+    let lsn = j.get("lsn").and_then(Json::as_u64).unwrap_or(0);
+    let header = backup.get(HEADER_FILE)?;
+    let last_segment =
+        backup.list("wal/")?.iter().filter_map(|name| segment_lsn(name.trim_start_matches("wal/"))).max();
+    Ok(Some(BackupInfo {
+        snapshot,
+        lsn,
+        at: j.get("at").and_then(Json::as_i64).unwrap_or(0),
+        encrypted: j.get("encrypted").and_then(Json::as_bool) == Some(true),
+        header,
+        reach: last_segment.unwrap_or(0).max(lsn),
+    }))
+}
+
+/// What [`restore_best`] did.
+pub(crate) struct Best {
+    /// The place the data was restored from; `None`: neither holds a backup.
+    pub(crate) from: Option<String>,
+    /// The second place could not be read, and the data was restored from
+    /// the first: what it said.
+    pub(crate) skipped: Option<String>,
+}
+
+/// Restores an empty `dir` from one of the two places of a backup, whole,
+/// never a mix of both: the one that reaches furthest ([`BackupInfo::reach`]),
+/// the first on a tie; the other one when only one holds a backup. The first
+/// place that cannot be read is an error: an older copy is never restored in
+/// silence while a newer one may exist (to start from the second alone, the
+/// first is taken out of the settings). The second that cannot be read is
+/// skipped and said ([`Best::skipped`]), unless the first holds nothing: then
+/// the second may hold the only copy, and it is an error too. Two places
+/// that hold different databases are an error, and nothing is restored.
+pub(crate) fn restore_best(dir: &Path, first: &dyn BackupStore, second: &dyn BackupStore) -> Result<Best> {
+    let (one, two) = (first.describe(), second.describe());
+    let a = inspect(first).map_err(|e| {
+        storage_err(format!(
+            "the first backup destination does not answer ({one}: {}): nothing was restored. To start from the \
+             second alone ({two}), take the first out of the settings",
+            super::reason(&e)
+        ))
+    })?;
+    let (b, skipped) = match inspect(second) {
+        Ok(b) => (b, None),
+        Err(e) if a.is_some() => (None, Some(super::reason(&e))),
+        Err(e) => {
+            return Err(storage_err(format!(
+                "{one} holds no backup and the second backup destination does not answer ({two}: {}): nothing \
+                 was restored, and no empty database is started while it may hold the data",
+                super::reason(&e)
+            )));
+        }
+    };
+    let chosen = match (&a, &b) {
+        (None, None) => return Ok(Best { from: None, skipped }),
+        (Some(_), None) => first,
+        (None, Some(_)) => second,
+        (Some(a), Some(b)) => {
+            let same = match (&a.header, &b.header) {
+                (Some(x), Some(y)) => same_database(x, y),
+                // Backups in clear have nothing that tells them apart.
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                return Err(storage_err(format!(
+                    "the two backup destinations hold different databases ({one} and {two}): nothing was restored. \
+                     Keep the one of this database in the settings, and give the other a place of its own"
+                )));
+            }
+            if b.reach > a.reach { second } else { first }
+        }
+    };
+    let from = chosen.describe();
+    if !restore(dir, chosen)? {
+        return Err(storage_err(format!("{from} held a backup a moment ago and holds none now: nothing was restored")));
+    }
+    Ok(Best { from: Some(from), skipped })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +823,49 @@ mod tests {
         delete_all(&part).unwrap();
         assert_eq!(store.get("before-import/apps/shop/manifest.json").unwrap(), None);
         assert_eq!(aside(MANIFEST).map(|m| m.len() > 10), Some(true), "the others' stay");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two places as one store: written in both, read from either, and an
+    /// application's part of it is the same part of each place. Emptying it
+    /// empties each place, even when the other cannot be emptied.
+    #[test]
+    fn a_mirror_is_two_places() {
+        let dir = std::env::temp_dir().join(format!("nuage-backup-mirror-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (a, b) = (DirectoryStore::new(dir.join("a")), DirectoryStore::new(dir.join("b")));
+        let both: Arc<dyn BackupStore> = Arc::new(MirrorStore::new(Arc::new(a.clone()), Arc::new(b.clone())));
+        assert_eq!(both.describe(), format!("{} and {}", a.describe(), b.describe()));
+        both.put("x", b"1").unwrap();
+        assert_eq!((a.get("x").unwrap(), b.get("x").unwrap()), (Some(b"1".to_vec()), Some(b"1".to_vec())));
+        b.put("y", b"2").unwrap();
+        assert_eq!(both.get("y").unwrap(), Some(b"2".to_vec()), "from the second when the first has none");
+        assert_eq!(both.list("").unwrap(), ["x", "y"]);
+        assert!(a.parts().is_none());
+
+        let shop = PrefixedStore::new(both.clone(), "apps/shop/");
+        let (one, two) = shop.parts().expect("the same prefix in each place");
+        assert_eq!(one.describe(), format!("{}/apps/shop", a.describe()));
+        assert_eq!(shop.describe(), format!("{} and {}", one.describe(), two.describe()));
+        assert!(shop.describe_aside(BEFORE_IMPORT).ends_with("b/before-import/apps/shop"));
+        for part in [&one, &two] {
+            part.put(MANIFEST, b"m").unwrap();
+            part.put("wal/00000000000000000001.log", b"w").unwrap();
+        }
+        delete_all(&shop).unwrap();
+        for place in [&a, &b] {
+            assert!(place.list("apps/shop/wal/").unwrap().is_empty());
+            assert_eq!(place.get("apps/shop/manifest.json").unwrap(), None);
+        }
+        assert_eq!(a.get("x").unwrap(), Some(b"1".to_vec()), "the rest stays");
+
+        // A place that cannot be emptied (a file where its folder should be).
+        fs::write(dir.join("not-a-folder"), b"").unwrap();
+        let broken: Arc<dyn BackupStore> = Arc::new(DirectoryStore::new(dir.join("not-a-folder")));
+        b.put("apps/blog/manifest.json", b"m").unwrap();
+        let blog = PrefixedStore::new(Arc::new(MirrorStore::new(broken, Arc::new(b.clone()))), "apps/blog/");
+        assert!(delete_all(&blog).is_err());
+        assert_eq!(b.get("apps/blog/manifest.json").unwrap(), None, "the other place is emptied all the same");
         let _ = fs::remove_dir_all(&dir);
     }
 }

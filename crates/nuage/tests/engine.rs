@@ -4,12 +4,16 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use memoire_orm::prelude::*;
 use memoire_orm::{Query, Value};
-use nuage::{BackupOptions, BackupStore, DirectoryStore, Embedded, Encryption, EngineOptions, PrefixedStore};
+use nuage::{
+    BackupOptions, BackupStatus, BackupStore, DirectoryStore, Embedded, Encryption, EngineOptions, Event, MirrorStore,
+    PrefixedStore,
+};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("nuage-engine-{name}-{}", std::process::id()));
@@ -1093,4 +1097,586 @@ async fn a_limit_does_not_cut_what_an_aggregate_counts() {
     assert_eq!(db.fetch_rows(Query::Select(&rest)).unwrap().len(), 10);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A backup folder for the tests that stops answering (`down`), or refuses
+/// to write (`read_only`), on demand.
+struct TestPlace {
+    folder: DirectoryStore,
+    down: AtomicBool,
+    read_only: AtomicBool,
+}
+
+impl TestPlace {
+    fn new(root: &std::path::Path) -> Arc<TestPlace> {
+        Arc::new(TestPlace {
+            folder: DirectoryStore::new(root),
+            down: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
+        })
+    }
+
+    /// `root`, read and never written to: what the tests restore from, so
+    /// that the restored database's own backups leave it as it was.
+    fn reading(root: &std::path::Path) -> Arc<TestPlace> {
+        let place = TestPlace::new(root);
+        place.read_only.store(true, Ordering::SeqCst);
+        place
+    }
+
+    /// `root`, answering nothing.
+    fn away(root: &std::path::Path) -> Arc<TestPlace> {
+        let place = TestPlace::new(root);
+        place.set_down(true);
+        place
+    }
+
+    fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    fn answer(&self, write: bool) -> memoire_orm::Result<()> {
+        let why = if self.down.load(Ordering::SeqCst) {
+            "does not answer"
+        } else if write && self.read_only.load(Ordering::SeqCst) {
+            "is only read in this test"
+        } else {
+            return Ok(());
+        };
+        let e = std::io::Error::other(format!("{} {why}", self.folder.describe()));
+        Err(memoire_orm::Error::Database(Box::new(e)))
+    }
+}
+
+impl BackupStore for TestPlace {
+    fn describe(&self) -> String {
+        self.folder.describe()
+    }
+
+    fn put(&self, name: &str, data: &[u8]) -> memoire_orm::Result<()> {
+        self.answer(true)?;
+        self.folder.put(name, data)
+    }
+
+    fn put_file(&self, name: &str, path: &std::path::Path) -> memoire_orm::Result<()> {
+        self.answer(true)?;
+        self.folder.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> memoire_orm::Result<Option<Vec<u8>>> {
+        self.answer(false)?;
+        self.folder.get(name)
+    }
+
+    fn list(&self, prefix: &str) -> memoire_orm::Result<Vec<String>> {
+        self.answer(false)?;
+        self.folder.list(prefix)
+    }
+
+    fn delete(&self, name: &str) -> memoire_orm::Result<()> {
+        self.answer(true)?;
+        self.folder.delete(name)
+    }
+}
+
+/// A backup folder that writes down every call made to it (the LSNs in the
+/// names as `<lsn>`).
+struct Recorded {
+    folder: DirectoryStore,
+    calls: Mutex<Vec<String>>,
+}
+
+impl Recorded {
+    fn note(&self, call: &str, name: &str) {
+        let name: Vec<String> = name
+            .split('/')
+            .map(|part| match part.split_once('.') {
+                Some((lsn, end)) if lsn.len() == 20 && lsn.bytes().all(|b| b.is_ascii_digit()) => {
+                    format!("<lsn>.{end}")
+                }
+                _ => part.to_owned(),
+            })
+            .collect();
+        self.calls.lock().unwrap().push(format!("{call} {}", name.join("/")));
+    }
+
+    /// The calls since the last time.
+    fn calls(&self) -> Vec<String> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+}
+
+impl BackupStore for Recorded {
+    fn describe(&self) -> String {
+        self.folder.describe()
+    }
+
+    fn put(&self, name: &str, data: &[u8]) -> memoire_orm::Result<()> {
+        self.note("PUT", name);
+        self.folder.put(name, data)
+    }
+
+    fn put_file(&self, name: &str, path: &std::path::Path) -> memoire_orm::Result<()> {
+        self.note("PUT", name);
+        self.folder.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> memoire_orm::Result<Option<Vec<u8>>> {
+        self.note("GET", name);
+        self.folder.get(name)
+    }
+
+    fn list(&self, prefix: &str) -> memoire_orm::Result<Vec<String>> {
+        self.note("LIST", prefix);
+        self.folder.list(prefix)
+    }
+
+    fn delete(&self, name: &str) -> memoire_orm::Result<()> {
+        self.note("DELETE", name);
+        self.folder.delete(name)
+    }
+}
+
+/// Both places, as one store.
+fn mirror(first: Arc<dyn BackupStore>, second: Arc<dyn BackupStore>) -> Arc<dyn BackupStore> {
+    Arc::new(MirrorStore::new(first, second))
+}
+
+/// Waits for the backup round that a database just opened makes at once (its
+/// upkeep thread's) to have tried its `destinations`: the tests make theirs
+/// after it, one at a time.
+fn first_round(engine: &nuage::Engine, destinations: usize) {
+    for _ in 0..2000 {
+        let tried = engine
+            .events()
+            .0
+            .iter()
+            .filter(|e| e.message.starts_with("backup snapshot sent to ") || e.message.starts_with("backup failed: "))
+            .count();
+        if tried >= destinations {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("no backup round");
+}
+
+/// The log segments in a data directory.
+fn segments_in(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".log"))
+        .count()
+}
+
+/// What an empty directory gets from `store`: the status of its backup, its
+/// events, its rows of `items` (`-1`: no such table) and its branches.
+async fn restored_from(store: Arc<dyn BackupStore>, name: &str) -> (BackupStatus, Vec<Event>, i64, usize) {
+    let dir = temp_dir(name);
+    let db = Embedded::open_with(&dir, backed_up_to(store, 1)).unwrap();
+    let rows = Item::count(&db).await.map_or(-1, |n| n as i64);
+    let found = (db.engine().backup_status(), db.engine().events().0, rows, db.engine().branches().len());
+    let gone = Arc::downgrade(db.engine());
+    drop(db);
+    closed(gone);
+    let _ = std::fs::remove_dir_all(&dir);
+    found
+}
+
+/// The LSN of the latest snapshot in a backup folder.
+fn snapshot_lsn(folder: &std::path::Path) -> u64 {
+    nuage::engine::backup::inspect(&DirectoryStore::new(folder)).unwrap().expect("a backup").lsn
+}
+
+/// Two destinations get the same backup, from one copy of the page store:
+/// each one alone restores every row and branch into an empty directory.
+#[tokio::test]
+async fn two_destinations_hold_the_same_backup() {
+    let (dir, one, two) = (temp_dir("two-data"), temp_dir("two-one"), temp_dir("two-two"));
+    let places = mirror(Arc::new(DirectoryStore::new(&one)), Arc::new(DirectoryStore::new(&two)));
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(places, 1)).unwrap();
+        first_round(db.engine(), 2);
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..20 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().backup_now(true).unwrap();
+        // Written after the snapshot: they travel in log segments.
+        for n in 20..30 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().create_branch("after-snapshot", None).unwrap();
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_now(false).unwrap();
+        let status = db.engine().backup_status();
+        assert!(status.last_ok && status.last_error.is_none(), "{status:?}");
+        assert_eq!(status.target, Some(format!("{} and {}", one.display(), two.display())));
+        let sent: Vec<String> = db.engine().events().0.into_iter().map(|e| e.message).collect();
+        for place in [&one, &two] {
+            let to = format!("backup snapshot sent to {}", place.display());
+            assert_eq!(sent.iter().filter(|m| **m == to).count(), 2, "{sent:?}");
+        }
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // One copy for both: the same snapshots (byte for byte) and the same log segments.
+    let (a, b) = (tree(&one), tree(&two));
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    assert!(a.keys().any(|k| k.starts_with("wal/")), "{:?}", a.keys());
+    for (name, bytes) in a.iter().filter(|(name, _)| !name.ends_with("manifest.json")) {
+        assert_eq!(&b[name], bytes, "{name}");
+    }
+    for place in [&one, &two] {
+        let (status, _, rows, branches) = restored_from(TestPlace::reading(place), "two-restored").await;
+        assert!(status.restored, "{}", place.display());
+        assert_eq!((rows, branches), (30, 1), "{}", place.display());
+    }
+    for d in [dir, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// With one destination, the backup store gets the same calls, in the same
+/// order, as it always has: the restore's look at an empty folder, then
+/// each round's.
+#[tokio::test]
+async fn one_destination_alone_sends_as_before() {
+    let (dir, folder) = (temp_dir("calls-data"), temp_dir("calls-backup"));
+    let recorded = Arc::new(Recorded { folder: DirectoryStore::new(&folder), calls: Mutex::new(Vec::new()) });
+    let snapshot = [
+        "GET encryption.json",
+        "GET manifest.json",
+        "PUT snapshots/<lsn>.db",
+        "PUT encryption.json",
+        "PUT manifest.json",
+        "LIST snapshots/",
+    ];
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(recorded.clone(), 1)).unwrap();
+        first_round(db.engine(), 1);
+        // The restore found nothing, then the first round sent a snapshot.
+        assert_eq!(recorded.calls(), [&["GET manifest.json"][..], &snapshot].concat());
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..2 {
+            item(n).insert(&db).await.unwrap();
+            db.engine().checkpoint().unwrap();
+            db.engine().backup_now(false).unwrap();
+            assert_eq!(recorded.calls(), ["PUT wal/<lsn>.log"]);
+        }
+        db.engine().backup_now(true).unwrap();
+        assert_eq!(recorded.calls(), snapshot);
+        // A third snapshot: the oldest goes, with the segment that only it needed.
+        item(2).insert(&db).await.unwrap();
+        db.engine().backup_now(true).unwrap();
+        let pruned = ["DELETE snapshots/<lsn>.db", "LIST wal/", "DELETE wal/<lsn>.log"];
+        assert_eq!(recorded.calls(), [&snapshot[..], &pruned].concat());
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    for d in [dir, folder] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A second destination that does not answer never holds the first back:
+/// segments keep reaching the first, the status says what fails, and the
+/// data directory keeps only what the first needs. And the reverse: a first
+/// that does not answer leaves the second going on.
+#[tokio::test]
+async fn a_failing_second_does_not_hold_the_first() {
+    let dir = temp_dir("failing-data");
+    let (a, b) = (temp_dir("failing-one"), temp_dir("failing-two"));
+    let (one, two) = (TestPlace::new(&a), TestPlace::new(&b));
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(mirror(one.clone(), two.clone()), 1)).unwrap();
+        let engine = db.engine();
+        first_round(engine, 2);
+        two.set_down(true);
+        let before = tree(&b);
+        db.create_table::<Item>().await.unwrap();
+        for round in 0..5 {
+            for n in 0..10 {
+                item(round * 10 + n).insert(&db).await.unwrap();
+            }
+            let lsn = engine.checkpoint().unwrap();
+            let e = engine.backup_now(false).unwrap_err().to_string();
+            assert!(e.contains(&format!("second destination ({}): ", b.display())), "{e}");
+            let status = engine.backup_status();
+            assert_eq!(status.shipped_lsn, lsn, "the first has everything");
+            assert!(!status.last_ok, "{status:?}");
+            let error = status.last_error.unwrap();
+            assert!(error.contains(&format!("second destination ({}): {} does not answer", b.display(), b.display())));
+            assert!(segments_in(&dir) <= 2, "the data directory keeps only what the first needs");
+        }
+        let failed = engine.events().0.iter().filter(|e| e.message.contains("backup failed: ")).count();
+        assert!(failed >= 5, "each failure is an event");
+        assert_eq!(tree(&b), before, "nothing reached the second");
+
+        // The reverse: the first stops answering, the second comes back.
+        one.set_down(true);
+        two.set_down(false);
+        for round in 5..8 {
+            for n in 0..10 {
+                item(round * 10 + n).insert(&db).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            let e = engine.backup_now(false).unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("{} does not answer", a.display())) && !e.contains("second destination"),
+                "{e}"
+            );
+        }
+        let status = engine.backup_status();
+        assert!(!status.last_ok && !status.last_error.unwrap().contains("second destination"));
+        // Kept on this disk for the first, which is behind.
+        assert!(segments_in(&dir) >= 3, "{}", segments_in(&dir));
+        let (_, _, rows, _) = restored_from(TestPlace::reading(&b), "failing-from-two").await;
+        assert_eq!(rows, 80, "the second has every row");
+        let (_, _, rows, _) = restored_from(TestPlace::reading(&a), "failing-from-one").await;
+        assert_eq!(rows, 50, "the first has what it got before it stopped answering");
+
+        // The first answers again: what it missed is still on this disk, and goes as segments.
+        let to_one = format!("backup snapshot sent to {}", a.display());
+        let snapshots = |engine: &nuage::Engine| engine.events().0.iter().filter(|e| e.message == to_one).count();
+        let before = snapshots(engine);
+        one.set_down(false);
+        engine.backup_now(false).unwrap();
+        let status = engine.backup_status();
+        assert!(status.last_ok && status.last_error.is_none(), "{status:?}");
+        assert_eq!(snapshots(engine), before, "no snapshot: the segments were there");
+        engine.checkpoint().unwrap();
+        assert!(segments_in(&dir) <= 2, "{}", segments_in(&dir));
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let (_, _, rows, _) = restored_from(TestPlace::reading(&a), "failing-again").await;
+    assert_eq!(rows, 80);
+    for d in [dir, a, b] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A second destination that missed log segments no longer on the disk
+/// gets a whole snapshot when it answers again, then segments: never a
+/// segment after a hole. Restored alone, it has every row.
+#[tokio::test]
+async fn a_second_that_was_away_comes_back_with_a_snapshot() {
+    let dir = temp_dir("away-data");
+    let (a, b) = (temp_dir("away-one"), temp_dir("away-two"));
+    let two = TestPlace::new(&b);
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(mirror(TestPlace::new(&a), two.clone()), 1)).unwrap();
+        let engine = db.engine();
+        first_round(engine, 2);
+        db.create_table::<Item>().await.unwrap();
+        let mut n = 0;
+        let mut write = async |rows: i64| {
+            for _ in 0..rows {
+                item(n).insert(&db).await.unwrap();
+                n += 1;
+            }
+        };
+        write(10).await;
+        engine.checkpoint().unwrap();
+        engine.backup_now(false).unwrap();
+        // Away for two checkpoints: the segments it misses leave the disk.
+        two.set_down(true);
+        let before = tree(&b);
+        for _ in 0..2 {
+            write(10).await;
+            engine.checkpoint().unwrap();
+            assert!(engine.backup_now(false).is_err());
+        }
+        assert_eq!(tree(&b), before, "nothing reached it while it was away");
+        // Back: a snapshot first, and no segment.
+        two.set_down(false);
+        write(10).await;
+        let sent = |engine: &nuage::Engine| {
+            let to = format!("backup snapshot sent to {}", b.display());
+            engine.events().0.iter().filter(|e| e.message == to).count()
+        };
+        let snapshots = sent(engine);
+        engine.backup_now(false).unwrap();
+        assert_eq!(sent(engine), snapshots + 1, "a snapshot");
+        assert!(engine.backup_status().last_ok);
+        let lsn = snapshot_lsn(&b);
+        let segments = |tree: &BTreeMap<String, Vec<u8>>| -> Vec<u64> {
+            tree.keys()
+                .filter_map(|k| k.strip_prefix("wal/")?.strip_suffix(".log")?.parse().ok())
+                .filter(|first| !before.contains_key(&format!("wal/{first:020}.log")))
+                .collect()
+        };
+        assert_eq!(segments(&tree(&b)), Vec::<u64>::new(), "no segment came with the snapshot");
+        // Then segments, from the snapshot on.
+        write(10).await;
+        engine.checkpoint().unwrap();
+        engine.backup_now(false).unwrap();
+        assert_eq!(sent(engine), snapshots + 1, "no other snapshot");
+        assert_eq!(segments(&tree(&b)), [lsn + 1]);
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let (status, events, rows, _) = restored_from(TestPlace::reading(&b), "away-restored").await;
+    assert!(status.restored);
+    assert_eq!(rows, 50);
+    assert!(!events.iter().any(|e| e.level == "error" && e.message.contains("the log holds commit")), "{events:?}");
+    for d in [dir, a, b] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// An empty directory is restored from one destination, whole: the one that
+/// reaches furthest, the first on a tie, the second when the first holds
+/// nothing. Two databases, a first that does not answer, or a second that
+/// does not answer while the first holds nothing: nothing is restored, and
+/// nothing is created. A second that does not answer otherwise is said, and
+/// the first is used.
+#[tokio::test]
+async fn an_empty_directory_is_restored_from_the_one_that_reaches_furthest() {
+    let (dir, other) = (temp_dir("furthest-data"), temp_dir("furthest-other"));
+    let (a, b, c, empty) =
+        (temp_dir("furthest-one"), temp_dir("furthest-two"), temp_dir("furthest-three"), temp_dir("furthest-empty"));
+    std::fs::create_dir_all(&empty).unwrap();
+    let one = TestPlace::new(&a);
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(mirror(one.clone(), TestPlace::new(&b)), 1)).unwrap();
+        first_round(db.engine(), 2);
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..10 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_now(false).unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let both = |first: Arc<dyn BackupStore>, second: Arc<dyn BackupStore>| mirror(first, second);
+    let reading = |root: &std::path::Path| -> Arc<dyn BackupStore> { TestPlace::reading(root) };
+    // In step: the first.
+    let (status, _, rows, _) = restored_from(both(reading(&a), reading(&b)), "furthest-tie").await;
+    assert_eq!((status.restored_from, rows), (Some(a.display().to_string()), 10));
+
+    // The second one segment ahead: the second.
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up_to(mirror(one.clone(), TestPlace::new(&b)), 1)).unwrap();
+        first_round(db.engine(), 2);
+        one.set_down(true);
+        item(10).insert(&db).await.unwrap();
+        db.engine().checkpoint().unwrap();
+        assert!(db.engine().backup_now(false).is_err());
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    one.set_down(false);
+    let (status, _, rows, _) = restored_from(both(reading(&a), reading(&b)), "furthest-ahead").await;
+    assert_eq!((status.restored_from, rows), (Some(b.display().to_string()), 11));
+    let reach = |root: &std::path::Path| nuage::engine::backup::inspect(&DirectoryStore::new(root)).unwrap().unwrap();
+    assert!(reach(&b).reach > reach(&a).reach && reach(&b).header == reach(&a).header);
+
+    // The first holds nothing: the second.
+    let (status, _, rows, _) = restored_from(both(reading(&empty), reading(&b)), "furthest-empty-first").await;
+    assert_eq!((status.restored_from, rows), (Some(b.display().to_string()), 11));
+    assert!(tree(&empty).is_empty());
+
+    // Errors, and nothing made.
+    let refused = |places: Arc<dyn BackupStore>| {
+        let target = temp_dir("furthest-refused");
+        let e = Embedded::open_with(&target, backed_up_to(places, 1)).unwrap_err().to_string();
+        assert!(!target.exists(), "nothing was made: {e}");
+        e
+    };
+    // Another database, with the same key.
+    let gone = {
+        let db = Embedded::open_with(&other, backed_up(&c, 1)).unwrap();
+        first_round(db.engine(), 1);
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    let e = refused(both(reading(&a), reading(&c)));
+    let expected = format!(
+        "the two backup destinations hold different databases ({} and {}): nothing was restored",
+        a.display(),
+        c.display()
+    );
+    assert!(e.contains(&expected), "{e}");
+    let e = refused(both(TestPlace::away(&a), reading(&b)));
+    let expected =
+        format!("the first backup destination does not answer ({}: {} does not answer)", a.display(), a.display());
+    assert!(e.contains(&expected) && e.contains("To start from the second alone"), "{e}");
+    let e = refused(both(reading(&empty), TestPlace::away(&b)));
+    assert!(e.contains("holds no backup and the second backup destination does not answer"), "{e}");
+
+    // The second does not answer: the first, and it is said.
+    let (status, events, rows, _) = restored_from(both(reading(&a), TestPlace::away(&b)), "furthest-second-away").await;
+    assert_eq!((status.restored_from, rows), (Some(a.display().to_string()), 10));
+    let said =
+        format!("the second backup destination did not answer ({}: {} does not answer)", b.display(), b.display());
+    assert!(events.iter().any(|e| e.level == "warn" && e.message.starts_with(&said)), "{events:?}");
+    for d in [dir, other, a, b, c, empty] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Moving the backups without a stop, on a disk erased at each restart: the
+/// second destination is added (the restart restores from the first), the
+/// server runs until the second has everything, a clean stop sends the last
+/// commits to both, and the next start, with the second alone, restores
+/// every commit.
+#[tokio::test]
+async fn adding_then_removing_a_destination_loses_nothing() {
+    let (old, new) = (temp_dir("switch-old"), temp_dir("switch-new"));
+    let disks = ["switch-first", "switch-both", "switch-last"].map(temp_dir);
+    let place = |root: &std::path::Path| -> Arc<dyn BackupStore> { Arc::new(DirectoryStore::new(root)) };
+    // The first destination alone.
+    let gone = {
+        let db = Embedded::open_with(&disks[0], backed_up(&old, 1)).unwrap();
+        first_round(db.engine(), 1);
+        db.create_table::<Item>().await.unwrap();
+        for n in 0..10 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_to(0, false).unwrap();
+        db.engine().close().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // The second is added: an erased disk restores from the first, the only one that holds a backup.
+    let gone = {
+        let db = Embedded::open_with(&disks[1], backed_up_to(mirror(place(&old), place(&new)), 1)).unwrap();
+        assert_eq!(db.engine().backup_status().restored_from, Some(old.display().to_string()));
+        first_round(db.engine(), 2);
+        for n in 10..20 {
+            item(n).insert(&db).await.unwrap();
+        }
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_now(false).unwrap();
+        // The second is complete: the status shows no error.
+        let status = db.engine().backup_status();
+        assert!(status.last_ok && status.last_at.is_some(), "{status:?}");
+        // Written in the last seconds, before the stop.
+        for n in 20..25 {
+            item(n).insert(&db).await.unwrap();
+        }
+        // The stop of the server: the first destination, then the second.
+        db.engine().checkpoint().unwrap();
+        db.engine().backup_to(0, false).unwrap();
+        db.engine().backup_to(1, false).unwrap();
+        db.engine().close().unwrap();
+        assert!(db.engine().backup_to(2, false).is_err(), "there are two");
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    // The first is removed: an erased disk restores from the second alone.
+    let db = Embedded::open_with(&disks[2], backed_up(&new, 1)).unwrap();
+    assert_eq!(db.engine().backup_status().restored_from, Some(new.display().to_string()));
+    assert_eq!(Item::count(&db).await.unwrap(), 25);
+    assert_eq!(Item::get(&db, 25).await.unwrap().code, "code-00000024", "the last commit is there");
+    let gone = Arc::downgrade(db.engine());
+    drop(db);
+    closed(gone);
+    for d in disks.into_iter().chain([old, new]) {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -51,6 +51,37 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   and on the console's Server page; the caches, smaller, in megabytes of the same base. The
   dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
 
+### A second backup destination, kept in step
+
+- **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` with
+  `_REGION`, `_ENDPOINT`, `_PREFIX`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` (else
+  `AWS_*`), add a second destination. Each one gets the snapshots and the log segments with
+  its own progress: one that does not answer never holds the other back, the log is kept on
+  the disk for the first only (a second that is away never fills it), and a second that
+  missed segments no longer on the disk gets a whole snapshot before any further segment,
+  never one after a hole. A round in which both are due copies the page store once. Every
+  application backs up under `apps/<name>/` of both; deleting one empties both.
+- **An empty data directory is restored from one destination, whole**: the one that reaches
+  furthest in the log, the first on a tie, the second when the first holds nothing. A first
+  that does not answer, two destinations that hold different databases, or a second that
+  does not answer while the first holds nothing stop the start, and nothing is created; a
+  second that does not answer otherwise is said, and the first is used.
+- **The status tells both**: `target` reads `A and B`, `last_ok` is true only while the last
+  attempt of each succeeded, `last_error` names the second (`second destination (<place>):
+  …`), and the last backup's time moves only then: the console and `/app` show it as they
+  are. The startup line says where the backups go and how an empty disk is restored.
+- **The stop** sends to the first destination of every application before any second one:
+  a slow second cannot take the first's last seconds.
+- **Settings**: set alone, `NUAGE_BACKUP2_*` is the only destination, so adding the second,
+  waiting until it has everything, then removing the first moves the backups without a stop
+  (the steps for Heroku are in the README). `NUAGE_BACKUP2_DIR` with
+  `NUAGE_BACKUP2_S3_BUCKET`, or the two destinations naming the same place, stop the start.
+  Without them, nothing changes: the backup store gets the same calls, in the same order.
+- **Rust API**: `MirrorStore` (a pair of stores, `BackupStore::parts`, which
+  `PrefixedStore` forwards), `Engine::backup_to` (one destination's round),
+  `engine::backup::inspect` and `BackupInfo` (what a location holds, and how far it
+  reaches), `BackupStatus::restored_from`; `Config::backups`.
+
 ## 0.4.6 (2026-11-15)
 
 ### The dashboard shows what an application keeps besides its tables

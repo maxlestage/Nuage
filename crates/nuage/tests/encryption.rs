@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memoire_orm::prelude::*;
-use nuage::{BackupOptions, DirectoryStore, Embedded, Encryption, EngineOptions};
+use nuage::{BackupOptions, BackupStore, DirectoryStore, Embedded, Encryption, EngineOptions, MirrorStore};
 
 const NEEDLE: &str = "TOP-SECRET-PAYLOAD";
 
@@ -119,10 +119,28 @@ async fn a_passphrase_works_too() {
 
 #[tokio::test]
 async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
-    let dir = temp_dir("migrate");
-    let target = temp_dir("migrate-backup");
-    let copy = temp_dir("migrate-copy");
-    let backup = || BackupOptions::new(Arc::new(DirectoryStore::new(&target)));
+    in_clear_then_encrypted(false).await;
+}
+
+/// The same with two backup destinations: each one's backup in clear is
+/// replaced, and each one alone restores the encrypted database.
+#[tokio::test]
+async fn backups_in_clear_in_two_places_are_encrypted_too() {
+    in_clear_then_encrypted(true).await;
+}
+
+async fn in_clear_then_encrypted(two: bool) {
+    let end = if two { "-two" } else { "" };
+    let dir = temp_dir(&format!("migrate{end}"));
+    let target = temp_dir(&format!("migrate-backup{end}"));
+    let second = temp_dir(&format!("migrate-second{end}"));
+    let copy = temp_dir(&format!("migrate-copy{end}"));
+    let folder = |at: &Path| -> Arc<dyn BackupStore> { Arc::new(DirectoryStore::new(at)) };
+    let backup = || {
+        let store = if two { Arc::new(MirrorStore::new(folder(&target), folder(&second))) } else { folder(&target) };
+        BackupOptions::new(store)
+    };
+    let folders = if two { vec![target.clone(), second.clone()] } else { vec![target.clone()] };
     // A database of an earlier version: in clear, backed up in clear.
     let gone = {
         let db =
@@ -150,7 +168,10 @@ async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(gone.upgrade().is_none(), "the engine in clear is still open");
-    assert!(!files_with_needle(&dir).is_empty() && !files_with_needle(&target).is_empty(), "in clear before");
+    assert!(!files_with_needle(&dir).is_empty(), "in clear before");
+    for at in &folders {
+        assert!(!files_with_needle(at).is_empty(), "in clear before: {}", at.display());
+    }
 
     // Opened with a key: encrypted in place, and the backup replaced.
     {
@@ -161,13 +182,17 @@ async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
         assert_eq!(db.engine().branches()[0].name, "review");
         let (events, _) = db.engine().events();
         assert!(events.iter().any(|e| e.message.contains("now encrypted")), "{events:?}");
+        let replaced = events.iter().filter(|e| e.message.contains("was replaced by an encrypted one")).count();
+        assert_eq!(replaced, folders.len(), "{events:?}");
         secret(30).insert(&db).await.unwrap();
         db.engine().checkpoint().unwrap();
         db.engine().backup_now(false).unwrap();
     }
     assert_eq!(files_with_needle(&dir), Vec::<PathBuf>::new());
-    assert_eq!(files_with_needle(&target), Vec::<PathBuf>::new(), "the backup in clear is gone");
-    assert!(target.join("encryption.json").exists());
+    for at in &folders {
+        assert_eq!(files_with_needle(at), Vec::<PathBuf>::new(), "the backup in clear is gone: {}", at.display());
+        assert!(at.join("encryption.json").exists());
+    }
 
     // A new, empty disk restores the encrypted backup, with the key only.
     let err = Embedded::open_with(&copy, EngineOptions { backup: Some(backup()), ..EngineOptions::default() })
@@ -175,12 +200,27 @@ async fn data_and_backups_in_clear_are_encrypted_when_opened_with_a_key() {
         .to_string();
     assert!(err.contains("NUAGE_ENCRYPTION_KEY"), "{err}");
     let _ = std::fs::remove_dir_all(&copy);
-    let db =
-        Embedded::open_with(&copy, encrypted(EngineOptions { backup: Some(backup()), ..Default::default() })).unwrap();
-    assert!(db.engine().backup_status().restored);
-    assert_eq!(Secret::count(&db).await.unwrap(), 31);
-    drop(db);
-    for d in [dir, target, copy] {
+    // From each place alone too, with two.
+    for at in &folders {
+        let store = if two { folder(at) } else { backup().store };
+        let db = Embedded::open_with(
+            &copy,
+            encrypted(EngineOptions { backup: Some(BackupOptions::new(store)), ..Default::default() }),
+        )
+        .unwrap();
+        assert!(db.engine().backup_status().restored);
+        assert_eq!(Secret::count(&db).await.unwrap(), 31, "{}", at.display());
+        let gone = Arc::downgrade(db.engine());
+        drop(db);
+        for _ in 0..400 {
+            if gone.upgrade().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&copy);
+    }
+    for d in [dir, target, second, copy] {
         let _ = std::fs::remove_dir_all(&d);
     }
 }

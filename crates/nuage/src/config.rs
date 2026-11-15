@@ -28,7 +28,13 @@
 //! | `NUAGE_BACKUP_S3_REGION` | S3 region | `us-east-1` |
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
-//! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+//! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots (of each destination) | `60` |
+//! | `NUAGE_BACKUP2_DIR` | a second backup destination, kept in step with the first: this folder. Each destination gets the snapshots and the log with its own progress: one that does not answer never holds the other back, and gets a whole snapshot when it answers again. An empty data directory is restored from one destination, whole: the one that reaches furthest, the first on a tie; a first that does not answer, or two destinations that hold different databases, stop the start. Set alone, it is the only destination. Set with `NUAGE_BACKUP2_S3_BUCKET`, or naming the same place as the first, it stops the start. To move the backups without a stop: add the second, wait until the console shows each application's backup with no error, then remove the first | none |
+//! | `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this S3 bucket (see `NUAGE_BACKUP2_DIR`) | |
+//! | `NUAGE_BACKUP2_S3_ENDPOINT` | its endpoint URL | `https://s3.<region>.amazonaws.com` |
+//! | `NUAGE_BACKUP2_S3_REGION` | its region | `us-east-1` |
+//! | `NUAGE_BACKUP2_S3_PREFIX` | its prefix | `nuage/` |
+//! | `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; when the backup holds nothing to restore, or no backup is set, the server refuses to start, and creates and writes nothing. A registered application whose directory is empty and whose backup holds nothing is not served either: the server starts without it and lists it as one that cannot be opened (complete its backup and restart, or delete it in the console); a new application starts empty. For a disk erased at each restart (Heroku), once the server holds data: a first start has nothing to restore. `1`, `yes`, `0`, `no` too; any other value stops the start | `false`: an empty start is allowed, and said |
 //! | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (Cloudflare R2, AWS S3, MinIO...); the bytes go straight between the clients and the bucket, through signed links | none: no files |
 //! | `NUAGE_FILES_S3_ENDPOINT` | its endpoint URL (`https://<account>.r2.cloudflarestorage.com` for R2) | `https://s3.<region>.amazonaws.com` |
@@ -47,7 +53,7 @@ use std::time::Duration;
 use memoire_orm::{Error, Result};
 
 use crate::crypto::Encryption;
-use crate::engine::{BackupOptions, DirectoryStore, EngineOptions};
+use crate::engine::{BackupOptions, BackupStore, DirectoryStore, EngineOptions, MirrorStore};
 #[cfg(feature = "s3")]
 use crate::s3::{S3Options, S3Store};
 #[cfg(feature = "server")]
@@ -81,6 +87,10 @@ pub struct Config {
     pub keep_awake: Option<crate::keepawake::KeepAwake>,
     /// The backup folder (`NUAGE_BACKUP_DIR`), if the backups go to one.
     pub backup_dir: Option<PathBuf>,
+    /// The backup destinations, in order: the start of their variables'
+    /// names (`NUAGE_BACKUP`, `NUAGE_BACKUP2`), and the folder of one that is
+    /// a folder (`None`: a bucket). Empty without a backup.
+    pub backups: Vec<(&'static str, Option<PathBuf>)>,
     /// An empty data directory must be restored from the backup
     /// (`NUAGE_RESTORE_REQUIRED`): the binary opens it with
     /// [`Engine::open_existing`](crate::Engine::open_existing), and the
@@ -91,8 +101,10 @@ pub struct Config {
 /// The data directory and the engine settings, through `var`: `NUAGE_DATA_DIR`,
 /// `NUAGE_NAME`, `NUAGE_ENCRYPTION_KEY`, `NUAGE_CACHE_MB`, `NUAGE_KV_STORAGE`,
 /// and the backups (`NUAGE_BACKUP_DIR`, or `NUAGE_BACKUP_S3_*` with the feature
-/// `s3`, `NUAGE_BACKUP_SNAPSHOT_MINUTES`). What an embedded database needs,
-/// without the server.
+/// `s3`; a second destination kept in step, `NUAGE_BACKUP2_DIR` or
+/// `NUAGE_BACKUP2_S3_*`, then a [`MirrorStore`];
+/// `NUAGE_BACKUP_SNAPSHOT_MINUTES`). What an embedded database needs, without
+/// the server.
 pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf, EngineOptions)> {
     let get = |k: &str| var(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
     let bad = |k: &str, v: &str| Error::Validation(format!("{k}=`{v}` is not valid"));
@@ -115,12 +127,21 @@ pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf
             _ => return Err(Error::Validation(format!("NUAGE_KV_STORAGE=`{v}`: `memory` or `database`"))),
         },
     };
-    let store: Option<Arc<dyn crate::engine::BackupStore>> = if let Some(dir) = get("NUAGE_BACKUP_DIR") {
-        Some(Arc::new(DirectoryStore::new(dir)))
-    } else if let Some(bucket) = get("NUAGE_BACKUP_S3_BUCKET") {
-        s3_store(&get, bucket)?
-    } else {
-        None
+    // A second destination kept in step with the first; set alone, it is the
+    // only one.
+    let store = match (backup_store(&get, FIRST)?, backup_store(&get, SECOND)?) {
+        (Some((one, first)), Some((two, second))) => {
+            if one.same_as(&two) {
+                return Err(Error::Validation(format!(
+                    "the two backup destinations are the same place ({}): set NUAGE_BACKUP2_* to another folder or \
+                     bucket, or remove them",
+                    first.describe()
+                )));
+            }
+            Some(Arc::new(MirrorStore::new(first, second)) as Arc<dyn BackupStore>)
+        }
+        (Some((_, only)), None) | (None, Some((_, only))) => Some(only),
+        (None, None) => None,
     };
     if let Some(store) = store {
         let mut backup = BackupOptions::new(store);
@@ -134,35 +155,91 @@ pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf
     Ok((data_dir, engine))
 }
 
+/// The variables of the first backup destination start with this.
+const FIRST: &str = "NUAGE_BACKUP";
+/// ... and those of the second, kept in step with it.
+const SECOND: &str = "NUAGE_BACKUP2";
+
+/// Where a backup destination of the settings is, to tell whether two are the
+/// same place.
+#[derive(Debug)]
+enum Place {
+    Folder(PathBuf),
+    /// Endpoint, bucket and prefix.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    Bucket(String, String, String),
+}
+
+impl Place {
+    /// The same folder (written two ways, or through a link), or the same
+    /// prefix of the same bucket at the same endpoint. A prefix is used as it
+    /// is written: `nuage` and `nuage/` are two places.
+    fn same_as(&self, other: &Place) -> bool {
+        match (self, other) {
+            (Place::Folder(a), Place::Folder(b)) => {
+                a.components().eq(b.components())
+                    || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+            }
+            (Place::Bucket(e1, b1, p1), Place::Bucket(e2, b2, p2)) => {
+                e1.trim_end_matches('/').eq_ignore_ascii_case(e2.trim_end_matches('/')) && b1 == b2 && p1 == p2
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The backup destination of the variables that start with `base`
+/// (`NUAGE_BACKUP` or `NUAGE_BACKUP2`): `<base>_DIR`, or `<base>_S3_BUCKET`
+/// and the other `<base>_S3_*`. For the first, a folder wins over a bucket,
+/// as it always has; for the second, both are refused.
+fn backup_store(get: &impl Fn(&str) -> Option<String>, base: &str) -> Result<Option<(Place, Arc<dyn BackupStore>)>> {
+    match (get(&format!("{base}_DIR")), get(&format!("{base}_S3_BUCKET"))) {
+        (Some(_), Some(_)) if base != FIRST => {
+            Err(Error::Validation(format!("set {base}_DIR or {base}_S3_BUCKET, not both")))
+        }
+        (Some(dir), _) => {
+            let store: Arc<dyn BackupStore> = Arc::new(DirectoryStore::new(&dir));
+            Ok(Some((Place::Folder(PathBuf::from(dir)), store)))
+        }
+        (None, Some(bucket)) => s3_store(get, base, bucket).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 #[cfg(feature = "s3")]
 fn s3_store(
     get: &impl Fn(&str) -> Option<String>,
+    base: &str,
     bucket: String,
-) -> Result<Option<Arc<dyn crate::engine::BackupStore>>> {
-    let region = get("NUAGE_BACKUP_S3_REGION").unwrap_or_else(|| "us-east-1".into());
-    let key = get("NUAGE_BACKUP_S3_ACCESS_KEY_ID")
+) -> Result<(Place, Arc<dyn BackupStore>)> {
+    let var = |name: &str| get(&format!("{base}_S3_{name}"));
+    let region = var("REGION").unwrap_or_else(|| "us-east-1".into());
+    let key = var("ACCESS_KEY_ID")
         .or_else(|| get("AWS_ACCESS_KEY_ID"))
-        .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_ACCESS_KEY_ID is missing".into()))?;
-    let secret = get("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY")
+        .ok_or_else(|| Error::Validation(format!("{base}_S3_ACCESS_KEY_ID is missing")))?;
+    let secret = var("SECRET_ACCESS_KEY")
         .or_else(|| get("AWS_SECRET_ACCESS_KEY"))
-        .ok_or_else(|| Error::Validation("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY is missing".into()))?;
-    Ok(Some(Arc::new(S3Store::new(S3Options {
-        endpoint: get("NUAGE_BACKUP_S3_ENDPOINT").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
+        .ok_or_else(|| Error::Validation(format!("{base}_S3_SECRET_ACCESS_KEY is missing")))?;
+    let options = S3Options {
+        endpoint: var("ENDPOINT").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
         bucket,
         region,
-        prefix: get("NUAGE_BACKUP_S3_PREFIX").unwrap_or_else(|| "nuage/".into()),
+        prefix: var("PREFIX").unwrap_or_else(|| "nuage/".into()),
         access_key_id: key,
         secret_access_key: secret,
-    })?)))
+    };
+    let place = Place::Bucket(options.endpoint.clone(), options.bucket.clone(), options.prefix.clone());
+    Ok((place, Arc::new(S3Store::new(options)?)))
 }
 
 /// Without the feature `s3`, S3 backups are refused rather than silently ignored.
 #[cfg(not(feature = "s3"))]
 fn s3_store(
     _get: &impl Fn(&str) -> Option<String>,
+    base: &str,
     _bucket: String,
-) -> Result<Option<Arc<dyn crate::engine::BackupStore>>> {
-    Err(Error::Validation("NUAGE_BACKUP_S3_BUCKET is set, but this build of Nuage DB has no `s3` feature".into()))
+) -> Result<(Place, Arc<dyn BackupStore>)> {
+    Err(Error::Validation(format!("{base}_S3_BUCKET is set, but this build of Nuage DB has no `s3` feature")))
 }
 
 /// The bucket of `/v1/files`, from `NUAGE_FILES_S3_*`.
@@ -277,8 +354,15 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         )?),
         None => None,
     };
+    // The same choice as `backup_store`: the folder, when the first has both.
+    let backups = [FIRST, SECOND]
+        .into_iter()
+        .filter(|base| get(&format!("{base}_DIR")).or_else(|| get(&format!("{base}_S3_BUCKET"))).is_some())
+        .map(|base| (base, get(&format!("{base}_DIR")).map(PathBuf::from)))
+        .collect();
     Ok(Config {
         backup_dir: get("NUAGE_BACKUP_DIR").map(PathBuf::from),
+        backups,
         restore_required,
         keep_awake,
         port,
@@ -379,6 +463,8 @@ pub fn same_disk(a: &std::path::Path, b: &std::path::Path) -> Option<bool> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -514,6 +600,92 @@ mod tests {
             let e = with(bad).unwrap_err().to_string();
             assert!(e.contains(&format!("NUAGE_KV_STORAGE=`{bad}`: `memory` or `database`")), "{e}");
         }
+    }
+
+    /// A second backup destination: kept in step with the first, the only
+    /// one when set alone, and refused when it is unclear or the same place.
+    #[test]
+    fn a_second_backup_destination() {
+        let with = |vars: &[(&str, &str)]| {
+            let vars: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            from_vars(move |k| vars.get(k).cloned())
+        };
+        let describe = |c: &Config| c.engine.backup.as_ref().map(|b| b.store.describe());
+        let s3 = [
+            ("NUAGE_BACKUP2_S3_BUCKET", "other"),
+            ("NUAGE_BACKUP2_S3_REGION", "eu-west-3"),
+            ("NUAGE_BACKUP2_S3_PREFIX", "copy/"),
+            ("NUAGE_BACKUP2_S3_ACCESS_KEY_ID", "id2"),
+            ("NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY", "secret2"),
+        ];
+        let both = with(&[[("NUAGE_BACKUP_DIR", "/mnt/backup")].as_slice(), &s3].concat()).unwrap();
+        assert_eq!(describe(&both).as_deref(), Some("/mnt/backup and s3://other/copy/"));
+        let (first, second) = both.engine.backup.as_ref().unwrap().store.parts().expect("two places");
+        assert_eq!((first.describe(), second.describe()), ("/mnt/backup".into(), "s3://other/copy/".into()));
+        assert_eq!(both.backups, [("NUAGE_BACKUP", Some(PathBuf::from("/mnt/backup"))), ("NUAGE_BACKUP2", None)]);
+        let shown = format!("{:?}", both.engine.backup);
+        assert!(shown.contains("s3://other/copy/") && !shown.contains("secret2"), "{shown}");
+
+        // Its own credentials, else AWS_*: never the first's.
+        let no_key = with(&[
+            ("NUAGE_BACKUP_S3_BUCKET", "first"),
+            ("NUAGE_BACKUP_S3_ACCESS_KEY_ID", "id"),
+            ("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+            ("NUAGE_BACKUP2_S3_BUCKET", "other"),
+        ]);
+        let e = no_key.unwrap_err().to_string();
+        assert!(e.contains("NUAGE_BACKUP2_S3_ACCESS_KEY_ID is missing"), "{e}");
+        let aws = with(&[
+            ("NUAGE_BACKUP2_S3_BUCKET", "other"),
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ]);
+        assert_eq!(describe(&aws.unwrap()).as_deref(), Some("s3://other/nuage/"));
+
+        // Alone, it is the only destination.
+        let alone = with(&[("NUAGE_BACKUP2_DIR", "/mnt/new")]).unwrap();
+        assert_eq!(describe(&alone).as_deref(), Some("/mnt/new"));
+        assert!(alone.engine.backup.as_ref().unwrap().store.parts().is_none());
+        assert_eq!(alone.backups, [("NUAGE_BACKUP2", Some(PathBuf::from("/mnt/new")))]);
+        assert!(with(&[]).unwrap().backups.is_empty());
+
+        // The first keeps its rule (the folder wins); the second says what it means.
+        let first = with(&[("NUAGE_BACKUP_DIR", "/mnt/a"), ("NUAGE_BACKUP_S3_BUCKET", "b")]).unwrap();
+        assert_eq!(describe(&first).as_deref(), Some("/mnt/a"));
+        assert_eq!(first.backups, [("NUAGE_BACKUP", Some(PathBuf::from("/mnt/a")))]);
+        let e = with(&[[("NUAGE_BACKUP2_DIR", "/mnt/b")].as_slice(), &s3].concat()).unwrap_err().to_string();
+        assert!(e.contains("set NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_BUCKET, not both"), "{e}");
+
+        // The same place twice: one copy, though two were asked for.
+        let e = with(&[("NUAGE_BACKUP_DIR", "/mnt/backup"), ("NUAGE_BACKUP2_DIR", "/mnt//backup/")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the two backup destinations are the same place (/mnt/backup)"), "{e}");
+        let tmp = std::env::temp_dir().join(format!("nuage-config-same-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("real")).unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(tmp.join("link"));
+            std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+            let (real, link) = (tmp.join("real").display().to_string(), tmp.join("link").display().to_string());
+            let e = with(&[("NUAGE_BACKUP_DIR", &real), ("NUAGE_BACKUP2_DIR", &link)]).unwrap_err().to_string();
+            assert!(e.contains("are the same place"), "a link to the same folder: {e}");
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let bucket = |prefix: &str| {
+            let prefix = prefix.to_owned();
+            with(&[
+                ("NUAGE_BACKUP_S3_BUCKET", "b"),
+                ("NUAGE_BACKUP2_S3_BUCKET", "b"),
+                ("NUAGE_BACKUP2_S3_PREFIX", &prefix),
+                ("AWS_ACCESS_KEY_ID", "id"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ])
+        };
+        let e = bucket("nuage/").unwrap_err().to_string();
+        assert!(e.contains("the two backup destinations are the same place (s3://b/nuage/)"), "{e}");
+        assert_eq!(describe(&bucket("copy/").unwrap()).as_deref(), Some("s3://b/nuage/ and s3://b/copy/"));
+        assert!(bucket("nuage").is_ok(), "`nuage` and `nuage/` are two places");
     }
 
     #[test]

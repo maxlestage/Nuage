@@ -561,6 +561,16 @@ before it serves. The installer asks where they go; or say it in the command:
   account (`COMPUTER$`) write.
 - **Change** where they go: run the installer again with the new option; it replaces the old
   one in the settings file and restarts the service. Without an option, it keeps them.
+- **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` and the other
+  `NUAGE_BACKUP2_S3_*`, add a second destination kept in step with the first. Each one gets
+  the snapshots and the log with its own progress: one that does not answer never holds the
+  other back, and gets a whole snapshot when it answers again. An empty data folder is
+  restored from one of them, whole: the one that reaches furthest. The server does not start
+  when the first does not answer (take it out of the settings to start from the second
+  alone), or when the two hold different databases. Without the first, `NUAGE_BACKUP2_*` is
+  the only destination: adding the second, waiting until it has everything, then removing
+  the first moves the backups without a stop. On Linux, the installer's service may write
+  only to the data folder and `NUAGE_BACKUP_DIR`: there, make the second one a bucket.
 - **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors.
 - **Restore** on a new computer: install, put the old settings file's
   `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
@@ -611,6 +621,16 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
 - **Loss window.** Commits since the last shipped log segment (30 seconds by default) are
   lost only if the dyno stops without the `SIGTERM` Heroku sends first: on `SIGTERM` the
   server checkpoints and ships the last segment.
+- **Move the backups without a stop.** A change of the backup variables restarts the dyno,
+  which restores from what the new settings name. To move them to another bucket:
+  (1) add the new one as the second destination, in one command (`heroku config:set
+  NUAGE_BACKUP2_S3_BUCKET=new-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
+  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`): the dyno restarts from the old one and sends a
+  whole snapshot of every application to the new one; (2) wait until the console's *Storage*
+  page, or `/app`, shows the last backup of every application with no error; (3) remove the
+  old one, in one command (`heroku config:unset NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION
+  …`): the stopping dyno sends its last seconds to both, and the next one restores from the
+  new bucket, now the only destination.
 
 By hand:
 
@@ -652,7 +672,11 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_BACKUP_S3_REGION` | region | `us-east-1` |
 | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
-| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots (of each destination) | `60` |
+| `NUAGE_BACKUP2_DIR` | a second backup destination kept in step with the first: this folder (see the backups above); alone, it is the only destination | |
+| `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this bucket (with `NUAGE_BACKUP2_DIR` too, or the same place as the first, the server does not start) | |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | its endpoint, region and prefix | as for the first |
+| `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the wire Redis clients speak: one connects to an application's store, a token as the password | off |
 | `NUAGE_KV_BIND` | its address | `NUAGE_BIND` |
 | `NUAGE_KV_MB` | memory of each application's key-value store, in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory, 4 to 256 MiB |
