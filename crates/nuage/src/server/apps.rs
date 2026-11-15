@@ -933,8 +933,9 @@ impl Apps {
     }
 
     /// Sets the websites whose pages may call `app`, one per line or comma:
-    /// `https://site.fr`, `http://localhost:3000`, or `*` for any.
-    pub(crate) fn set_origins(&self, app: &App, list: &str) -> Result<Vec<String>> {
+    /// `https://site.fr`, `http://localhost:3000`, or `*` for any. An empty
+    /// list removes them.
+    pub(crate) fn set_origins(&self, app: &App, list: &str) -> std::result::Result<Vec<String>, Refusal> {
         let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         let mut origins = Vec::new();
         for o in list.split(|c: char| c == ',' || c.is_whitespace()).filter(|o| !o.is_empty()) {
@@ -943,16 +944,14 @@ impl Apps {
                 || ((o.starts_with("https://") || o.starts_with("http://"))
                     && o.split("://").nth(1).is_some_and(|h| !h.is_empty() && !h.contains('/')));
             if !valid {
-                return Err(Error::Validation(format!(
-                    "`{o}` is not an origin: write `https://site.fr` (scheme and host, no path), or `*`"
-                )));
+                return Err(Refusal::new(refused::NOT_AN_ORIGIN, &[&o]));
             }
             if !origins.contains(&o) {
                 origins.push(o);
             }
         }
         *app.origins.write().unwrap_or_else(|e| e.into_inner()) = origins.clone();
-        self.save(app)?;
+        self.save(app).map_err(|e| Refusal::failed(&e))?;
         self.first.engine.event("info", format!("websites of application `{}`: {}", app.name, origins.join(", ")));
         Ok(origins)
     }

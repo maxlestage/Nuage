@@ -93,6 +93,18 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   memory and visibility lines starting values. `ServerOptions::settings_env`,
   `settings_read_only`, `startup`; `memory::declare`, `detected`.
 
+### The management token: the websites, and the whole status
+
+- **`POST /api/apps/{name}/origins`** `{"origins": ["https://site.fr", "http://localhost:3000"]}`
+  sets the websites whose pages may call an application (CORS), as the console's
+  **Settings → Websites** does: the whole list, `[]` removes them. The answer is the
+  application, with its `origins`. A website that is not an origin is refused (`400`) in the
+  language of `Accept-Language`; the console says it in its language too.
+- **`/api/status` and `/api/status/stream` with the management token** show every
+  application, as a console session does: backups, version, last connections. An
+  application's token still shows that application only. The management token already makes
+  tokens for any application, so it sees nothing it could not open.
+
 ### Memory you can count on, and a steadier server
 
 - **The right figures.** The memory shown is the one this server may use: its container's

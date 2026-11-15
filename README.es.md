@@ -253,6 +253,8 @@ y `env()`, las dos líneas. En un proyecto [Paquets](https://github.com/maxlesta
 | `GET` | `/api/apps/{nombre}` | | `200` la aplicación; `404` |
 | `POST` | `/api/apps/{nombre}/tokens` | `{"read_only": true}` (opcional, `false` por defecto) | `201 {"application", "token", "read_only", "env"}` |
 | `DELETE` | `/api/apps/{nombre}/tokens/{id}` | | `200 {"revoked": true}`; `404` no existe ese token |
+| `POST` | `/api/apps/{nombre}/origins` | `{"origins": ["https://sitio.es", "http://localhost:3000"]}`, la lista entera; `[]` los quita | `200` la aplicación, con sus `origins`; `400` no es un origen (esquema y host, sin ruta, o `*`) |
+| `GET` | `/api/status` | | `200` el estado en directo de todas las aplicaciones, como lo ve una sesión de la consola |
 
 Un rechazo es JSON, `{"error": {"kind", "message"}}`, con un mensaje que dice qué hacer:
 `401` sin el token de gestión o con uno incorrecto, `403` cuando `NUAGE_ADMIN_TOKEN` no está
@@ -343,8 +345,9 @@ Cualquier sitio puede usar la base de una aplicación, desde su servidor o desde
   (`"arrays": true` para arrays); un insert devuelve su `last_insert_id`. Varias instrucciones
   (separadas por `;`, o `"statements": [...]`) forman una sola transacción, todo o nada.
 - **Desde el navegador**: añade el sitio en la consola (**Settings → Websites**:
-  `https://sitio.es`, `http://localhost:3000`, o `*`) y sus páginas pueden llamar a `/v1`
-  (CORS). La petición previa del navegador se guarda en caché un día: un viaje, una sola vez.
+  `https://sitio.es`, `http://localhost:3000`, o `*`), o con `POST /api/apps/{nombre}/origins`
+  y el token de gestión, y sus páginas pueden llamar a `/v1` (CORS). La petición previa del
+  navegador se guarda en caché un día: un viaje, una sola vez.
 - **Tokens de solo lectura** (**Tokens → New read-only token**): un token en una página es
   público, así que las páginas reciben uno que lee y nunca escribe; los tokens de lectura y
   escritura se quedan en servidores.
@@ -812,7 +815,7 @@ instalador): el token viaja en una cabecera, y la cookie de la consola es `Secur
 | `/v1/kv` | el almacén clave-valor de la aplicación, en memoria (ver [Almacén clave-valor](#almacén-clave-valor)) | un token de la aplicación; un token de solo lectura lee |
 | `/v1/files` | los archivos de la aplicación, por enlaces firmados hacia su bucket (ver [Archivos](#archivos)) | un token de la aplicación; un token de solo lectura lista y descarga |
 | `/api/health` | `{"status":"ok"}` | público |
-| `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token de una aplicación (esa aplicación) o sesión de la consola (todas) |
+| `/api/status`, `/api/status/stream` | estado en directo, en JSON y en Server-Sent Events | token de una aplicación (esa aplicación), token de gestión o sesión de la consola (todas) |
 | `/api/apps` | la API de gestión: las aplicaciones y sus tokens (ver [Crear una aplicación con un comando](#crear-una-aplicación-con-un-comando)) | `Authorization: Bearer <NUAGE_ADMIN_TOKEN>` |
 | `/admin` | la consola | `NUAGE_ADMIN_PASSWORD` |
 | todo lo demás | el sitio web, `/app` incluido | público |
