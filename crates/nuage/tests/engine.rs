@@ -142,10 +142,11 @@ fn crash_rounds(test: &str, key: Option<String>) {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut out = BufReader::new(child.stdout.take().unwrap());
         let mut acknowledged = 0usize;
         let mut seen = 0;
-        while let Some(Ok(line)) = lines.next() {
+        let mut line = String::new();
+        while out.read_line(&mut line).is_ok_and(|read| read > 0) {
             if let Ok(n) = line.trim().parse::<usize>() {
                 acknowledged = n;
                 seen += 1;
@@ -153,10 +154,23 @@ fn crash_rounds(test: &str, key: Option<String>) {
                     break;
                 }
             }
+            line.clear();
         }
         // SIGKILL: no destructor, no flush, in the middle of whatever it does.
         child.kill().unwrap();
         child.wait().unwrap();
+        // The child kept committing until the kill: the groups it acknowledged meanwhile are
+        // still in the pipe. Read them all, or a whole group would look like rows too many.
+        // Only complete lines count: a number cut short by the kill was not acknowledged.
+        line.clear();
+        while out.read_line(&mut line).is_ok_and(|read| read > 0) {
+            if line.ends_with('\n')
+                && let Ok(n) = line.trim().parse::<usize>()
+            {
+                acknowledged = n;
+            }
+            line.clear();
+        }
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
