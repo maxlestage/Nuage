@@ -20,6 +20,7 @@ pub enum Detail {
     App(String),
     Service(String),
     Storage,
+    Memory,
     Wal,
     Backup,
 }
@@ -58,6 +59,7 @@ pub fn title(tx: &Texts, which: &Detail) -> String {
         Detail::App(name) => name.clone(),
         Detail::Service(name) => service_label(tx, name),
         Detail::Storage => tx.storage_title.into(),
+        Detail::Memory => tx.detail_memory.into(),
         Detail::Wal => tx.wal_title.into(),
         Detail::Backup => tx.backup_title.into(),
     }
@@ -321,25 +323,6 @@ pub fn body(
                 ]),
                 help(tx.help_storage),
             ];
-            if let Some(m) = &d.memory {
-                let b = |v: Option<u64>| v.map_or(DASH.to_string(), status::bytes);
-                let free = match (m.available_bytes, m.total_bytes) {
-                    (Some(a), Some(t)) => format!("{} / {}", status::bytes(a), status::bytes(t)),
-                    (a, _) => b(a),
-                };
-                let swap = match (m.swap_free_bytes, m.swap_total_bytes) {
-                    (_, Some(0)) | (_, None) => tx.detail_none.to_string(),
-                    (Some(f), Some(t)) => format!("{} / {}", status::bytes(f), status::bytes(t)),
-                    (None, Some(t)) => status::bytes(t),
-                };
-                out.push(heading(tx.detail_memory));
-                out.push(facts(vec![
-                    (tx.detail_mem_used, b(m.process_bytes)),
-                    (tx.detail_mem_free, free),
-                    (tx.detail_swap, swap),
-                    (tx.detail_cache_app, b(m.cache_per_app_bytes)),
-                ]));
-            }
             out.push(heading(tx.detail_by_app));
             out.push(app_table(
                 detail,
@@ -354,6 +337,50 @@ pub fn body(
                     .collect(),
             ));
             out
+        }
+        Detail::Memory => {
+            let Some(m) = &d.memory else {
+                return vec![p().class("muted").text(DASH).into()];
+            };
+            let b = |v: Option<u64>| v.map_or(DASH.to_string(), status::bytes);
+            let pct = match (m.used_bytes, m.total_bytes) {
+                (Some(u), Some(t)) if t > 0 => u as f64 / t as f64 * 100.0,
+                _ => 0.0,
+            };
+            let used = match m.used_bytes {
+                Some(u) => format!("{} · {pct:.0} %", status::bytes(u)),
+                None => DASH.to_string(),
+            };
+            let swap = match (m.swap_free_bytes, m.swap_total_bytes) {
+                (_, Some(0)) => tx.detail_none.to_string(),
+                (Some(f), Some(t)) => format!("{} / {}", status::bytes(f), status::bytes(t)),
+                (None, Some(t)) => status::bytes(t),
+                (_, None) if m.limited => tx.mem_swap_unknown.to_string(),
+                (_, None) => tx.detail_none.to_string(),
+            };
+            let cache_used = d.storage.as_ref().map(|s| s.cache_bytes);
+            vec![
+                div()
+                    .class(if pct >= 85.0 { "bar is-high" } else { "bar" })
+                    .attr("aria-hidden", "true")
+                    .child(span().class("bar-fill").style(format!("width:{pct:.1}%")))
+                    .into(),
+                facts(vec![
+                    (if m.limited { tx.mem_total_limit } else { tx.mem_total_machine }, b(m.total_bytes)),
+                    (tx.mem_used, used),
+                    (tx.detail_mem_free, b(m.available_bytes)),
+                    (tx.detail_mem_used, b(m.process_bytes)),
+                    (tx.detail_swap, swap),
+                ]),
+                help(tx.help_memory),
+                heading(tx.cache_size),
+                facts(vec![
+                    (tx.mem_cache_budget, b(m.cache_budget_bytes)),
+                    (tx.detail_cache_app, b(m.cache_per_app_bytes)),
+                    (tx.mem_cache_used, b(cache_used)),
+                    (tx.mem_reliefs, m.reliefs.to_string()),
+                ]),
+            ]
         }
         Detail::Wal => {
             let w = d.wal.clone().unwrap_or_default();

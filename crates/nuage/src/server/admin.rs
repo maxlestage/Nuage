@@ -1273,9 +1273,10 @@ fn server_body(state: &State, cx: &Cx) -> String {
         ("Free disk", engine.stats().disk_free_bytes.map_or_else(|| cx.t("unknown").into(), |b| bytes(l, b))),
         (
             "Memory",
-            match (memory.process_bytes, memory.available_bytes, memory.total_bytes) {
-                (Some(p), Some(a), Some(t)) => {
-                    cx.tf("{} used by Nuage, {} free of {}", &[&bytes(l, p), &bytes(l, a), &bytes(l, t)])
+            match (memory.used_bytes, memory.available_bytes, memory.total_bytes) {
+                (Some(u), Some(a), Some(t)) => {
+                    let text = cx.tf("{} used, {} free of {}", &[&bytes(l, u), &bytes(l, a), &bytes(l, t)]);
+                    if memory.limited { format!("{text} ({})", cx.t("the limit of this server")) } else { text }
                 }
                 _ => cx.t("unknown").into(),
             },
@@ -1285,10 +1286,20 @@ fn server_body(state: &State, cx: &Cx) -> String {
             match (memory.swap_total_bytes, memory.swap_free_bytes) {
                 (Some(0), _) => cx.t("none").into(),
                 (Some(t), Some(f)) => cx.tf("{} free of {}", &[&bytes(l, f), &bytes(l, t)]),
+                _ if memory.limited => cx.t("not reported by the host").into(),
                 _ => cx.t("unknown").into(),
             },
         ),
-        ("Cache of each application", bytes(l, engine.options().cache_bytes as u64)),
+        (
+            "Page caches",
+            match state.apps.cache_budget() {
+                Some(budget) => cx.tf(
+                    "{} for all the applications, {} each",
+                    &[&bytes(l, budget as u64), &bytes(l, engine.cache_capacity() as u64)],
+                ),
+                None => bytes(l, engine.cache_capacity() as u64),
+            },
+        ),
     ] {
         body.push_str(&card(cx.t(label), &v));
     }

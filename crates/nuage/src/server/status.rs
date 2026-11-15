@@ -207,11 +207,15 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
     let m = crate::memory::MemoryInfo::now();
     let memory = json!({
         "total_bytes": m.total_bytes,
+        "used_bytes": m.used_bytes,
         "available_bytes": m.available_bytes,
+        "limited": m.limited,
+        "cache_budget_bytes": state.apps.cache_budget(),
+        "reliefs": state.memory_reliefs(),
         "process_bytes": m.process_bytes,
         "swap_total_bytes": m.swap_total_bytes,
         "swap_free_bytes": m.swap_free_bytes,
-        "cache_per_app_bytes": engine.options().cache_bytes,
+        "cache_per_app_bytes": engine.cache_capacity(),
     });
     json!({
         "name": "Nuage DB",

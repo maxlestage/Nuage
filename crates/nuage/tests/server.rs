@@ -1733,3 +1733,33 @@ async fn key_value_store() {
     port.shutdown().await;
     running.shutdown().await;
 }
+
+#[tokio::test]
+async fn applications_share_one_cache_budget() {
+    let options = ServerOptions { cache_budget: Some(48 << 20), ..options() };
+    let server = Server::new(engine("cache-budget"), options);
+    let capacity = |name: &str| server.app_engine(name).unwrap().cache_capacity();
+    assert_eq!(capacity("nuage"), 48 << 20, "alone, it has the budget");
+    server.create_app("shop", "").unwrap();
+    server.create_app("blog", "").unwrap();
+    // Three applications: a third each, and never more than the budget in all.
+    let total: usize = ["nuage", "shop", "blog"].iter().map(|n| capacity(n)).sum();
+    assert_eq!(capacity("shop"), (48 << 20) / 3 / 16 * 16);
+    assert!(total <= 48 << 20, "{total}");
+    server.delete_app("blog").unwrap();
+    assert_eq!(capacity("shop"), 24 << 20, "its part goes back to the others");
+    // The status says what the memory is, and what the caches may hold.
+    let status = server.status();
+    let memory = &status["memory"];
+    assert_eq!(memory["cache_budget_bytes"], 48 << 20);
+    assert_eq!(memory["cache_per_app_bytes"], 24 << 20);
+    assert_eq!(status["storage"]["cache_capacity_bytes"], 48 << 20);
+    if cfg!(target_os = "linux") {
+        let (total, used, free) = (
+            memory["total_bytes"].as_u64().unwrap(),
+            memory["used_bytes"].as_u64().unwrap(),
+            memory["available_bytes"].as_u64().unwrap(),
+        );
+        assert!(used > 0 && free < total && used + free <= total + (64 << 20), "{memory}");
+    }
+}

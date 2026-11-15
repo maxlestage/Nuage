@@ -479,8 +479,47 @@ pub fn dashboard(props: &str) -> Node {
                 ),
         );
 
+    let memory = div()
+        .class("panel card is-clickable")
+        .bool_attr("hidden", move || data.with(|d| d.as_ref().is_none_or(|d| d.memory.is_none())))
+        .child(opener(detail, Detail::Memory, open_label(tx.detail_memory)))
+        .child(h2().class("dash-h2").child(icon(Icon::Activity)).text(tx.detail_memory))
+        .child(div().class("bar").attr("aria-hidden", "true").child(span().class("bar-fill").style_dyn(
+            "width",
+            move || {
+                data.with(|d| {
+                    let m = d.as_ref().and_then(|d| d.memory.as_ref());
+                    let pct = m
+                        .and_then(|m| m.used_bytes.zip(m.total_bytes))
+                        .map_or(0.0, |(u, t)| u as f64 / t.max(1) as f64 * 100.0);
+                    format!("{pct:.1}%")
+                })
+            },
+        )))
+        .child(
+            dl().class("facts")
+                .child(div().child(dt().text(tx.mem_used)).child(dd().text_dyn(val(|d| {
+                    d.memory
+                        .as_ref()
+                        .and_then(|m| m.used_bytes.zip(m.total_bytes))
+                        .map(|(u, t)| format!("{} / {}", status::bytes(u), status::bytes(t)))
+                }))))
+                .child(
+                    div().child(dt().text(tx.detail_mem_free)).child(
+                        dd().class("big")
+                            .text_dyn(val(|d| d.memory.as_ref().and_then(|m| m.available_bytes).map(status::bytes))),
+                    ),
+                )
+                .child(
+                    div().child(dt().text(tx.detail_mem_used)).child(
+                        dd().text_dyn(val(|d| d.memory.as_ref().and_then(|m| m.process_bytes).map(status::bytes))),
+                    ),
+                ),
+        );
+
     let wal = div()
         .class("panel card is-clickable")
+        .child(opener(detail, Detail::Wal, open_label(tx.wal_title)))
         .child(opener(detail, Detail::Wal, open_label(tx.wal_title)))
         .child(h2().class("dash-h2").child(icon(Icon::Refresh)).text(tx.wal_title))
         .child(
@@ -720,6 +759,7 @@ pub fn dashboard(props: &str) -> Node {
                         .class("panels")
                         .bool_attr("hidden", move || !private())
                         .child(storage)
+                        .child(memory)
                         .child(wal)
                         .child(backup),
                 )

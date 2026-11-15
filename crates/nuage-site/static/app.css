@@ -2574,3 +2574,8 @@ h3 {
     transform: none;
   }
 }
+
+/* Memory in use past 85 %: the bar says so. */
+.bar.is-high .bar-fill {
+  background: var(--warn);
+}

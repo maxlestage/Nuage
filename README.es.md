@@ -506,9 +506,14 @@ legible solo por los administradores, con una regla de cortafuegos para la red l
 - **Desinstalar**: `... | sudo bash -s uninstall` conserva los datos, los ajustes y las
   copias; `... | sudo bash -s purge` borra los datos y los ajustes, nunca las copias. En
   Windows: `$env:NUAGE_ACTION = 'uninstall'` (o `'purge'`) y después el mismo comando.
-- **Memoria**: la caché de páginas de cada aplicación es `NUAGE_CACHE_MB=auto`, un octavo de
-  la memoria (8 a 512 MiB); el resto queda en disco. La página *Servidor* de la consola muestra
-  la memoria que usa Nuage DB, la memoria libre y el swap.
+- **Memoria**: las cachés de páginas de todas las aplicaciones comparten un único
+  presupuesto, `NUAGE_CACHE_MB=auto`: una cuarta parte de la memoria (de 16 MiB a 4 GiB), a
+  partes iguales; nunca lo superan, sea cual sea el número de aplicaciones, y el resto queda en
+  disco. Si la memoria en uso supera el 85 %, las cachés se vacían, su presupuesto se reduce a
+  la mitad y la memoria liberada se devuelve al sistema, mientras las peticiones siguen; vuelve
+  a crecer cuando la memoria está holgada. La página *Servidor* de la consola y la tarjeta
+  **Memoria** del panel muestran la memoria de la que dispone este servidor (el límite de su
+  contenedor, si lo tiene), lo usado y lo que queda.
 - **A mano**: hay binarios para Linux, macOS y Windows en la
   [página de versiones](https://github.com/maxlestage/Nuage/releases); `nuage --env-file nuage.env`
   arranca el servidor con los ajustes de un fichero (líneas `CLAVE=valor`; el entorno gana).
@@ -655,7 +660,9 @@ abre `https://mi-nuage.herokuapp.com/admin`.
 | `NUAGE_ADMIN_PASSWORD` | contraseña de la consola (y del panel) | ninguna: la consola está desactivada |
 | `NUAGE_ADMIN_TOKEN` | token de la API de gestión (`/api/apps`, `nuage apps`): crea las aplicaciones y sus tokens; 32 caracteres como mínimo (`nuage genkey`) | ninguno: la API está desactivada |
 | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` y `/app` muestran una parte pública sin iniciar sesión | `false` |
-| `NUAGE_CACHE_MB` | caché de páginas de cada aplicación, en MiB, o `auto` | `auto`: un octavo de la memoria, de 8 a 512 MiB |
+| `NUAGE_CACHE_MB` | memoria que las cachés de páginas de todas las aplicaciones pueden ocupar juntas, en MiB, o `auto`; repartida a partes iguales | `auto`: una cuarta parte de la memoria, de 16 MiB a 4 GiB |
+| `NUAGE_MEMORY_MB` | la memoria con la que contar, en MiB, para un alojamiento que la limita sin decirlo | el límite del contenedor, si no la memoria de la máquina |
+| `NUAGE_PG_MAX_CONNECTIONS` | conexiones PostgreSQL atendidas a la vez (cada una tiene un hilo) | `100`, menos donde el sistema permite pocos hilos |
 | `NUAGE_ENV_FILE` | lee también los ajustes de este fichero (líneas `CLAVE=valor`; `nuage --env-file <fichero>` hace lo mismo); el entorno gana al fichero | ninguno |
 | `NUAGE_BACKUP_DIR` | copias de seguridad en esta carpeta, en otro disco (el servidor avisa cuando está en el disco de los datos) | |
 | `NUAGE_BACKUP_S3_BUCKET` | copias de seguridad en este bucket | |

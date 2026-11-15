@@ -9,7 +9,7 @@
 //! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) and the key-value port | none: in clear |
 //! | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the protocol Redis clients speak: they connect to an application's store, with a token as their password | off |
 //! | `NUAGE_KV_BIND` | address of the key-value port | `NUAGE_BIND` |
-//! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the key-value port), in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory (4 to 256 MiB) |
+//! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the key-value port), in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory (4 to 256 MiB) each, and an eighth of it for all of them together |
 //! | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 //! | `NUAGE_NAME` | name of the database | `nuage` |
 //! | `NUAGE_ENCRYPTION_KEY` | the key everything is encrypted with: 64 hex digits (`openssl rand -hex 32`), base64 of 32 bytes, or a passphrase | none: the binary refuses to start |
@@ -17,7 +17,9 @@
 //! | `NUAGE_ADMIN_PASSWORD` | password of the console (`/admin`) | none: the console is off |
 //! | `NUAGE_ADMIN_TOKEN` | token of the management API (`/api/apps`, `nuage apps`): creates applications and their tokens; 32 characters at least (`nuage genkey`) | none: the API is off |
 //! | `NUAGE_PUBLIC_STATUS` | `true`: `/api/status` shows a public subset without credentials | `false` |
-//! | `NUAGE_CACHE_MB` | page cache of each application's database, in MiB, or `auto` | `auto`: an eighth of the memory (8 to 512 MiB) |
+//! | `NUAGE_CACHE_MB` | memory the page caches of all the applications may hold together, in MiB, or `auto`; shared equally among them | `auto`: a quarter of the memory (16 MiB to 4 GiB) |
+//! | `NUAGE_MEMORY_MB` | the memory to count on, in MiB, for a host that limits it without saying so | the container's limit, else the machine's memory |
+//! | `NUAGE_PG_MAX_CONNECTIONS` | PostgreSQL connections served at once (each has a thread) | `100`, less where the system allows few threads |
 //! | `NUAGE_ENV_FILE` | read the settings from this file too (`KEY=value` lines; `nuage --env-file <file>` does the same); a variable of the environment wins over the file | none |
 //! | `NUAGE_BACKUP_DIR` | back up to this directory (another disk: a backup on the data's disk dies with it) | |
 //! | `NUAGE_BACKUP_S3_BUCKET` | back up to this S3 bucket | |
@@ -93,6 +95,8 @@ pub fn engine_from_vars(var: impl Fn(&str) -> Option<String>) -> Result<(PathBuf
     if let Some(secret) = get("NUAGE_ENCRYPTION_KEY") {
         engine.encryption = Some(Encryption::parse(&secret)?);
     }
+    // One budget for the caches: a server shares it among its applications
+    // (the first one opens with it all); an embedded database has it whole.
     engine.cache_bytes = crate::memory::cache_bytes(get("NUAGE_CACHE_MB").as_deref()).map_err(Error::Validation)?;
     let store: Option<Arc<dyn crate::engine::BackupStore>> = if let Some(dir) = get("NUAGE_BACKUP_DIR") {
         Some(Arc::new(DirectoryStore::new(dir)))
@@ -219,10 +223,18 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         Some(bucket) => Some(Arc::new(file_store(&get, bucket)?)),
         None => None,
     };
+    let pg_max_connections = match get("NUAGE_PG_MAX_CONNECTIONS") {
+        Some(n) => n.parse::<usize>().map_err(|_| bad("NUAGE_PG_MAX_CONNECTIONS", &n))?.max(1),
+        // Each has a thread: well under what the system lets this user start.
+        None => crate::memory::thread_limit().map_or(100, |limit| (limit / 2).clamp(8, 100)),
+    };
     let server = ServerOptions {
         kv_bytes,
+        kv_budget: crate::memory::kv_budget(get("NUAGE_KV_MB").as_deref()),
         files,
         admin_token,
+        cache_budget: Some(engine.cache_bytes),
+        pg_max_connections,
         pg_port,
         pg_tls: tls.is_some(),
         token: get("NUAGE_TOKEN"),

@@ -41,6 +41,10 @@ use crate::sql::{Script, SqlResult};
 pub struct PgOptions {
     /// The server's certificate, for `sslmode=require`.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Set by the listener for a connection past the limit: it is told
+    /// `too_many_connections` and closed.
+    #[doc(hidden)]
+    pub refuse: bool,
 }
 
 impl std::fmt::Debug for PgOptions {
@@ -174,10 +178,23 @@ const PROTOCOL_3: i32 = 196608;
 
 /// Serves one connection until the client leaves (blocking).
 pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
+    /// Counts a connection for as long as it lives, a panic included.
+    struct Open<'a>(&'a State);
+    impl Drop for Open<'_> {
+        fn drop(&mut self) {
+            self.0.metrics.open_connections.fetch_sub(1, Ordering::Relaxed);
+            self.0.pg_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
     let _ = stream.set_nodelay(true);
     state.metrics.open_connections.fetch_add(1, Ordering::Relaxed);
+    state.pg_connections.fetch_add(1, Ordering::Relaxed);
+    let _open = Open(&state);
+    if options.refuse {
+        // Past the limit: a client that says nothing does not keep the thread.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    }
     let _ = session(&state, stream, &options);
-    state.metrics.open_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Result<()> {
@@ -228,6 +245,18 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
         }
     };
 
+    if options.refuse {
+        let mut out = Out::default();
+        error(
+            &mut out,
+            "53300",
+            &format!(
+                "too many connections: this server serves {} PostgreSQL connections at once (NUAGE_PG_MAX_CONNECTIONS); use a connection pool, or close idle ones",
+                state.options.pg_max_connections
+            ),
+        );
+        return conn.write_all(&out.0);
+    }
     // The password is a token of an application.
     let mut out = Out::default();
     out.msg(b'R', |b| b.extend_from_slice(&3i32.to_be_bytes()));

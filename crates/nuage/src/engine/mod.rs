@@ -473,7 +473,7 @@ impl Engine {
             wal_bytes,
             disk_free_bytes: disk_free(&self.store.dir),
             cache_bytes: pages.cache_bytes,
-            cache_capacity_bytes: self.options.cache_bytes as u64,
+            cache_capacity_bytes: self.store.pages.cache_limit() as u64,
             cache_hit_rate: if hits + misses == 0 { 1.0 } else { hits as f64 / (hits + misses) as f64 },
             lsn,
             checkpoint_lsn,
@@ -543,6 +543,24 @@ impl Engine {
         self.store.set_meta(key, value)
     }
 
+    /// Changes how much memory the page cache may hold, at once: a server
+    /// shares one budget among its applications ([`EngineOptions::cache_bytes`]
+    /// is the size at opening).
+    pub fn set_cache_bytes(&self, bytes: usize) {
+        self.store.pages.set_cache_limit(bytes);
+    }
+
+    /// Bytes the page cache may hold now.
+    pub fn cache_capacity(&self) -> usize {
+        self.store.pages.cache_limit()
+    }
+
+    /// Lets go of every cached page (they are read again when needed): what a
+    /// server does when memory runs short.
+    pub fn drop_cache(&self) {
+        self.store.pages.drop_cache();
+    }
+
     /// Stops the upkeep thread and makes everything durable.
     pub fn close(&self) -> Result<()> {
         self.stop.store(true, Ordering::SeqCst);
@@ -587,6 +605,21 @@ fn upkeep(engine: Weak<Engine>) {
         if e.stop.load(Ordering::SeqCst) {
             return;
         }
+        // A round that panics (a bug) is reported, and the next one runs: the
+        // checkpoints and the backups must not stop for it.
+        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upkeep_round(&e, &mut last_compact, &mut last_backup_try);
+        }));
+        if round.is_err() {
+            e.event("error", "upkeep: a round failed unexpectedly (a bug); the next one runs as usual".to_owned());
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+}
+
+/// One round of [`upkeep`].
+fn upkeep_round(e: &Engine, last_compact: &mut Instant, last_backup_try: &mut Instant) {
+    {
         let (due, idle) = {
             let w = e.store.writer();
             let age = w.last_checkpoint.and_then(|t| t.elapsed().ok()).unwrap_or_default();
@@ -597,11 +630,11 @@ fn upkeep(engine: Weak<Engine>) {
             e.event("error", format!("checkpoint failed: {err}"));
         }
         if e.options.backup.is_some() && (due || last_backup_try.elapsed() >= Duration::from_secs(60)) {
-            last_backup_try = Instant::now();
+            *last_backup_try = Instant::now();
             let _ = e.backup_now(false);
         }
         if idle && last_compact.elapsed() >= e.options.compact_every {
-            last_compact = Instant::now();
+            *last_compact = Instant::now();
             let s = e.stats();
             if s.file_bytes > 0 && s.fragmented_bytes * 4 >= s.file_bytes {
                 let _ = e.compact();

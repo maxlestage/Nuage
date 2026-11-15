@@ -208,13 +208,27 @@ pub(crate) struct Apps {
     changes: Mutex<()>,
     /// Memory of each application's key-value store.
     kv_bytes: usize,
+    /// Memory the key-value stores of all the applications may hold
+    /// together (`None`: each has `kv_bytes`, whatever their number).
+    kv_budget: Option<usize>,
+    /// Memory the page caches of all the applications may hold together
+    /// (`None`: each engine keeps the size it was opened with).
+    cache_budget: Option<usize>,
+    /// The budget in force: `cache_budget`, less when memory ran short
+    /// (see [`Apps::tighten_cache`]).
+    cache_in_force: std::sync::atomic::AtomicUsize,
 }
 
 impl Apps {
     /// The applications of `engine` (the first one): opens every other
     /// application it lists. One that cannot be opened is reported, not
     /// fatal.
-    pub(crate) fn open(engine: Arc<Engine>, kv_bytes: usize) -> Apps {
+    pub(crate) fn open(
+        engine: Arc<Engine>,
+        kv_bytes: usize,
+        kv_budget: Option<usize>,
+        cache_budget: Option<usize>,
+    ) -> Apps {
         let first = Arc::new(App::new(
             engine.options().name.clone(),
             engine.clone(),
@@ -229,6 +243,9 @@ impl Apps {
             failed: Mutex::new(Vec::new()),
             changes: Mutex::new(()),
             kv_bytes,
+            kv_budget,
+            cache_budget,
+            cache_in_force: std::sync::atomic::AtomicUsize::new(cache_budget.unwrap_or(0)),
         };
         let entries = match engine.meta_entries(REGISTRY_PREFIX) {
             Ok(e) => e,
@@ -261,7 +278,62 @@ impl Apps {
                 }
             }
         }
+        apps.share_cache();
         apps
+    }
+
+    /// Gives each application its part of the cache budget: equal parts,
+    /// whatever their number, so the caches never outgrow the budget. Called
+    /// when the applications change.
+    pub(crate) fn share_cache(&self) {
+        let all = self.all();
+        // The key-value stores too: together they keep to their budget.
+        let kv = crate::memory::kv_share(self.kv_bytes, self.kv_budget, all.len());
+        for app in &all {
+            app.kv.set_max_bytes(kv);
+        }
+        if self.cache_budget.is_none() {
+            return;
+        }
+        let budget = self.cache_in_force.load(Ordering::Relaxed);
+        let share = crate::memory::cache_share(budget, all.len());
+        for app in all {
+            app.engine.set_cache_bytes(share);
+        }
+    }
+
+    /// The cache budget of the server, all applications together: the one
+    /// in force (the configured one, less when memory ran short).
+    pub(crate) fn cache_budget(&self) -> Option<usize> {
+        self.cache_budget.map(|_| self.cache_in_force.load(Ordering::Relaxed))
+    }
+
+    /// Memory runs short: the caches let go of everything, and their budget
+    /// is halved (16 MiB at least), since what it was did not fit. Returns
+    /// the budget now in force.
+    pub(crate) fn tighten_cache(&self) -> Option<usize> {
+        if let Some(configured) = self.cache_budget {
+            let now = self.cache_in_force.load(Ordering::Relaxed);
+            self.cache_in_force.store((now / 2).max((16 << 20).min(configured)), Ordering::Relaxed);
+            self.share_cache();
+        }
+        for app in self.all() {
+            app.engine.drop_cache();
+        }
+        self.cache_budget()
+    }
+
+    /// Memory has been comfortable for a while: the budget grows back by a
+    /// quarter of the configured one, up to it. Returns whether it changed.
+    pub(crate) fn loosen_cache(&self) -> bool {
+        let Some(configured) = self.cache_budget else { return false };
+        let now = self.cache_in_force.load(Ordering::Relaxed);
+        if now >= configured {
+            return false;
+        }
+        self.cache_in_force.store((now + configured / 4).min(configured), Ordering::Relaxed);
+        self.share_cache();
+        true
     }
 
     pub(crate) fn first(&self) -> &Arc<App> {
@@ -346,6 +418,10 @@ impl Apps {
         let first = &self.first.engine;
         let mut options = first.options().clone();
         options.name = name.to_owned();
+        if let Some(budget) = self.cache_budget {
+            // Its part once it is there; `share_cache` then evens the others.
+            options.cache_bytes = crate::memory::cache_share(budget, self.all().len() + 1);
+        }
         options.backup = options.backup.map(|b| {
             let store: Arc<dyn crate::engine::BackupStore> =
                 Arc::new(PrefixedStore::new(b.store.clone(), format!("apps/{name}/")));
@@ -391,6 +467,7 @@ impl Apps {
         let token = add_token(&app, false);
         self.save(&app)?;
         self.others.write().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned(), app.clone());
+        self.share_cache();
         self.first.engine.event("info", format!("application `{name}` created"));
         Ok((app, token))
     }
@@ -455,6 +532,7 @@ impl Apps {
             let _ = backup::delete_all(&PrefixedStore::new(b.store.clone(), format!("apps/{name}/")));
         }
         let _ = std::fs::remove_dir_all(dir_of(&self.first.engine, name));
+        self.share_cache();
         self.first.engine.event("warn", format!("application `{name}` deleted, with its data and backups"));
         Ok(true)
     }

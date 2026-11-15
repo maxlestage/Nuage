@@ -342,7 +342,7 @@ NUAGE_TOKEN=$token
 NUAGE_ADMIN_PASSWORD=$password
 # The management API: \`nuage apps create <name>\` makes an application with it.
 NUAGE_ADMIN_TOKEN=$admin_token
-# Page cache of each application, in MiB; auto: an eighth of the memory (8 to 512 MiB).
+# Memory the page caches of all the applications share, in MiB; auto: a quarter of the memory.
 NUAGE_CACHE_MB=auto
 NUAGE_PUBLIC_STATUS=false
 # Backups: run the installer again with NUAGE_BACKUP_DIR=... or NUAGE_BACKUP_S3_*=... to change.

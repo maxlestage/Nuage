@@ -187,3 +187,35 @@ async fn describing_a_statement_in_a_transaction_changes_nothing() {
     let n: i64 = db.query_one("UPDATE counters SET n = n + 1 WHERE name = 'b' RETURNING n", &[]).await.unwrap().get(0);
     assert_eq!(n, 21);
 }
+
+#[tokio::test]
+async fn connections_past_the_limit_are_told_so() {
+    let dir = std::env::temp_dir().join(format!("nuage-pg-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine: Arc<Engine> = Engine::open(&dir, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+    let options = ServerOptions { token: Some("t0ken".into()), pg_max_connections: 2, ..ServerOptions::default() };
+    let server = Server::new(engine, options);
+    let running = server.listen_pg("127.0.0.1:0", PgOptions::default()).await.unwrap();
+    let addr = running.local_addr();
+    std::mem::forget(running);
+
+    let first = connect(addr, "t0ken", "nuage").await.unwrap();
+    let second = connect(addr, "t0ken", "nuage").await.unwrap();
+    // Each has a thread: the third is refused as PostgreSQL does.
+    let third = connect(addr, "t0ken", "nuage").await.err().unwrap();
+    assert_eq!(third.code(), Some(&SqlState::TOO_MANY_CONNECTIONS));
+    assert_eq!(first.query_one("SELECT 1 + 1", &[]).await.unwrap().get::<_, i64>(0), 2, "the others go on");
+    // A place freed is a place to take.
+    drop(second);
+    let mut again = None;
+    for _ in 0..50 {
+        match connect(addr, "t0ken", "nuage").await {
+            Ok(c) => {
+                again = Some(c);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    assert!(again.is_some(), "a closed connection frees its place");
+}

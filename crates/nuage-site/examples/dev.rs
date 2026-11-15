@@ -225,6 +225,10 @@ impl Sim {
             applications: Some(3),
             memory: Some(nuage_site::status::Memory {
                 total_bytes: Some(1 << 30),
+                used_bytes: Some(324 << 20),
+                limited: true,
+                cache_budget_bytes: Some(256 << 20),
+                reliefs: 0,
                 available_bytes: Some(700 << 20),
                 process_bytes: Some(24 << 20),
                 swap_total_bytes: Some(1 << 30),

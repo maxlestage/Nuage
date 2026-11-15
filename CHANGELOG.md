@@ -4,6 +4,39 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Memory you can count on, and a steadier server
+
+- **The right figures.** The memory shown is the one this server may use: its container's
+  limit (cgroup v2 and v1, in a group of its own or not), else the machine's. What is used is
+  the container's usage, or this process's where the host gives the limit and nothing else
+  (a Heroku dyno): there, the dashboard said that everything was free. The swap is the
+  container's; the swap of the whole machine it shares is no longer shown as its own.
+  `NUAGE_MEMORY_MB` says the memory by hand. `/api/status`: `memory.used_bytes`, `limited`,
+  `cache_budget_bytes`, `reliefs`.
+- **One cache budget for all the applications** (`NUAGE_CACHE_MB`, by default a quarter of
+  the memory), shared equally and shared again when an application is created or deleted.
+  It was an eighth of the memory for each application: six of them could hold three quarters
+  of it. `Engine::set_cache_bytes`, `cache_capacity`, `drop_cache`;
+  `ServerOptions::cache_budget`.
+- **A memory guard.** Every two seconds; past 85 % in use, the caches are emptied, their
+  budget halved (16 MiB at least) and the freed memory returned to the system, while requests
+  go on; the budget grows back after ten comfortable minutes. Said in the event log and in
+  the server's log.
+- **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
+  memory held under load, for a few percent of throughput.
+- **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them
+  together hold an eighth of the memory at most; each has the smaller of its own limit and
+  its equal part. `Kv::set_max_bytes`; `ServerOptions::kv_budget`.
+- **Threads are bounded**: blocking work on four threads a core (16 to 64, less where the
+  system allows few: a Heroku dyno has 256 in all), instead of up to 512; more requests wait
+  their turn. PostgreSQL connections, a thread each, are limited
+  (`NUAGE_PG_MAX_CONNECTIONS`, 100 by default); the next ones are told
+  `too_many_connections` (53300).
+- **The upkeep thread survives a failure**: a round that panics is reported, and the
+  checkpoints and backups go on.
+- The dashboard has a **Memory** card (used, free, of how much), with its details; the
+  console's Server page shows the same.
+
 ## 0.4.6 (2026-11-15)
 
 ### The dashboard shows what an application keeps besides its tables

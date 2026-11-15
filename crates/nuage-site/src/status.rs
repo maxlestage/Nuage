@@ -54,6 +54,18 @@ pub struct Status {
 pub struct Memory {
     #[serde(default)]
     pub total_bytes: Option<u64>,
+    /// Memory in use within `total_bytes`.
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    /// `total_bytes` is a limit set on this server, not the whole machine.
+    #[serde(default)]
+    pub limited: bool,
+    /// Memory the page caches of all the applications may hold together.
+    #[serde(default)]
+    pub cache_budget_bytes: Option<u64>,
+    /// Times the caches were emptied because memory ran short.
+    #[serde(default)]
+    pub reliefs: u64,
     #[serde(default)]
     pub available_bytes: Option<u64>,
     #[serde(default)]

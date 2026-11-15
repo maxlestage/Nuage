@@ -227,6 +227,18 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("SQL over HTTP", "SQL en HTTP", "SQL por HTTP"),
     ("PostgreSQL", "PostgreSQL", "PostgreSQL"),
     ("Refresh", "Actualiser", "Actualizar"),
+    ("{} used, {} free of {}", "{} utilisés, {} libres sur {}", "{} usados, {} libres de {}"),
+    ("the limit of this server", "la limite de ce serveur", "el límite de este servidor"),
+    ("not reported by the host", "non indiqué par l'hébergeur", "no indicado por el alojamiento"),
+    ("Page caches", "Caches de pages", "Cachés de páginas"),
+    ("Time", "Heure", "Hora"),
+    ("Level", "Niveau", "Nivel"),
+    ("Event", "Événement", "Evento"),
+    (
+        "{} for all the applications, {} each",
+        "{} pour toutes les applications, {} chacune",
+        "{} para todas las aplicaciones, {} cada una",
+    ),
     ("Light", "Clair", "Claro"),
     ("Dark", "Sombre", "Oscuro"),
     ("Auto", "Auto", "Auto"),
@@ -477,18 +489,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Events", "Événements", "Eventos"),
     ("Memory", "Mémoire", "Memoria"),
-    (
-        "{} used by Nuage, {} free of {}",
-        "{} utilisés par Nuage, {} libres sur {}",
-        "{} usados por Nuage, {} libres de {}",
-    ),
     ("Swap", "Swap", "Swap"),
     ("none", "aucun", "ninguno"),
     ("{} free of {}", "{} libres sur {}", "{} libres de {}"),
-    ("Cache of each application", "Cache de chaque application", "Caché de cada aplicación"),
-    ("Time", "Heure", "Hora"),
-    ("Level", "Niveau", "Nivel"),
-    ("Event", "Événement", "Evento"),
 ];
 
 #[cfg(test)]

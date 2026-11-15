@@ -77,7 +77,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    nuage::memory::tune_allocator();
+    // Blocking work (statements, backups) on a bounded number of threads: more
+    // requests wait their turn instead of starting threads without end (a
+    // Heroku dyno allows 256 in all).
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(nuage::memory::blocking_threads())
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("nuage: cannot start: {e}");
@@ -191,7 +199,7 @@ fn main() -> ExitCode {
                     None => None,
                 };
                 let encrypted = tls.is_some();
-                match server.listen_pg((config.pg_bind.as_str(), port), nuage::PgOptions { tls }).await {
+                match server.listen_pg((config.pg_bind.as_str(), port), nuage::PgOptions { tls, ..Default::default() }).await {
                     Ok(r) => {
                         let how = if encrypted { "with TLS" } else { "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)" };
                         log(&format!(
