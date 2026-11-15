@@ -36,6 +36,10 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   checkpoints and backups go on.
 - The dashboard has a **Memory** card (used, free, of how much), with its details; the
   console's Server page shows the same.
+- **Memory reads in gigabytes**: `0.45 GB free`, `0.05 GB / 0.50 GB` used (a gigabyte of
+  memory is 1024³ bytes, as memory is sold: a 512 MB dyno shows `0.50 GB`), on the dashboard
+  and on the console's Server page; the caches, smaller, in megabytes of the same base. The
+  dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
 
 ## 0.4.6 (2026-11-15)
 

@@ -235,6 +235,13 @@ pub fn dashboard(props: &str) -> Node {
     // A value of the status, or a dash.
     let val =
         move |f: fn(&Status) -> Option<String>| move || data.with(|d| d.as_ref().and_then(f)).unwrap_or(DASH.into());
+    // A size of the status in the language's units, or a dash; `memory`: in gigabytes.
+    let size = move |f: fn(&Status) -> Option<u64>| {
+        move || data.with(|d| d.as_ref().and_then(f)).map_or(DASH.to_string(), |n| tx.bytes(n))
+    };
+    let memory_size = move |f: fn(&Status) -> Option<u64>| {
+        move || data.with(|d| d.as_ref().and_then(f)).map_or(DASH.to_string(), |n| tx.gigas(n))
+    };
     let private = move || data.with(|d| d.as_ref().is_none_or(|d| !d.is_public()));
 
     let badge = div()
@@ -457,21 +464,22 @@ pub fn dashboard(props: &str) -> Node {
                 .child(
                     div()
                         .child(dt().text(tx.storage_data))
-                        .child(dd().text_dyn(val(|d| d.storage.as_ref().map(|s| status::bytes(s.bytes))))),
+                        .child(dd().text_dyn(size(|d| d.storage.as_ref().map(|s| s.bytes)))),
                 )
                 .child(
                     div()
                         .child(dt().text(tx.storage_free))
-                        .child(dd().text_dyn(val(|d| d.storage.as_ref().map(|s| status::bytes(s.disk_free_bytes))))),
+                        .child(dd().text_dyn(size(|d| d.storage.as_ref().map(|s| s.disk_free_bytes)))),
                 )
                 .child(div().child(dt().text(tx.cache_hit)).child(
                     dd().class("big").text_dyn(val(|d| d.storage.as_ref().map(|s| status::percent(s.cache_hit_rate)))),
                 ))
-                .child(div().child(dt().text(tx.cache_size)).child(dd().text_dyn(val(|d| {
-                    d.storage.as_ref().map(|s| {
-                        format!("{} / {}", status::bytes(s.cache_bytes), status::bytes(s.cache_capacity_bytes))
+                .child(div().child(dt().text(tx.cache_size)).child(dd().text_dyn(move || {
+                    data.with(|d| {
+                        d.as_ref().and_then(|d| d.storage.as_ref()).map(|s| (s.cache_bytes, s.cache_capacity_bytes))
                     })
-                }))))
+                    .map_or(DASH.to_string(), |(used, max)| format!("{} / {}", tx.megas(used), tx.megas(max)))
+                })))
                 .child(
                     div()
                         .child(dt().text(tx.storage_pages))
@@ -498,22 +506,19 @@ pub fn dashboard(props: &str) -> Node {
         )))
         .child(
             dl().class("facts")
-                .child(div().child(dt().text(tx.mem_used)).child(dd().text_dyn(val(|d| {
-                    d.memory
-                        .as_ref()
-                        .and_then(|m| m.used_bytes.zip(m.total_bytes))
-                        .map(|(u, t)| format!("{} / {}", status::bytes(u), status::bytes(t)))
-                }))))
+                .child(div().child(dt().text(tx.mem_used)).child(dd().text_dyn(move || {
+                    data.with(|d| {
+                        d.as_ref().and_then(|d| d.memory.as_ref()).and_then(|m| m.used_bytes.zip(m.total_bytes))
+                    })
+                    .map_or(DASH.to_string(), |(used, total)| format!("{} / {}", tx.gigas(used), tx.gigas(total)))
+                })))
+                .child(div().child(dt().text(tx.detail_mem_free)).child(
+                    dd().class("big").text_dyn(memory_size(|d| d.memory.as_ref().and_then(|m| m.available_bytes))),
+                ))
                 .child(
-                    div().child(dt().text(tx.detail_mem_free)).child(
-                        dd().class("big")
-                            .text_dyn(val(|d| d.memory.as_ref().and_then(|m| m.available_bytes).map(status::bytes))),
-                    ),
-                )
-                .child(
-                    div().child(dt().text(tx.detail_mem_used)).child(
-                        dd().text_dyn(val(|d| d.memory.as_ref().and_then(|m| m.process_bytes).map(status::bytes))),
-                    ),
+                    div()
+                        .child(dt().text(tx.detail_mem_used))
+                        .child(dd().text_dyn(memory_size(|d| d.memory.as_ref().and_then(|m| m.process_bytes)))),
                 ),
         );
 
@@ -532,9 +537,7 @@ pub fn dashboard(props: &str) -> Node {
                     })
                 })))
                 .child(
-                    div()
-                        .child(dt().text(tx.wal_size))
-                        .child(dd().text_dyn(val(|d| d.wal.as_ref().map(|w| status::bytes(w.bytes))))),
+                    div().child(dt().text(tx.wal_size)).child(dd().text_dyn(size(|d| d.wal.as_ref().map(|w| w.bytes)))),
                 ),
         );
 
@@ -822,9 +825,9 @@ fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64, detail
                 .child(fact(tx.kpi_errors, format!("{:.2}", requests.errors_per_s)))
                 .child(fact(tx.db_tables, db.tables.to_string()))
                 .child(fact(tx.db_rows, status::group(db.rows)))
-                .child(fact(tx.app_size, status::bytes(db.file_bytes.max(db.bytes))))
-                .child(fact(tx.app_files, db.files_text().unwrap_or_else(|| DASH.to_owned())))
-                .child(fact(tx.app_kv, db.kv_text().unwrap_or_else(|| DASH.to_owned())))
+                .child(fact(tx.app_size, tx.bytes(db.file_bytes.max(db.bytes))))
+                .child(fact(tx.app_files, db.files_text(&tx.byte_units).unwrap_or_else(|| DASH.to_owned())))
+                .child(fact(tx.app_kv, db.kv_text(&tx.byte_units).unwrap_or_else(|| DASH.to_owned())))
                 .child(fact(tx.app_last_request, ago_of(tx, now, db.last_request_at.as_deref()))),
         );
     if !db.branches.is_empty() {
@@ -838,7 +841,7 @@ fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64, detail
                             .child(span().class("mono").text(b.name.clone()))
                             .child(span().class("muted").text(format!(
                                 " · {} {}",
-                                status::bytes(b.own_bytes),
+                                tx.bytes(b.own_bytes),
                                 tx.db_branch_own
                             )))
                             .into()

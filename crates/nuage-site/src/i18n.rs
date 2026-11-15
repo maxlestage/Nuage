@@ -269,6 +269,25 @@ pub struct Texts {
     pub footer_proprietary: &'static str,
     pub footer_built: &'static str,
     pub back_to_top: &'static str,
+    /// The units of sizes, from the byte up.
+    pub byte_units: crate::status::Units,
+}
+
+impl Texts {
+    /// A size in this language's units: `27.2 MB`, `27.2 Mo`.
+    pub fn bytes(&self, n: u64) -> String {
+        crate::status::bytes_in(&self.byte_units, n)
+    }
+
+    /// A cache's memory, in megabytes: `128 MB`, `128 Mo`.
+    pub fn megas(&self, n: u64) -> String {
+        crate::status::megas_in(&self.byte_units, n)
+    }
+
+    /// Memory, in gigabytes: `0.48 GB`, `0.48 Go`.
+    pub fn gigas(&self, n: u64) -> String {
+        crate::status::gigas_in(&self.byte_units, n)
+    }
 }
 
 pub static EN: Texts = Texts {
@@ -714,6 +733,7 @@ pub static EN: Texts = Texts {
     footer_proprietary: "Proprietary software",
     footer_built: "Built with Rust + Active + WebAssembly",
     back_to_top: "Back to top",
+    byte_units: ["B", "kB", "MB", "GB", "TB", "PB"],
 };
 
 pub static FR: Texts = Texts {
@@ -1165,6 +1185,7 @@ pub static FR: Texts = Texts {
     footer_proprietary: "Logiciel propriétaire",
     footer_built: "Construit avec Rust + Active + WebAssembly",
     back_to_top: "Retour en haut",
+    byte_units: ["o", "ko", "Mo", "Go", "To", "Po"],
 };
 
 pub static ES: Texts = Texts {
@@ -1616,6 +1637,7 @@ pub static ES: Texts = Texts {
     footer_proprietary: "Software propietario",
     footer_built: "Hecho con Rust + Active + WebAssembly",
     back_to_top: "Volver arriba",
+    byte_units: ["B", "kB", "MB", "GB", "TB", "PB"],
 };
 
 /// `"{} s ago"` with `n`.

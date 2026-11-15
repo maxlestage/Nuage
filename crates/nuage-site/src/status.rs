@@ -239,19 +239,19 @@ pub struct KeyValue {
 }
 
 /// A count and its weight, as a card says them: `540 · 47.1 GB`, or `0`.
-fn count_and_bytes(count: u64, weight: u64) -> String {
-    if count == 0 { "0".to_owned() } else { format!("{} · {}", group(count), bytes(weight)) }
+fn count_and_bytes(units: &Units, count: u64, weight: u64) -> String {
+    if count == 0 { "0".to_owned() } else { format!("{} · {}", group(count), bytes_in(units, weight)) }
 }
 
 impl Database {
     /// Its files: `540 · 47.1 GB`.
-    pub fn files_text(&self) -> Option<String> {
-        self.files.map(|f| count_and_bytes(f.count, f.bytes))
+    pub fn files_text(&self, units: &Units) -> Option<String> {
+        self.files.map(|f| count_and_bytes(units, f.count, f.bytes))
     }
 
     /// Its key-value store: `12 · 3.4 kB`.
-    pub fn kv_text(&self) -> Option<String> {
-        self.kv.map(|k| count_and_bytes(k.keys, k.bytes))
+    pub fn kv_text(&self, units: &Units) -> Option<String> {
+        self.kv.map(|k| count_and_bytes(units, k.keys, k.bytes))
     }
 }
 
@@ -314,21 +314,69 @@ impl Status {
 
 /// `1.5 MB`, `52.4 MB`, `1.07 GB` (powers of 1000, like disk vendors and file managers).
 pub fn bytes(n: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
+    bytes_in(&UNITS, n)
+}
+
+/// The names of the units of sizes in a language, from the byte up:
+/// `B kB MB GB TB PB` (in French `o ko Mo Go To Po`).
+pub type Units = [&'static str; 6];
+
+/// The units in English.
+pub const UNITS: Units = ["B", "kB", "MB", "GB", "TB", "PB"];
+
+/// [`bytes`] with the units of a language.
+pub fn bytes_in(units: &Units, n: u64) -> String {
     let mut value = n as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
+    while value >= 1000.0 && unit < units.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
-        format!("{n} B")
+        format!("{n} {}", units[0])
     } else if value >= 100.0 {
-        format!("{value:.0} {}", UNITS[unit])
+        format!("{value:.0} {}", units[unit])
     } else if value >= 10.0 {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1} {}", units[unit])
     } else {
-        format!("{value:.2} {}", UNITS[unit])
+        format!("{value:.2} {}", units[unit])
+    }
+}
+
+/// A small amount of memory (a cache), in megabytes of 1024² bytes, the base
+/// memory is counted in: `128 MB`, `21 MB`, `0.3 MB`; a gigabyte or more reads
+/// as [`gigas_in`].
+pub fn megas_in(units: &Units, n: u64) -> String {
+    let unit = units[2];
+    let value = n as f64 / (1u64 << 20) as f64;
+    if n >= 1 << 30 {
+        gigas_in(units, n)
+    } else if n == 0 {
+        format!("0 {unit}")
+    } else if value < 0.05 {
+        format!("< 0.1 {unit}")
+    } else if value < 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+/// Memory, always in gigabytes: `0.48 GB`, `7.75 GB`, `62 GB`. A gigabyte of
+/// memory is 1024³ bytes, as memory is sold: a 512 MB dyno shows `0.50 GB`.
+pub fn gigas_in(units: &Units, n: u64) -> String {
+    let unit = units[3];
+    let value = n as f64 / (1u64 << 30) as f64;
+    if n == 0 {
+        format!("0 {unit}")
+    } else if value < 0.005 {
+        format!("< 0.01 {unit}")
+    } else if value < 10.0 {
+        format!("{value:.2} {unit}")
+    } else if value < 100.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
     }
 }
 
@@ -497,11 +545,11 @@ mod tests {
         let shop = &status.databases.as_ref().unwrap()[1];
         assert_eq!(shop.description.as_deref(), Some("La boutique"));
         // What an application keeps besides its tables: files and its key-value store.
-        assert_eq!(shop.files_text().as_deref(), Some("540 · 47.1 GB"));
-        assert_eq!(shop.kv_text().as_deref(), Some("12 · 3.40 kB"));
+        assert_eq!(shop.files_text(&UNITS).as_deref(), Some("540 · 47.1 GB"));
+        assert_eq!(shop.kv_text(&UNITS).as_deref(), Some("12 · 3.40 kB"));
         let first = &status.databases.as_ref().unwrap()[0];
-        assert_eq!((first.files_text(), first.kv_text()), (None, None), "an older server says nothing");
-        assert_eq!(count_and_bytes(0, 0), "0");
+        assert_eq!((first.files_text(&UNITS), first.kv_text(&UNITS)), (None, None), "an older server says nothing");
+        assert_eq!(count_and_bytes(&UNITS, 0, 0), "0");
         assert!(status.encryption.as_ref().unwrap().enabled);
         assert_eq!(status.applications, Some(2));
         assert_eq!(status.services.len(), 5);
@@ -522,6 +570,23 @@ mod tests {
         assert_eq!(bytes(512), "512 B");
         assert_eq!(bytes(52_428_800), "52.4 MB");
         assert_eq!(bytes(1_073_741_824), "1.07 GB");
+        const FR: Units = ["o", "ko", "Mo", "Go", "To", "Po"];
+        assert_eq!(bytes_in(&FR, 52_428_800), "52.4 Mo");
+        assert_eq!(bytes_in(&FR, 512), "512 o");
+        // Memory: gigabytes always, of 1024³ bytes.
+        assert_eq!(gigas_in(&UNITS, 512 << 20), "0.50 GB", "a 512 MB dyno");
+        assert_eq!(gigas_in(&FR, 491 << 20), "0.48 Go");
+        assert_eq!(gigas_in(&FR, 21 << 20), "0.02 Go");
+        assert_eq!(gigas_in(&UNITS, 300 << 10), "< 0.01 GB");
+        assert_eq!(gigas_in(&UNITS, 0), "0 GB");
+        assert_eq!(gigas_in(&UNITS, 16 << 30), "16.0 GB");
+        assert_eq!(gigas_in(&UNITS, 128 << 30), "128 GB");
+        // Caches: megabytes, in the same base (128 MB is a quarter of 0.50 GB).
+        assert_eq!(megas_in(&FR, 128 << 20), "128 Mo");
+        assert_eq!(megas_in(&FR, 22_369_616), "21 Mo");
+        assert_eq!(megas_in(&UNITS, 333_723), "0.3 MB");
+        assert_eq!(megas_in(&UNITS, 0), "0 MB");
+        assert_eq!(megas_in(&UNITS, 2 << 30), "2.00 GB");
         assert_eq!(percent(0.97), "97 %");
         assert_eq!(percent(0.9734), "97.3 %");
         assert_eq!(millis(0.8), "0.80 ms");
