@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/nuage", "crates/nuage-site", "crates/nuage-editor"]
+# A bare `cargo build` or `cargo run` at the root is the server, as before the editor came
+# (with two programs, `cargo run` would ask which one). The editor: `-p nuage-editor`.
+default-members = ["crates/nuage", "crates/nuage-site"]
 
 [workspace.package]
 version = "0.4.6"
@@ -35,9 +38,24 @@ codegen-units = 1
 panic = "abort"
 strip = false
 
+# Nuage DB Editor, as released (.github/workflows/release.yml: --profile release-editor):
+# a window does not need the server's whole-program optimization, and a lighter one links
+# its large graphics crates much faster. No symbols: a smaller download. Unwinding stays
+# on: a bug in the window shows a page saying so instead of closing it.
+[profile.release-editor]
+inherits = "release"
+lto = "thin"
+strip = "symbols"
+
 # Argon2id (64 MiB, a passphrase as encryption key) and AES are slow without optimization:
 # optimized even in debug, so `cargo test` stays fast.
 [profile.dev.package]
 argon2 = { opt-level = 3 }
 blake2 = { opt-level = 3 }
 aes = { opt-level = 3 }
+
+# The editor's test programs link a window toolkit and a whole server: with their debug
+# information they weigh 300 to 450 MB each. Without it, a few tens; panics still say their
+# file and line, and backtraces their functions.
+[profile.dev.package.nuage-editor]
+strip = "debuginfo"

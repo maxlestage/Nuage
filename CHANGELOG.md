@@ -13,8 +13,15 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   (shown once, with Copy buttons and the connection lines), revokes a token after asking, and
   says in plain words what the server refuses, with its figures.
 - **Connecting is one step.** A server installed on this computer by the installer is found
-  by itself: the system asks for the administrator's password in a window of its own, and
-  only the port and the management token are read from the settings file. A server online
+  by itself, even where its settings file is for administrators only. The editor never runs
+  as administrator: the system's own tools read four lines of that file (`PORT`,
+  `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; never the encryption key) after a window of
+  the system's: polkit's password (pkexec and grep) on Linux, macOS's (osascript and grep;
+  none for the account that installed, which reads its file itself), and on Windows the UAC
+  consent for Windows' own cmd.exe and findstr, which hand the lines over through a pipe of
+  the editor's. A closed window, a refused password and a system that cannot ask are each
+  said; a file without a management token is said too, with how to add one (the installer
+  writes one on a first installation only). A server online
   takes its address and its management token; the address is remembered, the token only
   when asked, in the system's password store (Keychain, Credential Manager, Secret Service),
   never in a file. The token is never sent after a redirect, nor to an address that does not
@@ -28,12 +35,20 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   computer only. Copied tokens are kept out of the clipboard history where the system allows.
 - What the editor saves goes through `/api/settings` and `/api/apps`, as the console's: in
   force at once, kept with the data. The settings read when the server starts are listed,
-  with how to change them on that host. Without a screen it says why it cannot open, on the
-  terminal, in a log file next to its settings, and in a message box on Windows.
-- Released with the server: `nuage-editor-<system>.zip` (a signed-for-this-computer
-  `Nuage DB Editor.app` on macOS, `nuage-editor.exe` on Windows) and `.tar.gz` for Linux
-  (with a menu entry). Tested on Linux, macOS and Windows by driving the window through its
-  accessibility tree against a real server.
+  with how to change them on that host.
+- **A bug does not close the window**: the window shows a page that says what failed, with
+  a way back to the start. On Windows the window is drawn with Direct3D 12, which falls back
+  to Windows' software renderer on remote desktops and virtual machines without a graphics
+  driver, then with OpenGL. When no renderer can open it, it says why in a message box (a
+  dialog on macOS and Linux desktops), on the terminal and in `nuage-editor.log` next to its
+  preferences, the one thing ever written there.
+- Released with the server, unsigned: `Nuage-DB-Editor-macOS.dmg` (one application for Apple
+  silicon and Intel, macOS 11 and later), `Nuage-DB-Editor-windows-x64.exe` (nothing to
+  unzip or install, no console window; its icon and version in Explorer) and
+  `nuage-editor-x86_64-linux.tar.gz` (glibc 2.31 and later, with a menu entry), each with
+  its `.sha256`. Each opens its real window on GitHub's runners before it is published, and
+  is tested on Linux, macOS and Windows by driving the window through its accessibility tree
+  against a real server. `cargo build` and `cargo run` at the root still mean the server.
 
 ### Settings: yours to choose, and to change later
 

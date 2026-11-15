@@ -66,14 +66,7 @@ impl<T: Send + 'static> Job<T> {
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new().name("nuage-editor-call".into()).spawn(move || {
             let _running = running;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
-                let message = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_owned())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
-                Err(ApiError::Bug(message))
-            });
+            let result = crate::guard::catch(work).unwrap_or_else(|failure| Err(ApiError::Bug(failure.message)));
             let _ = send.send(result);
             ctx.request_repaint();
         });

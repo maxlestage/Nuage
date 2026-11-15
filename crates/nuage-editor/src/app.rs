@@ -15,13 +15,18 @@ use zeroize::Zeroizing;
 
 use crate::address::{self, AddressError};
 use crate::api::{self, ApiError, Application, Caps, Connected, Connection, Server, Settings, Transport};
-use crate::clip::{ArboardSink, Copied, CopySink};
+use crate::clip::{ArboardSink, Copied, CopySink, FakeSink};
 use crate::format;
+use crate::guard::{self, Failure};
 use crate::i18n::{Lang, t, tf};
 use crate::jobs::{Calls, Job, take};
 use crate::local;
 use crate::secret::Secret;
 use crate::vault::{self, KeyringVault, Vault};
+
+/// A read of the settings file of this computer, and, when it is for
+/// administrators only, whether the system can ask for one (else why not).
+type LocalRead = (Result<local::Found, local::ReadError>, Option<Result<(), String>>);
 
 /// What eframe keeps between two launches. No field can hold a secret: a
 /// kept token is in the system's password store, and here only `token_kept`.
@@ -149,8 +154,10 @@ enum Given {
     Typed,
     /// The password store.
     Kept,
-    /// A settings file of this computer, or the environment.
+    /// The environment, or a settings file read with an administrator's consent.
     Secret(Secret),
+    /// A settings file the person reads by themselves: read again next time, never kept.
+    File(Secret),
 }
 
 /// What a connection comes back with: the server, and how keeping its
@@ -183,12 +190,15 @@ struct ConnectForm {
     notice: Option<Notice>,
     /// After a redirect to the same host over https: that address.
     upgrade: Option<String>,
-    /// Reading the settings file of this computer: what it gave, and whether
-    /// the system can ask for the administrator's password (looked up there too).
-    local_job: Option<Job<(Result<local::Found, local::ReadError>, bool)>>,
-    /// The settings file of a server of this computer that needs the
-    /// administrator's password, and whether the system can ask for it.
-    needs_admin: Option<(PathBuf, bool)>,
+    /// Reading the settings file of this computer: what it gave, and, when it
+    /// is for administrators only, whether the system can ask for one here
+    /// (looked up there too: it looks at files).
+    local_job: Option<Job<LocalRead>>,
+    /// Stops the system's password window of the read running.
+    local_stop: Option<local::Stop>,
+    /// The settings file of a server of this computer that is for
+    /// administrators only, and whether the system can ask for one (else why not).
+    needs_admin: Option<(PathBuf, Result<(), String>)>,
 }
 
 /// What a change sent to the server comes back with.
@@ -340,9 +350,9 @@ pub struct Editor {
     calls: Calls,
     storage_dir: Option<PathBuf>,
     detect_local: bool,
-    /// The settings file of a server of this computer (`None`: still looking).
-    installed: Option<Option<PathBuf>>,
-    installed_job: Option<Job<Option<PathBuf>>>,
+    /// A server the installer set up on this computer (`None`: still looking).
+    installed: Option<Option<local::Detected>>,
+    installed_job: Option<Job<Option<local::Detected>>>,
     /// The jobs of the first frame were started.
     started: bool,
     connect_to: Option<(String, Secret)>,
@@ -350,6 +360,8 @@ pub struct Editor {
     session: Option<Session>,
     /// The theme the window was last given.
     theme_applied: Option<Theme>,
+    /// A bug stopped a frame: the window shows it, instead of its page.
+    failure: Option<Failure>,
 }
 
 impl std::fmt::Debug for Editor {
@@ -391,6 +403,7 @@ impl Editor {
             connect,
             session: None,
             theme_applied: None,
+            failure: None,
         }
     }
 
@@ -425,6 +438,80 @@ impl Editor {
     /// Whether tokens can be kept on this computer (`None`: still asking).
     pub fn can_keep_tokens(&self) -> Option<&Result<(), String>> {
         self.vault_status.as_ref()
+    }
+
+    /// One frame of the window. A bug (a panic) in it does not close the
+    /// window: the frame is dropped, and the window shows what failed.
+    pub fn frame(&mut self, ui: &mut egui::Ui) {
+        self.frame_with(ui, Editor::show);
+    }
+
+    /// [`Editor::frame`], drawn by `draw` (the tests make it fail on purpose).
+    #[doc(hidden)]
+    pub fn frame_with(&mut self, ui: &mut egui::Ui, draw: impl FnOnce(&mut Editor, &mut egui::Ui)) {
+        if let Some(failure) = self.failure.clone() {
+            // The failure page itself failing leaves an empty frame, never a closed window.
+            let _ = guard::catch(|| self.failure_page(ui, &failure));
+            return;
+        }
+        if let Err(failure) = guard::catch(|| draw(self, ui)) {
+            self.failure = Some(failure);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The bug that stopped the window's page, if one did.
+    pub fn failure(&self) -> Option<&Failure> {
+        self.failure.as_ref()
+    }
+
+    /// What the window shows after a bug: what failed, and the ways on.
+    fn failure_page(&mut self, ui: &mut egui::Ui, failure: &Failure) {
+        let l = self.lang();
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(16.0);
+            ui.heading(t(l, "The editor hit a bug"));
+            ui.label(t(
+                l,
+                "Something in the editor went wrong, and its page stopped. Nothing more was sent to your server. What was saved before is saved; a change on its way may or may not have been made: look again once connected.",
+            ));
+            ui.add_space(8.0);
+            ui.label(RichText::new(tf(l, "What failed: {}", &[&failure.message])).monospace());
+            if let Some(place) = &failure.place {
+                ui.label(RichText::new(tf(l, "Where: {}", &[place])).monospace().weak());
+            }
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(t(l, "Back to the start")).clicked() {
+                    self.back_to_start();
+                }
+                if ui.button(t(l, "Copy the details")).clicked() {
+                    ui.ctx().copy_text(failure.details());
+                }
+                if ui.button(t(l, "Quit")).clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                t(l, "Tell the editor's authors (GitHub issues)"),
+                "https://github.com/maxlestage/Nuage/issues",
+            );
+        });
+    }
+
+    /// The editor as it was opened, with its preferences, its password store
+    /// and its clipboard: what the bug left behind is dropped.
+    fn back_to_start(&mut self) {
+        let setup = Setup {
+            vault: self.vault.clone(),
+            clipboard: std::mem::replace(&mut self.clipboard, Box::new(FakeSink::default())),
+            transport: self.transport.clone(),
+            storage_dir: self.storage_dir.clone(),
+            detect_local: self.detect_local,
+            connect_to: None,
+        };
+        *self = Editor::new(self.prefs.clone(), setup);
     }
 
     /// The whole window.
@@ -472,7 +559,7 @@ impl Editor {
             self.old_file_job = Some(Job::start(ctx, &self.calls, move || Ok(vault::delete_old_tokens_file(&dir))));
         }
         if self.detect_local {
-            self.installed_job = Some(Job::start(ctx, &self.calls, || Ok(local::installed())));
+            self.installed_job = Some(Job::start(ctx, &self.calls, || Ok(local::detect_installed())));
         } else {
             self.installed = Some(None);
         }
@@ -553,10 +640,11 @@ impl Editor {
             self.connected(ctx, answer);
         }
         if let Some(answer) = take(&mut self.connect.local_job) {
+            self.connect.local_stop = None;
             match answer {
                 Ok((Ok(found), _)) => self.use_local(ctx, found),
                 Ok((Err(local::ReadError::NeedsAdministrator(file)), can_ask)) => {
-                    self.connect.needs_admin = Some((file, can_ask))
+                    self.connect.needs_admin = Some((file, can_ask.unwrap_or(Ok(()))))
                 }
                 Ok((Err(e), _)) => self.connect.notice = Some(Notice::bad(local_error(l, e))),
                 Err(e) => self.connect.notice = Some(Notice::bad(e.explain(l))),
@@ -694,19 +782,16 @@ impl Editor {
     /// The settings file of the server of this computer was read.
     fn use_local(&mut self, ctx: &egui::Context, found: local::Found) {
         let l = self.lang();
-        let local::Found { address, site_url, token, .. } = found;
+        let local::Found { file, address, site_url, token, via, .. } = found;
         self.connect.needs_admin = None;
         self.connect.address = address.clone();
         self.connect.use_kept = false;
         self.connect.public = site_url.map(|site| (address, site));
-        match token {
-            Some(token) => self.start_connect(ctx, Given::Secret(token)),
-            None => {
-                self.connect.notice = Some(Notice::bad(t(
-                    l,
-                    "The settings file of this computer has no management token (NUAGE_ADMIN_TOKEN): run the installer again, it adds one.",
-                )))
-            }
+        match (token, via) {
+            // The person can read the file again next time: no copy goes in the password store.
+            (Some(token), local::Via::File) => self.start_connect(ctx, Given::File(token)),
+            (Some(token), local::Via::Administrator) => self.start_connect(ctx, Given::Secret(token)),
+            (None, _) => self.connect.notice = Some(Notice::bad(no_token(l, &file))),
         }
     }
 
@@ -727,8 +812,9 @@ impl Editor {
             )));
             return;
         }
+        let keep = !matches!(given, Given::File(_));
         let token = match given {
-            Given::Secret(token) => Some(token),
+            Given::Secret(token) | Given::File(token) => Some(token),
             Given::Kept => None,
             Given::Typed => match api::typed_token(&self.connect.token) {
                 Ok(token) => Some(token),
@@ -738,7 +824,7 @@ impl Editor {
                 }
             },
         };
-        let remember = self.connect.remember && token.is_some() && matches!(self.vault_status, Some(Ok(())));
+        let remember = keep && self.connect.remember && token.is_some() && matches!(self.vault_status, Some(Ok(())));
         let public = self.connect.public.as_ref().filter(|(a, _)| *a == base).map(|(_, site)| site.clone());
         let (vault, transport) = (self.vault.clone(), self.transport.clone());
         self.connect.with_kept = token.is_none();
@@ -862,37 +948,69 @@ impl Editor {
                         ui.label(t(l, "Looking for a Nuage DB server installed here…"));
                     });
                 }
-                Some(Some(file)) => {
+                Some(Some(found)) => {
                     ui.label(tf(
                         l,
                         "A Nuage DB server is installed here (its settings are in {}).",
-                        &[&file.display()],
+                        &[&found.paths.settings.display()],
                     ));
+                    if !found.answers {
+                        ui.label(
+                            RichText::new(tf(
+                                l,
+                                "Nothing answers on port {} of this computer right now: the server may be stopped.",
+                                &[&found.port],
+                            ))
+                            .weak(),
+                        );
+                    }
                     if let Some((needs, can_ask)) = self.connect.needs_admin.clone() {
-                        if can_ask {
-                            ui.label(t(
-                                l,
-                                "Its settings file is protected (it holds the encryption key): your system asks for your password to read its address and its management token, and nothing else.",
-                            ));
-                            if ui.add_enabled(!waiting, egui::Button::new(t(l, "Enter my password"))).clicked() {
-                                self.connect.local_job = Some(Job::start(ctx, &self.calls, move || {
-                                    Ok((local::read_as_administrator(&needs), true))
-                                }));
+                        match can_ask {
+                            Ok(()) => {
+                                // Said before the system's window: what runs as administrator, and what it reads.
+                                ui.label(t(l, ASK_ADMINISTRATOR));
+                                let button = if cfg!(windows) { t(l, "Ask Windows") } else { t(l, "Enter my password") };
+                                if ui.add_enabled(!waiting, egui::Button::new(button)).clicked() {
+                                    let stop = local::Stop::default();
+                                    self.connect.local_stop = Some(stop.clone());
+                                    self.connect.notice = None;
+                                    self.connect.local_job = Some(Job::start(ctx, &self.calls, move || {
+                                        Ok((local::read_as_administrator(l, &stop), None))
+                                    }));
+                                }
                             }
-                        } else {
-                            ui.label(t(
-                                l,
-                                "Its settings file is protected (it holds the encryption key). Close the editor, then open it again as administrator (right-click: Run as administrator) to read it once, with \"Remember on this computer\" ticked.",
-                            ));
+                            Err(why) => {
+                                ui.label(tf(
+                                    l,
+                                    "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of {}.",
+                                    &[&why, &needs.display()],
+                                ));
+                            }
                         }
                     } else if ui.add_enabled(!waiting, egui::Button::new(t(l, "Use this server"))).clicked() {
+                        self.connect.notice = None;
                         self.connect.local_job = Some(Job::start(ctx, &self.calls, || {
                             let read = local::read();
-                            // Looked up here: it searches the PATH.
+                            // Looked up here: it looks at files.
                             let can_ask = matches!(read, Err(local::ReadError::NeedsAdministrator(_)))
-                                && local::can_ask_administrator();
+                                .then(local::can_ask_administrator);
                             Ok((read, can_ask))
                         }));
+                    }
+                    if let Some(job) = &self.connect.local_job {
+                        let elapsed = job.elapsed();
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tf(l, "Waiting for the system's window… ({} s)", &[&elapsed.as_secs()]));
+                            // pkexec and osascript can be stopped, and their window with them; Windows' cannot.
+                            if let Some(stop) = &self.connect.local_stop
+                                && !cfg!(windows)
+                                && elapsed >= Duration::from_secs(3)
+                                && ui.button(t(l, "Stop waiting")).clicked()
+                            {
+                                stop.now();
+                            }
+                        });
                     }
                 }
                 Some(None) => {
@@ -1150,16 +1268,60 @@ fn address_error(l: Lang, typed: &str, e: &AddressError) -> String {
 }
 
 fn local_error(l: Lang, e: local::ReadError) -> String {
+    use local::ReadError as E;
     match e {
-        local::ReadError::NotInstalled => t(l, "No server was installed on this computer by the installer.").to_owned(),
-        local::ReadError::NeedsAdministrator(_) => t(l, "Its settings file is for administrators only.").to_owned(),
-        local::ReadError::Cancelled => {
-            t(l, "The password was not given: nothing was read. Type the address and the token below instead.")
-                .to_owned()
+        E::NotInstalled => t(l, "No server was installed on this computer by the installer.").to_owned(),
+        E::NeedsAdministrator(_) => t(l, "Its settings file is for administrators only.").to_owned(),
+        E::Dismissed => t(
+            l,
+            "The window asking for an administrator was closed: nothing was read. Click the button again to be asked once more, or type the address and the token below.",
+        )
+        .to_owned(),
+        E::NotAccepted(why) => tf(
+            l,
+            "The system did not accept the answer ({}): nothing was read. It takes the password of an administrator of this computer.",
+            &[&why],
+        ),
+        E::NoPrompt(why) => tf(
+            l,
+            "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of the settings file.",
+            &[&why],
+        ),
+        E::Unreadable(why) => tf(l, "The settings file could not be read, even as administrator: {}", &[&why]),
+        E::NotHandedOver(Some(code)) => {
+            tf(l, "Windows did not hand the settings file over (code {}): nothing was read.", &[&code])
         }
-        local::ReadError::Failed(why) => tf(l, "Its settings file could not be read: {}", &[&why]),
+        E::NotHandedOver(None) => {
+            t(l, "Windows did not hand the settings file over within two minutes: nothing was read.").to_owned()
+        }
+        E::Failed(why) => tf(l, "Its settings file could not be read: {}", &[&why]),
     }
 }
+
+/// The settings file `file` has no management token: what is true, and what to do.
+fn no_token(l: Lang, file: &std::path::Path) -> String {
+    let restart = if cfg!(windows) {
+        t(l, "restart this computer (the server starts with it)")
+    } else if cfg!(target_os = "macos") {
+        t(l, "restart the server: sudo launchctl kickstart -k system/io.github.maxlestage.nuage")
+    } else {
+        t(l, "restart the server: sudo systemctl restart nuage")
+    };
+    tf(
+        l,
+        "{} has no management token (NUAGE_ADMIN_TOKEN), so the server's management API is off. The installer writes one only when it installs Nuage DB for the first time, not when it updates it: running it again adds none. To add one, as an administrator: add a line NUAGE_ADMIN_TOKEN= followed by 32 characters or more to that file (nuage genkey makes 64), then {}. Then come back here.",
+        &[&file.display(), &restart],
+    )
+}
+
+/// Said before the system asks for an administrator: what will run with
+/// those rights, what it reads, and that the encryption key is not read.
+#[cfg(windows)]
+const ASK_ADMINISTRATOR: &str = "Its settings file is for administrators only (it holds the encryption key). Windows asks for an administrator's consent: its window names Windows Command Processor, verified publisher Microsoft Windows, and its details show the command. That command runs findstr, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.";
+#[cfg(target_os = "macos")]
+const ASK_ADMINISTRATOR: &str = "Its settings file is for administrators only (it holds the encryption key). macOS asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.";
+#[cfg(not(any(windows, target_os = "macos")))]
+const ASK_ADMINISTRATOR: &str = "Its settings file is for administrators only (it holds the encryption key). Your system asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.";
 
 fn notice(ui: &mut egui::Ui, n: &Notice) {
     let color = if n.ok { Color32::from_rgb(4, 150, 87) } else { ui.visuals().error_fg_color };
@@ -1665,3 +1827,41 @@ const COPIED: &str = "Copied. It stays in the clipboard until you copy something
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 const COPIED: &str =
     "Copied. It stays in the clipboard until you copy something else; the clipboard history is asked to skip it.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_is_said_of_the_settings_file_is_true() {
+        let file = std::path::Path::new("/etc/nuage/nuage.env");
+        for l in Lang::ALL {
+            let said = no_token(l, file);
+            assert!(said.contains("/etc/nuage/nuage.env") && said.contains("NUAGE_ADMIN_TOKEN="), "{said}");
+            // Running the installer again adds no management token (see local::parity).
+            for wrong in ["it adds one", "il en ajoute un", "añade uno"] {
+                assert!(!said.contains(wrong), "{said}");
+            }
+            assert!(!t(l, ASK_ADMINISTRATOR).is_empty());
+            use local::ReadError as E;
+            for e in [
+                E::NotInstalled,
+                E::NeedsAdministrator(file.to_path_buf()),
+                E::Dismissed,
+                E::NotAccepted("Not authorized".into()),
+                E::NoPrompt("No authentication agent found.".into()),
+                E::Unreadable("Permission denied".into()),
+                E::NotHandedOver(Some(2)),
+                E::NotHandedOver(None),
+                E::Failed("x".into()),
+            ] {
+                assert!(!local_error(l, e.clone()).is_empty(), "{e:?}");
+            }
+        }
+        // Each answer of the system has its own sentence.
+        let dismissed = local_error(Lang::En, local::ReadError::Dismissed);
+        let refused = local_error(Lang::En, local::ReadError::NotAccepted("Not authorized".into()));
+        let alone = local_error(Lang::En, local::ReadError::NoPrompt("no agent".into()));
+        assert!(dismissed != refused && refused != alone && alone != dismissed);
+    }
+}

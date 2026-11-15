@@ -709,32 +709,37 @@ claras lo que rechaza y por qué. Hace lo mismo que la página de Ajustes de la 
 tu escritorio.
 
 1. **Descárgalo** de la [última versión](https://github.com/maxlestage/Nuage/releases/latest):
-   `nuage-editor-aarch64-apple-darwin.zip` (Mac con chip de Apple) o
-   `nuage-editor-x86_64-apple-darwin.zip` (Mac Intel), `nuage-editor-x86_64-pc-windows-msvc.zip`
-   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (escritorio Linux).
-2. **Ábrelo.** macOS: descomprime, mueve *Nuage DB Editor* a Aplicaciones; la primera vez,
-   clic derecho y **Abrir** (en un macOS reciente: Ajustes del Sistema, Privacidad y
-   seguridad, **Abrir igualmente**), porque no está firmado con un certificado de
-   desarrollador de Apple. Windows: descomprime, haz doble clic en `nuage-editor.exe`; si
-   SmartScreen dice que protegió tu equipo, **Más información** y luego **Ejecutar de todas
-   formas**. Linux: descomprime, doble clic en `nuage-editor` (necesita OpenGL y
-   libxkbcommon, que los escritorios tienen; `nuage-editor.desktop` lo pone en el menú).
-3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo:
-   un clic, y tu sistema pide tu contraseña para leer su puerto y su token de gestión (el
-   archivo de ajustes está protegido, contiene la clave de cifrado; no se lee nada más).
-   Para un servidor en línea, escribe su dirección y su token de gestión,
-   `NUAGE_ADMIN_TOKEN` (en Heroku: Settings de la aplicación, **Reveal Config Vars**). El
-   editor recuerda la dirección; el token solo si marcas *Recordar en este equipo*, y entonces
-   en el almacén de contraseñas de tu sistema (el llavero de macOS, el Administrador de
-   credenciales de Windows, el llavero de un escritorio Linux), nunca en un archivo propio.
-   Nunca envía el token tras una redirección, y pregunta antes de enviarlo en claro
-   (`http://`) a una dirección de Internet.
+   `Nuage-DB-Editor-macOS.dmg` (cualquier Mac con macOS 11 o posterior, chip de Apple o
+   Intel), `Nuage-DB-Editor-windows-x64.exe` (Windows 10 y 11),
+   `nuage-editor-x86_64-linux.tar.gz` (un escritorio Linux, Ubuntu 20.04, Debian 11 o
+   posterior). Cada uno tiene su `.sha256`.
+2. **Ábrelo.** No está firmado con un certificado de desarrollador: la primera vez pregunta.
+   macOS: abre el `.dmg`, arrastra *Nuage DB Editor* a Aplicaciones y ábrelo; macOS dice que
+   no puede comprobarlo: Ajustes del Sistema, Privacidad y seguridad, **Abrir igualmente**, y
+   tu contraseña. Windows: doble clic en el `.exe` (nada que instalar); Edge puede decir que
+   no se descarga a menudo: **Conservar**; SmartScreen dice que protegió tu PC: **Más
+   información** y **Ejecutar de todas formas**. Linux: descomprime y haz clic derecho en
+   `nuage-editor`, **Ejecutar como un programa** (Archivos de GNOME no abre un programa con
+   doble clic); `README.txt` lo pone en el menú.
+3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo,
+   con una ventana del sistema como mucho: el editor nunca se ejecuta como administrador;
+   las herramientas del sistema leen por él cuatro líneas del archivo de ajustes (`PORT`,
+   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; nunca la clave de cifrado): pkexec y grep
+   tras tu contraseña en Linux, osascript y grep en macOS (sin contraseña para la cuenta que
+   instaló), cmd.exe y findstr de Windows tras la ventana UAC, que nombra *Procesador de
+   comandos de Windows*, de Microsoft. Para un servidor en línea, escribe su dirección y su
+   token de gestión, `NUAGE_ADMIN_TOKEN` (en Heroku: Settings de la aplicación, **Reveal
+   Config Vars**). El editor recuerda la dirección; el token solo si marcas *Recordar en este
+   equipo*, y entonces en el almacén de contraseñas de tu sistema (el llavero de macOS, el
+   Administrador de credenciales de Windows, el llavero de un escritorio Linux), nunca en un
+   archivo propio. Nunca envía el token tras una redirección, y pregunta antes de enviarlo en
+   claro (`http://`) a una dirección de Internet.
 
 Lo que cambia lo guarda el servidor, como desde la consola: vigente al instante, guardado
 con los datos. Los ajustes que el servidor lee al arrancar (la clave de cifrado, los
 puertos, las contraseñas, el destino de las copias) se muestran, y el editor dice cómo
 cambiarlos en ese alojamiento. Arrancado con `NUAGE_URL` y `NUAGE_ADMIN_TOKEN` en su
-entorno, se conecta al momento. Desde el código fuente: `cargo run --release -p nuage-editor`.
+entorno, se conecta al momento. Desde el código fuente: `cargo run --profile release-editor -p nuage-editor`.
 
 ## Variables de entorno
 
@@ -824,7 +829,7 @@ instalador): el token viaja en una cabecera, y la cookie de la consola es `Secur
 │   ├── nuage-site/       el sitio web: páginas, el panel /app (Rust/wasm, el bundle
 │   │                     precompilado en pkg/, regenerado por build-wasm.sh), PWA, tarjeta para compartir
 │   └── nuage-editor/     Nuage DB Editor, los ajustes en una ventana (egui); packaging/ para
-│                         la aplicación de macOS y el menú de Linux
+│                         la aplicación de macOS, el icono de Windows y el menú de Linux
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            cualquier alojamiento de contenedores
 ├── nuage.env.example     el entorno, comentado

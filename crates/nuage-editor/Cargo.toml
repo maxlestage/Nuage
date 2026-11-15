@@ -8,6 +8,8 @@ license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+# On Windows: the icon, the version and the name Explorer shows (build.rs). Elsewhere it does nothing.
+build = "build.rs"
 
 [[bin]]
 name = "nuage-editor"
@@ -38,6 +40,34 @@ keyring = "4.2"
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
 
+# Windows: Direct3D 12 first (wgpu), which falls back to WARP, Windows' own software
+# renderer, where there is no graphics driver (remote desktop, virtual machines): glow alone
+# needs OpenGL 2, which those only have at version 1.1. Then glow, if it fails. Only DX12 is
+# compiled in, and only here: macOS and Linux builds have no wgpu at all.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+# The settings file of a local server is read by Windows' own cmd.exe and findstr, elevated,
+# into a pipe of the editor's (src/local/windows.rs); the pipe's name is random.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+getrandom = "0.4"
+
+[build-dependencies]
+# Only its resource compiler call (rc.exe, or windres when cross-compiling): no TOML parser.
+winresource = { version = "0.1", default-features = false }
+
 [dev-dependencies]
 # The editor against a real server, in the same process.
 nuage = { path = "../nuage", default-features = false, features = ["server"] }
@@ -46,6 +76,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"]
 egui_kittest = "0.37"
 
 [lints.rust]
+# The exceptions: src/local/windows.rs and the message box of src/main.rs, on Windows only.
 unsafe_code = "deny"
 
 # A bug must not close the window: no unwrap, no indexing that may panic, no byte slicing of text.

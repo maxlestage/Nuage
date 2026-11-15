@@ -14,7 +14,7 @@ use crate::secret::Secret;
 
 /// The name the tokens are kept under in the system's store (the address
 /// of the server is the account).
-pub const SERVICE: &str = "io.github.maxlestage.nuage-editor";
+pub const SERVICE: &str = crate::APP_ID;
 
 /// A password store.
 pub trait Vault: Send + Sync {

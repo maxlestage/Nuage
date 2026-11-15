@@ -684,30 +684,35 @@ applications and their tokens (shown once, with a Copy button), and says in plai
 it refuses and why. It does what the console's Settings page does, from your desktop.
 
 1. **Download it** from the [latest release](https://github.com/maxlestage/Nuage/releases/latest):
-   `nuage-editor-aarch64-apple-darwin.zip` (Mac with Apple silicon) or
-   `nuage-editor-x86_64-apple-darwin.zip` (Intel Mac), `nuage-editor-x86_64-pc-windows-msvc.zip`
-   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (Linux desktop).
-2. **Open it.** macOS: unzip, move *Nuage DB Editor* to Applications; the first time,
-   right-click it and choose **Open** (on recent macOS: System Settings, Privacy & Security,
-   **Open Anyway**), because it is not signed with an Apple developer certificate. Windows:
-   unzip, double-click `nuage-editor.exe`; if SmartScreen says it protected your computer,
-   **More info**, then **Run anyway**. Linux: unpack, double-click `nuage-editor` (it needs
-   OpenGL and libxkbcommon, which desktops have; `nuage-editor.desktop` puts it in the menu).
-3. **Connect.** A server installed on this computer by the installer is found by itself:
-   one click, and your system asks for your password to read its port and its management
-   token (the settings file is protected, it holds the encryption key; nothing else is read).
-   For a server online, type its address and its management token, `NUAGE_ADMIN_TOKEN`
-   (on Heroku: the app's Settings, **Reveal Config Vars**). The editor remembers the
-   address; the token only if you tick *Remember on this computer*, and then in your
-   system's password store (the macOS Keychain, the Windows Credential Manager, the keyring
-   of a Linux desktop), never in a file of its own. It never sends the token after a
-   redirect, and asks before sending it in clear (`http://`) to an address on the Internet.
+   `Nuage-DB-Editor-macOS.dmg` (any Mac with macOS 11 or later, Apple silicon or Intel),
+   `Nuage-DB-Editor-windows-x64.exe` (Windows 10 and 11), `nuage-editor-x86_64-linux.tar.gz`
+   (a Linux desktop, Ubuntu 20.04, Debian 11 or later). Each has its `.sha256`.
+2. **Open it.** It is not signed with a developer certificate, so the first opening asks
+   once. macOS: open the `.dmg`, drag *Nuage DB Editor* to Applications, open it; macOS says
+   it cannot check it: System Settings, Privacy & Security, **Open Anyway**, then your
+   password. Windows: double-click the `.exe` (nothing to install); Edge may say it is not
+   commonly downloaded: **Keep**; SmartScreen says it protected your PC: **More info**, then
+   **Run anyway**. Linux: unpack, then right-click `nuage-editor`, **Run as a Program** (GNOME
+   Files does not start a program on a double-click); `README.txt` puts it in the menu.
+3. **Connect.** A server installed on this computer by the installer is found by itself,
+   with one window of the system's at most: the editor never runs as administrator; the
+   system's own tools read four lines of the settings file for it (`PORT`,
+   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; never the encryption key): pkexec and
+   grep after your password on Linux, osascript and grep on macOS (no password for the
+   account that installed), Windows' own cmd.exe and findstr after the UAC window, which
+   names *Windows Command Processor*, by Microsoft. For a server online, type its address and
+   its management token, `NUAGE_ADMIN_TOKEN` (on Heroku: the app's Settings, **Reveal Config
+   Vars**). The editor remembers the address; the token only if you tick *Remember on this
+   computer*, and then in your system's password store (the macOS Keychain, the Windows
+   Credential Manager, the keyring of a Linux desktop), never in a file of its own. It never
+   sends the token after a redirect, and asks before sending it in clear (`http://`) to an
+   address on the Internet.
 
 What it changes is saved by the server, as from the console: in force at once, kept with
 the data. Settings read when the server starts (the encryption key, ports, passwords,
 where backups go) are shown, and the editor says how to change them on that host.
 Started with `NUAGE_URL` and `NUAGE_ADMIN_TOKEN` in its environment, it connects at once.
-From the sources: `cargo run --release -p nuage-editor`.
+From the sources: `cargo run --profile release-editor -p nuage-editor`.
 
 ## Environment variables
 
@@ -796,7 +801,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 │   ├── nuage-site/       the website: pages, the live /app dashboard (Rust/wasm, the
 │   │                     prebuilt bundle in pkg/, rebuilt by build-wasm.sh), PWA, share card
 │   └── nuage-editor/     Nuage DB Editor, the settings in a window (egui); packaging/ for
-│                         the macOS application and the Linux menu
+│                         the macOS application, the Windows icon and the Linux menu
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            any container host
 ├── nuage.env.example     the environment, commented

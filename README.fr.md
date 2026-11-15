@@ -719,34 +719,39 @@ bouton Copier), et dit en clair ce qu'il refuse et pourquoi. Il fait ce que fait
 Réglages de la console, depuis votre bureau.
 
 1. **Téléchargez-le** depuis la [dernière version](https://github.com/maxlestage/Nuage/releases/latest) :
-   `nuage-editor-aarch64-apple-darwin.zip` (Mac à puce Apple) ou
-   `nuage-editor-x86_64-apple-darwin.zip` (Mac Intel), `nuage-editor-x86_64-pc-windows-msvc.zip`
-   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (bureau Linux).
-2. **Ouvrez-le.** macOS : décompressez, glissez *Nuage DB Editor* dans Applications ; la
-   première fois, clic droit puis **Ouvrir** (sur un macOS récent : Réglages Système,
-   Confidentialité et sécurité, **Ouvrir quand même**), car il n'est pas signé par un
-   certificat de développeur Apple. Windows : décompressez, double-cliquez sur
-   `nuage-editor.exe` ; si SmartScreen dit avoir protégé votre ordinateur, **Informations
-   complémentaires** puis **Exécuter quand même**. Linux : décompressez, double-cliquez sur
-   `nuage-editor` (il lui faut OpenGL et libxkbcommon, que les bureaux ont ;
-   `nuage-editor.desktop` le met dans le menu).
+   `Nuage-DB-Editor-macOS.dmg` (tout Mac sous macOS 11 ou plus récent, puce Apple ou Intel),
+   `Nuage-DB-Editor-windows-x64.exe` (Windows 10 et 11), `nuage-editor-x86_64-linux.tar.gz`
+   (un bureau Linux, Ubuntu 20.04, Debian 11 ou plus récent). Chacun a son `.sha256`.
+2. **Ouvrez-le.** Il n'est pas signé par un certificat de développeur : la première
+   ouverture demande une fois. macOS : ouvrez le `.dmg`, glissez *Nuage DB Editor* dans
+   Applications, ouvrez-le ; macOS dit ne pas pouvoir le vérifier : Réglages Système,
+   Confidentialité et sécurité, **Ouvrir quand même**, puis votre mot de passe. Windows :
+   double-cliquez sur le `.exe` (rien à installer) ; Edge peut dire qu'il est rarement
+   téléchargé : **Conserver** ; SmartScreen dit « Windows a protégé votre ordinateur » :
+   **Informations complémentaires**, puis **Exécuter quand même**. Linux : décompressez, puis
+   clic droit sur `nuage-editor`, **Exécuter comme un programme** (GNOME Fichiers ne lance pas
+   un programme d'un double-clic) ; `README.txt` le met dans le menu.
 3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installeur est trouvé
-   tout seul : un clic, et votre système demande votre mot de passe pour lire son port et
-   son jeton de gestion (le fichier de réglages est protégé, il contient la clé de
-   chiffrement ; rien d'autre n'est lu). Pour un serveur en ligne, tapez son adresse et son
-   jeton de gestion, `NUAGE_ADMIN_TOKEN` (sur Heroku : Settings de l'application,
-   **Reveal Config Vars**). L'éditeur retient l'adresse ; le jeton seulement si vous cochez
-   *Retenir sur cet ordinateur*, et alors dans le gestionnaire de mots de passe de votre
-   système (le trousseau de macOS, le Gestionnaire d'identification de Windows, le trousseau
-   d'un bureau Linux), jamais dans un fichier à lui. Il n'envoie jamais le jeton après une
-   redirection, et demande avant de l'envoyer en clair (`http://`) à une adresse d'Internet.
+   tout seul, avec une fenêtre du système au plus : l'éditeur ne tourne jamais en
+   administrateur ; les outils du système lisent pour lui quatre lignes du fichier de
+   réglages (`PORT`, `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND` ; jamais la clé de
+   chiffrement) : pkexec et grep après votre mot de passe sous Linux, osascript et grep sous
+   macOS (sans mot de passe pour le compte qui a installé), cmd.exe et findstr de Windows
+   après la fenêtre UAC, qui nomme *Processeur de commandes Windows*, de Microsoft. Pour un
+   serveur en ligne, tapez son adresse et son jeton de gestion, `NUAGE_ADMIN_TOKEN` (sur
+   Heroku : Settings de l'application, **Reveal Config Vars**). L'éditeur retient l'adresse ;
+   le jeton seulement si vous cochez *Retenir sur cet ordinateur*, et alors dans le
+   gestionnaire de mots de passe de votre système (le trousseau de macOS, le Gestionnaire
+   d'identification de Windows, le trousseau d'un bureau Linux), jamais dans un fichier à
+   lui. Il n'envoie jamais le jeton après une redirection, et demande avant de l'envoyer en
+   clair (`http://`) à une adresse d'Internet.
 
 Ce qu'il change est enregistré par le serveur, comme depuis la console : en vigueur tout de
 suite, gardé avec les données. Les réglages lus au démarrage du serveur (la clé de
 chiffrement, les ports, les mots de passe, la destination des sauvegardes) sont affichés,
 et l'éditeur dit comment les changer sur cet hébergement. Lancé avec `NUAGE_URL` et
 `NUAGE_ADMIN_TOKEN` dans son environnement, il se connecte aussitôt. Depuis les sources :
-`cargo run --release -p nuage-editor`.
+`cargo run --profile release-editor -p nuage-editor`.
 
 ## Variables d'environnement
 
@@ -837,7 +842,7 @@ HTTPS.
 │   ├── nuage-site/       le site : pages, tableau de bord /app (Rust/wasm, le bundle
 │   │                     précompilé dans pkg/, refait par build-wasm.sh), PWA, carte de partage
 │   └── nuage-editor/     Nuage DB Éditeur, les réglages dans une fenêtre (egui) ; packaging/
-│                         pour l'application macOS et le menu Linux
+│                         pour l'application macOS, l'icône Windows et le menu Linux
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            tout hébergeur de conteneurs
 ├── nuage.env.example     l'environnement, commenté

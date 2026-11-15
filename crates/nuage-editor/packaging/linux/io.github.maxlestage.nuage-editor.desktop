@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Nuage DB Editor
+Name[fr]=Nuage DB Éditeur
+Name[es]=Nuage DB Editor
+GenericName=Database server settings
+GenericName[fr]=Réglages d'un serveur de bases de données
+GenericName[es]=Ajustes de un servidor de bases de datos
+Comment=Set up and change a Nuage DB server, without a terminal
+Comment[fr]=Régler et modifier un serveur Nuage DB, sans terminal
+Comment[es]=Configurar y cambiar un servidor Nuage DB, sin terminal
+Exec=nuage-editor
+Icon=io.github.maxlestage.nuage-editor
+Terminal=false
+Categories=Development;Database;
+Keywords=Nuage;database;server;settings;
+# The window's app id (src/lib.rs: APP_ID): the desktop groups the window under this entry.
+StartupWMClass=io.github.maxlestage.nuage-editor

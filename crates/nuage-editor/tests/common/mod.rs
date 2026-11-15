@@ -20,7 +20,8 @@ pub fn window(prefs: Prefs, vault: Arc<dyn Vault>, clipboard: FakeSink) -> Harne
         .with_size([1100.0, 1600.0])
         // A new window (a dialog) settles in a few frames: its widgets are styled once they exist.
         .with_max_steps(30)
-        .build_ui_state(|ui, editor: &mut Editor| editor.show(ui), editor);
+        // As the program draws it: a bug shows a page instead of closing the window.
+        .build_ui_state(|ui, editor: &mut Editor| editor.frame(ui), editor);
     harness.run();
     harness
 }
