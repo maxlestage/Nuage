@@ -56,7 +56,7 @@ pub(crate) struct App {
     pub last_request: AtomicI64,
     /// Who connected last, and how: the console shows it.
     pub last_connection: Mutex<Option<Connection>>,
-    /// Its key-value store, in memory (`/v1/kv`, the Redis protocol).
+    /// Its key-value store, in memory (`/v1/kv`, the key-value port).
     pub kv: crate::kv::Kv,
 }
 

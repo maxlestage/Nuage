@@ -4,9 +4,22 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.5 (2026-11-15)
+
+### The key-value store has names of its own
+
+- The key-value store is called what it is, everywhere: the setting of its port is
+  **`NUAGE_KV_PORT`** (and `NUAGE_KV_BIND`), next to `NUAGE_KV_MB`; in Rust, `Server::listen_kv`
+  and `KvOptions`. `NUAGE_REDIS_PORT`, `NUAGE_REDIS_BIND`, `listen_redis` and `RedisOptions`,
+  which 0.4.4 had for a few hours, are gone. Nothing else changes: `/v1/kv`, the commands, and
+  the port's wire (RESP 2 and 3, the one Redis clients speak, so `redis-cli` and every
+  language's Redis client still connect as they are).
+- The READMEs, `openapi.json`, `nuage.env.example` and the logs describe the store by what it
+  does (a cache, counters, locks) rather than by another product's name.
+
 ## 0.4.4 (2026-11-15)
 
-### A key-value store, the way Redis is used
+### A key-value store
 
 - **`/v1/kv`**: each application has a key-value store in memory, next to its database:
   values with an expiry, counters, locks, a cache in front of anything slow. `GET`, `PUT`

@@ -1,6 +1,9 @@
-//! The Redis protocol (RESP2, and RESP3 after `HELLO 3`): every language's Redis client connects to an
-//! application's key-value store ([`crate::kv`]), with a token of the
-//! application as its password.
+//! The key-value store on a port of its own (`NUAGE_KV_PORT`): an
+//! application's store ([`crate::kv`]), reached over a socket that stays
+//! open, with a token of the application as the password.
+//!
+//! The wire is RESP (RESP2, and RESP3 after `HELLO 3`), the protocol Redis
+//! clients speak: no client to write, each language already has one.
 //!
 //! ```text
 //! redis-cli -u redis://default:<token>@db.example.com:6379
@@ -8,8 +11,8 @@
 //!
 //! The token picks the application, as everywhere else; a read-only token
 //! reads. With a certificate (`NUAGE_TLS_CERT`, `NUAGE_TLS_KEY`) the same port
-//! also answers TLS (`rediss://`): the first byte of a connection tells which.
-//! Commands sent together (a pipeline) are answered together.
+//! also answers TLS: the first byte of a connection tells which. Commands sent
+//! together (a pipeline) are answered together.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,16 +26,16 @@ use super::State;
 use super::apps::App;
 use crate::kv::Reply;
 
-/// Settings of the Redis protocol.
+/// Settings of the key-value port.
 #[derive(Clone, Default)]
-pub struct RedisOptions {
-    /// The server's certificate, for `rediss://`.
+pub struct KvOptions {
+    /// The server's certificate, for TLS.
     pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
-impl std::fmt::Debug for RedisOptions {
+impl std::fmt::Debug for KvOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedisOptions").field("tls", &self.tls.is_some()).finish()
+        f.debug_struct("KvOptions").field("tls", &self.tls.is_some()).finish()
     }
 }
 
@@ -109,7 +112,7 @@ impl Session {
         match self.state.apps.authenticate(&token, self.state.options.token.as_deref()) {
             Some((app, read_only)) => {
                 app.touch();
-                app.connected("Redis", &self.name, &self.peer, read_only);
+                app.connected("Key-value port", &self.name, &self.peer, read_only);
                 self.app = Some((app, read_only));
                 Reply::Ok
             }
@@ -297,10 +300,10 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut strea
 }
 
 /// Serves one connection until the client leaves.
-pub(crate) async fn serve(state: Arc<State>, stream: TcpStream, peer: SocketAddr, options: RedisOptions) {
+pub(crate) async fn serve(state: Arc<State>, stream: TcpStream, peer: SocketAddr, options: KvOptions) {
     let _ = stream.set_nodelay(true);
     state.metrics.open_connections.fetch_add(1, Ordering::Relaxed);
-    // A TLS handshake starts with the byte 0x16; a Redis command never does.
+    // A TLS handshake starts with the byte 0x16; a command never does.
     let mut first = [0u8; 1];
     let tls = matches!(stream.peek(&mut first).await, Ok(1) if first[0] == 0x16);
     match (tls, &options.tls) {

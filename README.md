@@ -35,7 +35,7 @@ server in production, without changing a line.
 | **Transactions** | Snapshot reads, optimistic commits (`Error::Conflict`, retried by `db.transaction(...)`), interactive transactions over HTTP, all-or-nothing batches. |
 | **Branches** | A full copy of the database for a preview, a test or an experiment, made in an instant: it shares its parent's pages and stores only its own changes. |
 | **Backups, restored at boot** | Snapshots plus log segments, to a folder or to S3-compatible storage. An empty data directory is restored automatically at startup, which makes hosts with an ephemeral disk work. |
-| **Key-value store** | Each application has a store in memory, the way Redis is used: values with an expiry, counters, locks, over HTTP (`/v1/kv`) and over the Redis protocol, for any Redis client ([Key-value store](#key-value-store)). |
+| **Key-value store** | Each application has a store in memory: values with an expiry, counters, locks, a cache, over HTTP (`/v1/kv`) and on a port of its own ([Key-value store](#key-value-store)). |
 | **Files** | Each application keeps files of any size (map tiles, photos, archives) in an S3-compatible bucket such as Cloudflare R2: the server lists them and signs the links, the bytes go straight between the client and the bucket ([Files](#files)). |
 | **Server** | One binary, configured by environment variables: the database protocol (`/v1`), the live status (`/api/status`, `/api/status/stream`), the console (`/admin`) and the website with its live dashboard (`/app`), on one port. |
 | **WebAssembly client** | `memoire_orm::NuageDb` speaks HTTP(S): natively with Tokio, and in the browser through `fetch`. |
@@ -296,7 +296,7 @@ every PostgreSQL driver connects too: see below.
 
 **Does my connection work?** `GET /v1/ping` answers which application the token opens:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` gives
-`Connected to Nuage DB 0.4.4: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.5: application blog, read and write, branch main, 3 table(s).`,
 and without a token, or with one that opens nothing, it says what is wrong. From any machine:
 `nuage check <url> <token>`. A PostgreSQL connection gets the same line as a notice (psql
 prints it), and each application's page in the console shows its last connection (when, how,
@@ -362,12 +362,11 @@ seconds).
 
 ## Key-value store
 
-Next to its database, each application has a **key-value store in memory**, the way Redis is
-used: a cache in front of anything slow, sessions, counters, rate limits, locks. Nothing
+Next to its database, each application has a **key-value store in memory**: a cache in front of anything slow, sessions, counters, rate limits, locks. Nothing
 touches the disk: a read or a write costs one round trip, and the server answers more than
 140 000 of them a second on 4 cores. A restart empties it; what must survive goes in the
 database. Memory is bounded for each application (`NUAGE_KV_MB`): past the limit, the keys that
-expired go first, then the least recently used ones (Redis's `allkeys-lru`).
+expired go first, then the least recently used ones.
 
 **Over HTTP**, from any language, with a token of the application (a read-only token reads):
 
@@ -379,7 +378,7 @@ expired go first, then the least recently used ones (Redis's `allkeys-lru`).
 | `POST /v1/kv/<key>?incr` (`=5`, `&ttl=60`) | adds to a counter: `{"value": 6}`; `ttl` is the expiry of a counter this call creates (a rate limit in one request) |
 | `POST /v1/kv/<key>?expire=60`, `?persist` | changes its expiry |
 | `GET /v1/kv` (`?prefix=`, `&limit=`) | the keys (size, time left) and the figures of the store |
-| `POST /v1/kv` | commands of Redis as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`; a list of commands answers `{"results": [...]}` in one round trip |
+| `POST /v1/kv` | commands as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`; a list of commands answers `{"results": [...]}` in one round trip |
 | `DELETE /v1/kv` | deletes every key |
 
 ```bash
@@ -389,9 +388,10 @@ curl -X POST "https://my-nuage.herokuapp.com/v1/kv/hits?incr&ttl=60" -H "Authori
 curl https://my-nuage.herokuapp.com/v1/kv -H "Authorization: Bearer $NUAGE_TOKEN" -d '[["GET","session:42"],["TTL","session:42"]]'
 ```
 
-**With any Redis client**: set `NUAGE_REDIS_PORT=6379` and the server speaks the Redis protocol
-(RESP2 and RESP3), a token of the application as the password. `redis-cli`, redis-py,
-node-redis, go-redis, Jedis... connect as is:
+**On a port of its own**: set `NUAGE_KV_PORT=6379` and the store also answers on a socket that
+stays open, a token of the application as the password. Its wire is RESP (2 and 3), the one
+Redis clients speak, so there is no client to write: `redis-cli`, redis-py, node-redis,
+go-redis, Jedis... connect as they are:
 
 ```bash
 redis-cli -u redis://default:<token>@db.example.com:6379 SET greeting hello EX 60
@@ -402,7 +402,7 @@ Strings and counters: `GET`, `SET` (`EX`, `PX`, `NX`, `XX`, `KEEPTTL`, `GET`), `
 `DECRBY`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN`,
 `DBSIZE`, `FLUSHDB`, `INFO`, `PING`, and `MULTI` ... `EXEC` (the commands run as one). Lists,
 hashes, sets and pub/sub are not there. With `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY`, the same port
-also answers TLS (`rediss://`). Heroku routes only HTTP: there, use `/v1/kv`.
+also answers TLS. Heroku routes only HTTP: there, use `/v1/kv`.
 
 **From Rust**, Memoire's `NuageKv` (`db.kv()`): `get`, `set_for`, `incr_by`, `set_if_absent`,
 and `remember(key, ttl, || compute())`, a cache in one call. Embedded, `nuage::kv::Kv` is the
@@ -484,7 +484,7 @@ administrators only, with a firewall rule for the local network.
   but warns that the password travels in clear.
 - **Upgrade**: run the command again; data, key, settings and backups stay.
 - **Options**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: off), `NUAGE_SWAP_MB` (`0`: no swap),
-  `NUAGE_VERSION=v0.4.4`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
+  `NUAGE_VERSION=v0.4.5`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
   cargo). On Windows, set them first: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
   `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
@@ -509,7 +509,7 @@ The `nuage` binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Window
 website and the live dashboard. A lighter server, without them (`/` is then a small home page;
 the console, the API and everything else stay):
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-A release: `--tag v0.4.4`. Upgrade: the same command, with `--force`.
+A release: `--tag v0.4.5`. Upgrade: the same command, with `--force`.
 
 `cargo install` only puts the binary there: no service, no settings, no backups. Hand it to
 the installer, which does the rest (settings, backups, service started with the computer):
@@ -644,8 +644,8 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
-| `NUAGE_REDIS_PORT` | also serve the Redis protocol on this port (`6379`): every language's Redis client, on an application's key-value store, a token as the password | off |
-| `NUAGE_REDIS_BIND` | its address | `NUAGE_BIND` |
+| `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the wire Redis clients speak: one connects to an application's store, a token as the password | off |
+| `NUAGE_KV_BIND` | its address | `NUAGE_BIND` |
 | `NUAGE_KV_MB` | memory of each application's key-value store, in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory, 4 to 256 MiB |
 | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (see [Files](#files)) | none: no files |
 | `NUAGE_FILES_S3_ENDPOINT` | its endpoint (`https://<account id>.r2.cloudflarestorage.com` on R2) | `https://s3.<region>.amazonaws.com` |

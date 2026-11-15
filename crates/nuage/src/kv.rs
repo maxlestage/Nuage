@@ -1,4 +1,4 @@
-//! A key-value store in memory, the way Redis is used: values with an expiry,
+//! A key-value store in memory: values with an expiry,
 //! counters, locks (`SET key value NX EX 30`), a cache in front of anything
 //! slow. Each application of a server has its own, next to its database.
 //!
@@ -7,8 +7,7 @@
 //! restart empties it. What must survive belongs in the database.
 //!
 //! Memory is bounded ([`Kv::new`]): past the limit, the keys that expired go
-//! first, then the least recently used ones, as Redis does with
-//! `allkeys-lru`.
+//! first, then the least recently used ones.
 //!
 //! ```
 //! use std::time::Duration;
@@ -20,9 +19,10 @@
 //! assert_eq!(kv.incr_by(b"visits", 1, None).unwrap(), 1);
 //! ```
 //!
-//! [`Kv::command`] runs the commands of Redis (`GET`, `SET`, `DEL`, `INCR`,
-//! `EXPIRE`, `TTL`, `MGET`, `KEYS`...): the server answers them over HTTP
-//! (`/v1/kv`) and over the Redis protocol.
+//! [`Kv::command`] runs commands by name (`GET`, `SET`, `DEL`, `INCR`,
+//! `EXPIRE`, `TTL`, `MGET`, `KEYS`...), the names and the answers Redis
+//! clients know: the server answers them over HTTP (`/v1/kv`) and on the
+//! key-value port, where such a client connects as it is.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -350,7 +350,7 @@ impl Kv {
         self.locked(|l| l.stats())
     }
 
-    /// Runs one command of Redis: `args[0]` is its name, in any case. A
+    /// Runs one command: `args[0]` is its name, in any case. A
     /// command runs alone: nothing else reads or writes while it does. With
     /// `read_only`, the commands that write are refused.
     ///
@@ -366,17 +366,18 @@ impl Kv {
 
     /// Runs several commands as one (`MULTI` ... `EXEC`): nothing else reads
     /// or writes between them. Each one has its answer; one that is refused
-    /// does not undo the others, as in Redis.
+    /// does not undo the others.
     pub fn transaction(&self, commands: &[Vec<Vec<u8>>], read_only: bool) -> Vec<Reply> {
         self.locked(|l| commands.iter().map(|c| l.command(c, read_only)).collect())
     }
 }
 
 // ---------------------------------------------------------------------------
-// The commands of Redis
+// Commands by name
 // ---------------------------------------------------------------------------
 
-/// The answer to a command, in the shapes of the Redis protocol.
+/// The answer to a command, in the shapes of RESP (the wire of the
+/// key-value port).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// `OK`.
@@ -393,7 +394,7 @@ pub enum Reply {
     Array(Vec<Reply>),
     /// Names and their values (the answer to `HELLO`).
     Map(Vec<(Reply, Reply)>),
-    /// A refusal, as Redis words them (`ERR ...`, `READONLY ...`).
+    /// A refusal (`ERR ...`, `READONLY ...`).
     Error(String),
 }
 
@@ -402,7 +403,7 @@ impl Reply {
         Reply::Error(format!("ERR {message}"))
     }
 
-    /// The answer in the Redis protocol: RESP2, or RESP3 (`HELLO 3`), where
+    /// The answer on the wire: RESP2, or RESP3 (`HELLO 3`), where
     /// "nothing" and maps have their own shapes.
     pub fn write_resp(&self, out: &mut Vec<u8>, resp3: bool) {
         match self {
@@ -826,7 +827,7 @@ impl Locked<'_> {
             ("EXPIRE" | "PEXPIRE", [key, ttl]) => {
                 let Some(ttl) = number::<i64>(ttl) else { return Reply::err(NOT_INTEGER) };
                 if ttl <= 0 {
-                    // An expiry in the past deletes the key, as Redis does.
+                    // An expiry in the past deletes the key.
                     return Reply::Int(i64::from(self.delete(key)));
                 }
                 let ttl = ttl as u64;
@@ -870,6 +871,7 @@ impl Locked<'_> {
                 self.clear();
                 Reply::Ok
             }
+            // `redis_version` is what clients read to choose how they talk.
             ("INFO", _) => {
                 let s = self.stats();
                 Reply::Bulk(
@@ -1037,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_commands() {
+    fn commands_by_name() {
         let kv = Kv::new(1 << 20);
         assert_eq!(run(&kv, &["ping"]), Reply::Status("PONG".into()));
         assert_eq!(run(&kv, &["SET", "k", "v"]), Reply::Ok);
