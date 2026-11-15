@@ -367,7 +367,7 @@ impl Ctx<'_> {
             out.push(key.to_vec());
             // An index on a column of few values names most of the table: for a SQL
             // statement, the keys count in what it may hold, and the walk in its time.
-            if out.len() % CHUNK == 0
+            if out.len().is_multiple_of(CHUNK)
                 && let Some(limits) = limits::at_work()
             {
                 limits.check_time()?;
@@ -1193,10 +1193,26 @@ pub(crate) fn fetch(ctx: &mut Ctx<'_>, query: &Query<'_>) -> Result<Fetched> {
             if !ast.joins.is_empty()
                 && let Some(limits) = &watch.limits
             {
-                let references = join_bound(ast, &tables).saturating_mul((ast.joins.len() + 1) * JOINED_ROW_BYTES);
-                if limits.fits(watch.held.saturating_add(references)).is_err() {
+                let bound = join_bound(ast, &tables);
+                let mut need = bound.saturating_mul((ast.joins.len() + 1) * JOINED_ROW_BYTES);
+                // The rows it answers are copies of the values (a grouped one answers its groups).
+                let grouped = !ast.group_by.is_empty()
+                    || ast.having.is_some()
+                    || matches!(&ast.projection, Projection::Exprs(e) if e.iter().any(Expr::has_aggregate));
+                if !grouped {
+                    let wanted = ast.limit.map_or(u64::MAX, |l| l.saturating_add(ast.offset.unwrap_or(0)));
+                    let answered = bound.min(usize::try_from(wanted).unwrap_or(usize::MAX));
+                    let width: usize = ast
+                        .tables()
+                        .map(|t| tables.rows(t.name).map_or(0, |rows| rows_bytes(rows) / rows.len().max(1)))
+                        .sum();
+                    need = need.saturating_add(answered.saturating_mul(width));
+                }
+                if limits.fits(watch.held.saturating_add(need)).is_err() {
                     limits.decline();
-                    return Err(Error::Validation("SQL: the join may give more rows than the statement may hold".into()));
+                    return Err(Error::Validation(
+                        "SQL: the join may give more rows than the statement may hold".into(),
+                    ));
                 }
             }
             Ok(Fetched::Tables(tables))

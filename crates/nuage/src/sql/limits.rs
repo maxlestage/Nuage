@@ -208,7 +208,7 @@ impl Limits {
     pub(crate) fn tick(&self) -> Result<()> {
         let n = self.steps.get().wrapping_add(1);
         self.steps.set(n);
-        if n % STEPS == 0 { self.check_time() } else { Ok(()) }
+        if n.is_multiple_of(STEPS) { self.check_time() } else { Ok(()) }
     }
 
     /// Fails when the statement ran past its deadline.
@@ -385,7 +385,12 @@ mod tests {
         assert!(value_bytes(&doc) >= 1000);
         assert_eq!(rows_bytes(&[vec![text.clone()], vec![text]]), 2 * row_bytes(&[Value::Text("x".repeat(1000))]));
         assert!(text_fits("repeat()", MAX_TEXT).is_ok());
-        assert!(text_fits("repeat()", MAX_TEXT + 1).unwrap_err().to_string().contains("repeat(): the result would be larger than 64 MiB"));
+        assert!(
+            text_fits("repeat()", MAX_TEXT + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("repeat(): the result would be larger than 64 MiB")
+        );
     }
 
     #[test]

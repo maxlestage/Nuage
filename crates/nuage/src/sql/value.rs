@@ -11,10 +11,32 @@ use serde_json::{Value as Json, json};
 
 use super::ast::Op;
 use super::lex::syntax;
-use super::limits::{text_fits, value_bytes};
+use super::limits::{self, MAX_TEXT, text_fits, value_bytes};
 
 fn conversion(msg: impl Into<String>) -> Error {
     Error::Conversion(msg.into())
+}
+
+/// A JSON document read from `text` (`None`: it is not JSON), by `what`. Its
+/// tree takes more memory than its text (a value of 32 bytes for each `0,`
+/// of two): its size is counted from the text before it is built.
+fn json_of(what: &str, text: &str) -> Result<Option<Json>> {
+    let mut bytes = text.len();
+    for b in text.bytes() {
+        bytes = bytes.saturating_add(match b {
+            b',' | b'[' | b'{' => size_of::<Json>(),
+            // A member of an object: its name and the entry that holds it.
+            b':' => 2 * size_of::<Json>() + size_of::<String>(),
+            _ => 0,
+        });
+    }
+    text_fits(what, bytes)?;
+    Ok(serde_json::from_str(text).ok())
+}
+
+/// The byte where character `n` of `s` starts (the length of `s` past its end).
+fn char_at(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
 }
 
 /// A value of `kind` read from text, `None` when it is not one.
@@ -57,7 +79,7 @@ fn parse_as(s: &str, kind: ColumnType) -> Option<Value> {
                 .or_else(|| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok().map(|d| d.date()))?,
         ),
         ColumnType::Time => Value::Time(s.parse().ok()?),
-        ColumnType::Json => Value::Json(serde_json::from_str(s).ok()?),
+        ColumnType::Json => Value::Json(json_of("JSON", s).ok()??),
         ColumnType::Bytes => Value::Bytes(s.as_bytes().to_vec()),
         _ => Value::Text(s.to_owned()),
     })
@@ -363,7 +385,7 @@ pub(crate) fn cast(v: &Value, kind: ColumnType) -> Result<Value> {
         (ColumnType::Real | ColumnType::Double, _) => Value::F64(numeric(v).and_then(|n| n.as_f64()).ok_or_else(bad)?),
         (ColumnType::Bool, Value::I32(_) | Value::I64(_) | Value::F64(_)) => Value::Bool(truthy(v)),
         (ColumnType::Json, Value::Text(t)) => {
-            Value::Json(serde_json::from_str(t).unwrap_or_else(|_| Json::String(t.clone())))
+            Value::Json(json_of("CAST AS JSON", t)?.unwrap_or_else(|| Json::String(t.clone())))
         }
         (ColumnType::Json, other) => Value::Json(to_json(other)),
         (ColumnType::Bytes, Value::Text(t)) => Value::Bytes(t.as_bytes().to_vec()),
@@ -381,63 +403,92 @@ pub(crate) fn cast(v: &Value, kind: ColumnType) -> Result<Value> {
 }
 
 /// `LIKE`: `%` any run, `_` any character, `escape` before a literal one.
-pub(crate) fn like(s: &str, pattern: &str, ci: bool, escape: Option<char>) -> bool {
-    let (s, p): (Vec<char>, Vec<char>) = if ci {
-        (s.to_lowercase().chars().collect(), pattern.to_lowercase().chars().collect())
-    } else {
-        (s.chars().collect(), pattern.chars().collect())
-    };
-    // Tokens: Some(c) a literal, None('%'), and `_`.
-    #[derive(Clone, Copy, PartialEq)]
-    enum T {
-        Lit(char),
-        One,
-        Any,
+/// Read in place, by bytes: a copy of the text as characters would take four
+/// times its size. A long text against a long pattern takes long: the
+/// statement's deadline is read as it goes.
+pub(crate) fn like(s: &str, pattern: &str, ci: bool, escape: Option<char>) -> Result<bool> {
+    if ci {
+        return like_at(&s.to_lowercase(), &pattern.to_lowercase(), escape);
     }
-    let mut toks = Vec::with_capacity(p.len());
-    let mut i = 0;
-    while i < p.len() {
-        if Some(p[i]) == escape && i + 1 < p.len() {
-            toks.push(T::Lit(p[i + 1]));
-            i += 2;
-            continue;
-        }
-        toks.push(match p[i] {
-            '%' => T::Any,
-            '_' => T::One,
-            c => T::Lit(c),
-        });
-        i += 1;
+    like_at(s, pattern, escape)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Wild {
+    Lit(char),
+    /// `_`
+    One,
+    /// `%`
+    Any,
+}
+
+/// The token of `pattern` at byte `i`, and the byte after it.
+fn wild(pattern: &str, i: usize, escape: Option<char>) -> Option<(Wild, usize)> {
+    let mut rest = pattern.get(i..)?.chars();
+    let c = rest.next()?;
+    let after = i + c.len_utf8();
+    if Some(c) == escape
+        && let Some(lit) = rest.next()
+    {
+        return Some((Wild::Lit(lit), after + lit.len_utf8()));
     }
-    // Greedy matching with backtracking on the last `%`.
+    Some((
+        match c {
+            '%' => Wild::Any,
+            '_' => Wild::One,
+            c => Wild::Lit(c),
+        },
+        after,
+    ))
+}
+
+/// Steps of [`like`] between two readings of the deadline.
+const LIKE_STEPS: u32 = 1 << 20;
+
+fn like_at(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
+    // Greedy matching with backtracking on the last `%`: positions in bytes.
     let (mut si, mut ti) = (0, 0);
     let (mut star, mut mark) = (None, 0);
-    while si < s.len() {
-        match toks.get(ti) {
-            Some(T::Lit(c)) if *c == s[si] => {
-                si += 1;
-                ti += 1;
+    let mut steps = 0u32;
+    while let Some(c) = s.get(si..).and_then(|rest| rest.chars().next()) {
+        steps = steps.wrapping_add(1);
+        if steps.is_multiple_of(LIKE_STEPS)
+            && let Some(limits) = limits::at_work()
+        {
+            limits.check_time()?;
+        }
+        match wild(pattern, ti, escape) {
+            Some((Wild::Lit(l), next)) if l == c => {
+                si += c.len_utf8();
+                ti = next;
             }
-            Some(T::One) => {
-                si += 1;
-                ti += 1;
+            Some((Wild::One, next)) => {
+                si += c.len_utf8();
+                ti = next;
             }
-            Some(T::Any) => {
-                star = Some(ti);
+            Some((Wild::Any, next)) => {
+                star = Some(next);
                 mark = si;
-                ti += 1;
+                ti = next;
             }
             _ => match star {
-                Some(st) => {
-                    ti = st + 1;
-                    mark += 1;
+                Some(after) => {
+                    ti = after;
+                    mark += s[mark..].chars().next().map_or(1, char::len_utf8);
                     si = mark;
                 }
-                None => return false,
+                None => return Ok(false),
             },
         }
     }
-    toks[ti..].iter().all(|t| *t == T::Any)
+    // What is left of the pattern must match the empty text.
+    while let Some((t, next)) = wild(pattern, ti, escape) {
+        if t != Wild::Any {
+            return Ok(false);
+        }
+        ti = next;
+    }
+    Ok(true)
 }
 
 /// A key for grouping, DISTINCT and hash joins: equal values, equal keys
@@ -647,8 +698,8 @@ pub(crate) fn set_returning(name: &str, arg: &Value) -> Result<Vec<Value>> {
     let doc = match arg {
         Value::Null => return Ok(Vec::new()),
         Value::Json(j) => j.clone(),
-        other => serde_json::from_str(&text_arg(other).unwrap_or_default())
-            .map_err(|_| conversion(format!("{name}(): not JSON")))?,
+        other => json_of(&format!("{name}()"), &text_arg(other).unwrap_or_default())?
+            .ok_or_else(|| conversion(format!("{name}(): not JSON")))?,
     };
     let Json::Array(items) = doc else {
         return Err(conversion(format!("{name}(): cannot extract elements from a JSON value that is not an array")));
@@ -684,11 +735,23 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 }));
             }
             let Some(s) = text_arg(&a[0]) else { return Ok(Value::Null) };
-            let chars: Option<Vec<char>> = a.get(1).and_then(text_arg).map(|c| c.chars().collect());
+            // The characters to trim, each once: the text giving them may be long.
+            let chars: Option<std::collections::BTreeSet<char>> =
+                a.get(1).and_then(text_arg).map(|c| c.chars().collect());
             let set = |c: char| chars.as_ref().map_or(c.is_whitespace(), |cs| cs.contains(&c));
             match name {
-                "lower" => Value::Text(s.to_lowercase()),
-                "upper" => Value::Text(s.to_uppercase()),
+                "lower" | "upper" => {
+                    // A character may become up to three (`ß` gives `SS`).
+                    if s.len() > MAX_TEXT / 3 {
+                        let grown: usize = if name == "lower" {
+                            s.chars().flat_map(char::to_lowercase).map(char::len_utf8).sum()
+                        } else {
+                            s.chars().flat_map(char::to_uppercase).map(char::len_utf8).sum()
+                        };
+                        text_fits(&format!("{name}()"), grown)?;
+                    }
+                    Value::Text(if name == "lower" { s.to_lowercase() } else { s.to_uppercase() })
+                }
                 "length" | "char_length" | "character_length" => match &a[0] {
                     Value::Bytes(b) => Value::I64(b.len() as i64),
                     _ => Value::I64(s.chars().count() as i64),
@@ -727,7 +790,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 }
                 _ => Value::Text(match &a[0] {
                     Value::Text(t) => {
-                        text_fits("quote()", t.len().saturating_mul(2))?;
+                        text_fits("quote()", t.len().saturating_mul(2).saturating_add(2))?;
                         format!("'{}'", t.replace('\'', "''"))
                     }
                     _ => s,
@@ -739,7 +802,7 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             if null_in() {
                 return Ok(Value::Null);
             }
-            let s: Vec<char> = text_arg(&a[0]).unwrap_or_default().chars().collect();
+            let s = text_arg(&a[0]).unwrap_or_default();
             let start = int_arg(name, &a[1])?.unwrap_or(1);
             let len = match a.get(2) {
                 Some(v) => int_arg(name, v)?,
@@ -748,21 +811,29 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             // 1-based; a start of 0 or less eats into the length, as in SQL.
             let from = usize::try_from(start.saturating_sub(1).max(0)).unwrap_or(usize::MAX);
             let end = match len {
-                Some(l) => usize::try_from(start.saturating_sub(1).saturating_add(l).max(0))
-                    .unwrap_or(usize::MAX)
-                    .min(s.len()),
-                None => s.len(),
+                Some(l) => usize::try_from(start.saturating_sub(1).saturating_add(l).max(0)).unwrap_or(usize::MAX),
+                None => usize::MAX,
             };
-            Value::Text(if from >= end { String::new() } else { s[from..end].iter().collect() })
+            // Characters `from` to `end`, found in place.
+            if from >= end {
+                return Ok(Value::Text(String::new()));
+            }
+            let first = char_at(&s, from);
+            let last = first + char_at(&s[first..], end - from);
+            Value::Text(s[first..last].to_owned())
         }
         "left" | "right" => {
             arg_count(name, a, 2, 2)?;
             if null_in() {
                 return Ok(Value::Null);
             }
-            let s: Vec<char> = text_arg(&a[0]).unwrap_or_default().chars().collect();
-            let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX).min(s.len());
-            Value::Text(if name == "left" { s[..n].iter().collect() } else { s[s.len() - n..].iter().collect() })
+            let s = text_arg(&a[0]).unwrap_or_default();
+            let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+            Value::Text(if name == "left" {
+                s[..char_at(&s, n)].to_owned()
+            } else {
+                s[char_at(&s, s.chars().count().saturating_sub(n))..].to_owned()
+            })
         }
         "replace" => {
             arg_count(name, a, 3, 3)?;
@@ -798,16 +869,16 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let text = text_arg(&a[0]).unwrap_or_default();
-            let s: Vec<char> = text.chars().collect();
+            let chars = text.chars().count();
             let n = usize::try_from(int_arg(name, &a[1])?.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
-            let fill: Vec<char> = a.get(2).and_then(text_arg).unwrap_or_else(|| " ".into()).chars().collect();
-            if n <= s.len() || fill.is_empty() {
-                return Ok(Value::Text(s[..n.min(s.len())].iter().collect()));
+            let fill = a.get(2).and_then(text_arg).unwrap_or_else(|| " ".into());
+            if n <= chars || fill.is_empty() {
+                return Ok(Value::Text(text[..char_at(&text, n)].to_owned()));
             }
             // The length asked for is the caller's: the size is known before the padding is built.
-            let widest = fill.iter().map(|c| c.len_utf8()).max().unwrap_or(1);
-            text_fits(&format!("{name}()"), text.len().saturating_add((n - s.len()).saturating_mul(widest)))?;
-            let pad: String = fill.iter().cycle().take(n - s.len()).collect();
+            let widest = fill.chars().map(char::len_utf8).max().unwrap_or(1);
+            text_fits(&format!("{name}()"), text.len().saturating_add((n - chars).saturating_mul(widest)))?;
+            let pad: String = fill.chars().cycle().take(n - chars).collect();
             Value::Text(if name == "lpad" { pad + &text } else { text + &pad })
         }
         "repeat" => {
@@ -1021,8 +1092,8 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             }
             let doc = match &a[0] {
                 Value::Json(j) => j.clone(),
-                other => serde_json::from_str(&text_arg(other).unwrap_or_default())
-                    .map_err(|_| conversion(format!("{name}(): not JSON")))?,
+                other => json_of(&format!("{name}()"), &text_arg(other).unwrap_or_default())?
+                    .ok_or_else(|| conversion(format!("{name}(): not JSON")))?,
             };
             json_path(&doc, &text_arg(&a[1]).unwrap_or_default()).map_or(Value::Null, json_value)
         }
@@ -1030,8 +1101,8 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
             arg_count(name, a, 1, 1)?;
             match &a[0] {
                 Value::Json(Json::Array(l)) => Value::I64(l.len() as i64),
-                Value::Text(t) => match serde_json::from_str::<Json>(t) {
-                    Ok(Json::Array(l)) => Value::I64(l.len() as i64),
+                Value::Text(t) => match json_of("json_array_length()", t)? {
+                    Some(Json::Array(l)) => Value::I64(l.len() as i64),
                     _ => Value::Null,
                 },
                 _ => Value::Null,
@@ -1140,12 +1211,17 @@ mod tests {
         assert_eq!(cast(&Value::F64(2.9), ColumnType::BigInt).unwrap(), Value::I64(2));
         assert!(cast(&Value::Text("x".into()), ColumnType::Int).is_err());
         assert!(
-            like("Hello", "H%o", false, None)
-                && like("Hello", "h_LLO", true, None)
-                && !like("Hello", "h%", false, None)
+            like("Hello", "H%o", false, None).unwrap()
+                && like("Hello", "h_LLO", true, None).unwrap()
+                && !like("Hello", "h%", false, None).unwrap()
         );
-        assert!(like("50%", "50!%", false, Some('!')) && !like("500", "50!%", false, Some('!')));
-        assert!(like("abc", "%", false, None) && like("", "%", false, None) && !like("abc", "%d%", false, None));
+        assert!(like("50%", "50!%", false, Some('!')).unwrap() && !like("500", "50!%", false, Some('!')).unwrap());
+        let l = |s: &str, p: &str| like(s, p, false, None).unwrap();
+        assert!(l("abc", "%") && l("", "%") && !l("abc", "%d%"));
+        // Characters of several bytes, `_` and `%` around them, an escape at the end.
+        assert!(l("héllo wörld", "h_llo w%d") && l("日本語", "_本%") && !l("日本語", "__") && l("é", "%%é%"));
+        assert!(like("a!", "a!", false, Some('!')).unwrap() && !like("a%", "a!", false, Some('!')).unwrap());
+        assert!(l("aaa", "%a") && !l("aab", "%a") && l("mississippi", "%iss%pi") && !l("", "_"));
         let (mut k1, mut k2) = (String::new(), String::new());
         key(&Value::I32(1), &mut k1);
         key(&Value::F64(1.0), &mut k2);
