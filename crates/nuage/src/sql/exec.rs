@@ -160,7 +160,14 @@ pub(crate) struct Runner<'a> {
     cache: RefCell<HashMap<u64, Rc<Rows>>>,
     /// The memory and the time the statements may take.
     limits: Rc<Limits>,
+    /// Levels of [`Runner::to_m`] at work (see [`M_DEPTH`]).
+    m_depth: Cell<usize>,
 }
+
+/// How deep a condition handed to Memoire may be. Its evaluator calls itself
+/// once per level with larger frames than this module's: a deeper condition
+/// is evaluated here.
+const M_DEPTH: usize = 24;
 
 /// The conditions `e` is the `AND` of.
 fn conj<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
@@ -228,6 +235,9 @@ struct Joined {
     failed: Vec<bool>,
 }
 
+/// The rows of a group.
+type Group = Vec<Vec<Value>>;
+
 /// What a key of a group, of `DISTINCT` or of a hash join takes beside its text.
 const KEY_BYTES: usize = 48;
 
@@ -284,6 +294,33 @@ fn unique_headers(names: Vec<(String, Option<String>)>) -> Vec<String> {
     out
 }
 
+/// A column of `scope` for Memoire (of part `only`, when given), or one of
+/// the enclosing row's as a value.
+fn m_column(
+    table: Option<&str>,
+    name: &str,
+    scope: &Scope,
+    only: Option<usize>,
+    outer: Option<&Env<'_>>,
+    used: &Cell<bool>,
+) -> Option<M> {
+    match scope.find(table, name).ok()? {
+        Some((p, c)) => {
+            if only.is_some_and(|o| o != p) {
+                return None;
+            }
+            let schema = scope.parts[p].schema?;
+            let col = &schema.columns[c];
+            Some(M::Column(ColumnRef { table: schema.name, name: col.name, index: c, kind: col.kind }))
+        }
+        None => {
+            let v = outer?.lookup(table, name).ok()?;
+            used.set(true);
+            Some(M::Value(v))
+        }
+    }
+}
+
 impl<'a> Runner<'a> {
     /// A runner with the limits the settings give (see [`super::limits`]).
     pub(crate) fn new(tx: &'a EmbeddedTransaction, schemas: &'a SchemaCache, params: &'a [Value]) -> Self {
@@ -297,7 +334,7 @@ impl<'a> Runner<'a> {
         params: &'a [Value],
         limits: Rc<Limits>,
     ) -> Self {
-        Runner { tx, schemas, params, cache: RefCell::new(HashMap::new()), limits }
+        Runner { tx, schemas, params, cache: RefCell::new(HashMap::new()), limits, m_depth: Cell::new(0) }
     }
 
     /// The schema of a table (its name in any case).
@@ -320,162 +357,224 @@ impl<'a> Runner<'a> {
     // Expressions
     // -----------------------------------------------------------------------
 
+    /// The value of `e`. Each kind of expression is computed by a function of
+    /// its own: an expression inside another is computed by calling this one
+    /// again, and every level would otherwise pay on the stack for the
+    /// variables of every kind (unoptimized builds give each its own place).
     fn eval(&self, e: &Expr, env: &Env<'_>) -> Result<Value> {
-        Ok(match e {
-            Expr::Lit(v) => v.clone(),
-            Expr::Param(i) => self.param(*i)?,
-            Expr::Col { table, name } => env.lookup(table.as_deref(), name)?,
-            Expr::Neg(x) => {
-                let v = self.eval(x, env)?;
-                match v {
-                    // The smallest INT has no opposite among them.
-                    Value::I32(i) => i.checked_neg().map_or(Value::I64(-i64::from(i)), Value::I32),
-                    Value::F64(f) => Value::F64(-f),
-                    other => arith(Op::Sub, &Value::I64(0), &other)?,
-                }
-            }
-            Expr::Not(x) => bool_or_null(tri(&self.eval(x, env)?).map(|b| !b)),
-            Expr::Chain(first, rest) => self.chain(first, rest, env)?,
-            Expr::Bin(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge), a, b) => {
-                let (l, r) = (self.eval(a, env)?, self.eval(b, env)?);
-                if l.is_null() || r.is_null() {
-                    return Ok(Value::Null);
-                }
-                let ord = compare(&l, &r);
-                Value::Bool(match (op, ord) {
-                    (Op::Ne, None) => true,
-                    (_, None) => false,
-                    (Op::Eq, Some(o)) => o.is_eq(),
-                    (Op::Ne, Some(o)) => !o.is_eq(),
-                    (Op::Lt, Some(o)) => o.is_lt(),
-                    (Op::Le, Some(o)) => o.is_le(),
-                    (Op::Gt, Some(o)) => o.is_gt(),
-                    (_, Some(o)) => o.is_ge(),
-                })
-            }
-            Expr::Bin(op, a, b) => arith(*op, &self.eval(a, env)?, &self.eval(b, env)?)?,
-            Expr::IsNull(x, negated) => Value::Bool(self.eval(x, env)?.is_null() != *negated),
-            Expr::In(x, list, negated) => {
-                let v = self.eval(x, env)?;
-                let mut values = Vec::with_capacity(list.len());
-                for item in list {
-                    values.push(self.eval(item, env)?);
-                }
-                in_values(&v, &values, *negated)
-            }
-            Expr::InSelect(x, sub, negated) => {
-                let v = self.eval(x, env)?;
-                let rows = self.subquery(sub, env)?;
-                if rows.columns.len() != 1 {
-                    return Err(syntax("the subquery of IN must return one column"));
-                }
-                let values: Vec<Value> = rows.rows.iter().map(|r| r[0].clone()).collect();
-                in_values(&v, &values, *negated)
-            }
-            Expr::Exists(sub, negated) => Value::Bool(self.subquery(sub, env)?.rows.is_empty() == *negated),
-            Expr::Scalar(sub) => {
-                let rows = self.subquery(sub, env)?;
-                if rows.columns.len() != 1 {
-                    return Err(syntax("a subquery used as a value must return one column"));
-                }
-                rows.rows.first().map_or(Value::Null, |r| r[0].clone())
-            }
-            Expr::Between(x, low, high, negated) => {
-                let (v, l, h) = (self.eval(x, env)?, self.eval(low, env)?, self.eval(high, env)?);
-                if v.is_null() || l.is_null() || h.is_null() {
-                    return Ok(Value::Null);
-                }
-                let inside = compare(&v, &l).is_some_and(|o| o.is_ge()) && compare(&v, &h).is_some_and(|o| o.is_le());
-                Value::Bool(inside != *negated)
-            }
+        match e {
+            Expr::Lit(v) => Ok(v.clone()),
+            Expr::Param(i) => self.param(*i),
+            Expr::Col { table, name } => env.lookup(table.as_deref(), name),
+            Expr::Neg(x) => self.neg(x, env),
+            Expr::Not(x) => self.not(x, env),
+            Expr::Chain(first, rest) => self.chain(first, rest, env),
+            Expr::Bin(op, a, b) => self.binary(*op, a, b, env),
+            Expr::IsNull(x, negated) => self.is_null(x, *negated, env),
+            Expr::In(x, list, negated) => self.in_list(x, list, *negated, env),
+            Expr::InSelect(x, sub, negated) => self.in_select(x, sub, *negated, env),
+            Expr::Exists(sub, negated) => self.exists(sub, *negated, env),
+            Expr::Scalar(sub) => self.scalar_subquery(sub, env),
+            Expr::Between(x, low, high, negated) => self.between(x, low, high, *negated, env),
             Expr::Like { expr, pattern, ci, negated, escape } => {
-                let (s, p) = (self.eval(expr, env)?, self.eval(pattern, env)?);
-                let (Some(s), Some(p)) = (v::to_text(&s), v::to_text(&p)) else { return Ok(Value::Null) };
-                let esc = match escape {
-                    Some(e) => v::to_text(&self.eval(e, env)?).and_then(|t| t.chars().next()),
-                    None => None,
-                };
-                Value::Bool(v::like(&s, &p, *ci, esc) != *negated)
+                self.like(expr, pattern, *ci, *negated, escape.as_deref(), env)
             }
-            Expr::Case { operand, whens, otherwise } => {
-                let subject = match operand {
-                    Some(o) => Some(self.eval(o, env)?),
-                    None => None,
-                };
-                for (w, then) in whens {
-                    let hit = match &subject {
-                        Some(s) => compare(s, &self.eval(w, env)?).is_some_and(|o| o.is_eq()),
-                        None => truthy(&self.eval(w, env)?),
-                    };
-                    if hit {
-                        return self.eval(then, env);
-                    }
-                }
-                match otherwise {
-                    Some(o) => self.eval(o, env)?,
-                    None => Value::Null,
-                }
-            }
-            Expr::Cast(x, kind) => cast(&self.eval(x, env)?, *kind)?,
-            Expr::Func { .. } if e.is_aggregate() => self.aggregate(e, env)?,
-            Expr::Func { name, args, .. } => {
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.eval(a, env)?);
-                }
-                v::scalar(name, values)?
-            }
+            Expr::Case { operand, whens, otherwise } => self.case(operand.as_deref(), whens, otherwise.as_deref(), env),
+            Expr::Cast(x, kind) => self.cast(x, *kind, env),
+            Expr::Func { .. } if e.is_aggregate() => self.aggregate(e, env),
+            Expr::Func { name, args, .. } => self.call(name, args, env),
+        }
+    }
+
+    fn neg(&self, x: &Expr, env: &Env<'_>) -> Result<Value> {
+        Ok(match self.eval(x, env)? {
+            // The smallest INT has no opposite among them.
+            Value::I32(i) => i.checked_neg().map_or(Value::I64(-i64::from(i)), Value::I32),
+            Value::F64(f) => Value::F64(-f),
+            other => arith(Op::Sub, &Value::I64(0), &other)?,
         })
+    }
+
+    fn not(&self, x: &Expr, env: &Env<'_>) -> Result<Value> {
+        Ok(bool_or_null(tri(&self.eval(x, env)?).map(|b| !b)))
+    }
+
+    fn binary(&self, op: Op, a: &Expr, b: &Expr, env: &Env<'_>) -> Result<Value> {
+        let (l, r) = (self.eval(a, env)?, self.eval(b, env)?);
+        if !matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+            return arith(op, &l, &r);
+        }
+        if l.is_null() || r.is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(Value::Bool(match (op, compare(&l, &r)) {
+            (Op::Ne, None) => true,
+            (_, None) => false,
+            (Op::Eq, Some(o)) => o.is_eq(),
+            (Op::Ne, Some(o)) => !o.is_eq(),
+            (Op::Lt, Some(o)) => o.is_lt(),
+            (Op::Le, Some(o)) => o.is_le(),
+            (Op::Gt, Some(o)) => o.is_gt(),
+            (_, Some(o)) => o.is_ge(),
+        }))
+    }
+
+    fn is_null(&self, x: &Expr, negated: bool, env: &Env<'_>) -> Result<Value> {
+        Ok(Value::Bool(self.eval(x, env)?.is_null() != negated))
+    }
+
+    fn in_list(&self, x: &Expr, list: &[Expr], negated: bool, env: &Env<'_>) -> Result<Value> {
+        let v = self.eval(x, env)?;
+        let mut values = Vec::with_capacity(list.len());
+        for item in list {
+            values.push(self.eval(item, env)?);
+        }
+        Ok(in_values(&v, &values, negated))
+    }
+
+    fn in_select(&self, x: &Expr, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
+        let v = self.eval(x, env)?;
+        let rows = self.subquery(sub, env)?;
+        if rows.columns.len() != 1 {
+            return Err(syntax("the subquery of IN must return one column"));
+        }
+        let values: Vec<Value> = rows.rows.iter().map(|r| r[0].clone()).collect();
+        Ok(in_values(&v, &values, negated))
+    }
+
+    fn exists(&self, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
+        Ok(Value::Bool(self.subquery(sub, env)?.rows.is_empty() == negated))
+    }
+
+    fn scalar_subquery(&self, sub: &Select, env: &Env<'_>) -> Result<Value> {
+        let rows = self.subquery(sub, env)?;
+        if rows.columns.len() != 1 {
+            return Err(syntax("a subquery used as a value must return one column"));
+        }
+        Ok(rows.rows.first().map_or(Value::Null, |r| r[0].clone()))
+    }
+
+    fn between(&self, x: &Expr, low: &Expr, high: &Expr, negated: bool, env: &Env<'_>) -> Result<Value> {
+        let (v, l, h) = (self.eval(x, env)?, self.eval(low, env)?, self.eval(high, env)?);
+        if v.is_null() || l.is_null() || h.is_null() {
+            return Ok(Value::Null);
+        }
+        let inside = compare(&v, &l).is_some_and(|o| o.is_ge()) && compare(&v, &h).is_some_and(|o| o.is_le());
+        Ok(Value::Bool(inside != negated))
+    }
+
+    fn like(
+        &self,
+        expr: &Expr,
+        pattern: &Expr,
+        ci: bool,
+        negated: bool,
+        escape: Option<&Expr>,
+        env: &Env<'_>,
+    ) -> Result<Value> {
+        let (s, p) = (self.eval(expr, env)?, self.eval(pattern, env)?);
+        let (Some(s), Some(p)) = (v::to_text(&s), v::to_text(&p)) else { return Ok(Value::Null) };
+        let esc = match escape {
+            Some(e) => v::to_text(&self.eval(e, env)?).and_then(|t| t.chars().next()),
+            None => None,
+        };
+        Ok(Value::Bool(v::like(&s, &p, ci, esc)? != negated))
+    }
+
+    fn case(
+        &self,
+        operand: Option<&Expr>,
+        whens: &[(Expr, Expr)],
+        otherwise: Option<&Expr>,
+        env: &Env<'_>,
+    ) -> Result<Value> {
+        let subject = match operand {
+            Some(o) => Some(self.eval(o, env)?),
+            None => None,
+        };
+        for (w, then) in whens {
+            let hit = match &subject {
+                Some(s) => compare(s, &self.eval(w, env)?).is_some_and(|o| o.is_eq()),
+                None => truthy(&self.eval(w, env)?),
+            };
+            if hit {
+                return self.eval(then, env);
+            }
+        }
+        match otherwise {
+            Some(o) => self.eval(o, env),
+            None => Ok(Value::Null),
+        }
+    }
+
+    fn cast(&self, x: &Expr, kind: ColumnType, env: &Env<'_>) -> Result<Value> {
+        cast(&self.eval(x, env)?, kind)
+    }
+
+    fn call(&self, name: &str, args: &[Expr], env: &Env<'_>) -> Result<Value> {
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            values.push(self.eval(a, env)?);
+        }
+        v::scalar(name, values)
     }
 
     /// `first op x op y ...`, from the left, in a loop: a long list takes no
     /// more of the stack than a short one.
     fn chain(&self, first: &Expr, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
-        let mut acc = self.eval(first, env)?;
-        Ok(match rest.first().map(|(op, _)| *op) {
-            // `AND`: false as soon as an operand is (the others are not
-            // evaluated), NULL when one is unknown and none is false.
-            Some(Op::And) => {
-                let mut all = tri(&acc);
-                for (_, x) in rest {
-                    if all == Some(false) {
-                        break;
-                    }
-                    all = match (all, tri(&self.eval(x, env)?)) {
-                        (_, Some(false)) => Some(false),
-                        (Some(true), Some(true)) => Some(true),
-                        _ => None,
-                    };
-                }
-                bool_or_null(all)
+        let acc = self.eval(first, env)?;
+        match rest.first().map(|(op, _)| *op) {
+            Some(Op::And) => self.all(acc, rest, env),
+            Some(Op::Or) => self.any(acc, rest, env),
+            _ => self.fold(acc, rest, env),
+        }
+    }
+
+    /// `AND`: false as soon as an operand is (the others are not evaluated),
+    /// NULL when one is unknown and none is false.
+    fn all(&self, first: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        let mut all = tri(&first);
+        for (_, x) in rest {
+            if all == Some(false) {
+                break;
             }
-            Some(Op::Or) => {
-                let mut any = tri(&acc);
-                for (_, x) in rest {
-                    if any == Some(true) {
-                        break;
-                    }
-                    any = match (any, tri(&self.eval(x, env)?)) {
-                        (_, Some(true)) => Some(true),
-                        (Some(false), Some(false)) => Some(false),
-                        _ => None,
-                    };
-                }
-                bool_or_null(any)
+            all = match (all, tri(&self.eval(x, env)?)) {
+                (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+        }
+        Ok(bool_or_null(all))
+    }
+
+    /// `OR`: true as soon as an operand is, NULL when one is unknown and none is true.
+    fn any(&self, first: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        let mut any = tri(&first);
+        for (_, x) in rest {
+            if any == Some(true) {
+                break;
             }
-            _ => {
-                for (op, x) in rest {
-                    acc = match (op, x.interval()) {
-                        // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`.
-                        (Op::Add, Some(span)) => v::shift(&acc, span, 1)?,
-                        (Op::Sub, Some(span)) => v::shift(&acc, span, -1)?,
-                        (Op::Concat, _) => v::concat(acc, &self.eval(x, env)?)?,
-                        _ => arith(*op, &acc, &self.eval(x, env)?)?,
-                    };
-                }
-                acc
-            }
-        })
+            any = match (any, tri(&self.eval(x, env)?)) {
+                (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
+        Ok(bool_or_null(any))
+    }
+
+    /// Arithmetic and `||`, from the left.
+    fn fold(&self, mut acc: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        for (op, x) in rest {
+            acc = match (op, x.interval()) {
+                // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`.
+                (Op::Add, Some(span)) => v::shift(&acc, span, 1)?,
+                (Op::Sub, Some(span)) => v::shift(&acc, span, -1)?,
+                (Op::Concat, _) => v::concat(acc, &self.eval(x, env)?)?,
+                _ => arith(*op, &acc, &self.eval(x, env)?)?,
+            };
+        }
+        Ok(acc)
     }
 
     fn aggregate(&self, e: &Expr, env: &Env<'_>) -> Result<Value> {
@@ -615,143 +714,240 @@ impl<'a> Runner<'a> {
         outer: Option<&Env<'_>>,
         used: &Cell<bool>,
     ) -> Option<M> {
-        Some(match e {
-            Expr::Lit(v) => M::Value(v.clone()),
-            Expr::Param(i) => M::Value(self.param(*i).ok()?),
-            Expr::Col { table, name } => match scope.find(table.as_deref(), name).ok()? {
-                Some((p, c)) => {
-                    if only.is_some_and(|o| o != p) {
-                        return None;
-                    }
-                    let schema = scope.parts[p].schema?;
-                    let col = &schema.columns[c];
-                    M::Column(ColumnRef { table: schema.name, name: col.name, index: c, kind: col.kind })
-                }
-                None => {
-                    let o = outer?;
-                    let v = o.lookup(table.as_deref(), name).ok()?;
-                    used.set(true);
-                    M::Value(v)
-                }
-            },
-            Expr::Not(x) => M::Not(Box::new(self.to_m(x, scope, only, outer, used)?)),
-            Expr::IsNull(x, negated) => {
-                M::IsNull { expr: Box::new(self.to_m(x, scope, only, outer, used)?), negated: *negated }
-            }
-            Expr::Bin(op, a, b) => {
-                let op = match op {
-                    Op::Eq => BinOp::Eq,
-                    Op::Ne => BinOp::Ne,
-                    Op::Lt => BinOp::Lt,
-                    Op::Le => BinOp::Le,
-                    Op::Gt => BinOp::Gt,
-                    Op::Ge => BinOp::Ge,
-                    _ => return None,
-                };
-                m_pair(op, self.to_m(a, scope, only, outer, used)?, self.to_m(b, scope, only, outer, used)?)?
-            }
-            Expr::Chain(first, rest) => {
-                let op = match rest.first()?.0 {
-                    Op::And => BinOp::And,
-                    Op::Or => BinOp::Or,
-                    _ => return None,
-                };
-                let mut parts = Vec::with_capacity(rest.len() + 1);
-                parts.push(self.to_m(first, scope, only, outer, used)?);
-                for (_, x) in rest {
-                    parts.push(self.to_m(x, scope, only, outer, used)?);
-                }
-                // `id = 1 OR id = 2 OR ...`: `id IN (1, 2, ...)`, which an index serves.
-                if op == BinOp::Or
-                    && let Some(list) = one_column_among(&parts)
-                {
-                    return Some(list);
-                }
-                // The first two as a pair (a value beside a column takes its type), the others after.
-                let mut parts = parts.into_iter();
-                let mut joined = vec![m_pair(op, parts.next()?, parts.next()?)?];
-                joined.extend(parts);
-                balanced(op, joined)?
-            }
-            Expr::In(x, list, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                let mut values = Vec::with_capacity(list.len());
-                for item in list {
-                    let M::Value(v) = self.to_m(item, scope, only, outer, used)? else { return None };
-                    if v.is_null() {
-                        return None;
-                    }
-                    values.push(coerce(&v, c.kind)?);
-                }
-                M::InList { expr: Box::new(M::Column(c)), list: values, negated: *negated }
-            }
-            Expr::InSelect(x, sub, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                // Run it first (once), and look the values up: an index serves them.
-                let env = Env {
-                    scope: &Scope::default(),
-                    row: &[],
-                    tail: &[],
-                    group: None,
-                    outer,
-                    used_outer: used,
-                    output: None,
-                };
-                let rows = self.subquery(sub, &env).ok()?;
-                if rows.columns.len() != 1 || rows.rows.iter().any(|r| r[0].is_null()) {
-                    return None;
-                }
-                let list = rows.rows.iter().map(|r| coerce(&r[0], c.kind)).collect::<Option<Vec<_>>>()?;
-                M::InList { expr: Box::new(M::Column(c)), list, negated: *negated }
-            }
+        let depth = self.m_depth.get();
+        if depth >= M_DEPTH {
+            return None;
+        }
+        self.m_depth.set(depth + 1);
+        let m = self.m_expr(e, scope, only, outer, used);
+        self.m_depth.set(depth);
+        m
+    }
+
+    /// [`Runner::to_m`], one function per kind of expression as for [`Runner::eval`].
+    fn m_expr(
+        &self,
+        e: &Expr,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        match e {
+            Expr::Lit(v) => Some(M::Value(v.clone())),
+            Expr::Param(i) => Some(M::Value(self.param(*i).ok()?)),
+            Expr::Col { table, name } => m_column(table.as_deref(), name, scope, only, outer, used),
+            Expr::Not(x) => Some(M::Not(Box::new(self.to_m(x, scope, only, outer, used)?))),
+            Expr::IsNull(x, negated) => self.m_is_null(x, *negated, scope, only, outer, used),
+            Expr::Bin(op, a, b) => self.m_compare(*op, a, b, scope, only, outer, used),
+            Expr::Chain(first, rest) => self.m_logic(first, rest, scope, only, outer, used),
+            Expr::In(x, list, negated) => self.m_in(x, list, *negated, scope, only, outer, used),
+            Expr::InSelect(x, sub, negated) => self.m_in_select(x, sub, *negated, scope, only, outer, used),
             Expr::Between(x, low, high, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                let (M::Value(l), M::Value(h)) =
-                    (self.to_m(low, scope, only, outer, used)?, self.to_m(high, scope, only, outer, used)?)
-                else {
-                    return None;
-                };
-                M::Between {
-                    expr: Box::new(M::Column(c)),
-                    low: Box::new(M::Value(coerce(&l, c.kind)?)),
-                    high: Box::new(M::Value(coerce(&h, c.kind)?)),
-                    negated: *negated,
-                }
+                self.m_between([&**x, &**low, &**high], *negated, scope, only, outer, used)
             }
             Expr::Like { expr, pattern, ci, negated, escape: None } => {
-                let M::Column(c) = self.to_m(expr, scope, only, outer, used)? else { return None };
-                if c.kind != ColumnType::Text {
-                    return None;
-                }
-                let M::Value(Value::Text(p)) = self.to_m(pattern, scope, only, outer, used)? else { return None };
-                if p.contains('\\') {
-                    return None;
-                }
-                M::Like {
-                    expr: Box::new(M::Column(c)),
-                    pattern: Box::new(M::Value(Value::Text(p))),
-                    case_insensitive: *ci,
-                    negated: *negated,
-                    escaped: false,
-                }
+                self.m_like(expr, pattern, *ci, *negated, scope, only, outer, used)
             }
             Expr::Func { name, args, distinct, star } if e.is_aggregate() => {
-                let func = match name.as_str() {
-                    "count" => AggFunc::Count,
-                    "sum" => AggFunc::Sum,
-                    "avg" => AggFunc::Avg,
-                    "min" => AggFunc::Min,
-                    "max" => AggFunc::Max,
-                    _ => return None,
-                };
-                let arg = if *star { None } else { Some(Box::new(self.to_m(&args[0], scope, only, outer, used)?)) };
-                if arg.as_deref().is_some_and(|a| !matches!(a, M::Column(_))) {
-                    return None;
-                }
-                M::Aggregate { func, arg, distinct: *distinct }
+                self.m_aggregate(name, args.first(), *distinct, *star, scope, only, outer, used)
             }
+            _ => None,
+        }
+    }
+
+    fn m_is_null(
+        &self,
+        x: &Expr,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        Some(M::IsNull { expr: Box::new(self.to_m(x, scope, only, outer, used)?), negated })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_compare(
+        &self,
+        op: Op,
+        a: &Expr,
+        b: &Expr,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let op = match op {
+            Op::Eq => BinOp::Eq,
+            Op::Ne => BinOp::Ne,
+            Op::Lt => BinOp::Lt,
+            Op::Le => BinOp::Le,
+            Op::Gt => BinOp::Gt,
+            Op::Ge => BinOp::Ge,
             _ => return None,
+        };
+        m_pair(op, self.to_m(a, scope, only, outer, used)?, self.to_m(b, scope, only, outer, used)?)
+    }
+
+    /// `AND` and `OR` lists (Memoire has no arithmetic).
+    fn m_logic(
+        &self,
+        first: &Expr,
+        rest: &[(Op, Expr)],
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let op = match rest.first()?.0 {
+            Op::And => BinOp::And,
+            Op::Or => BinOp::Or,
+            _ => return None,
+        };
+        let mut parts = Vec::with_capacity(rest.len() + 1);
+        parts.push(self.to_m(first, scope, only, outer, used)?);
+        for (_, x) in rest {
+            parts.push(self.to_m(x, scope, only, outer, used)?);
+        }
+        // `id = 1 OR id = 2 OR ...`: `id IN (1, 2, ...)`, which an index serves.
+        if op == BinOp::Or
+            && let Some(list) = one_column_among(&parts)
+        {
+            return Some(list);
+        }
+        // The first two as a pair (a value beside a column takes its type), the others after.
+        let mut parts = parts.into_iter();
+        let mut joined = vec![m_pair(op, parts.next()?, parts.next()?)?];
+        joined.extend(parts);
+        balanced(op, joined)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_in(
+        &self,
+        x: &Expr,
+        list: &[Expr],
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        let mut values = Vec::with_capacity(list.len());
+        for item in list {
+            let M::Value(v) = self.to_m(item, scope, only, outer, used)? else { return None };
+            if v.is_null() {
+                return None;
+            }
+            values.push(coerce(&v, c.kind)?);
+        }
+        Some(M::InList { expr: Box::new(M::Column(c)), list: values, negated })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_in_select(
+        &self,
+        x: &Expr,
+        sub: &Select,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        // Run it first (once), and look the values up: an index serves them.
+        let env =
+            Env { scope: &Scope::default(), row: &[], tail: &[], group: None, outer, used_outer: used, output: None };
+        let rows = self.subquery(sub, &env).ok()?;
+        if rows.columns.len() != 1 || rows.rows.iter().any(|r| r[0].is_null()) {
+            return None;
+        }
+        let list = rows.rows.iter().map(|r| coerce(&r[0], c.kind)).collect::<Option<Vec<_>>>()?;
+        Some(M::InList { expr: Box::new(M::Column(c)), list, negated })
+    }
+
+    /// `x BETWEEN low AND high`, `[x, low, high]`.
+    fn m_between(
+        &self,
+        [x, low, high]: [&Expr; 3],
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        let (M::Value(l), M::Value(h)) =
+            (self.to_m(low, scope, only, outer, used)?, self.to_m(high, scope, only, outer, used)?)
+        else {
+            return None;
+        };
+        Some(M::Between {
+            expr: Box::new(M::Column(c)),
+            low: Box::new(M::Value(coerce(&l, c.kind)?)),
+            high: Box::new(M::Value(coerce(&h, c.kind)?)),
+            negated,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_like(
+        &self,
+        expr: &Expr,
+        pattern: &Expr,
+        ci: bool,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(expr, scope, only, outer, used)? else { return None };
+        if c.kind != ColumnType::Text {
+            return None;
+        }
+        let M::Value(Value::Text(p)) = self.to_m(pattern, scope, only, outer, used)? else { return None };
+        if p.contains('\\') {
+            return None;
+        }
+        Some(M::Like {
+            expr: Box::new(M::Column(c)),
+            pattern: Box::new(M::Value(Value::Text(p))),
+            case_insensitive: ci,
+            negated,
+            escaped: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_aggregate(
+        &self,
+        name: &str,
+        arg: Option<&Expr>,
+        distinct: bool,
+        star: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let func = match name {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return None,
+        };
+        let arg = if star { None } else { Some(Box::new(self.to_m(arg?, scope, only, outer, used)?)) };
+        if arg.as_deref().is_some_and(|a| !matches!(a, M::Column(_))) {
+            return None;
+        }
+        Some(M::Aggregate { func, arg, distinct })
     }
 
     /// The whole `SELECT` as one Memoire statement, when it can be.
@@ -973,10 +1169,9 @@ impl<'a> Runner<'a> {
                 let mut keys = Vec::new();
                 for o in &sel.order {
                     let i = match &o.expr {
-                        Expr::Lit(Value::I64(n)) => usize::try_from(*n)
-                            .ok()
-                            .and_then(|n| n.checked_sub(1))
-                            .filter(|i| *i < acc.columns.len()),
+                        Expr::Lit(Value::I64(n)) => {
+                            usize::try_from(*n).ok().and_then(|n| n.checked_sub(1)).filter(|i| *i < acc.columns.len())
+                        }
                         Expr::Col { name, .. } => acc.columns.iter().position(|c| c.eq_ignore_ascii_case(name)),
                         _ => None,
                     }
@@ -1156,11 +1351,8 @@ impl<'a> Runner<'a> {
             && matches!(core.items.as_slice(), [SelItem::Expr(Expr::Func { name, star: true, .. }, _)] if name == "count");
         // For each condition of WHERE, the last table it reads: a join applies it as
         // soon as that table is joined, instead of keeping rows it will refuse.
-        let reads: Vec<Option<usize>> = if lone {
-            Vec::new()
-        } else {
-            where_parts.iter().map(|w| self.last_part_read(w, &scope)).collect()
-        };
+        let reads: Vec<Option<usize>> =
+            if lone { Vec::new() } else { where_parts.iter().map(|w| self.last_part_read(w, &scope)).collect() };
         let last = refs.len().saturating_sub(1);
         let mut rows: Vec<Vec<Value>> = if refs.is_empty() { vec![Vec::new()] } else { Vec::new() };
         let mut held = self.limits.hold_rows(&rows)?;
@@ -1218,15 +1410,21 @@ impl<'a> Runner<'a> {
                 held = part_hold;
                 // What WHERE says of the first table alone, before its rows are joined
                 // (a condition that fails on a row is left for the whole rows, as in a join).
-                let now: Vec<usize> =
-                    (0..reads.len()).filter(|&i| !pushed[i] && reads[i] == Some(0)).collect();
+                let now: Vec<usize> = (0..reads.len()).filter(|&i| !pushed[i] && reads[i] == Some(0)).collect();
                 if !now.is_empty() {
                     let mut failed = vec![false; now.len()];
                     let mut kept = Vec::with_capacity(rows.len());
                     for r in rows {
                         self.limits.tick()?;
-                        let env =
-                            Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
+                        let env = Env {
+                            scope: &scope,
+                            row: &r,
+                            tail: &[],
+                            group: None,
+                            outer,
+                            used_outer: used,
+                            output: None,
+                        };
                         let mut keep = true;
                         for (n, &i) in now.iter().enumerate() {
                             match self.eval(where_parts[i], &env) {
@@ -1258,11 +1456,11 @@ impl<'a> Runner<'a> {
             // are left, in their order: the rows it gives are the rows of the result.
             // Before, those that read only the tables joined so far.
             let whole = p == last;
-            let now: Vec<usize> = (0..where_parts.len())
-                .filter(|&i| !pushed[i] && (whole || reads[i].is_some_and(|q| q <= p)))
-                .collect();
+            let now: Vec<usize> =
+                (0..where_parts.len()).filter(|&i| !pushed[i] && (whole || reads[i].is_some_and(|q| q <= p))).collect();
             let also: Vec<&Expr> = now.iter().map(|&i| where_parts[i]).collect();
-            let joined = self.join(&scope, p, &rows, &part_rows, join, &also, whole, whole && count_only, outer, used)?;
+            let joined =
+                self.join(&scope, p, &rows, &part_rows, join, &also, whole, whole && count_only, outer, used)?;
             for (&i, failed) in now.iter().zip(&joined.failed) {
                 pushed[i] = !failed;
             }
@@ -1288,8 +1486,7 @@ impl<'a> Runner<'a> {
             let mut kept = Vec::with_capacity(rows.len());
             for r in rows {
                 self.limits.tick()?;
-                let env =
-                    Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
+                let env = Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
                 let mut ok = true;
                 for w in &residual {
                     if tri(&self.eval(w, &env)?) != Some(true) {
@@ -1348,9 +1545,9 @@ impl<'a> Runner<'a> {
         let columns = unique_headers(names);
         // Groups: the rows of each, the first one being where its plain columns are read.
         let null_row = vec![Value::Null; scope.width];
-        let (rows, groups): (Vec<Vec<Value>>, Option<Vec<Vec<Vec<Value>>>>) = if grouped {
+        let (rows, groups): (Vec<Vec<Value>>, Option<Vec<Group>>) = if grouped {
             let mut index: HashMap<String, usize> = HashMap::new();
-            let mut groups: Vec<Vec<Vec<Value>>> = Vec::new();
+            let mut groups: Vec<Group> = Vec::new();
             for r in rows {
                 self.limits.tick()?;
                 let mut k = String::new();
@@ -1831,8 +2028,15 @@ impl<'a> Runner<'a> {
             let mut kept = Vec::new();
             for r in rows {
                 self.limits.tick()?;
-                let env =
-                    Env { scope: &scope, row: &r, tail: &[], group: None, outer: None, used_outer: &used, output: None };
+                let env = Env {
+                    scope: &scope,
+                    row: &r,
+                    tail: &[],
+                    group: None,
+                    outer: None,
+                    used_outer: &used,
+                    output: None,
+                };
                 let mut ok = true;
                 for w in &residual {
                     if tri(&self.eval(w, &env)?) != Some(true) {

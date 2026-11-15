@@ -40,9 +40,9 @@ mod ast;
 mod exec;
 mod lex;
 pub(crate) mod limits;
-mod parse;
 #[cfg(test)]
-mod probe;
+mod nesting;
+mod parse;
 #[cfg(feature = "server")]
 mod types;
 pub(crate) mod value;

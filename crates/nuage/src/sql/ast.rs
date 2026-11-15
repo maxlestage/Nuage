@@ -262,7 +262,7 @@ pub(crate) enum InsertSource {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stmt {
-    Select(Select),
+    Select(Box<Select>),
     Insert {
         table: String,
         columns: Option<Vec<String>>,

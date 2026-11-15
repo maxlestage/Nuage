@@ -106,11 +106,8 @@ impl Infer<'_, '_> {
                     self.set(first, after);
                     for (op, x) in rest {
                         self.set(x, before);
-                        before = if *op == Op::Concat {
-                            Some(ColumnType::Text)
-                        } else {
-                            before.or_else(|| self.type_of(x))
-                        };
+                        before =
+                            if *op == Op::Concat { Some(ColumnType::Text) } else { before.or_else(|| self.type_of(x)) };
                     }
                 }
                 self.expr(first);

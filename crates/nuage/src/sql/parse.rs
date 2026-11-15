@@ -64,10 +64,21 @@ const RESERVED: [&str; 46] = [
 /// (`a OR b OR c ...`, `IN (...)`) is not nested and has no limit.
 pub(crate) const MAX_NESTING: usize = 64;
 
+/// Statements nested up to this are read on the thread that asks for them;
+/// deeper ones, up to [`MAX_NESTING`], on a thread of their own with
+/// [`DEEP_STACK`]. Unoptimized, the parser takes some 20 KiB of stack per level
+/// (it goes down through every level of precedence), and statements are read
+/// on threads of 2 MiB that hold other frames already.
+const NESTING_HERE: usize = 16;
+
+/// The stack of the thread that reads a deeply nested statement: several
+/// times what the deepest one takes unoptimized. Only touched pages count.
+const DEEP_STACK: usize = 32 << 20;
+
 /// How tall an expression may be: the nodes from its top to its deepest
 /// operand, a subquery counting for [`SELECT_HEIGHT`] plus its own tallest
 /// expression. Evaluating, translating, copying and dropping an expression
-/// take one call per node on the way down.
+/// take one call per node on the way down, on the thread that runs it.
 pub(crate) const MAX_HEIGHT: usize = 200;
 
 /// What a `SELECT` inside another counts for in the height of an expression:
@@ -77,8 +88,8 @@ pub(crate) const SELECT_HEIGHT: usize = 16;
 /// The numbers of the `SELECT`s (see [`Select::id`]).
 static SELECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(crate) struct Parser {
-    toks: Vec<Tok>,
+pub(crate) struct Parser<'t> {
+    toks: &'t [Tok],
     at: usize,
     /// The next positional `?`.
     next_param: usize,
@@ -86,6 +97,10 @@ pub(crate) struct Parser {
     pub params_used: usize,
     /// Expressions and `SELECT`s open around what is being read.
     depth: usize,
+    /// How many may be open here ([`NESTING_HERE`] or [`MAX_NESTING`]).
+    nesting: usize,
+    /// The statement nests deeper than `nesting`, and less than [`MAX_NESTING`] might do.
+    deeper: bool,
     /// The height of the expression (or `SELECT`) read last.
     height: usize,
     /// The tallest expression read in the `SELECT` being read.
@@ -93,37 +108,62 @@ pub(crate) struct Parser {
 }
 
 fn too_deep() -> memoire_orm::Error {
-    syntax("the statement is nested too deeply (parentheses, subqueries, functions inside one another): write it in several statements")
+    syntax(
+        "the statement is nested too deeply (parentheses, subqueries, functions inside one another): write it in several statements",
+    )
+}
+
+/// `what` read from `toks`, on this thread; a statement nested deeper than
+/// [`NESTING_HERE`] is read again on a thread with a stack it fits in.
+fn read<T: Send>(toks: &[Tok], what: fn(&mut Parser<'_>) -> Result<T>) -> Result<T> {
+    let mut p = Parser::new(toks, NESTING_HERE);
+    match what(&mut p) {
+        Err(_) if p.deeper => {}
+        done => return done,
+    }
+    std::thread::scope(|s| {
+        let reader = std::thread::Builder::new()
+            .name("nuage-sql-parse".into())
+            .stack_size(DEEP_STACK)
+            .spawn_scoped(s, || what(&mut Parser::new(toks, MAX_NESTING)));
+        match reader {
+            Ok(reader) => reader.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            // No thread for it (the system is out of them): refused as too deep.
+            Err(_) => Err(too_deep()),
+        }
+    })
 }
 
 /// The statements of `src`, separated by `;`.
 pub(crate) fn parse(src: &str) -> Result<(Vec<Stmt>, usize)> {
-    let mut p = Parser::new(tokenize(src)?);
-    let mut out = Vec::new();
-    loop {
-        while p.sym(";") {}
-        if p.at >= p.toks.len() {
-            break;
+    read(&tokenize(src)?, |p| {
+        let mut out = Vec::new();
+        loop {
+            while p.sym(";") {}
+            if p.at >= p.toks.len() {
+                break;
+            }
+            out.push(p.statement()?);
+            if p.at < p.toks.len() && !p.sym(";") {
+                return Err(syntax(format!("unexpected {} after the statement", p.describe())));
+            }
         }
-        out.push(p.statement()?);
-        if p.at < p.toks.len() && !p.sym(";") {
-            return Err(syntax(format!("unexpected {} after the statement", p.describe())));
+        if out.is_empty() {
+            return Err(syntax("no statement"));
         }
-    }
-    if out.is_empty() {
-        return Err(syntax("no statement"));
-    }
-    Ok((out, p.params_used))
+        Ok((out, p.params_used))
+    })
 }
 
 /// One expression of SQL (a column's `DEFAULT`).
 pub(crate) fn parse_expr(src: &str) -> Result<Expr> {
-    let mut p = Parser::new(tokenize(src)?);
-    let e = p.expr()?;
-    if p.at < p.toks.len() {
-        return Err(syntax(format!("unexpected {}", p.describe())));
-    }
-    Ok(e)
+    read(&tokenize(src)?, |p| {
+        let e = p.expr()?;
+        if p.at < p.toks.len() {
+            return Err(syntax(format!("unexpected {}", p.describe())));
+        }
+        Ok(e)
+    })
 }
 
 /// A type name of SQL, as the wire protocol names it, and whether it means
@@ -170,14 +210,15 @@ pub(crate) fn column_type(kind: &str) -> ColumnType {
     }
 }
 
-impl Parser {
-    fn new(toks: Vec<Tok>) -> Parser {
-        Parser { toks, at: 0, next_param: 0, params_used: 0, depth: 0, height: 0, tallest: 0 }
+impl<'t> Parser<'t> {
+    fn new(toks: &'t [Tok], nesting: usize) -> Parser<'t> {
+        Parser { toks, at: 0, next_param: 0, params_used: 0, depth: 0, nesting, deeper: false, height: 0, tallest: 0 }
     }
 
     /// One more expression or `SELECT` open (closed by `self.depth -= 1`).
     fn open(&mut self) -> Result<()> {
-        if self.depth >= MAX_NESTING {
+        if self.depth >= self.nesting {
+            self.deeper = self.nesting < MAX_NESTING;
             return Err(too_deep());
         }
         self.depth += 1;
@@ -330,7 +371,7 @@ impl Parser {
     fn statement(&mut self) -> Result<Stmt> {
         let w = self.peek_word(0).unwrap_or_default();
         match w.as_str() {
-            "select" | "with" | "values" => Ok(Stmt::Select(self.select()?)),
+            "select" | "with" | "values" => Ok(Stmt::Select(Box::new(self.select()?))),
             "insert" | "replace" => self.insert(),
             "update" => self.update(),
             "delete" => self.delete(),
@@ -362,7 +403,7 @@ impl Parser {
             }
             "" if self.sym("(") => {
                 self.at -= 1;
-                Ok(Stmt::Select(self.select()?))
+                Ok(Stmt::Select(Box::new(self.select()?)))
             }
             _ => Err(syntax(format!(
                 "a statement starts with SELECT, INSERT, UPDATE, DELETE, CREATE, DROP or ALTER, not {}",
@@ -1018,8 +1059,8 @@ impl Parser {
     #[inline(always)]
     fn chain(
         &mut self,
-        operand: fn(&mut Parser) -> Result<Expr>,
-        operator: fn(&mut Parser) -> Option<Op>,
+        operand: fn(&mut Parser<'t>) -> Result<Expr>,
+        operator: fn(&mut Parser<'t>) -> Option<Op>,
     ) -> Result<Expr> {
         let first = operand(self)?;
         let Some(mut op) = operator(self) else { return Ok(first) };
@@ -1058,99 +1099,36 @@ impl Parser {
         Ok(Expr::Not(Box::new(inner)))
     }
 
+    // The parser calls itself once per level of nesting, through every level
+    // of precedence: what follows an operand (`IS`, `IN`, `BETWEEN`, `LIKE`, a
+    // cast) is read by functions of their own, so that the frames on the way
+    // down hold only what that way needs.
+
     fn comparison(&mut self) -> Result<Expr> {
         let left = self.concat()?;
-        let mut under = self.height;
-        // `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] DISTINCT FROM`.
+        self.compared(left)
+    }
+
+    /// What follows the left operand of a comparison.
+    fn compared(&mut self, left: Expr) -> Result<Expr> {
         if self.keyword("is") {
-            let negated = self.keyword("not");
-            if self.keyword("null") {
-                self.built(under)?;
-                return Ok(Expr::IsNull(Box::new(left), negated));
-            }
-            if self.keyword("true") || self.keyword("false") {
-                let want = matches!(&self.toks[self.at - 1], Tok::Word(w) if w.eq_ignore_ascii_case("true"));
-                // The comparison, `coalesce` around it, and `NOT` around both.
-                self.built(under + if negated { 2 } else { 1 })?;
-                let test = Expr::Func {
-                    name: "coalesce".into(),
-                    args: vec![
-                        Expr::Bin(Op::Eq, Box::new(left), Box::new(Expr::Lit(Value::Bool(want)))),
-                        Expr::Lit(Value::Bool(false)),
-                    ],
-                    distinct: false,
-                    star: false,
-                };
-                return Ok(if negated { Expr::Not(Box::new(test)) } else { test });
-            }
-            // `a IS [NOT] DISTINCT FROM b`; `a IS [NOT] b`: SQLite's null-safe equality.
-            let distinct = self.keywords(&["distinct", "from"]);
-            let right = self.concat()?;
-            under = under.max(self.height);
-            let same = Expr::Func { name: "_same".into(), args: vec![left, right], distinct: false, star: false };
-            let wrapped = distinct != negated;
-            self.built(under + usize::from(wrapped))?;
-            return Ok(if wrapped { Expr::Not(Box::new(same)) } else { same });
+            return self.is(left);
         }
-        if self.keyword("isnull") {
-            self.built(under)?;
-            return Ok(Expr::IsNull(Box::new(left), false));
-        }
-        if self.keyword("notnull") {
-            self.built(under)?;
-            return Ok(Expr::IsNull(Box::new(left), true));
+        if self.keyword("isnull") || self.keyword("notnull") {
+            let negated = matches!(&self.toks[self.at - 1], Tok::Word(w) if w.eq_ignore_ascii_case("notnull"));
+            self.built(self.height)?;
+            return Ok(Expr::IsNull(Box::new(left), negated));
         }
         let negated = self.keyword("not");
         if self.keyword("in") {
-            self.expect_sym("(")?;
-            if matches!(self.peek_word(0).as_deref(), Some("select" | "with")) {
-                let sub = self.select()?;
-                under = under.max(self.height);
-                self.expect_sym(")")?;
-                self.built(under)?;
-                return Ok(Expr::InSelect(Box::new(left), Box::new(sub), negated));
-            }
-            let mut list = Vec::new();
-            if !self.sym(")") {
-                loop {
-                    list.push(self.expr()?);
-                    under = under.max(self.height);
-                    if !self.sym(",") {
-                        break;
-                    }
-                }
-                self.expect_sym(")")?;
-            }
-            self.built(under)?;
-            return Ok(Expr::In(Box::new(left), list, negated));
+            return self.in_list(left, negated);
         }
         if self.keyword("between") {
-            let low = self.concat()?;
-            under = under.max(self.height);
-            self.expect("and")?;
-            let high = self.concat()?;
-            self.built(under.max(self.height))?;
-            return Ok(Expr::Between(Box::new(left), Box::new(low), Box::new(high), negated));
+            return self.between(left, negated);
         }
-        let like = if self.keyword("like") {
-            Some(false)
-        } else if self.keyword("ilike") {
-            Some(true)
-        } else {
-            None
-        };
-        if let Some(ci) = like {
-            let pattern = self.concat()?;
-            under = under.max(self.height);
-            let escape = if self.keyword("escape") {
-                let e = self.concat()?;
-                under = under.max(self.height);
-                Some(Box::new(e))
-            } else {
-                None
-            };
-            self.built(under)?;
-            return Ok(Expr::Like { expr: Box::new(left), pattern: Box::new(pattern), ci, negated, escape });
+        if self.keyword("like") || self.keyword("ilike") {
+            let ci = matches!(&self.toks[self.at - 1], Tok::Word(w) if w.eq_ignore_ascii_case("ilike"));
+            return self.like(left, ci, negated);
         }
         if negated {
             return Err(syntax("expected IN, BETWEEN, LIKE or ILIKE after NOT"));
@@ -1165,10 +1143,97 @@ impl Parser {
             _ => return Ok(left),
         };
         self.at += 1;
+        let under = self.height;
         // `x = ANY (...)` is not supported; plain comparisons only.
         let right = self.concat()?;
         self.built(under.max(self.height))?;
         Ok(Expr::Bin(op, Box::new(left), Box::new(right)))
+    }
+
+    /// `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] DISTINCT FROM`, after `IS`.
+    fn is(&mut self, left: Expr) -> Result<Expr> {
+        let under = self.height;
+        let negated = self.keyword("not");
+        if self.keyword("null") {
+            self.built(under)?;
+            return Ok(Expr::IsNull(Box::new(left), negated));
+        }
+        if self.keyword("true") || self.keyword("false") {
+            let want = matches!(&self.toks[self.at - 1], Tok::Word(w) if w.eq_ignore_ascii_case("true"));
+            // The comparison, `coalesce` around it, and `NOT` around both.
+            self.built(under + if negated { 2 } else { 1 })?;
+            let test = Expr::Func {
+                name: "coalesce".into(),
+                args: vec![
+                    Expr::Bin(Op::Eq, Box::new(left), Box::new(Expr::Lit(Value::Bool(want)))),
+                    Expr::Lit(Value::Bool(false)),
+                ],
+                distinct: false,
+                star: false,
+            };
+            return Ok(if negated { Expr::Not(Box::new(test)) } else { test });
+        }
+        // `a IS [NOT] DISTINCT FROM b`; `a IS [NOT] b`: SQLite's null-safe equality.
+        let distinct = self.keywords(&["distinct", "from"]);
+        let right = self.concat()?;
+        let under = under.max(self.height);
+        let same = Expr::Func { name: "_same".into(), args: vec![left, right], distinct: false, star: false };
+        let wrapped = distinct != negated;
+        self.built(under + usize::from(wrapped))?;
+        Ok(if wrapped { Expr::Not(Box::new(same)) } else { same })
+    }
+
+    /// `IN (SELECT ...)` or `IN (a, b, ...)`, after `IN`.
+    fn in_list(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let mut under = self.height;
+        self.expect_sym("(")?;
+        if matches!(self.peek_word(0).as_deref(), Some("select" | "with")) {
+            let sub = self.select()?;
+            under = under.max(self.height);
+            self.expect_sym(")")?;
+            self.built(under)?;
+            return Ok(Expr::InSelect(Box::new(left), Box::new(sub), negated));
+        }
+        let mut list = Vec::new();
+        if !self.sym(")") {
+            loop {
+                list.push(self.expr()?);
+                under = under.max(self.height);
+                if !self.sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(")")?;
+        }
+        self.built(under)?;
+        Ok(Expr::In(Box::new(left), list, negated))
+    }
+
+    /// `BETWEEN low AND high`, after `BETWEEN`.
+    fn between(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let under = self.height;
+        let low = self.concat()?;
+        let under = under.max(self.height);
+        self.expect("and")?;
+        let high = self.concat()?;
+        self.built(under.max(self.height))?;
+        Ok(Expr::Between(Box::new(left), Box::new(low), Box::new(high), negated))
+    }
+
+    /// `LIKE pattern [ESCAPE e]`, after `LIKE` or `ILIKE`.
+    fn like(&mut self, left: Expr, ci: bool, negated: bool) -> Result<Expr> {
+        let under = self.height;
+        let pattern = self.concat()?;
+        let mut under = under.max(self.height);
+        let escape = if self.keyword("escape") {
+            let e = self.concat()?;
+            under = under.max(self.height);
+            Some(Box::new(e))
+        } else {
+            None
+        };
+        self.built(under)?;
+        Ok(Expr::Like { expr: Box::new(left), pattern: Box::new(pattern), ci, negated, escape })
     }
 
     fn concat(&mut self) -> Result<Expr> {
@@ -1216,17 +1281,7 @@ impl Parser {
 
     fn unary(&mut self) -> Result<Expr> {
         if self.sym("-") {
-            self.open()?;
-            let inner = self.unary();
-            self.depth -= 1;
-            return Ok(match inner? {
-                Expr::Lit(Value::I64(n)) if n != i64::MIN => Expr::Lit(Value::I64(-n)),
-                Expr::Lit(Value::F64(n)) => Expr::Lit(Value::F64(-n)),
-                e => {
-                    self.built(self.height)?;
-                    Expr::Neg(Box::new(e))
-                }
-            });
+            return self.negative();
         }
         if self.sym("+") {
             self.open()?;
@@ -1234,7 +1289,27 @@ impl Parser {
             self.depth -= 1;
             return inner;
         }
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        if self.peek() == Some(&Tok::Sym("::")) { self.casts(e) } else { Ok(e) }
+    }
+
+    /// `- x`, after the `-`.
+    fn negative(&mut self) -> Result<Expr> {
+        self.open()?;
+        let inner = self.unary();
+        self.depth -= 1;
+        Ok(match inner? {
+            Expr::Lit(Value::I64(n)) if n != i64::MIN => Expr::Lit(Value::I64(-n)),
+            Expr::Lit(Value::F64(n)) => Expr::Lit(Value::F64(-n)),
+            e => {
+                self.built(self.height)?;
+                Expr::Neg(Box::new(e))
+            }
+        })
+    }
+
+    /// `e::type::type...`.
+    fn casts(&mut self, mut e: Expr) -> Result<Expr> {
         while self.sym("::") {
             let word = self.name()?;
             let (kind, _) = type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}`")))?;
@@ -1246,9 +1321,35 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr> {
-        let tok = self.peek().cloned().ok_or_else(|| syntax("expected an expression, found the end"))?;
         // A value or a name, unless said otherwise below.
         self.height = 1;
+        match self.peek() {
+            Some(Tok::Sym("(")) => self.parenthesized(),
+            Some(Tok::Word(_)) => self.word(),
+            _ => self.literal(),
+        }
+    }
+
+    /// `(SELECT ...)` or `(expression)`, at the `(`.
+    fn parenthesized(&mut self) -> Result<Expr> {
+        self.at += 1;
+        if matches!(self.peek_word(0).as_deref(), Some("select" | "with" | "values")) {
+            let sub = self.select()?;
+            self.expect_sym(")")?;
+            self.built(self.height)?;
+            return Ok(Expr::Scalar(Box::new(sub)));
+        }
+        let e = self.expr()?;
+        if self.sym(",") {
+            return Err(syntax("row values `(a, b)` are not supported"));
+        }
+        self.expect_sym(")")?;
+        Ok(e)
+    }
+
+    /// A value, a parameter or a quoted name.
+    fn literal(&mut self) -> Result<Expr> {
+        let tok = self.peek().cloned().ok_or_else(|| syntax("expected an expression, found the end"))?;
         match tok {
             Tok::Str(s) => {
                 self.at += 1;
@@ -1269,110 +1370,96 @@ impl Parser {
                 self.at += 1;
                 Ok(self.param(n))
             }
-            Tok::Sym("(") => {
-                self.at += 1;
-                if matches!(self.peek_word(0).as_deref(), Some("select" | "with" | "values")) {
-                    let sub = self.select()?;
-                    self.expect_sym(")")?;
-                    self.built(self.height)?;
-                    return Ok(Expr::Scalar(Box::new(sub)));
-                }
-                let e = self.expr()?;
-                if self.sym(",") {
-                    return Err(syntax("row values `(a, b)` are not supported"));
-                }
-                self.expect_sym(")")?;
-                Ok(e)
-            }
-            Tok::Quoted(_) => self.column(),
-            Tok::Word(w) => {
-                let lw = w.to_ascii_lowercase();
-                match lw.as_str() {
-                    "null" => {
-                        self.at += 1;
-                        return Ok(Expr::Lit(Value::Null));
-                    }
-                    "true" => {
-                        self.at += 1;
-                        return Ok(Expr::Lit(Value::Bool(true)));
-                    }
-                    "false" => {
-                        self.at += 1;
-                        return Ok(Expr::Lit(Value::Bool(false)));
-                    }
-                    "current_timestamp" | "current_date" | "current_time" | "localtimestamp"
-                        if self.toks.get(self.at + 1) != Some(&Tok::Sym("(")) =>
-                    {
-                        self.at += 1;
-                        let name = if lw == "localtimestamp" { "current_timestamp".into() } else { lw };
-                        return Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: false });
-                    }
-                    // Typed literals: `DATE '2026-01-31'`, `TIMESTAMP '...'`, `TIMESTAMPTZ '...'`.
-                    "date" | "timestamp" | "timestamptz" | "time"
-                        if matches!(self.toks.get(self.at + 1), Some(Tok::Str(_))) =>
-                    {
-                        let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
-                        self.at += 2;
-                        let (kind, _) = type_of(&lw).expect("a type");
-                        self.height = 2;
-                        return Ok(Expr::Cast(Box::new(Expr::Lit(Value::Text(text))), column_type(kind)));
-                    }
-                    // `INTERVAL '1 day'`: a span to add to or take from a date
-                    // (`now() - INTERVAL '2 hours'`).
-                    "interval" if matches!(self.toks.get(self.at + 1), Some(Tok::Str(_))) => {
-                        let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else { unreachable!() };
-                        self.at += 2;
-                        value::interval_months_and_micros(&text)?;
-                        self.height = 2;
-                        return Ok(Expr::Func {
-                            name: "_interval".into(),
-                            args: vec![Expr::Lit(Value::Text(text))],
-                            distinct: false,
-                            star: false,
-                        });
-                    }
-                    "exists" => {
-                        self.at += 1;
-                        self.expect_sym("(")?;
-                        let sub = self.select()?;
-                        self.expect_sym(")")?;
-                        self.built(self.height)?;
-                        return Ok(Expr::Exists(Box::new(sub), false));
-                    }
-                    "case" => {
-                        self.at += 1;
-                        return self.case();
-                    }
-                    "cast" if self.toks.get(self.at + 1) == Some(&Tok::Sym("(")) => {
-                        self.at += 2;
-                        let e = self.expr()?;
-                        let under = self.height;
-                        self.expect("as")?;
-                        let word = self.name()?;
-                        let (kind, _) = type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}`")))?;
-                        // `DOUBLE PRECISION`, `VARCHAR(255)`, `TIMESTAMP WITH TIME ZONE`.
-                        while !self.sym(")") {
-                            if self.peek() == Some(&Tok::Sym("(")) {
-                                self.type_modifier()?;
-                                continue;
-                            }
-                            if self.peek().is_none() {
-                                return Err(syntax("expected `)`"));
-                            }
-                            self.at += 1;
-                        }
-                        self.built(under)?;
-                        return Ok(Expr::Cast(Box::new(e), column_type(kind)));
-                    }
-                    _ => {}
-                }
-                if self.toks.get(self.at + 1) == Some(&Tok::Sym("(")) {
-                    return self.call(lw);
-                }
-                self.column()
-            }
+            Tok::Quoted(_) | Tok::Word(_) => self.column(),
             Tok::Sym(s) => Err(syntax(format!("unexpected `{s}`"))),
         }
+    }
+
+    /// What starts with a word: a keyword (`NULL`, `CASE`, `EXISTS`...), a
+    /// function, a column.
+    fn word(&mut self) -> Result<Expr> {
+        let Some(Tok::Word(w)) = self.peek() else { return self.literal() };
+        let lw = w.to_ascii_lowercase();
+        let next = self.toks.get(self.at + 1);
+        let called = next == Some(&Tok::Sym("("));
+        let quoted = matches!(next, Some(Tok::Str(_)));
+        match lw.as_str() {
+            "null" | "true" | "false" => {
+                self.at += 1;
+                Ok(Expr::Lit(match lw.as_str() {
+                    "null" => Value::Null,
+                    b => Value::Bool(b == "true"),
+                }))
+            }
+            "current_timestamp" | "current_date" | "current_time" | "localtimestamp" if !called => {
+                self.at += 1;
+                let name = if lw == "localtimestamp" { "current_timestamp".into() } else { lw };
+                Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: false })
+            }
+            "date" | "timestamp" | "timestamptz" | "time" | "interval" if quoted => self.typed_literal(&lw),
+            "exists" => self.exists(),
+            "case" => {
+                self.at += 1;
+                self.case()
+            }
+            "cast" if called => self.cast(),
+            _ if called => self.call(lw),
+            _ => self.column(),
+        }
+    }
+
+    /// `DATE '2026-01-31'`, `TIMESTAMP '...'`, `TIMESTAMPTZ '...'`; `INTERVAL
+    /// '1 day'`: a span to add to or take from a date (`now() - INTERVAL '2 hours'`).
+    fn typed_literal(&mut self, kind: &str) -> Result<Expr> {
+        let Some(Tok::Str(text)) = self.toks.get(self.at + 1).cloned() else {
+            return Err(syntax(format!("expected a text after {}", kind.to_ascii_uppercase())));
+        };
+        self.at += 2;
+        self.height = 2;
+        if kind == "interval" {
+            value::interval_months_and_micros(&text)?;
+            return Ok(Expr::Func {
+                name: "_interval".into(),
+                args: vec![Expr::Lit(Value::Text(text))],
+                distinct: false,
+                star: false,
+            });
+        }
+        let (kind, _) = type_of(kind).ok_or_else(|| syntax(format!("unknown type `{kind}`")))?;
+        Ok(Expr::Cast(Box::new(Expr::Lit(Value::Text(text))), column_type(kind)))
+    }
+
+    /// `EXISTS (SELECT ...)`, at `EXISTS`.
+    fn exists(&mut self) -> Result<Expr> {
+        self.at += 1;
+        self.expect_sym("(")?;
+        let sub = self.select()?;
+        self.expect_sym(")")?;
+        self.built(self.height)?;
+        Ok(Expr::Exists(Box::new(sub), false))
+    }
+
+    /// `CAST(x AS type)`, at `CAST`.
+    fn cast(&mut self) -> Result<Expr> {
+        self.at += 2;
+        let e = self.expr()?;
+        let under = self.height;
+        self.expect("as")?;
+        let word = self.name()?;
+        let (kind, _) = type_of(&word).ok_or_else(|| syntax(format!("unknown type `{word}`")))?;
+        // `DOUBLE PRECISION`, `VARCHAR(255)`, `TIMESTAMP WITH TIME ZONE`.
+        while !self.sym(")") {
+            if self.peek() == Some(&Tok::Sym("(")) {
+                self.type_modifier()?;
+                continue;
+            }
+            if self.peek().is_none() {
+                return Err(syntax("expected `)`"));
+            }
+            self.at += 1;
+        }
+        self.built(under)?;
+        Ok(Expr::Cast(Box::new(e), column_type(kind)))
     }
 
     fn column(&mut self) -> Result<Expr> {
@@ -1403,20 +1490,8 @@ impl Parser {
             self.height = 1;
             return Ok(Expr::Func { name, args: Vec::new(), distinct: false, star: true });
         }
-        // `extract(epoch FROM x)`: the standard form of extract('epoch', x).
         if name == "extract" && matches!(self.peek_word(1).as_deref(), Some("from")) {
-            let field = self.name()?;
-            self.expect("from")?;
-            let x = self.expr()?;
-            let under = self.height;
-            self.expect_sym(")")?;
-            self.built(under)?;
-            return Ok(Expr::Func {
-                name,
-                args: vec![Expr::Lit(Value::Text(field.to_ascii_lowercase())), x],
-                distinct: false,
-                star: false,
-            });
+            return self.extract(name);
         }
         let distinct = self.keyword("distinct");
         let mut args = Vec::new();
@@ -1441,6 +1516,22 @@ impl Parser {
         // `substring(x from 2 for 3)` is written substr(x, 2, 3) here.
         self.built(under)?;
         Ok(Expr::Func { name, args, distinct, star: false })
+    }
+
+    /// `extract(epoch FROM x)`: the standard form of extract('epoch', x).
+    fn extract(&mut self, name: String) -> Result<Expr> {
+        let field = self.name()?;
+        self.expect("from")?;
+        let x = self.expr()?;
+        let under = self.height;
+        self.expect_sym(")")?;
+        self.built(under)?;
+        Ok(Expr::Func {
+            name,
+            args: vec![Expr::Lit(Value::Text(field.to_ascii_lowercase())), x],
+            distinct: false,
+            star: false,
+        })
     }
 
     fn case(&mut self) -> Result<Expr> {
@@ -1590,6 +1681,13 @@ mod tests {
             "select * from a right join b on 1",
             "insert into t",
             "create table t (a nope)",
+            // A type's `(` left open: once read past the end for ever.
+            "select 1::int(",
+            "select 1::varchar(10",
+            "select cast(1 as varchar(10",
+            // The functions the parser writes itself.
+            "select _same(1, 2)",
+            "select 1 + _interval('1 day')",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
