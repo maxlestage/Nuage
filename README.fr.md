@@ -736,7 +736,10 @@ Réglages de la console, depuis votre bureau.
    chiffrement ; rien d'autre n'est lu). Pour un serveur en ligne, tapez son adresse et son
    jeton de gestion, `NUAGE_ADMIN_TOKEN` (sur Heroku : Settings de l'application,
    **Reveal Config Vars**). L'éditeur retient l'adresse ; le jeton seulement si vous cochez
-   *Retenir sur cet ordinateur* (dans un fichier que vous seul pouvez lire).
+   *Retenir sur cet ordinateur*, et alors dans le gestionnaire de mots de passe de votre
+   système (le trousseau de macOS, le Gestionnaire d'identification de Windows, le trousseau
+   d'un bureau Linux), jamais dans un fichier à lui. Il n'envoie jamais le jeton après une
+   redirection, et demande avant de l'envoyer en clair (`http://`) à une adresse d'Internet.
 
 Ce qu'il change est enregistré par le serveur, comme depuis la console : en vigueur tout de
 suite, gardé avec les données. Les réglages lus au démarrage du serveur (la clé de

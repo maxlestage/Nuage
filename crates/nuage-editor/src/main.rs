@@ -29,7 +29,8 @@ fn main() -> ExitCode {
         Box::new(|cc| {
             let prefs: nuage_editor::Prefs =
                 cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
-            Ok(Box::new(nuage_editor::Editor::new(prefs, eframe::storage_dir(nuage_editor::APP_ID))))
+            let setup = nuage_editor::Setup::system(eframe::storage_dir(nuage_editor::APP_ID));
+            Ok(Box::new(nuage_editor::Editor::new(prefs, setup)))
         }),
     );
     match started {
@@ -80,6 +81,7 @@ fn report(message: &str) {
 /// A message box: on Windows, an editor started by a double-click has no
 /// console to print to.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn message_box(text: &str) {
     #[link(name = "user32")]
     unsafe extern "system" {

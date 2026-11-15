@@ -6,15 +6,20 @@
 
 use std::path::PathBuf;
 
+use crate::secret::Secret;
+
 /// What the editor takes from the settings file of a server of this computer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Found {
     /// The settings file.
     pub file: PathBuf,
     /// Where the server answers on this computer (`http://127.0.0.1:<PORT>`).
     pub address: String,
+    /// Its public address (`SITE_URL`, written by the installer given a
+    /// domain): the one its applications are given.
+    pub site_url: Option<String>,
     /// Its management token, when the file has one.
-    pub token: Option<String>,
+    pub token: Option<Secret>,
 }
 
 impl Found {
@@ -73,7 +78,12 @@ pub fn found_in(file: PathBuf, text: &str) -> Found {
     let vars = parse(text);
     let get = |k: &str| vars.iter().rev().find(|(key, _)| key == k).map(|(_, v)| v.clone()).filter(|v| !v.is_empty());
     let port = get("PORT").unwrap_or_else(|| "8080".into());
-    Found { file, address: format!("http://127.0.0.1:{port}"), token: get("NUAGE_ADMIN_TOKEN") }
+    Found {
+        file,
+        address: format!("http://127.0.0.1:{port}"),
+        site_url: get("SITE_URL"),
+        token: get("NUAGE_ADMIN_TOKEN").map(Secret::new),
+    }
 }
 
 /// Why the settings file could not be read.
@@ -118,7 +128,7 @@ fn which(program: &str) -> bool {
 
 /// Reads the settings file with the administrator's rights: the system asks
 /// for the password in a window of its own (macOS, and Linux desktops with
-/// polkit). Only the two lines the editor needs are kept from what is read;
+/// polkit). Only the lines the editor needs are kept from what is read;
 /// the encryption key never leaves the file.
 pub fn read_as_administrator(file: &std::path::Path) -> Result<Found, ReadError> {
     // The path is one of `settings_files()`: fixed by the installers, no user input.
@@ -128,11 +138,13 @@ pub fn read_as_administrator(file: &std::path::Path) -> Result<Found, ReadError>
     }
     let output = if cfg!(target_os = "macos") {
         let script = format!(
-            "do shell script \"/usr/bin/grep -E '^(PORT|NUAGE_ADMIN_TOKEN)=' '{path}'\" with prompt \"Nuage DB Editor reads the port and the management token of the Nuage DB server of this computer.\" with administrator privileges"
+            "do shell script \"/usr/bin/grep -E '^(PORT|NUAGE_ADMIN_TOKEN|SITE_URL)=' '{path}'\" with prompt \"Nuage DB Editor reads the port and the management token of the Nuage DB server of this computer.\" with administrator privileges"
         );
         std::process::Command::new("/usr/bin/osascript").arg("-e").arg(script).output()
     } else {
-        std::process::Command::new("pkexec").args(["/usr/bin/grep", "-E", "^(PORT|NUAGE_ADMIN_TOKEN)=", &path]).output()
+        std::process::Command::new("pkexec")
+            .args(["/usr/bin/grep", "-E", "^(PORT|NUAGE_ADMIN_TOKEN|SITE_URL)=", &path])
+            .output()
     };
     let output = output.map_err(|e| ReadError::Failed(e.to_string()))?;
     if output.status.success() {
@@ -153,14 +165,16 @@ mod tests {
 
     #[test]
     fn the_installers_settings_file() {
-        let text = "\u{feff}# Nuage DB settings\r\nPORT=8091\r\nNUAGE_ENCRYPTION_KEY=abc\r\nexport NUAGE_ADMIN_TOKEN=\"0123\"\r\n";
+        let text = "\u{feff}# Nuage DB settings\r\nPORT=8091\r\nNUAGE_ENCRYPTION_KEY=abc\r\nexport NUAGE_ADMIN_TOKEN=\"0123\"\r\nSITE_URL=https://nuage.example.com\r\n";
         let found = found_in(PathBuf::from("/etc/nuage/nuage.env"), text);
         assert_eq!(found.address, "http://127.0.0.1:8091");
-        assert_eq!(found.token.as_deref(), Some("0123"));
+        assert_eq!(found.site_url.as_deref(), Some("https://nuage.example.com"));
+        assert_eq!(found.token.as_ref().map(Secret::expose), Some("0123"));
         assert!(!found.describe().contains("0123"), "never the token");
+        assert!(!format!("{found:?}").contains("0123"), "never the token");
         // No port: the server's own default.
         let found = found_in(PathBuf::from("x"), "NUAGE_ADMIN_TOKEN=\n");
-        assert_eq!((found.address.as_str(), found.token), ("http://127.0.0.1:8080", None));
+        assert_eq!((found.address.as_str(), found.token, found.site_url), ("http://127.0.0.1:8080", None, None));
         assert!(!settings_files().is_empty());
         // Only the installers' files are read with the administrator's rights.
         assert!(matches!(read_as_administrator(std::path::Path::new("/etc/passwd")), Err(ReadError::Failed(_))));

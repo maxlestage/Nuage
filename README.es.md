@@ -724,8 +724,11 @@ tu escritorio.
    archivo de ajustes está protegido, contiene la clave de cifrado; no se lee nada más).
    Para un servidor en línea, escribe su dirección y su token de gestión,
    `NUAGE_ADMIN_TOKEN` (en Heroku: Settings de la aplicación, **Reveal Config Vars**). El
-   editor recuerda la dirección; el token solo si marcas *Recordar en este equipo* (en un
-   archivo que solo tú puedes leer).
+   editor recuerda la dirección; el token solo si marcas *Recordar en este equipo*, y entonces
+   en el almacén de contraseñas de tu sistema (el llavero de macOS, el Administrador de
+   credenciales de Windows, el llavero de un escritorio Linux), nunca en un archivo propio.
+   Nunca envía el token tras una redirección, y pregunta antes de enviarlo en claro
+   (`http://`) a una dirección de Internet.
 
 Lo que cambia lo guarda el servidor, como desde la consola: vigente al instante, guardado
 con los datos. Los ajustes que el servidor lee al arrancar (la clave de cifrado, los

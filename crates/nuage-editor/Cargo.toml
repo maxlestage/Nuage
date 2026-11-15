@@ -19,14 +19,42 @@ path = "src/main.rs"
 # readers, and the tests drive the window through it; clipboard: the Copy buttons; links: the
 # console opens in the browser; persistence: the language, the theme and the last address.
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "persistence", "wayland", "x11"] }
-ureq = { version = "3", features = ["json"] }
+# rustls with ring and webpki-roots (its default features): the same trust as `nuage check`.
+ureq = { version = "3.5", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sys-locale = "0.3"
+# Secrets in memory are wiped when dropped.
+zeroize = "1"
+# The Copy buttons of secrets ask the clipboard history to skip them (egui's copy cannot);
+# the same arboard egui-winit already uses.
+arboard = { version = "3.6", default-features = false }
+# A management token is kept only in the system's password store: the macOS Keychain, the
+# Windows Credential Manager, the Secret Service of Linux desktops.
+keyring = "4.2"
+
+# keyring's Secret Service store needs an async runtime for zbus: async-io, the one
+# accesskit already brings, said here rather than left to feature unification.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
 
 [dev-dependencies]
 # The editor against a real server, in the same process.
 nuage = { path = "../nuage", default-features = false, features = ["server"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 # Drives the window as a person would (labels, clicks, typing), through AccessKit, headless.
 egui_kittest = "0.37"
+
+[lints.rust]
+unsafe_code = "deny"
+
+# A bug must not close the window: no unwrap, no indexing that may panic, no byte slicing of text.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"

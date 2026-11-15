@@ -16,8 +16,16 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   by itself: the system asks for the administrator's password in a window of its own, and
   only the port and the management token are read from the settings file. A server online
   takes its address and its management token; the address is remembered, the token only
-  when asked (in a file only its owner can read). A wrong token, an address that is no Nuage
-  DB server, a server that does not answer: each is said, with what to do.
+  when asked, in the system's password store (Keychain, Credential Manager, Secret Service),
+  never in a file. The token is never sent after a redirect, nor to an address that does not
+  answer as Nuage DB, and plain `http://` to the Internet waits for a "Connect anyway". A
+  wrong token, a website's address, a redirect, a name that does not exist, a refused port, a
+  server that does not answer, a certificate not trusted: each is said, with what to do.
+- **Servers deployed today connect too** (0.4.2 to 0.4.6, before the settings): the editor
+  manages their applications and tokens, and says to update the server for the rest.
+- The connection lines given to an application use the server's public address when it has
+  one (`SITE_URL` of a server on this computer), and say when `127.0.0.1` works on this
+  computer only. Copied tokens are kept out of the clipboard history where the system allows.
 - What the editor saves goes through `/api/settings` and `/api/apps`, as the console's: in
   force at once, kept with the data. The settings read when the server starts are listed,
   with how to change them on that host. Without a screen it says why it cannot open, on the
