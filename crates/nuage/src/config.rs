@@ -28,7 +28,7 @@
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
-//! | `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; when the backup holds nothing to restore, or no backup is set, the server refuses to start, and creates and writes nothing. For a disk erased at each restart (Heroku), once the server holds data: a first start has nothing to restore. `1`, `yes`, `0`, `no` too; any other value stops the start | `false`: an empty start is allowed, and said |
+//! | `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; when the backup holds nothing to restore, or no backup is set, the server refuses to start, and creates and writes nothing. A registered application whose directory is empty and whose backup holds nothing is not served either: the server starts without it and lists it as one that cannot be opened (complete its backup and restart, or delete it in the console); a new application starts empty. For a disk erased at each restart (Heroku), once the server holds data: a first start has nothing to restore. `1`, `yes`, `0`, `no` too; any other value stops the start | `false`: an empty start is allowed, and said |
 //! | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (Cloudflare R2, AWS S3, MinIO...); the bytes go straight between the clients and the bucket, through signed links | none: no files |
 //! | `NUAGE_FILES_S3_ENDPOINT` | its endpoint URL (`https://<account>.r2.cloudflarestorage.com` for R2) | `https://s3.<region>.amazonaws.com` |
 //! | `NUAGE_FILES_S3_REGION` | its region | `auto` on R2, else `us-east-1` |
@@ -82,7 +82,8 @@ pub struct Config {
     pub backup_dir: Option<PathBuf>,
     /// An empty data directory must be restored from the backup
     /// (`NUAGE_RESTORE_REQUIRED`): the binary opens it with
-    /// [`Engine::open_existing`](crate::Engine::open_existing).
+    /// [`Engine::open_existing`](crate::Engine::open_existing), and the
+    /// registered applications follow it.
     pub restore_required: bool,
 }
 

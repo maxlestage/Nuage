@@ -215,6 +215,8 @@ pub struct Engine {
     encryption: Option<&'static str>,
     /// What opening brought from an earlier version's page store.
     imported: Option<Imported>,
+    /// Opened with [`Engine::open_existing`]: see [`Engine::restore_required`].
+    restore_required: bool,
 }
 
 impl std::fmt::Debug for Engine {
@@ -240,7 +242,9 @@ impl Engine {
     /// opens as with `open`. For a disk erased at each restart, once the
     /// database holds data: a backup setting that points at the wrong place
     /// then stops the start instead of starting an empty database that backs
-    /// itself up there (`NUAGE_RESTORE_REQUIRED` of the server).
+    /// itself up there (`NUAGE_RESTORE_REQUIRED` of the server). A server
+    /// whose first engine is opened this way opens its registered
+    /// applications this way too ([`restore_required`](Self::restore_required)).
     pub fn open_existing(dir: impl AsRef<Path>, options: EngineOptions) -> Result<Arc<Engine>> {
         Self::open_with(dir.as_ref(), options, true)
     }
@@ -293,6 +297,7 @@ impl Engine {
             schemas: memoire_orm::nuage::wire::SchemaCache::default(),
             encryption,
             imported,
+            restore_required: must_restore,
         });
         if restored {
             engine.event("info", "data restored from the backup");
@@ -358,6 +363,16 @@ impl Engine {
     /// compared with the old one, entry by entry, before it took its place.
     pub fn imported(&self) -> Option<Imported> {
         self.imported
+    }
+
+    /// It was opened with [`open_existing`](Self::open_existing): an empty
+    /// directory had to be restored from the backup. The applications of a
+    /// server follow its first engine: when this is `true`, a registered
+    /// application whose directory is empty and whose backup holds nothing
+    /// is reported as failed instead of starting empty. Creating a new
+    /// application is exempt.
+    pub fn restore_required(&self) -> bool {
+        self.restore_required
     }
 
     /// The data directory.

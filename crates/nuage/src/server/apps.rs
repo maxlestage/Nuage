@@ -268,7 +268,7 @@ impl Apps {
                 *apps.first.origins.write().unwrap_or_else(|e| e.into_inner()) = origins_of(&record);
                 continue;
             }
-            match apps.open_engine(&name) {
+            match apps.open_engine(&name, false) {
                 Ok(e) => {
                     let created = record.get("createdAt").and_then(Json::as_i64).unwrap_or(0);
                     let app = App::new(name.clone(), e, false, created, description_of(&record), kv_bytes);
@@ -424,7 +424,13 @@ impl Apps {
         self.all().iter().any(|a| !a.tokens.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
     }
 
-    fn open_engine(&self, name: &str) -> Result<Arc<Engine>> {
+    /// Opens the engine of application `name`, with the first one's options.
+    /// A registered application (`new` false) follows the first engine's
+    /// [`restore_required`](Engine::restore_required): an empty directory
+    /// whose backup holds nothing is then an error, and the application goes
+    /// to the failed list instead of being served empty with valid tokens.
+    /// A new application (`new` true) starts empty, as it should.
+    fn open_engine(&self, name: &str, new: bool) -> Result<Arc<Engine>> {
         let first = &self.first.engine;
         let mut options = first.options().clone();
         options.name = name.to_owned();
@@ -437,7 +443,11 @@ impl Apps {
                 Arc::new(PrefixedStore::new(b.store.clone(), format!("apps/{name}/")));
             BackupOptions { store, ..b }
         });
-        Engine::open(dir_of(first, name), options)
+        if !new && first.restore_required() {
+            Engine::open_existing(dir_of(first, name), options)
+        } else {
+            Engine::open(dir_of(first, name), options)
+        }
     }
 
     fn save(&self, app: &App) -> Result<()> {
@@ -465,7 +475,7 @@ impl Apps {
                 dir.display()
             )));
         }
-        let engine = self.open_engine(name)?;
+        let engine = self.open_engine(name, true)?;
         let app = Arc::new(App::new(
             name.to_owned(),
             engine,

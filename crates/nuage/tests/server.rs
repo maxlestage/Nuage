@@ -1052,8 +1052,8 @@ fn stopped(mut command: std::process::Command) -> (Option<i32>, String) {
 }
 
 /// Starts the binary and returns what it printed until it listened, then
-/// stops it.
-fn started(mut command: std::process::Command) -> Vec<String> {
+/// stops it: the lines of its standard output, and its standard error.
+fn started(mut command: std::process::Command) -> (Vec<String>, String) {
     use std::io::{BufRead, Read};
     let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -1086,7 +1086,9 @@ fn started(mut command: std::process::Command) -> Vec<String> {
     }
     let _ = child.kill();
     let _ = child.wait();
-    out
+    let mut err = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+    (out, err)
 }
 
 /// NUAGE_RESTORE_REQUIRED: an empty data directory with nothing to restore
@@ -1194,7 +1196,7 @@ fn the_server_says_when_it_starts_empty() {
             ("NUAGE_BIND", "127.0.0.1"),
         ])
     };
-    let out = started(binary(&data, &folder)).join("\n");
+    let out = started(binary(&data, &folder)).0.join("\n");
     let new = format!(
         "nuage: warning: the data directory was empty and {} holds no backup: this is a NEW, EMPTY database. \
          If this server had data, stop it now and check NUAGE_BACKUP_*",
@@ -1203,16 +1205,34 @@ fn the_server_says_when_it_starts_empty() {
     assert!(out.contains(&new), "{out}");
     assert!(out.contains("NUAGE_RESTORE_REQUIRED=true refuses to start in this case"), "{out}");
 
-    // A server with an application, backed up; then the application's backup
-    // loses its manifest, and the server starts on an empty disk.
+    // The application's backup loses its manifest, and the server starts on
+    // an empty disk.
+    shop_without_its_manifest(&first, &backups);
+    let out = started(binary(&restored, &backups)).0.join("\n");
+    assert!(out.contains("nuage: the data directory was empty: restored from the backup"), "{out}");
+    let shop = format!(
+        "nuage: warning: application `shop` is registered but its backup ({}/apps/shop) holds nothing: it starts empty",
+        backups.display()
+    );
+    assert!(out.contains(&shop), "{out}");
+    assert!(!out.contains("NEW, EMPTY"), "{out}");
+    for d in [data, folder, first, restored, backups] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A server in `first` with an application `shop`, backed up to the folder
+/// `backups` with the key of the binary's tests, then closed. Then shop's
+/// backup loses its manifest: a copy by hand that missed a file.
+fn shop_without_its_manifest(first: &std::path::Path, backups: &std::path::Path) {
     let options = EngineOptions {
         sync: false,
         encryption: Some(nuage::Encryption::from_key([7; 32])),
-        backup: Some(nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(&backups)))),
+        backup: Some(nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(backups)))),
         ..EngineOptions::default()
     };
     let engines = {
-        let server = Server::new(Engine::open(&first, options).unwrap(), ServerOptions::default());
+        let server = Server::new(Engine::open(first, options).unwrap(), ServerOptions::default());
         server.create_app("shop", "").unwrap();
         let engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
         for engine in &engines {
@@ -1222,15 +1242,244 @@ fn the_server_says_when_it_starts_empty() {
     };
     all_closed(&engines);
     std::fs::remove_file(backups.join("apps/shop/manifest.json")).unwrap();
-    let out = started(binary(&restored, &backups)).join("\n");
+}
+
+/// With NUAGE_RESTORE_REQUIRED, the binary does not serve a registered
+/// application whose backup holds nothing: it says it cannot be opened, with
+/// the engine's sentence, and starts with the others. Nothing is made for it
+/// on the disk or sent to its backup.
+#[test]
+fn the_server_does_not_serve_an_application_it_cannot_restore() {
+    let (first, data, backups) = (temp_dir("bin-unserved-first"), temp_dir("bin-unserved"), temp_dir("bin-unserved-b"));
+    shop_without_its_manifest(&first, &backups);
+    let before = files_in(&backups.join("apps/shop"));
+    let key = "07".repeat(32);
+    let (data_dir, folder) = (data.display().to_string(), backups.display().to_string());
+    let (out, err) = started(nuage_binary(&[
+        ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+        ("NUAGE_DATA_DIR", data_dir.as_str()),
+        ("NUAGE_BACKUP_DIR", folder.as_str()),
+        ("NUAGE_RESTORE_REQUIRED", "true"),
+        ("PORT", "0"),
+        ("NUAGE_BIND", "127.0.0.1"),
+    ]));
+    let out = out.join("\n");
     assert!(out.contains("nuage: the data directory was empty: restored from the backup"), "{out}");
-    let shop = format!(
-        "nuage: warning: application `shop` is registered but its backup ({}/apps/shop) holds nothing: it starts empty",
+    assert!(err.contains("nuage: application `shop` cannot be opened, its data is left as it was: "), "{err}");
+    let sentence = format!(
+        "Nuage DB storage: this directory is empty and {folder}/apps/shop holds no backup to restore: an empty \
+         database is not started here"
+    );
+    assert!(err.contains(&sentence), "{err}");
+    assert!(!out.contains("application `shop`"), "it is not served: {out}");
+    assert!(!data.join("apps/shop").exists(), "nothing was made for it");
+    assert_eq!(files_in(&backups.join("apps/shop")), before, "nothing was sent to its backup");
+    for d in [first, data, backups] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Every file under `dir`, with its bytes.
+fn files_in(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_in(&path));
+        } else {
+            out.insert(path.clone(), std::fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// Drops `server` and waits until every engine it opened is closed (call
+/// `shutdown` on what it listens on first).
+async fn closed(server: Server) {
+    let engines: Vec<_> =
+        server.apps().iter().filter_map(|a| server.app_engine(&a.name)).map(|e| Arc::downgrade(&e)).collect();
+    drop(server);
+    tokio::task::spawn_blocking(move || all_closed(&engines)).await.unwrap();
+}
+
+/// The options of the engines of the applications' tests below: encrypted,
+/// backed up to the folder `backups`.
+fn backed_up_to(backups: &std::path::Path) -> EngineOptions {
+    let mut backup = nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(backups)));
+    backup.snapshot_every = Duration::from_secs(3600);
+    EngineOptions {
+        sync: false,
+        encryption: Some(nuage::Encryption::from_key([7; 32])),
+        backup: Some(backup),
+        ..EngineOptions::default()
+    }
+}
+
+/// The status of `GET /v1/info` with `token`, and the application it names.
+async fn info(addr: SocketAddr, token: &str) -> (u16, Option<String>) {
+    let res = http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {token}"))], "").await;
+    let body: serde_json::Value = serde_json::from_str(&res.body).unwrap_or_default();
+    (res.status, body["application"].as_str().map(str::to_owned))
+}
+
+fn names(server: &Server) -> Vec<String> {
+    server.apps().into_iter().map(|a| a.name).collect()
+}
+
+/// A server whose first engine was opened with `Engine::open_existing` (what
+/// NUAGE_RESTORE_REQUIRED does) does not serve a registered application whose
+/// directory is empty and whose backup holds nothing: it is in the failed list
+/// with the engine's sentence, its token opens nothing, nothing is made for it
+/// on the disk or sent to its backup, and the other applications are served.
+/// Once its backup is complete again, a restart brings it back; or the
+/// console deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_without_its_backup_is_not_served_empty() {
+    use common::{User, user};
+    let (dir, backups) = (temp_dir("unserved"), temp_dir("unserved-backup"));
+    let (restored, again) = (temp_dir("unserved-restored"), temp_dir("unserved-again"));
+
+    // A server with two applications, each with a row, backed up.
+    let server = Server::new(Engine::open(&dir, backed_up_to(&backups)).unwrap(), options());
+    assert!(!server.engine().restore_required(), "Engine::open requires nothing");
+    let (_, shop) = server.create_app("shop", "").unwrap();
+    let (_, blog) = server.create_app("blog", "").unwrap();
+    for name in ["shop", "blog"] {
+        let db = nuage::Embedded::from_engine(server.app_engine(name).unwrap());
+        db.create_table::<User>().await.unwrap();
+        user(&format!("one@{name}.dev"), name, None, 1.0).insert(&db).await.unwrap();
+    }
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    closed(server).await;
+
+    // The copy of the backup missed one file: shop's manifest.
+    let manifest = backups.join("apps/shop/manifest.json");
+    let kept = std::fs::read(&manifest).unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    let before = files_in(&backups.join("apps/shop"));
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.engine().restore_required() && server.engine().backup_status().restored);
+    assert_eq!(names(&server), ["nuage", "blog"]);
+    let sentence = format!(
+        "Nuage DB storage: this directory is empty and {}/apps/shop holds no backup to restore: an empty database \
+         is not started here",
         backups.display()
     );
-    assert!(out.contains(&shop), "{out}");
-    assert!(!out.contains("NEW, EMPTY"), "{out}");
-    for d in [data, folder, first, restored, backups] {
+    let failed = server.failed_apps();
+    assert!(failed.len() == 1 && failed[0].0 == "shop" && failed[0].1.contains(&sentence), "{failed:?}");
+    let said = server.engine().events().0.into_iter().any(|e| {
+        e.level == "error" && e.message.contains("application `shop` cannot be opened") && e.message.contains(&sentence)
+    });
+    assert!(said, "{:?}", server.engine().events().0);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    assert_eq!(info(addr, &shop).await, (401, None), "its token opens nothing");
+    assert_eq!(info(addr, &blog).await, (200, Some("blog".into())));
+    let db = NuageDb::connect(&running.url(), &blog).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    assert!(!restored.join("apps/shop").exists(), "nothing was made for it");
+    assert_eq!(files_in(&backups.join("apps/shop")), before, "nothing was sent to its backup");
+    // The console shows why.
+    let mut c = Console { addr, cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let list = c.request("GET", "/admin", &[]).await;
+    assert!(list.body.contains("cannot be opened") && list.body.contains(&sentence), "{}", list.body);
+    running.shutdown().await;
+    closed(server).await;
+
+    // The copy is completed: a restart brings the application back.
+    std::fs::write(&manifest, &kept).unwrap();
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    assert_eq!(names(&server), ["nuage", "blog", "shop"]);
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    assert_eq!(info(running.local_addr(), &shop).await, (200, Some("shop".into())));
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+
+    // Or the console deletes it, with what is left of its backup.
+    std::fs::remove_file(&manifest).unwrap();
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert_eq!(server.failed_apps().len(), 1);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let mut c = Console { addr: running.local_addr(), cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let settings = c.request("GET", "/admin/apps/shop/settings", &[]).await;
+    assert!(settings.body.contains("could not be opened at startup"), "{}", settings.body);
+    let token = csrf(&settings.body);
+    let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "shop")]).await;
+    assert!(res.body.contains("Application shop deleted"), "{}", res.body);
+    assert!(server.failed_apps().is_empty() && files_in(&backups.join("apps/shop")).is_empty());
+    running.shutdown().await;
+    closed(server).await;
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty() && names(&server) == ["nuage", "blog"]);
+    closed(server).await;
+    for d in [dir, backups, restored, again] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Creating an application is not restoring one: under a server that
+/// requires a restore (here restored from its backup onto an empty disk), a
+/// new application starts empty and is served. A restart on the same disk
+/// keeps it, and once it is backed up, an empty disk gets it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creating_an_application_works_when_a_restore_is_required() {
+    use common::{User, user};
+    let (dir, backups) = (temp_dir("required-create"), temp_dir("required-create-backup"));
+    let (restored, again) = (temp_dir("required-create-restored"), temp_dir("required-create-again"));
+    let server = Server::new(Engine::open(&dir, backed_up_to(&backups)).unwrap(), options());
+    server.engine().backup_now(true).unwrap();
+    closed(server).await;
+
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.engine().restore_required() && server.engine().backup_status().restored);
+    let (_, shop) = server.create_app("shop", "").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    assert_eq!(info(running.local_addr(), &shop).await, (200, Some("shop".into())));
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    db.create_table::<User>().await.unwrap();
+    user("one@shop.dev", "One", None, 1.0).insert(&db).await.unwrap();
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+
+    // The same disk.
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    let db = nuage::Embedded::from_engine(server.app_engine("shop").unwrap());
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    closed(server).await;
+
+    // An empty disk.
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+    for d in [dir, backups, restored, again] {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
