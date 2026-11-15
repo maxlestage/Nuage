@@ -698,8 +698,10 @@ it refuses and why. It does what the console's Settings page does, from your des
    token (the settings file is protected, it holds the encryption key; nothing else is read).
    For a server online, type its address and its management token, `NUAGE_ADMIN_TOKEN`
    (on Heroku: the app's Settings, **Reveal Config Vars**). The editor remembers the
-   address; the token only if you tick *Remember on this computer* (kept in a file that only
-   you can read).
+   address; the token only if you tick *Remember on this computer*, and then in your
+   system's password store (the macOS Keychain, the Windows Credential Manager, the keyring
+   of a Linux desktop), never in a file of its own. It never sends the token after a
+   redirect, and asks before sending it in clear (`http://`) to an address on the Internet.
 
 What it changes is saved by the server, as from the console: in force at once, kept with
 the data. Settings read when the server starts (the encryption key, ports, passwords,

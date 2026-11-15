@@ -1,0 +1,5 @@
+# The tests may stop on what they check.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

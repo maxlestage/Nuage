@@ -2,55 +2,238 @@
 //! (`/api/apps`, `/api/settings`), with its management token
 //! (`NUAGE_ADMIN_TOKEN`). Every call is blocking: the window runs them on a
 //! thread of their own (see [`crate::jobs`]), never on its own.
+//!
+//! A redirect is never followed: the token would go to an address nobody
+//! approved. Servers deployed before a route existed are told apart from
+//! servers that refuse: the editor says what to update, and works with the
+//! rest.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
+use zeroize::Zeroizing;
 
-use crate::i18n::Lang;
+use crate::address::{self, Address, Class, Scheme};
+use crate::i18n::{Lang, t, tf};
+use crate::secret::Secret;
 
-/// How long a server may take to answer a call. Saving a setting makes the
-/// server send it to its backup at once, which may take a few seconds.
-const TIMEOUT: Duration = Duration::from_secs(30);
-/// How long reaching a server may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// The shortest management token a server accepts (`nuage::server::MIN_ADMIN_TOKEN`).
+pub const MIN_ADMIN_TOKEN: usize = 32;
+
+/// How long calls may take, and how much they may bring back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transport {
+    /// Reaching a server elsewhere.
+    pub connect: Duration,
+    /// Reaching a server of this computer: it answers at once, or it is not running.
+    pub connect_loopback: Duration,
+    /// A whole call. Saving a setting sends it to the backup at once, and
+    /// Heroku's router gives up after 30 s anyway.
+    pub global: Duration,
+    /// The largest answer read (answers are a few KB).
+    pub body_limit: u64,
+}
+
+impl Default for Transport {
+    fn default() -> Transport {
+        Transport {
+            connect: Duration::from_secs(10),
+            connect_loopback: Duration::from_secs(2),
+            global: Duration::from_secs(45),
+            body_limit: 1 << 20,
+        }
+    }
+}
+
+/// What a server has, besides applications and tokens (0.4.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Caps {
+    /// `/api/settings` (0.4.7): memory, limits, what it was started with.
+    pub settings: bool,
+    /// `/api/status` opened by the management token, with the version.
+    pub status: bool,
+    /// `POST /api/apps/{name}/origins` (it came with the status above).
+    pub origins: bool,
+    /// The server's version, when its status says it.
+    pub version: Option<String>,
+}
+
+/// The routes, for what their refusals mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// `/api/health`, called without the token.
+    Health,
+    /// `/api/apps`: the token, and a server of 0.4.2 or later.
+    Apps,
+    /// `/api/settings`.
+    Settings,
+    /// `/api/status`.
+    Status,
+    /// An application, its tokens, its memory.
+    App,
+}
 
 /// Why a call failed, as the window says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
-    /// No server answered at this address (nothing listens there, it is down,
-    /// or the network is cut).
-    Unreachable(String),
-    /// The address answered, but not as a Nuage DB server.
+    /// The address cannot be called (what was typed).
+    BadAddress(String),
+    /// No computer has this name (the host).
+    HostNotFound(String),
+    /// Nothing listens there.
+    Refused { address: String, loopback: bool, port: u16 },
+    /// No answer in time.
+    Timeout { address: String, after: Duration },
+    /// The secure connection failed (the system's words).
+    Tls(String),
+    /// The network failed in another way (the system's words).
+    Network(String),
+    /// An answer larger than any of Nuage DB's.
+    TooLarge,
+    /// Too many calls still wait for an answer.
+    Busy,
+    /// The editor failed (a bug): its message.
+    Bug(String),
+    /// A `3xx`: the editor does not follow it with the token. `upgrade`: the
+    /// same host over `https://`, the one case offered as is.
+    Redirect { from: String, to: String, upgrade: Option<String> },
+    /// The address answers, but not as Nuage DB (a website, another program).
     NotNuage(String),
-    /// The server refused the management token.
-    Unauthorized(String),
-    /// The management API is off on this server, or what was asked is not
-    /// allowed (the settings come from its environment only).
-    Forbidden(String),
-    /// A value that does not fit: the server's message says why, with the figures.
-    Refused(String),
-    /// No such application (deleted from the console meanwhile?).
+    /// A page of the host instead of the server's answer (the status).
+    HostAnswered(u16),
+    /// `401`: not the management token.
+    TokenRefused,
+    /// `403` on `/api/apps`: NUAGE_ADMIN_TOKEN is not set on the server.
+    ManagementOff,
+    /// `403` on the settings: they come from the environment only.
+    ReadOnly(String),
+    /// `/api/apps` is missing: a server before 0.4.2.
+    TooOld,
+    /// The route is missing: a server older than what was asked.
+    Unsupported,
+    /// No such application or token (the server's message).
     NotFound(String),
-    /// Anything else (the server failed): its message.
-    Failed(String),
+    /// It is there already (the server's message).
+    Conflict(String),
+    /// A value that does not fit: the server's message says why, with the figures.
+    Invalid(String),
+    /// The server failed: its status and message.
+    Server(u16, String),
+    /// No token is kept for this server any more.
+    NotKept,
+    /// The password store did not give the kept token (its words).
+    Keystore(String),
 }
 
 impl ApiError {
-    /// What the server or the network said.
-    pub fn detail(&self) -> &str {
+    /// What it means for the person, and what they can do, in `l`.
+    pub fn explain(&self, l: Lang) -> String {
+        let with = |what: &str, detail: &str| {
+            if detail.is_empty() { what.to_owned() } else { format!("{what} ({detail})") }
+        };
         match self {
-            ApiError::Unreachable(m)
-            | ApiError::NotNuage(m)
-            | ApiError::Unauthorized(m)
-            | ApiError::Forbidden(m)
-            | ApiError::Refused(m)
-            | ApiError::NotFound(m)
-            | ApiError::Failed(m) => m,
+            ApiError::BadAddress(typed) => {
+                tf(l, "\"{}\" is not an address. Example: https://my-nuage.herokuapp.com", &[typed])
+            }
+            ApiError::HostNotFound(host) => tf(
+                l,
+                "No computer has the name {}: check the spelling, and that this computer is on the Internet.",
+                &[host],
+            ),
+            ApiError::Refused { loopback: true, port, .. } => tf(
+                l,
+                "Nuage DB does not answer on this computer (port {}): it is stopped, or still starting.",
+                &[port],
+            ),
+            ApiError::Refused { address, .. } => {
+                tf(l, "Nothing answers at {}: is the server running, and is the port right?", &[address])
+            }
+            ApiError::Timeout { address, after } => tf(
+                l,
+                "{} did not answer within {}; a server that was asleep can take half a minute to wake. Try again.",
+                &[address, &seconds(*after)],
+            ),
+            ApiError::Tls(detail) => with(
+                t(
+                    l,
+                    "The secure connection (https) failed: the server's certificate is not trusted, or nothing speaks https at this address (a server of your own network may need http://). A network that inspects HTTPS causes this too. The editor never ignores a certificate.",
+                ),
+                detail,
+            ),
+            ApiError::Network(detail) => {
+                with(t(l, "The connection failed: check this computer's network, then try again."), detail)
+            }
+            ApiError::TooLarge => {
+                t(l, "The answer is larger than any of Nuage DB's (1 MiB): is this address really your Nuage DB server?")
+                    .to_owned()
+            }
+            ApiError::Busy => t(l, "Too many calls are still waiting for an answer: try again in a moment.").to_owned(),
+            ApiError::Bug(detail) => {
+                with(t(l, "The editor failed unexpectedly (a bug). Try again; if it happens again, please report it."), detail)
+            }
+            ApiError::Redirect { from, to, upgrade: Some(_) } => tf(
+                l,
+                "{} sends the editor to {}, its https:// address: use that one (the editor does not follow it with your token by itself).",
+                &[from, to],
+            ),
+            ApiError::Redirect { from, to, upgrade: None } => tf(
+                l,
+                "{} sends the editor to {}. The editor does not follow it with your token: if that is your server, type its address.",
+                &[from, to],
+            ),
+            ApiError::NotNuage(address) => tf(
+                l,
+                "{} answers, but not as a Nuage DB server. Is it your website's address rather than Nuage DB's?",
+                &[address],
+            ),
+            ApiError::HostAnswered(status) if *status >= 500 => tf(
+                l,
+                "The host answered {}: the server is starting, asleep or crashed. Try again in a minute (Heroku: More, then View logs).",
+                &[status],
+            ),
+            ApiError::HostAnswered(status) => tf(
+                l,
+                "The host answered {} with a page of its own, not Nuage DB's answer: something between this computer and the server (a proxy) refuses the call.",
+                &[status],
+            ),
+            ApiError::TokenRefused => t(
+                l,
+                "The server refused this token. The editor needs the management token (NUAGE_ADMIN_TOKEN), not an application's token nor the console password.",
+            )
+            .to_owned(),
+            ApiError::ManagementOff => t(
+                l,
+                "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Set it in its settings file or its host's variables (`nuage genkey` makes one), then restart the server.",
+            )
+            .to_owned(),
+            ApiError::ReadOnly(detail) => with(
+                t(
+                    l,
+                    "This server takes its settings from its environment only (NUAGE_SETTINGS=environment): nothing is changed from here.",
+                ),
+                detail,
+            ),
+            ApiError::TooOld => {
+                t(l, "This server is older than Nuage DB 0.4.2: update it to manage it from here.").to_owned()
+            }
+            ApiError::Unsupported => t(l, "This server's version cannot do this yet: update the server to do it here.").to_owned(),
+            ApiError::NotFound(detail) => with(t(l, "Not found:"), detail),
+            ApiError::Conflict(detail) | ApiError::Invalid(detail) => with(t(l, "Not saved:"), detail),
+            ApiError::Server(status, detail) => with(&tf(l, "The server failed (HTTP {}).", &[status]), detail),
+            ApiError::NotKept => t(l, "No token is kept for this server any more: type it again.").to_owned(),
+            ApiError::Keystore(detail) => {
+                with(t(l, "The password store did not give the kept token: type it instead."), detail)
+            }
         }
     }
+}
+
+/// A duration as a sentence says it: `45 s`, `300 ms`.
+fn seconds(d: Duration) -> String {
+    if d >= Duration::from_secs(1) { format!("{} s", d.as_secs()) } else { format!("{} ms", d.as_millis()) }
 }
 
 /// An amount of memory an owner sets: a number of MiB, or `auto` (`None`).
@@ -80,8 +263,12 @@ pub fn mib_of(typed: &str) -> Option<u64> {
     }
 }
 
+// The answers are read leniently: a field a server does not send takes its
+// default, and fields it adds are ignored, so older and newer servers parse.
+
 /// A setting, as `/api/settings` gives it.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Setting {
     /// Its name (`memory.cache_mb`).
     pub key: String,
@@ -96,7 +283,6 @@ pub struct Setting {
     /// What the environment, or the settings file, says.
     pub environment: Option<String>,
     /// What it is when nobody says anything.
-    #[serde(default)]
     pub default: String,
 }
 
@@ -109,6 +295,7 @@ impl Setting {
 
 /// The memory of the server, in bytes.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Memory {
     /// What the server counts on.
     pub total_bytes: Option<u64>,
@@ -123,7 +310,8 @@ pub struct Memory {
 }
 
 /// The memory of one application, as `/api/settings` gives it.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AppMemory {
     pub name: String,
     /// Set apart for its page cache (`None`: it shares).
@@ -139,7 +327,8 @@ pub struct AppMemory {
 }
 
 /// A setting read once, when the server starts.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Startup {
     pub variable: String,
     /// `***` for a secret that is set; `None` when nothing was said.
@@ -148,21 +337,19 @@ pub struct Startup {
 
 /// Everything `/api/settings` answers.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Settings {
     /// The server takes its settings from its environment only.
     pub read_only: bool,
     /// What was saved and is not in force (`read_only`).
-    #[serde(default)]
     pub ignored: BTreeMap<String, String>,
     pub settings: Vec<Setting>,
     pub memory: Memory,
     pub applications: Vec<AppMemory>,
-    #[serde(default)]
     pub startup: Vec<Startup>,
     /// The settings file the server was started with.
     pub settings_file: Option<String>,
     /// Saved and in force, but not yet in the backup.
-    #[serde(default)]
     pub warning: Option<String>,
 }
 
@@ -174,7 +361,8 @@ impl Settings {
 }
 
 /// A token of an application: never the token itself.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Token {
     /// Its first characters, shown to tell tokens apart.
     pub id: String,
@@ -184,104 +372,139 @@ pub struct Token {
 
 /// The memory of an application, as `/api/apps` gives it.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AppAmounts {
-    #[serde(deserialize_with = "amount", default)]
+    #[serde(deserialize_with = "amount")]
     pub cache_mb: Amount,
-    #[serde(deserialize_with = "amount", default)]
+    #[serde(deserialize_with = "amount")]
     pub kv_mb: Amount,
 }
 
 /// An application of the server.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Application {
     pub name: String,
-    #[serde(default)]
     pub description: String,
     /// The server's own application (`NUAGE_NAME`).
-    #[serde(default)]
     pub first: bool,
-    #[serde(default)]
     pub created_at: i64,
-    #[serde(default)]
     pub tokens: Vec<Token>,
     /// `NUAGE_TOKEN` opens it too.
-    #[serde(default)]
     pub env_token: bool,
     /// Websites whose pages may call it.
-    #[serde(default)]
     pub origins: Vec<String>,
-    #[serde(default)]
     pub memory: AppAmounts,
 }
 
 /// What an application needs to connect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Connection {
     /// The token, shown once: the server keeps only its digest.
-    pub token: String,
-    /// `NUAGE_URL`.
+    pub token: Secret,
+    /// `NUAGE_URL`: the server's public address when it has one, else the
+    /// address the editor used.
     pub url: String,
 }
 
 impl Connection {
     /// The two lines an application's settings take.
-    pub fn env_lines(&self) -> String {
-        format!("NUAGE_URL={}\nNUAGE_TOKEN={}", self.url, self.token)
+    pub fn env_lines(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("NUAGE_URL={}\nNUAGE_TOKEN={}", self.url, self.token.expose()))
     }
+
+    /// `NUAGE_URL` reaches this computer only (`127.0.0.1`, `localhost`).
+    pub fn is_this_computer_only(&self) -> bool {
+        address::normalize(&self.url).is_ok_and(|a| a.class() == Class::Loopback)
+    }
+}
+
+/// A server once connected: what it has, and what it said.
+#[derive(Debug)]
+pub struct Connected {
+    pub server: Server,
+    pub apps: Vec<Application>,
+    /// `None`: an older server without settings, or they failed (`settings_error`).
+    pub settings: Option<Settings>,
+    pub settings_error: Option<ApiError>,
 }
 
 /// A Nuage DB server and its management token.
 #[derive(Clone)]
 pub struct Server {
+    address: Address,
     base: String,
-    token: String,
+    token: Arc<Secret>,
     lang: Lang,
     agent: ureq::Agent,
+    transport: Transport,
+    /// The address its applications use, when it is not the one called
+    /// (`SITE_URL` of a server of this computer).
+    public: Option<String>,
+    caps: Caps,
 }
 
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the token.
-        f.debug_struct("Server").field("base", &self.base).finish_non_exhaustive()
+        // The token prints as Secret(***).
+        f.debug_struct("Server")
+            .field("base", &self.base)
+            .field("token", &self.token)
+            .field("public", &self.public)
+            .field("caps", &self.caps)
+            .finish_non_exhaustive()
     }
 }
 
-/// An address as a person types it: `localhost:8080`, `nuage.example.com`,
-/// `https://…/admin` → `http://localhost:8080`, `https://nuage.example.com`.
-pub fn normalize_address(typed: &str) -> String {
-    let typed = typed.trim().trim_end_matches('/');
-    let with_scheme = if typed.starts_with("http://") || typed.starts_with("https://") {
-        typed.to_owned()
-    } else {
-        // A server of this computer or of the local network answers in clear;
-        // anything else is reached over HTTPS.
-        let host = typed.split(['/', ':']).next().unwrap_or_default();
-        let local = host == "localhost"
-            || host.starts_with("127.")
-            || host.starts_with("192.168.")
-            || host.starts_with("10.")
-            || host.ends_with(".local");
-        format!("{}://{typed}", if local { "http" } else { "https" })
-    };
-    // What follows the host (a page of the console or of the site) is not the server's address.
-    match with_scheme.find("://").and_then(|i| with_scheme[i + 3..].find('/').map(|j| i + 3 + j)) {
-        Some(path) => with_scheme[..path].to_owned(),
-        None => with_scheme,
-    }
+/// `text` as one segment of a path (an application's name, a token's id).
+fn segment(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(b).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Method {
+    Get,
+    Post,
+    Delete,
 }
 
 impl Server {
-    /// The server at `address` (normalized), opened with `token`. Its
-    /// refusals come back in `lang`.
-    pub fn new(address: &str, token: &str, lang: Lang) -> Server {
+    /// The server at `address` (as typed: it is normalized), opened with
+    /// `token`. Its refusals come back in `lang`.
+    pub fn new(address: &str, token: Secret, lang: Lang, transport: &Transport) -> Result<Server, ApiError> {
+        let address = address::normalize(address).map_err(|_| ApiError::BadAddress(address.trim().to_owned()))?;
+        let connect = if address.class() == Class::Loopback { transport.connect_loopback } else { transport.connect };
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
-            .timeout_connect(Some(CONNECT_TIMEOUT))
             .http_status_as_error(false)
+            // A 3xx comes back as it is: the token goes nowhere else.
+            .max_redirects(0)
+            .timeout_connect(Some(connect))
+            .timeout_global(Some(transport.global))
             .user_agent(concat!("nuage-editor/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Server { base: normalize_address(address), token: token.trim().to_owned(), lang, agent }
+        let base = address.base();
+        Ok(Server {
+            address,
+            base,
+            token: Arc::new(token),
+            lang,
+            agent,
+            transport: transport.clone(),
+            public: None,
+            caps: Caps::default(),
+        })
+    }
+
+    /// The address its applications use (`SITE_URL`), when it is not the one called.
+    pub fn with_public(mut self, public: Option<String>) -> Server {
+        self.public = public.map(|p| p.trim().trim_end_matches('/').to_owned()).filter(|p| !p.is_empty());
+        self
     }
 
     /// Its address.
@@ -289,102 +512,216 @@ impl Server {
         &self.base
     }
 
+    /// The address the applications are given.
+    pub fn public_address(&self) -> &str {
+        self.public.as_deref().unwrap_or(&self.base)
+    }
+
+    /// How long a call may take.
+    pub fn timeout(&self) -> Duration {
+        self.transport.global
+    }
+
+    /// What it has (known once connected).
+    pub fn caps(&self) -> &Caps {
+        &self.caps
+    }
+
+    /// The token, for the one place that keeps it (the password store).
+    pub fn token(&self) -> &Secret {
+        &self.token
+    }
+
     /// Its console, in a browser.
     pub fn console_url(&self) -> String {
         format!("{}/admin", self.base)
     }
 
-    /// One call: the answer's JSON, or why it failed.
-    fn call(&self, method: &str, path: &str, body: Option<Json>) -> Result<Json, ApiError> {
+    /// Checks the server step by step, and what it has: `/api/health` without
+    /// the token (a wrong address, a website, a captive portal never gets it),
+    /// `/api/apps` with it, then the settings and the status together.
+    pub fn connect(mut self) -> Result<Connected, ApiError> {
+        self.health()?;
+        let apps = self.applications()?;
+        let (settings, status) = std::thread::scope(|scope| {
+            let this = &self;
+            let status =
+                std::thread::Builder::new().name("nuage-editor-call".into()).spawn_scoped(scope, || this.status());
+            let settings = this.settings();
+            let status = match status {
+                Ok(handle) => handle.join().unwrap_or(Err(ApiError::Unsupported)),
+                // No thread: one after the other.
+                Err(_) => this.status(),
+            };
+            (settings, status)
+        });
+        // An older server answers a token it does not know with its public
+        // status, which has no version: that is no status.
+        let version = status.ok().and_then(|s| s.get("version")?.as_str().map(str::to_owned));
+        self.caps.status = version.is_some();
+        self.caps.origins = self.caps.status;
+        self.caps.version = version;
+        let (settings, settings_error) = match settings {
+            Ok(s) => (Some(s), None),
+            Err(ApiError::Unsupported) => (None, None),
+            Err(e) => (None, Some(e)),
+        };
+        self.caps.settings = settings.is_some() || settings_error.is_some();
+        Ok(Connected { server: self, apps, settings, settings_error })
+    }
+
+    /// One call: the answer's JSON, or why it failed. `bearer`: with the token.
+    fn call(
+        &self,
+        route: Route,
+        method: Method,
+        path: &str,
+        body: Option<Json>,
+        bearer: bool,
+    ) -> Result<Json, ApiError> {
         let url = format!("{}{path}", self.base);
-        let auth = format!("Bearer {}", self.token);
         let lang = self.lang.code();
-        let answer = match (method, body) {
-            ("GET", _) => self.agent.get(&url).header("authorization", &auth).header("accept-language", lang).call(),
-            ("DELETE", _) => {
-                self.agent.delete(&url).header("authorization", &auth).header("accept-language", lang).call()
+        let auth = Zeroizing::new(format!("Bearer {}", self.token.expose()));
+        let answer = match method {
+            Method::Get => {
+                let request = self.agent.get(&url).header("accept-language", lang);
+                if bearer { request.header("authorization", auth.as_str()).call() } else { request.call() }
             }
-            (_, body) => self
+            Method::Delete => {
+                self.agent.delete(&url).header("accept-language", lang).header("authorization", auth.as_str()).call()
+            }
+            Method::Post => self
                 .agent
                 .post(&url)
-                .header("authorization", &auth)
                 .header("accept-language", lang)
+                .header("authorization", auth.as_str())
                 .send_json(body.unwrap_or_else(|| json!({}))),
         };
-        let mut answer = answer.map_err(|e| ApiError::Unreachable(e.to_string()))?;
+        let mut answer = answer.map_err(|e| self.failed(e, true))?;
         let status = answer.status().as_u16();
-        let is_json = answer
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("application/json"));
-        let text = answer.body_mut().with_config().limit(32 << 20).read_to_string().unwrap_or_default();
-        let json: Json = if is_json { serde_json::from_str(&text).unwrap_or(Json::Null) } else { Json::Null };
-        let message = json["error"]["message"].as_str().unwrap_or_default().to_owned();
-        match status {
-            200..=299 if is_json => Ok(json),
-            // A page instead of JSON: a website, a proxy's error page, a console page.
-            200..=299 => {
-                Err(ApiError::NotNuage(format!("{} answered with a web page, not with Nuage DB's API", self.base)))
-            }
-            401 => Err(ApiError::Unauthorized(message)),
-            403 => Err(ApiError::Forbidden(message)),
-            404 if message.is_empty() || message.starts_with("no such route") => Err(ApiError::NotNuage(format!(
-                "{} has no management API: not a Nuage DB server, or a version before 0.4.2 (the settings came with 0.4.7)",
-                self.base
-            ))),
-            404 => Err(ApiError::NotFound(message)),
-            400 | 409 | 413 => Err(ApiError::Refused(message)),
-            _ if !is_json => Err(ApiError::NotNuage(format!("{} answered {status}", self.base))),
-            _ => Err(ApiError::Failed(if message.is_empty() { format!("HTTP {status}") } else { message })),
+        let header = |name: &str| answer.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let location = header("location");
+        let is_json =
+            header("content-type").is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("application/json"));
+        // The answer may hold a token: its bytes are wiped once read.
+        let bytes = Zeroizing::new(
+            answer
+                .body_mut()
+                .with_config()
+                .limit(self.transport.body_limit)
+                .read_to_vec()
+                .map_err(|e| self.failed(e, false))?,
+        );
+        let json = if is_json { serde_json::from_slice::<Json>(&bytes).ok() } else { None };
+        match (status, json) {
+            (200..=299, Some(json)) => Ok(json),
+            (status, json) => Err(refusal(route, &self.base, status, json.as_ref(), location.as_deref())),
         }
     }
 
-    fn parse<T: serde::de::DeserializeOwned>(json: Json) -> Result<T, ApiError> {
-        serde_json::from_value(json)
-            .map_err(|e| ApiError::NotNuage(format!("an answer this editor does not understand: {e}")))
+    /// What a failure of the transport means. `connecting`: before the answer
+    /// came (a broken TLS stream reads as invalid data then).
+    fn failed(&self, e: ureq::Error, connecting: bool) -> ApiError {
+        let https = self.address.scheme == Scheme::Https;
+        match e {
+            ureq::Error::HostNotFound => ApiError::HostNotFound(self.address.host.clone()),
+            ureq::Error::Timeout(which) => ApiError::Timeout {
+                address: self.base.clone(),
+                after: match which {
+                    ureq::Timeout::Connect | ureq::Timeout::Resolve if self.address.class() == Class::Loopback => {
+                        self.transport.connect_loopback
+                    }
+                    ureq::Timeout::Connect | ureq::Timeout::Resolve => self.transport.connect,
+                    _ => self.transport.global,
+                },
+            },
+            ureq::Error::Io(io) => match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => ApiError::Refused {
+                    address: self.base.clone(),
+                    loopback: self.address.class() == Class::Loopback,
+                    port: self.address.port_or_default(),
+                },
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                    ApiError::Timeout { address: self.base.clone(), after: self.transport.global }
+                }
+                std::io::ErrorKind::InvalidData if https && connecting => ApiError::Tls(io.to_string()),
+                _ => ApiError::Network(io.to_string()),
+            },
+            ureq::Error::Rustls(e) => ApiError::Tls(e.to_string()),
+            ureq::Error::Tls(e) => ApiError::Tls(e.to_owned()),
+            ureq::Error::BodyExceedsLimit(_) | ureq::Error::LargeResponseHeader(..) => ApiError::TooLarge,
+            ureq::Error::BadUri(_) => ApiError::BadAddress(self.base.clone()),
+            // Not HTTP: another program listens there.
+            ureq::Error::Protocol(_) => ApiError::NotNuage(self.base.clone()),
+            ureq::Error::ConnectProxyFailed(why) => ApiError::Network(format!("proxy: {why}")),
+            other => ApiError::Network(other.to_string()),
+        }
     }
 
-    /// The settings, the memory and the applications' amounts. Also what
-    /// "check the connection" calls: it needs the management token.
+    fn parse<T: serde::de::DeserializeOwned>(&self, json: Json) -> Result<T, ApiError> {
+        serde_json::from_value(json).map_err(|_| ApiError::NotNuage(self.base.clone()))
+    }
+
+    /// `/api/health`, without the token: `{"status":"ok"}` from Nuage DB.
+    pub fn health(&self) -> Result<(), ApiError> {
+        let json = self.call(Route::Health, Method::Get, "/api/health", None, false)?;
+        match json.get("status").and_then(Json::as_str) {
+            Some("ok") => Ok(()),
+            _ => Err(ApiError::NotNuage(self.base.clone())),
+        }
+    }
+
+    /// The live status (its `version` says the management token opens it).
+    pub fn status(&self) -> Result<Json, ApiError> {
+        self.call(Route::Status, Method::Get, "/api/status", None, true)
+    }
+
+    /// The settings, the memory and the applications' amounts (0.4.7).
     pub fn settings(&self) -> Result<Settings, ApiError> {
-        Self::parse(self.call("GET", "/api/settings", None)?)
+        self.parse(self.call(Route::Settings, Method::Get, "/api/settings", None, true)?)
     }
 
     /// Saves settings (`None`: back to the environment's value), all or none.
     pub fn save_settings(&self, changes: &[(&str, Option<String>)]) -> Result<Settings, ApiError> {
         let body: serde_json::Map<String, Json> =
             changes.iter().map(|(k, v)| ((*k).to_owned(), v.clone().map_or(Json::Null, Json::String))).collect();
-        Self::parse(self.call("POST", "/api/settings", Some(Json::Object(body)))?)
+        self.parse(self.call(Route::Settings, Method::Post, "/api/settings", Some(Json::Object(body)), true)?)
     }
 
     /// Gives a setting back to the environment's value, or the default.
     pub fn reset_setting(&self, key: &str) -> Result<Settings, ApiError> {
-        Self::parse(self.call("DELETE", &format!("/api/settings/{key}"), None)?)
+        let path = format!("/api/settings/{}", segment(key));
+        self.parse(self.call(Route::Settings, Method::Delete, &path, None, true)?)
     }
 
     /// Every application.
     pub fn applications(&self) -> Result<Vec<Application>, ApiError> {
-        let json = self.call("GET", "/api/apps", None)?;
-        Self::parse(json["applications"].clone())
+        let mut json = self.call(Route::Apps, Method::Get, "/api/apps", None, true)?;
+        match json.get_mut("applications").map(Json::take) {
+            Some(list) => self.parse(list),
+            None => Err(ApiError::NotNuage(self.base.clone())),
+        }
     }
 
     /// A new application, with its first token.
     pub fn create_application(&self, name: &str, description: &str) -> Result<(Application, Connection), ApiError> {
-        let json = self.call("POST", "/api/apps", Some(json!({ "name": name.trim(), "description": description })))?;
-        let app = Self::parse(json["application"].clone())?;
-        Ok((app, self.connection_of(&json)))
+        let body = json!({ "name": name.trim(), "description": description });
+        let mut json = self.call(Route::App, Method::Post, "/api/apps", Some(body), true)?;
+        let app = self.parse(json.get_mut("application").map(Json::take).unwrap_or_default())?;
+        Ok((app, self.connection_of(json)?))
     }
 
     /// Another token for `name`; `read_only`: it reads, never writes.
     pub fn new_token(&self, name: &str, read_only: bool) -> Result<Connection, ApiError> {
-        let json = self.call("POST", &format!("/api/apps/{name}/tokens"), Some(json!({ "read_only": read_only })))?;
-        Ok(self.connection_of(&json))
+        let path = format!("/api/apps/{}/tokens", segment(name));
+        let json = self.call(Route::App, Method::Post, &path, Some(json!({ "read_only": read_only })), true)?;
+        self.connection_of(json)
     }
 
     /// Revokes the token `id` of `name`: it opens nothing any more.
     pub fn revoke_token(&self, name: &str, id: &str) -> Result<(), ApiError> {
-        self.call("DELETE", &format!("/api/apps/{name}/tokens/{id}"), None).map(|_| ())
+        let path = format!("/api/apps/{}/tokens/{}", segment(name), segment(id));
+        self.call(Route::App, Method::Delete, &path, None, true).map(|_| ())
     }
 
     /// The memory of one application: amounts as typed (`2 GiB`, `512`,
@@ -397,13 +734,131 @@ impl Server {
                 body.insert(key.into(), if v.is_empty() { json!("auto") } else { json!(v) });
             }
         }
-        Self::parse(self.call("POST", &format!("/api/apps/{name}/memory"), Some(Json::Object(body)))?)
+        let path = format!("/api/apps/{}/memory", segment(name));
+        self.parse(self.call(Route::App, Method::Post, &path, Some(Json::Object(body)), true)?)
     }
 
-    fn connection_of(&self, json: &Json) -> Connection {
-        Connection {
-            token: json["token"].as_str().unwrap_or_default().to_owned(),
-            url: json["env"]["NUAGE_URL"].as_str().map_or_else(|| self.base.clone(), str::to_owned),
+    /// The new token of an answer, taken out of it (the copy the server put
+    /// in `env` is wiped), and the address the applications use.
+    fn connection_of(&self, mut json: Json) -> Result<Connection, ApiError> {
+        if let Some(Json::String(copy)) = json.pointer_mut("/env/NUAGE_TOKEN").map(Json::take) {
+            drop(Zeroizing::new(copy));
+        }
+        match json.get_mut("token").map(Json::take) {
+            Some(Json::String(token)) if !token.is_empty() => {
+                Ok(Connection { token: Secret::new(token), url: self.public_address().to_owned() })
+            }
+            _ => Err(ApiError::NotNuage(self.base.clone())),
+        }
+    }
+}
+
+/// What a refused answer means, by route: `status`, its JSON (`None`: not
+/// JSON, a page), and its `Location`.
+pub fn refusal(route: Route, base: &str, status: u16, json: Option<&Json>, location: Option<&str>) -> ApiError {
+    let message = json.and_then(|j| j.get("error")?.get("message")?.as_str()).map(str::to_owned).unwrap_or_default();
+    let no_route = message.is_empty() || message.starts_with("no such route") || message.starts_with("no such page");
+    match status {
+        300..=399 => match location {
+            Some(to) => redirect(base, to),
+            None => ApiError::HostAnswered(status),
+        },
+        // A 2xx that is not JSON, or not the JSON asked for.
+        200..=299 => ApiError::NotNuage(base.to_owned()),
+        _ if route == Route::Health => {
+            if status >= 500 && json.is_none() {
+                ApiError::HostAnswered(status)
+            } else {
+                ApiError::NotNuage(base.to_owned())
+            }
+        }
+        // A page of the host, a proxy, a router: not the server's answer.
+        _ if json.is_none() => ApiError::HostAnswered(status),
+        401 => ApiError::TokenRefused,
+        403 if route == Route::Settings => ApiError::ReadOnly(message),
+        403 => ApiError::ManagementOff,
+        404 if no_route && route == Route::Apps => ApiError::TooOld,
+        404 if no_route => ApiError::Unsupported,
+        405 => ApiError::Unsupported,
+        404 => ApiError::NotFound(message),
+        409 => ApiError::Conflict(message),
+        400 | 413 | 422 => ApiError::Invalid(message),
+        _ => ApiError::Server(status, message),
+    }
+}
+
+/// A redirect from `base` to `location` (absolute, or a path of `base`).
+fn redirect(base: &str, location: &str) -> ApiError {
+    let location = location.trim();
+    let lower = location.to_ascii_lowercase();
+    let to = if lower.starts_with("http://") || lower.starts_with("https://") {
+        location.to_owned()
+    } else if let Some(rest) = location.strip_prefix("//") {
+        let scheme = base.split_once("://").map_or("https", |(s, _)| s);
+        format!("{scheme}://{rest}")
+    } else if location.starts_with('/') {
+        format!("{base}{location}")
+    } else {
+        format!("{base}/{location}")
+    };
+    // Only the same host going from http to https is offered as is.
+    let upgrade = match (address::normalize(base), address::normalize(&to)) {
+        (Ok(from), Ok(target))
+            if from.scheme == Scheme::Http && target.scheme == Scheme::Https && from.host == target.host =>
+        {
+            Some(target.base())
+        }
+        _ => None,
+    };
+    ApiError::Redirect { from: base.to_owned(), to, upgrade }
+}
+
+/// What a typed management token is, once a pasted `NUAGE_ADMIN_TOKEN=…`
+/// line, quotes and spaces are taken off; or why it cannot be one (said
+/// before anything is sent).
+pub fn typed_token(typed: &str) -> Result<Secret, TokenError> {
+    let text = typed.trim();
+    let text = text.strip_prefix("export ").map_or(text, str::trim_start);
+    let text = text.strip_prefix("NUAGE_ADMIN_TOKEN").map_or(text, |rest| rest.trim_start().trim_start_matches('='));
+    let text = text.trim().trim_matches(['"', '\'']).trim();
+    if text.is_empty() {
+        Err(TokenError::Empty)
+    } else if text.starts_with("nuage_") {
+        Err(TokenError::Application)
+    } else if !text.chars().all(|c| c.is_ascii_graphic()) {
+        Err(TokenError::Characters)
+    } else if text.chars().count() < MIN_ADMIN_TOKEN {
+        Err(TokenError::Short)
+    } else {
+        Ok(Secret::new(text.to_owned()))
+    }
+}
+
+/// Why a typed text is not a management token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenError {
+    Empty,
+    /// Under [`MIN_ADMIN_TOKEN`] characters.
+    Short,
+    /// `nuage_…`: an application's token.
+    Application,
+    /// Spaces or characters a token does not have.
+    Characters,
+}
+
+impl TokenError {
+    pub fn explain(self, l: Lang) -> String {
+        match self {
+            TokenError::Empty => t(l, "Type its management token first.").to_owned(),
+            TokenError::Short => {
+                tf(l, "A management token has {} characters at least: is part of it missing?", &[&MIN_ADMIN_TOKEN])
+            }
+            TokenError::Application => {
+                t(l, "This is an application's token (NUAGE_TOKEN), not the management token.").to_owned()
+            }
+            TokenError::Characters => {
+                t(l, "A management token has letters, digits and signs only, without spaces.").to_owned()
+            }
         }
     }
 }
@@ -411,27 +866,6 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn addresses_as_people_type_them() {
-        for (typed, address) in [
-            ("localhost:8080", "http://localhost:8080"),
-            ("  127.0.0.1:8080/ ", "http://127.0.0.1:8080"),
-            ("192.168.1.20:8080", "http://192.168.1.20:8080"),
-            ("nuage.example.com", "https://nuage.example.com"),
-            ("https://nuage-f48a.herokuapp.com/admin/settings", "https://nuage-f48a.herokuapp.com"),
-            ("http://maison.local:8080/fr/app/", "http://maison.local:8080"),
-        ] {
-            assert_eq!(normalize_address(typed), address, "{typed}");
-        }
-        assert_eq!(
-            (mib_of("2 Go"), mib_of("1,5 Gio"), mib_of("512"), mib_of("auto")),
-            (Some(2048), Some(1536), Some(512), None)
-        );
-        let server = Server::new("localhost:8080", " secret ", Lang::Fr);
-        assert_eq!(server.console_url(), "http://localhost:8080/admin");
-        assert!(!format!("{server:?}").contains("secret"), "the token is never printed");
-    }
 
     #[test]
     fn answers_are_read_as_the_server_writes_them() {
@@ -453,14 +887,160 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((app.memory.cache_mb, app.memory.kv_mb), (None, Some(8)));
-        let connection = Connection { token: "nuage_x".into(), url: "https://n.example".into() };
-        assert_eq!(connection.env_lines(), "NUAGE_URL=https://n.example\nNUAGE_TOKEN=nuage_x");
+        let connection = Connection { token: Secret::new("nuage_x".into()), url: "https://n.example".into() };
+        assert_eq!(connection.env_lines().as_str(), "NUAGE_URL=https://n.example\nNUAGE_TOKEN=nuage_x");
+        assert!(!format!("{connection:?}").contains("nuage_x"), "never printed");
+        assert!(!connection.is_this_computer_only());
+        let here = Connection { token: Secret::new("nuage_x".into()), url: "http://127.0.0.1:8080".into() };
+        assert!(here.is_this_computer_only());
+        assert_eq!(
+            (mib_of("2 Go"), mib_of("1,5 Gio"), mib_of("512"), mib_of("auto")),
+            (Some(2048), Some(1536), Some(512), None)
+        );
     }
 
     #[test]
-    fn nobody_there() {
-        // A port nothing listens on (the first ones are reserved and closed).
-        let err = Server::new("127.0.0.1:9", "t", Lang::En).settings().unwrap_err();
-        assert!(matches!(err, ApiError::Unreachable(_)), "{err:?}");
+    fn older_and_newer_servers_both_parse() {
+        // An application of 0.4.2 (no memory, no origins), and one of a later
+        // version with fields this editor does not know.
+        let old: Application = serde_json::from_value(json!({ "name": "shop", "tokens": [{ "id": "ab12" }] })).unwrap();
+        assert_eq!((old.name.as_str(), old.tokens.len(), old.memory.cache_mb), ("shop", 1, None));
+        let new: Application =
+            serde_json::from_value(json!({ "name": "shop", "last_seen": 3, "memory": { "cache_mb": 8, "x": 1 } }))
+                .unwrap();
+        assert_eq!(new.memory.cache_mb, Some(8));
+        let settings: Settings = serde_json::from_value(json!({ "settings": [{ "key": "k" }], "more": [] })).unwrap();
+        assert_eq!(settings.get("k").unwrap().shown(), "");
+    }
+
+    #[test]
+    fn refusals_by_route() {
+        let base = "http://127.0.0.1:8080";
+        let error = |message: &str| json!({ "error": { "kind": "x", "message": message } });
+        let no_route = error("no such route: see /v1/openapi.json");
+        let no_page = error("no such page: /api/settings");
+        for (route, status, json, expected) in [
+            (Route::Settings, 404, Some(&no_page), ApiError::Unsupported),
+            (Route::Settings, 405, Some(&no_route), ApiError::Unsupported),
+            (Route::Apps, 404, Some(&no_page), ApiError::TooOld),
+            (Route::Apps, 403, Some(&error("off")), ApiError::ManagementOff),
+            (Route::Settings, 403, Some(&error("environment")), ApiError::ReadOnly("environment".into())),
+            (Route::Apps, 401, Some(&error("no")), ApiError::TokenRefused),
+            (
+                Route::App,
+                404,
+                Some(&error("there is no application `x`")),
+                ApiError::NotFound("there is no application `x`".into()),
+            ),
+            (Route::App, 409, Some(&error("taken")), ApiError::Conflict("taken".into())),
+            (Route::App, 400, Some(&error("bad name")), ApiError::Invalid("bad name".into())),
+            (Route::App, 500, Some(&error("disk full")), ApiError::Server(500, "disk full".into())),
+            (Route::Apps, 503, None, ApiError::HostAnswered(503)),
+            (Route::Health, 503, None, ApiError::HostAnswered(503)),
+            (Route::Health, 404, None, ApiError::NotNuage(base.into())),
+            (Route::Health, 404, Some(&no_page), ApiError::NotNuage(base.into())),
+            (Route::Apps, 200, None, ApiError::NotNuage(base.into())),
+        ] {
+            assert_eq!(refusal(route, base, status, json, None), expected, "{route:?} {status}");
+        }
+        assert_eq!(
+            refusal(Route::Health, base, 301, None, Some("https://127.0.0.1:8080/api/health")),
+            ApiError::Redirect {
+                from: base.into(),
+                to: "https://127.0.0.1:8080/api/health".into(),
+                upgrade: Some("https://127.0.0.1:8080".into()),
+            }
+        );
+        assert_eq!(
+            refusal(Route::Apps, "https://n.example.com", 302, None, Some("/admin/login")),
+            ApiError::Redirect {
+                from: "https://n.example.com".into(),
+                to: "https://n.example.com/admin/login".into(),
+                upgrade: None
+            }
+        );
+        let elsewhere = refusal(Route::Health, "http://n.example.com", 301, None, Some("https://other.example.com/"));
+        assert!(matches!(elsewhere, ApiError::Redirect { upgrade: None, .. }), "{elsewhere:?}");
+        assert_eq!(refusal(Route::Health, base, 304, None, None), ApiError::HostAnswered(304));
+    }
+
+    #[test]
+    fn every_error_is_said_in_three_languages() {
+        let all = [
+            ApiError::BadAddress("x y".into()),
+            ApiError::HostNotFound("nuage.example.com".into()),
+            ApiError::Refused { address: "http://127.0.0.1:8080".into(), loopback: true, port: 8080 },
+            ApiError::Refused { address: "http://192.168.1.2:8080".into(), loopback: false, port: 8080 },
+            ApiError::Timeout { address: "https://n.example.com".into(), after: Duration::from_secs(45) },
+            ApiError::Tls("invalid peer certificate: UnknownIssuer".into()),
+            ApiError::Network("connection reset".into()),
+            ApiError::TooLarge,
+            ApiError::Busy,
+            ApiError::Bug("index out of bounds".into()),
+            ApiError::Redirect { from: "http://a".into(), to: "https://a".into(), upgrade: Some("https://a".into()) },
+            ApiError::Redirect { from: "http://a".into(), to: "https://b".into(), upgrade: None },
+            ApiError::NotNuage("https://n.example.com".into()),
+            ApiError::HostAnswered(503),
+            ApiError::HostAnswered(407),
+            ApiError::TokenRefused,
+            ApiError::ManagementOff,
+            ApiError::ReadOnly(String::new()),
+            ApiError::TooOld,
+            ApiError::Unsupported,
+            ApiError::NotFound("x".into()),
+            ApiError::Conflict("x".into()),
+            ApiError::Invalid("x".into()),
+            ApiError::Server(500, String::new()),
+            ApiError::NotKept,
+            ApiError::Keystore("locked".into()),
+        ];
+        for l in Lang::ALL {
+            for e in &all {
+                let text = e.explain(l);
+                assert!(!text.is_empty() && !text.contains("{}"), "{l:?} {e:?}: {text}");
+            }
+            for e in [TokenError::Empty, TokenError::Short, TokenError::Application, TokenError::Characters] {
+                assert!(!e.explain(l).is_empty());
+            }
+        }
+        assert_eq!(seconds(Duration::from_millis(300)), "300 ms");
+        assert_eq!(seconds(Duration::from_secs(45)), "45 s");
+    }
+
+    #[test]
+    fn a_typed_token() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for typed in [
+            token.to_owned(),
+            format!("  {token}\n"),
+            format!("NUAGE_ADMIN_TOKEN={token}"),
+            format!("NUAGE_ADMIN_TOKEN=\"{token}\""),
+            format!("export NUAGE_ADMIN_TOKEN = '{token}'"),
+        ] {
+            assert_eq!(typed_token(&typed).map(|s| s.expose().to_owned()), Ok(token.to_owned()), "{typed}");
+        }
+        assert_eq!(typed_token("  ").map(|_| ()), Err(TokenError::Empty));
+        assert_eq!(typed_token("short").map(|_| ()), Err(TokenError::Short));
+        assert_eq!(typed_token("nuage_0123456789abcdef0123456789abcdef").map(|_| ()), Err(TokenError::Application));
+        assert_eq!(typed_token("0123456789abcdef 0123456789abcdef").map(|_| ()), Err(TokenError::Characters));
+        assert_eq!(segment("ma boutique/é"), "ma%20boutique%2F%C3%A9");
+    }
+
+    #[test]
+    fn the_token_is_never_printed() {
+        let server =
+            Server::new("localhost:8080", Secret::new("made-up-token".into()), Lang::Fr, &Transport::default())
+                .unwrap();
+        assert_eq!(server.console_url(), "http://localhost:8080/admin");
+        assert!(!format!("{server:?}").contains("made-up-token"));
+        assert!(matches!(
+            Server::new("ftp://x", Secret::new("t".into()), Lang::En, &Transport::default()),
+            Err(ApiError::BadAddress(_))
+        ));
+        let public = server.clone().with_public(Some("https://nuage.example.com/".into()));
+        assert_eq!(
+            (server.public_address(), public.public_address()),
+            ("http://localhost:8080", "https://nuage.example.com")
+        );
     }
 }

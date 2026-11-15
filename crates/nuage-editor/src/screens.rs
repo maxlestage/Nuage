@@ -3,26 +3,58 @@
 
 use eframe::egui::{self, RichText};
 
-use crate::api::{Application, Settings};
+use crate::api::{ApiError, Application, Caps, Settings};
 use crate::format;
 use crate::i18n::{Lang, t, tf};
+
+/// What a page that needs the settings says on a server without them.
+pub const NO_SETTINGS: &str =
+    "Update the server to see this here: its version has no settings for the editor (they came with Nuage DB 0.4.7).";
 
 /// What the overview shows.
 pub struct View<'a> {
     pub address: &'a str,
+    pub caps: &'a Caps,
     pub settings: Option<&'a Settings>,
+    pub settings_error: Option<&'a ApiError>,
     pub apps: Option<&'a [Application]>,
 }
 
 /// The overview: is it there, how much memory, how many applications, and
 /// anything its owner should know.
 pub fn overview(ui: &mut egui::Ui, v: View<'_>, l: Lang) {
+    ui.label(tf(l, "The server at {} answers, and its management token is right.", &[&v.address]));
+    if let Some(version) = &v.caps.version {
+        ui.label(RichText::new(tf(l, "Nuage DB {}", &[version])).weak());
+    }
+    ui.add_space(8.0);
+    if !v.caps.settings {
+        // A server deployed before the settings: applications and tokens only.
+        egui::Grid::new("overview").num_columns(2).spacing([18.0, 8.0]).striped(true).show(ui, |ui| {
+            ui.label(t(l, "Applications"));
+            match v.apps {
+                Some(apps) => ui.label(apps.len().to_string()),
+                None => ui.spinner(),
+            };
+            ui.end_row();
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(t(
+                l,
+                "This server (before the settings came, 0.4.7) lets the editor manage applications and tokens only: update it for memory and limits.",
+            ))
+            .color(ui.visuals().warn_fg_color),
+        );
+        return;
+    }
     let Some(settings) = v.settings else {
-        ui.spinner();
+        match v.settings_error {
+            Some(e) => ui.label(RichText::new(e.explain(l)).color(ui.visuals().error_fg_color)),
+            None => ui.spinner(),
+        };
         return;
     };
-    ui.label(tf(l, "The server at {} answers, and its management token is right.", &[&v.address]));
-    ui.add_space(8.0);
     egui::Grid::new("overview").num_columns(2).spacing([18.0, 8.0]).striped(true).show(ui, |ui| {
         let m = &settings.memory;
         ui.label(t(l, "Memory"));
