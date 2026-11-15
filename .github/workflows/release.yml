@@ -2,7 +2,9 @@ name: Release
 
 # A tag `v0.3.0` publishes the release `v0.3.0`: the `nuage` binary for Linux (static,
 # x86_64 and ARM64: any distribution), macOS and Windows, each with its sha256. install.sh
-# downloads the Linux ones.
+# downloads the Linux ones. And Nuage DB Editor, the window for those who would rather not
+# use a terminal: an application for macOS (Apple silicon and Intel), a program for Windows
+# and for Linux desktops (x86_64).
 
 on:
   push:
@@ -76,8 +78,87 @@ jobs:
           name: ${{ matrix.target }}
           path: out/*
 
+  editor:
+    name: editor ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu runner: the program then runs on older Linux systems too (glibc).
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: editor-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p nuage-editor --bin nuage-editor --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          dir=target/${{ matrix.target }}/release
+          version=${TAG#v}
+          mkdir out
+          case "${{ runner.os }}" in
+            Windows)
+              name=nuage-editor-${{ matrix.target }}.zip
+              mkdir dist && cp "$dir/nuage-editor.exe" LICENSE dist/
+              (cd dist && 7z a -bd -tzip "../out/$name" nuage-editor.exe LICENSE >/dev/null)
+              ;;
+            macOS)
+              # An application: double-click it (the first time: right-click, Open).
+              app="dist/Nuage DB Editor.app"
+              mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+              cp "$dir/nuage-editor" "$app/Contents/MacOS/"
+              icons=$(mktemp -d)/AppIcon.iconset && mkdir -p "$icons"
+              for size in 16 32 128 256 512; do
+                sips -z $size $size crates/nuage-site/static/icon-512.png --out "$icons/icon_${size}x${size}.png" >/dev/null
+                double=$((size * 2)); [ $double -le 512 ] || double=512
+                sips -z $double $double crates/nuage-site/static/icon-512.png --out "$icons/icon_${size}x${size}@2x.png" >/dev/null
+              done
+              iconutil -c icns "$icons" -o "$app/Contents/Resources/AppIcon.icns"
+              sed "s/@VERSION@/$version/g" crates/nuage-editor/packaging/Info.plist > "$app/Contents/Info.plist"
+              cp LICENSE "$app/Contents/Resources/"
+              # Signed for this computer only (no Apple developer certificate): macOS then
+              # asks once whether to open it, instead of saying it is damaged.
+              codesign --force --deep --sign - "$app"
+              codesign --verify --verbose "$app"
+              name=nuage-editor-${{ matrix.target }}.zip
+              (cd dist && ditto -c -k --sequesterRsrc --keepParent "Nuage DB Editor.app" "../out/$name")
+              ;;
+            Linux)
+              name=nuage-editor-${{ matrix.target }}.tar.gz
+              mkdir dist
+              cp "$dir/nuage-editor" LICENSE crates/nuage-editor/packaging/nuage-editor.desktop dist/
+              cp crates/nuage-site/static/icon-512.png dist/nuage-editor.png
+              tar -czf "out/$name" -C dist nuage-editor nuage-editor.desktop nuage-editor.png LICENSE
+              ;;
+          esac
+          cd out
+          if command -v sha256sum >/dev/null; then sha256sum "$name" > "$name.sha256"; else shasum -a 256 "$name" > "$name.sha256"; fi
+          cat "$name.sha256"
+      - name: Check that the Linux program starts (without a screen it says why, and stops)
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          target/${{ matrix.target }}/release/nuage-editor 2> said.txt
+          code=$?
+          cat said.txt
+          [ $code -ne 0 ] && grep -q "could not open its window" said.txt
+      - uses: actions/upload-artifact@v5
+        with:
+          name: editor-${{ matrix.target }}
+          path: out/*
+
   publish:
-    needs: build
+    needs: [build, editor]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -98,6 +179,20 @@ jobs:
           \`\`\`sh
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/install.sh | sudo bash
           \`\`\`
+
+          ## Nuage DB Editor: the same settings, in a window
+
+          For those who would rather not use a terminal. Download the file for your computer,
+          open it, and connect to your server (on this computer, or online):
+
+          - **macOS**: \`nuage-editor-aarch64-apple-darwin.zip\` (Apple silicon: M1 and later) or
+            \`nuage-editor-x86_64-apple-darwin.zip\` (Intel). Unzip, move *Nuage DB Editor* to
+            Applications. The first time, right-click it and choose **Open** (it is not signed with an
+            Apple developer certificate; on recent macOS: System Settings, Privacy & Security, **Open Anyway**).
+          - **Windows**: \`nuage-editor-x86_64-pc-windows-msvc.zip\`. Unzip, double-click
+            \`nuage-editor.exe\`. If SmartScreen says it protected your computer: **More info**, then **Run anyway**.
+          - **Linux** (x86_64, a desktop with X11 or Wayland): \`nuage-editor-x86_64-unknown-linux-gnu.tar.gz\`.
+            It needs OpenGL and libxkbcommon, which desktops have.
           EOF
           cat notes.md
       - uses: softprops/action-gh-release@v2

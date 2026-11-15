@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Nuage DB Editor.app (see .github/workflows/release.yml: @VERSION@ is the release's). -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Nuage DB Editor</string>
+	<key>CFBundleDisplayName</key>
+	<string>Nuage DB Editor</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.github.maxlestage.nuage-editor</string>
+	<key>CFBundleExecutable</key>
+	<string>nuage-editor</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>fr</string>
+		<string>es</string>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

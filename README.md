@@ -676,6 +676,37 @@ what opens it (password, tokens) and where its backups go are read once, when it
 wrong value saved from the console could lock you out. The Settings page lists them (a
 secret shows as set, never its value) and says how to change them on this host.
 
+### In a window: Nuage DB Editor
+
+For those who would rather not use a terminal, **Nuage DB Editor** is a program with a window,
+in English, French and Spanish: it shows the server, changes its memory and its limits, makes
+applications and their tokens (shown once, with a Copy button), and says in plain words what
+it refuses and why. It does what the console's Settings page does, from your desktop.
+
+1. **Download it** from the [latest release](https://github.com/maxlestage/Nuage/releases/latest):
+   `nuage-editor-aarch64-apple-darwin.zip` (Mac with Apple silicon) or
+   `nuage-editor-x86_64-apple-darwin.zip` (Intel Mac), `nuage-editor-x86_64-pc-windows-msvc.zip`
+   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (Linux desktop).
+2. **Open it.** macOS: unzip, move *Nuage DB Editor* to Applications; the first time,
+   right-click it and choose **Open** (on recent macOS: System Settings, Privacy & Security,
+   **Open Anyway**), because it is not signed with an Apple developer certificate. Windows:
+   unzip, double-click `nuage-editor.exe`; if SmartScreen says it protected your computer,
+   **More info**, then **Run anyway**. Linux: unpack, double-click `nuage-editor` (it needs
+   OpenGL and libxkbcommon, which desktops have; `nuage-editor.desktop` puts it in the menu).
+3. **Connect.** A server installed on this computer by the installer is found by itself:
+   one click, and your system asks for your password to read its port and its management
+   token (the settings file is protected, it holds the encryption key; nothing else is read).
+   For a server online, type its address and its management token, `NUAGE_ADMIN_TOKEN`
+   (on Heroku: the app's Settings, **Reveal Config Vars**). The editor remembers the
+   address; the token only if you tick *Remember on this computer* (kept in a file that only
+   you can read).
+
+What it changes is saved by the server, as from the console: in force at once, kept with
+the data. Settings read when the server starts (the encryption key, ports, passwords,
+where backups go) are shown, and the editor says how to change them on that host.
+Started with `NUAGE_URL` and `NUAGE_ADMIN_TOKEN` in its environment, it connects at once.
+From the sources: `cargo run --release -p nuage-editor`.
+
 ## Environment variables
 
 | Variable | Meaning | Default |
@@ -760,8 +791,10 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 │   ├── nuage/            the engine, embedded mode, server, console, status API,
 │   │                     backups (folder, S3), the `nuage` binary; tests/common is
 │   │                     Memoire's backend test suite
-│   └── nuage-site/       the website: pages, the live /app dashboard (Rust/wasm, the
-│                         prebuilt bundle in pkg/, rebuilt by build-wasm.sh), PWA, share card
+│   ├── nuage-site/       the website: pages, the live /app dashboard (Rust/wasm, the
+│   │                     prebuilt bundle in pkg/, rebuilt by build-wasm.sh), PWA, share card
+│   └── nuage-editor/     Nuage DB Editor, the settings in a window (egui); packaging/ for
+│                         the macOS application and the Linux menu
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            any container host
 ├── nuage.env.example     the environment, commented
@@ -778,6 +811,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p nuage-site --lib --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace --all-features
+cargo run -p nuage-editor           # the editor, against a server you run
 crates/nuage-site/build-wasm.sh   # after changing the dashboard (Rust 1.99, wasm-bindgen of Cargo.lock)
 ```
 

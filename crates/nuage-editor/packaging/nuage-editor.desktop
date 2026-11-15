@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Nuage DB Editor
+Name[fr]=Nuage DB Éditeur
+Name[es]=Nuage DB Editor
+Comment=Set up and change a Nuage DB server, without a terminal
+Comment[fr]=Régler et modifier un serveur Nuage DB, sans terminal
+Comment[es]=Configurar y cambiar un servidor Nuage DB, sin terminal
+Exec=nuage-editor
+Icon=nuage-editor
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=nuage-editor
