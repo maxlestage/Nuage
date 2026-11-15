@@ -322,3 +322,34 @@ fn a_token_the_store_no_longer_has() {
     assert!(!harness.state().prefs.servers[0].token_kept);
     assert_eq!(harness.query_all_by_role(Role::PasswordInput).count(), 1);
 }
+
+#[test]
+fn a_bug_in_the_window_shows_a_page_and_the_way_back() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // One frame of the window panics (a made-up bug): the window stays, and says so.
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail = fail_once.clone();
+    let editor = nuage_editor::Editor::new(
+        french(),
+        nuage_editor::Setup::with(Arc::new(MemoryVault::default()), Box::new(FakeSink::default())),
+    );
+    let mut harness = egui_kittest::Harness::builder().with_size([1100.0, 900.0]).with_max_steps(30).build_ui_state(
+        move |ui, editor: &mut nuage_editor::Editor| {
+            editor.frame_with(ui, |editor, ui| {
+                editor.show(ui);
+                if fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("made-up bug in the window");
+                }
+            })
+        },
+        editor,
+    );
+    harness.run();
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert_eq!(harness.state().failure().map(|f| f.message.as_str()), Some("made-up bug in the window"));
+    assert!(has(&harness, "L'éditeur a rencontré un bug"));
+    assert!(shows_anywhere(&harness, "made-up bug in the window"));
+    click(&mut harness, "Revenir au début");
+    assert!(harness.state().failure().is_none());
+    wait_for(&mut harness, "the start page", |h| has(h, "Adresse et jeton de gestion"));
+}

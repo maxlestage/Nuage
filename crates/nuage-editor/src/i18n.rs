@@ -90,30 +90,10 @@ fn table() -> &'static HashMap<&'static str, (&'static str, &'static str)> {
 
 /// English, French, Spanish.
 const TEXTS: &[(&str, &str, &str)] = &[
-    (
-        "Nuage DB Editor stopped unexpectedly (a bug): {}",
-        "Nuage DB Éditeur s'est arrêté de façon inattendue (un bug) : {}",
-        "Nuage DB Editor se detuvo de forma inesperada (un error del programa): {}",
-    ),
-    (
-        "Nuage DB Editor could not open its window: {}.",
-        "Nuage DB Éditeur n'a pas pu ouvrir sa fenêtre : {}.",
-        "Nuage DB Editor no pudo abrir su ventana: {}.",
-    ),
-    (
-        "It needs a computer with a screen and graphics (OpenGL 2 or later); on Linux, a desktop (X11 or Wayland).",
-        "Il lui faut un ordinateur avec un écran et des graphismes (OpenGL 2 ou plus récent) ; sous Linux, un bureau (X11 ou Wayland).",
-        "Necesita un equipo con pantalla y gráficos (OpenGL 2 o posterior); en Linux, un escritorio (X11 o Wayland).",
-    ),
     ("This message is also in {}.", "Ce message est aussi dans {}.", "Este mensaje también está en {}."),
     ("Theme", "Thème", "Tema"),
     ("Connection lines", "Lignes de connexion", "Líneas de conexión"),
     ("Language", "Langue", "Idioma"),
-    (
-        "The settings file of this computer has no management token (NUAGE_ADMIN_TOKEN): run the installer again, it adds one.",
-        "Le fichier de réglages de cet ordinateur n'a pas de jeton de gestion (NUAGE_ADMIN_TOKEN) : relancez l'installateur, il en ajoute un.",
-        "El archivo de ajustes de este equipo no tiene token de gestión (NUAGE_ADMIN_TOKEN): vuelve a ejecutar el instalador, añade uno.",
-    ),
     (
         "Saved: in force now, with no restart.",
         "Enregistré : en vigueur tout de suite, sans redémarrage.",
@@ -160,17 +140,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Un serveur Nuage DB est installé ici (ses réglages sont dans {}).",
         "Hay un servidor Nuage DB instalado aquí (sus ajustes están en {}).",
     ),
-    (
-        "Its settings file is protected (it holds the encryption key): your system asks for your password to read its address and its management token, and nothing else.",
-        "Son fichier de réglages est protégé (il contient la clé de chiffrement) : votre système vous demande votre mot de passe pour y lire son adresse et son jeton de gestion, et rien d'autre.",
-        "Su archivo de ajustes está protegido (contiene la clave de cifrado): tu sistema te pide tu contraseña para leer su dirección y su token de gestión, y nada más.",
-    ),
     ("Enter my password", "Saisir mon mot de passe", "Introducir mi contraseña"),
-    (
-        "Its settings file is protected (it holds the encryption key). Close the editor, then open it again as administrator (right-click: Run as administrator) to read it once, with \"Remember on this computer\" ticked.",
-        "Son fichier de réglages est protégé (il contient la clé de chiffrement). Fermez l'éditeur, puis rouvrez-le en tant qu'administrateur (clic droit : Exécuter en tant qu'administrateur) pour le lire une fois, avec « Retenir sur cet ordinateur » coché.",
-        "Su archivo de ajustes está protegido (contiene la clave de cifrado). Cierra el editor y vuelve a abrirlo como administrador (clic derecho: Ejecutar como administrador) para leerlo una vez, con «Recordar en este equipo» marcado.",
-    ),
     ("Use this server", "Utiliser ce serveur", "Usar este servidor"),
     (
         "No server was installed on this computer by the installer. If yours is elsewhere (online, another computer), type its address below.",
@@ -203,11 +173,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Its settings file is for administrators only.",
         "Son fichier de réglages est réservé aux administrateurs.",
         "Su archivo de ajustes es solo para administradores.",
-    ),
-    (
-        "The password was not given: nothing was read. Type the address and the token below instead.",
-        "Le mot de passe n'a pas été donné : rien n'a été lu. Tapez plutôt l'adresse et le jeton ci-dessous.",
-        "No se dio la contraseña: no se leyó nada. Escribe en su lugar la dirección y el token abajo.",
     ),
     (
         "Its settings file could not be read: {}",
@@ -705,6 +670,118 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "{} sends the editor to {}. The editor does not follow it with your token: if that is your server, type its address.",
         "{} renvoie l'éditeur vers {}. L'éditeur ne la suit pas avec votre jeton : si c'est votre serveur, tapez son adresse.",
         "{} envía el editor a {}. El editor no la sigue con tu token: si es tu servidor, escribe su dirección.",
+    ),
+    (
+        "Nuage DB Editor could not open its window on this computer (graphics: {}). The web console works in a browser: http://127.0.0.1:8080/admin for a server on this computer.",
+        "Nuage DB Éditeur n'a pas pu ouvrir sa fenêtre sur cet ordinateur (graphismes : {}). La console web fonctionne dans un navigateur : http://127.0.0.1:8080/admin pour un serveur de cet ordinateur.",
+        "Nuage DB Editor no pudo abrir su ventana en este equipo (gráficos: {}). La consola web funciona en un navegador: http://127.0.0.1:8080/admin para un servidor de este equipo.",
+    ),
+    (
+        "Nuage DB Editor reads the port and the management token of the Nuage DB server of this computer (not its encryption key).",
+        "Nuage DB Éditeur lit le port et le jeton de gestion du serveur Nuage DB de cet ordinateur (pas sa clé de chiffrement).",
+        "Nuage DB Editor lee el puerto y el token de gestión del servidor Nuage DB de este equipo (no su clave de cifrado).",
+    ),
+    (
+        "Nuage DB Editor starts the Nuage DB server of this computer.",
+        "Nuage DB Éditeur démarre le serveur Nuage DB de cet ordinateur.",
+        "Nuage DB Editor inicia el servidor Nuage DB de este equipo.",
+    ),
+    ("The editor hit a bug", "L'éditeur a rencontré un bug", "El editor encontró un error de programa"),
+    (
+        "Something in the editor went wrong, and its page stopped. Nothing more was sent to your server. What was saved before is saved; a change on its way may or may not have been made: look again once connected.",
+        "Quelque chose s'est mal passé dans l'éditeur, et sa page s'est arrêtée. Rien de plus n'a été envoyé à votre serveur. Ce qui était enregistré avant l'est toujours ; un changement en cours a pu être fait ou non : regardez à nouveau une fois connecté.",
+        "Algo falló en el editor y su página se detuvo. No se envió nada más a tu servidor. Lo que estaba guardado antes sigue guardado; un cambio en curso puede haberse hecho o no: vuelve a mirar una vez conectado.",
+    ),
+    ("What failed: {}", "Ce qui a échoué : {}", "Lo que falló: {}"),
+    ("Where: {}", "Où : {}", "Dónde: {}"),
+    ("Back to the start", "Revenir au début", "Volver al inicio"),
+    ("Copy the details", "Copier les détails", "Copiar los detalles"),
+    ("Quit", "Quitter", "Salir"),
+    (
+        "Tell the editor's authors (GitHub issues)",
+        "Le signaler aux auteurs de l'éditeur (GitHub issues)",
+        "Avisar a los autores del editor (GitHub issues)",
+    ),
+    (
+        "Nothing answers on port {} of this computer right now: the server may be stopped.",
+        "Rien ne répond sur le port {} de cet ordinateur pour l'instant : le serveur est peut-être arrêté.",
+        "Nada responde en el puerto {} de este equipo ahora mismo: puede que el servidor esté detenido.",
+    ),
+    ("Ask Windows", "Demander à Windows", "Pedírselo a Windows"),
+    (
+        "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of {}.",
+        "Ce système ne peut pas afficher ici de fenêtre demandant un administrateur ({}). Tapez l'adresse et le jeton de gestion ci-dessous : le jeton est la ligne NUAGE_ADMIN_TOKEN de {}.",
+        "Este sistema no puede mostrar aquí una ventana que pida un administrador ({}). Escribe abajo la dirección y el token de gestión: el token es la línea NUAGE_ADMIN_TOKEN de {}.",
+    ),
+    (
+        "Waiting for the system's window… ({} s)",
+        "En attente de la fenêtre du système… ({} s)",
+        "Esperando la ventana del sistema… ({} s)",
+    ),
+    (
+        "The window asking for an administrator was closed: nothing was read. Click the button again to be asked once more, or type the address and the token below.",
+        "La fenêtre demandant un administrateur a été fermée : rien n'a été lu. Cliquez à nouveau sur le bouton pour qu'elle revienne, ou tapez l'adresse et le jeton ci-dessous.",
+        "Se cerró la ventana que pedía un administrador: no se leyó nada. Pulsa otra vez el botón para que vuelva, o escribe abajo la dirección y el token.",
+    ),
+    (
+        "The system did not accept the answer ({}): nothing was read. It takes the password of an administrator of this computer.",
+        "Le système n'a pas accepté la réponse ({}) : rien n'a été lu. Il faut le mot de passe d'un administrateur de cet ordinateur.",
+        "El sistema no aceptó la respuesta ({}): no se leyó nada. Hace falta la contraseña de un administrador de este equipo.",
+    ),
+    (
+        "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of the settings file.",
+        "Ce système ne peut pas afficher ici de fenêtre demandant un administrateur ({}). Tapez l'adresse et le jeton de gestion ci-dessous : le jeton est la ligne NUAGE_ADMIN_TOKEN du fichier de réglages.",
+        "Este sistema no puede mostrar aquí una ventana que pida un administrador ({}). Escribe abajo la dirección y el token de gestión: el token es la línea NUAGE_ADMIN_TOKEN del archivo de ajustes.",
+    ),
+    (
+        "The settings file could not be read, even as administrator: {}",
+        "Le fichier de réglages n'a pas pu être lu, même en administrateur : {}",
+        "No se pudo leer el archivo de ajustes, ni siquiera como administrador: {}",
+    ),
+    (
+        "Windows did not hand the settings file over (code {}): nothing was read.",
+        "Windows n'a pas transmis le fichier de réglages (code {}) : rien n'a été lu.",
+        "Windows no entregó el archivo de ajustes (código {}): no se leyó nada.",
+    ),
+    (
+        "Windows did not hand the settings file over within two minutes: nothing was read.",
+        "Windows n'a pas transmis le fichier de réglages en deux minutes : rien n'a été lu.",
+        "Windows no entregó el archivo de ajustes en dos minutos: no se leyó nada.",
+    ),
+    (
+        "restart this computer (the server starts with it)",
+        "redémarrez cet ordinateur (le serveur démarre avec lui)",
+        "reinicia este equipo (el servidor se inicia con él)",
+    ),
+    (
+        "restart the server: sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
+        "redémarrez le serveur : sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
+        "reinicia el servidor: sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
+    ),
+    (
+        "restart the server: sudo systemctl restart nuage",
+        "redémarrez le serveur : sudo systemctl restart nuage",
+        "reinicia el servidor: sudo systemctl restart nuage",
+    ),
+    (
+        "{} has no management token (NUAGE_ADMIN_TOKEN), so the server's management API is off. The installer writes one only when it installs Nuage DB for the first time, not when it updates it: running it again adds none. To add one, as an administrator: add a line NUAGE_ADMIN_TOKEN= followed by 32 characters or more to that file (nuage genkey makes 64), then {}. Then come back here.",
+        "{} n'a pas de jeton de gestion (NUAGE_ADMIN_TOKEN) : l'API de gestion du serveur est donc fermée. L'installateur n'en écrit un que lorsqu'il installe Nuage DB pour la première fois, pas lors d'une mise à jour : le relancer n'en ajoute aucun. Pour en ajouter un, en administrateur : ajoutez à ce fichier une ligne NUAGE_ADMIN_TOKEN= suivie d'au moins 32 caractères (nuage genkey en donne 64), puis {}. Revenez ensuite ici.",
+        "{} no tiene token de gestión (NUAGE_ADMIN_TOKEN), así que la API de gestión del servidor está desactivada. El instalador solo escribe uno cuando instala Nuage DB por primera vez, no cuando lo actualiza: volver a ejecutarlo no añade ninguno. Para añadir uno, como administrador: añade a ese archivo una línea NUAGE_ADMIN_TOKEN= seguida de 32 caracteres o más (nuage genkey da 64) y después {}. Luego vuelve aquí.",
+    ),
+    (
+        "Its settings file is for administrators only (it holds the encryption key). Windows asks for an administrator's consent: its window names Windows Command Processor, verified publisher Microsoft Windows, and its details show the command. That command runs findstr, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
+        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). Windows demande l'accord d'un administrateur : sa fenêtre nomme Processeur de commandes Windows, éditeur vérifié Microsoft Windows, et ses détails montrent la commande. Cette commande lance findstr, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
+        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). Windows pide el consentimiento de un administrador: su ventana nombra Procesador de comandos de Windows, editor comprobado Microsoft Windows, y sus detalles muestran el comando. Ese comando ejecuta findstr, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
+    ),
+    (
+        "Its settings file is for administrators only (it holds the encryption key). macOS asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
+        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). macOS demande le mot de passe d'un administrateur, puis lance grep en administrateur, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
+        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). macOS pide la contraseña de un administrador y luego ejecuta grep como administrador, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
+    ),
+    (
+        "Its settings file is for administrators only (it holds the encryption key). Your system asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
+        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). Votre système demande le mot de passe d'un administrateur, puis lance grep en administrateur, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
+        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). Tu sistema pide la contraseña de un administrador y luego ejecuta grep como administrador, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
     ),
 ];
 

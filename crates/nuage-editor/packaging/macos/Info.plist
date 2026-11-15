@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Nuage DB Editor.app (see .github/workflows/release.yml: @VERSION@ is the release's). -->
+<!-- Nuage DB Editor.app (.github/workflows/release.yml replaces @VERSION@ with the release's).
+     The identifier is the window's app id and the password store's service name
+     (crates/nuage-editor/src/lib.rs: APP_ID). The name shown in Finder is localized in
+     {en,fr,es}.lproj/InfoPlist.strings. -->
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
@@ -8,7 +11,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>Nuage DB Editor</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.github.maxlestage.nuage-editor</string>
+	<string>io.github.maxlestage.nuage-editor</string>
 	<key>CFBundleExecutable</key>
 	<string>nuage-editor</string>
 	<key>CFBundleIconFile</key>
@@ -37,5 +40,7 @@
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Maxime Nathan Lestage</string>
 </dict>
 </plist>

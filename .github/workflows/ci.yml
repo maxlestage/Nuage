@@ -35,6 +35,19 @@ jobs:
         run: cargo clippy -p nuage --all-targets --no-default-features --locked -- -D warnings
       - name: Clippy (the site's browser bundle, wasm32)
         run: cargo clippy -p nuage-site --lib --target wasm32-unknown-unknown --locked -- -D warnings
+      # The server (Docker, Heroku, the releases install.sh downloads) never compiles a window
+      # crate: the editor depends on the server for its tests only, never the other way round.
+      - name: The server's dependencies hold no window crate
+        run: |
+          cargo tree -p nuage --all-features --target all -e normal,build --prefix none --locked > server.txt
+          gui='eframe|egui|egui-winit|egui_glow|egui-wgpu|winit|wgpu|glow|glutin|keyring|ureq|arboard|winresource'
+          found=$(sed 's/ .*//' server.txt | sort -u | grep -xE "$gui" || true)
+          if [ -n "$found" ]; then echo "::error::nuage depends on window crates: $found"; exit 1; fi
+          # The editor on Linux: no wgpu (Windows only), no fontconfig, and not the server.
+          cargo tree -p nuage-editor --target x86_64-unknown-linux-gnu -e normal --prefix none --locked > editor.txt
+          found=$(sed 's/ .*//' editor.txt | sort -u | grep -xE 'wgpu|naga|fontconfig-sys|nuage' || true)
+          if [ -n "$found" ]; then echo "::error::nuage-editor for Linux depends on: $found"; exit 1; fi
+          echo "nuage: $(sed 's/ .*//' server.txt | sort -u | wc -l) crates, none of a window"
 
   test:
     name: Tests
@@ -48,25 +61,57 @@ jobs:
 
   editor:
     # Nuage DB Editor is a window: it is built, and driven headless through its accessibility
-    # tree against a real server, on the three systems people double-click it on.
+    # tree against a real server, on the three systems people double-click it on (Linux's
+    # clippy and tests are the lint and test jobs'). Then its real window opens once.
     name: Editor (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy
+      - name: Clippy (the code of this system, windows-sys and osascript)
+        if: runner.os != 'Linux'
         run: cargo clippy -p nuage-editor --all-targets --locked -- -D warnings
-      - name: Tests (the window, against a server in the same process)
+      - name: Tests (the window against a server in the same process, Windows' pipe and findstr)
+        if: runner.os != 'Linux'
         run: cargo test -p nuage-editor --locked
+      # GitHub's Windows runners elevate without asking: the UAC path runs for real. If it ever
+      # waits for a click, it stops here (it is then for the checklist before a release).
+      - name: The elevated read of Windows (UAC)
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        continue-on-error: true
+        run: cargo test -p nuage-editor --locked --lib -- --ignored elevated
       - name: The program builds
         run: cargo build -p nuage-editor --bin nuage-editor --locked
+      - name: What a Linux desktop has (an X server in memory, Mesa's OpenGL)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q xvfb libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 libgl1 libegl1 libgl1-mesa-dri
+      # The real window draws a few frames and closes (Windows: Direct3D 12, WARP on a runner
+      # without a graphics card). macOS runners are virtual machines whose OpenGL may be
+      # refused: a failure there is shown, and checked again before a release.
+      - name: The window opens (--self-test)
+        shell: bash
+        continue-on-error: ${{ matrix.os == 'macos-latest' }}
+        run: |
+          run=target/debug/nuage-editor
+          if [ "$RUNNER_OS" = Linux ]; then run="xvfb-run -a $run"; fi
+          $run --self-test self-test.json
+          cat self-test.json
+      - name: The window opens with OpenGL asked first (it falls back where there is no driver)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NUAGE_EDITOR_RENDERER: glow
+        run: |
+          target/debug/nuage-editor --self-test self-test.json
+          cat self-test.json
 
   msrv:
     name: MSRV (1.95)
