@@ -13,7 +13,9 @@
 //! `NUAGE_FILES_S3_*` variables (see [`crate::config`]); without them,
 //! `/v1/files` answers `501`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
@@ -32,6 +34,21 @@ pub struct FileStore {
     store: S3Store,
     /// How long a link works.
     link_seconds: u64,
+    /// What each application keeps, as last counted.
+    usage: Mutex<HashMap<String, Usage>>,
+}
+
+/// How long a count of an application's files is shown before it is taken again.
+const USAGE_SECONDS: u64 = 120;
+
+/// The files of an application, as last counted.
+#[derive(Clone, Copy)]
+struct Usage {
+    /// How many files, and their bytes; `None` until the first count is back.
+    counted: Option<(u64, u64)>,
+    at: Instant,
+    /// A count is on its way.
+    counting: bool,
 }
 
 impl std::fmt::Debug for FileStore {
@@ -44,7 +61,53 @@ impl FileStore {
     /// The files of every application go in the bucket of `options`, under
     /// `<prefix><application>/`; a link works `link_seconds` (7 days at most).
     pub fn new(options: S3Options, link_seconds: u64) -> Result<FileStore> {
-        Ok(FileStore { store: S3Store::new(options)?, link_seconds: link_seconds.clamp(60, 7 * 24 * 3600) })
+        Ok(FileStore {
+            store: S3Store::new(options)?,
+            link_seconds: link_seconds.clamp(60, 7 * 24 * 3600),
+            usage: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// How many files the application `app` keeps and what they weigh, as
+    /// last counted: `None` until a first count is back. It never waits: a
+    /// count older than two minutes is taken again in the background (one
+    /// listing of the application's folder), for the next call. The live
+    /// status asks every second; the bucket is asked every two minutes.
+    pub(crate) fn usage(self: &Arc<Self>, app: &str) -> Option<(u64, u64)> {
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let entry = usage.entry(app.to_owned()).or_insert(Usage { counted: None, at: now, counting: false });
+        let stale = entry.counted.is_none() || entry.at.elapsed().as_secs() >= USAGE_SECONDS;
+        if stale && !entry.counting {
+            entry.counting = true;
+            let (files, app) = (self.clone(), app.to_owned());
+            let spawned = std::thread::Builder::new().name("nuage-files".into()).spawn(move || {
+                let counted = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .and_then(|rt| rt.block_on(files.store.objects(&format!("{app}/"))).ok())
+                    .map(|objects| (objects.len() as u64, objects.iter().map(|o| o.size).sum()));
+                let mut usage = files.usage.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = usage.get_mut(&app) {
+                    // A count that failed keeps the last one, and is tried again later.
+                    entry.counted = counted.or(entry.counted);
+                    entry.at = Instant::now();
+                    entry.counting = false;
+                }
+            });
+            if spawned.is_err() {
+                entry.counting = false;
+            }
+        }
+        entry.counted
+    }
+
+    /// The files of `app` changed: its next count does not wait.
+    fn changed(&self, app: &str) {
+        if let Some(entry) = self.usage.lock().unwrap_or_else(|e| e.into_inner()).get_mut(app) {
+            entry.at = Instant::now().checked_sub(std::time::Duration::from_secs(USAGE_SECONDS)).unwrap_or(entry.at);
+        }
     }
 
     /// Where the files are, for the logs: `s3://bucket/prefix`.
@@ -190,6 +253,7 @@ pub(super) async fn route(
             }
             let _ = read_json(state, req).await?;
             let url = files.store.presigned_url("PUT", &key, seconds, &[]);
+            files.changed(app);
             Ok(json_response(
                 200,
                 &json!({
@@ -206,7 +270,10 @@ pub(super) async fn route(
                 return Ok(forbidden(READ_ONLY));
             }
             match files.store.remove(&key).await {
-                Ok(()) => Ok(json_response(200, &json!({ "name": name, "deleted": true }))),
+                Ok(()) => {
+                    files.changed(app);
+                    Ok(json_response(200, &json!({ "name": name, "deleted": true })))
+                }
                 Err(e) => Ok(unreachable_bucket(&e)),
             }
         }
