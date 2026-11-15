@@ -286,3 +286,37 @@ async fn preparing_a_statement_does_not_run_it() {
     assert_eq!(seen, (1..=20_000).collect::<Vec<i64>>());
     tx.commit().await.unwrap();
 }
+
+/// A session holds a bounded number of prepared statements; one closed, or
+/// forgotten with `DEALLOCATE`, frees its place.
+#[tokio::test]
+async fn prepared_statements_are_bounded() {
+    let (_server, addr) = start("statements", ServerOptions::default(), PgOptions::default()).await;
+    let db = connect(addr).await.unwrap();
+    let mut kept = Vec::new();
+    for _ in 0..10_000 {
+        kept.push(db.prepare("SELECT 1").await.unwrap());
+    }
+    let refused = db.prepare("SELECT 1").await.unwrap_err();
+    assert_eq!(refused.code(), Some(&SqlState::PROGRAM_LIMIT_EXCEEDED), "{refused}");
+    // Dropped, a statement is closed (the driver says so with its next message).
+    kept.truncate(9_990);
+    db.batch_execute("SELECT 1").await.unwrap();
+    assert_eq!(db.query_one(&db.prepare("SELECT 2").await.unwrap(), &[]).await.unwrap().get::<_, i64>(0), 2);
+
+    // DEALLOCATE forgets a statement by its name, as PostgreSQL does.
+    let mut s = startup(addr).await;
+    s.write_all(&msg(b'p', b"t0ken\0")).await.unwrap();
+    until_ready(&mut s).await;
+    let mut wire = msg(b'P', b"stmt_1\0select 1\0\0\0");
+    wire.extend(msg(b'S', b""));
+    wire.extend(msg(b'Q', b"DEALLOCATE stmt_1\0"));
+    wire.extend(msg(b'B', b"\0stmt_1\0\0\0\0\0\0\0"));
+    wire.extend(msg(b'S', b""));
+    s.write_all(&wire).await.unwrap();
+    assert!(until_ready(&mut s).await.iter().any(|m| m.0 == b'1'));
+    assert!(until_ready(&mut s).await.iter().any(|m| m.0 == b'C' && m.1.starts_with(b"DEALLOCATE")));
+    let bind = until_ready(&mut s).await;
+    let error = bind.iter().find(|m| m.0 == b'E').map(|m| String::from_utf8_lossy(&m.1).into_owned());
+    assert!(error.as_deref().is_some_and(|e| e.contains("does not exist")), "{bind:?}");
+}
