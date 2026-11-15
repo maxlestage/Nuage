@@ -700,6 +700,39 @@ una vez, al arrancar: un valor erróneo guardado desde la consola podría dejart
 página Ajustes los lista (un secreto se muestra como definido, nunca su valor) y dice cómo
 cambiarlos en este alojamiento.
 
+### En una ventana: Nuage DB Editor
+
+Para quien prefiera no usar una terminal, **Nuage DB Editor** es un programa con ventana, en
+español, inglés y francés: muestra el servidor, cambia su memoria y sus límites, crea
+aplicaciones y sus tokens (mostrados una sola vez, con un botón Copiar) y dice con palabras
+claras lo que rechaza y por qué. Hace lo mismo que la página de Ajustes de la consola, desde
+tu escritorio.
+
+1. **Descárgalo** de la [última versión](https://github.com/maxlestage/Nuage/releases/latest):
+   `nuage-editor-aarch64-apple-darwin.zip` (Mac con chip de Apple) o
+   `nuage-editor-x86_64-apple-darwin.zip` (Mac Intel), `nuage-editor-x86_64-pc-windows-msvc.zip`
+   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (escritorio Linux).
+2. **Ábrelo.** macOS: descomprime, mueve *Nuage DB Editor* a Aplicaciones; la primera vez,
+   clic derecho y **Abrir** (en un macOS reciente: Ajustes del Sistema, Privacidad y
+   seguridad, **Abrir igualmente**), porque no está firmado con un certificado de
+   desarrollador de Apple. Windows: descomprime, haz doble clic en `nuage-editor.exe`; si
+   SmartScreen dice que protegió tu equipo, **Más información** y luego **Ejecutar de todas
+   formas**. Linux: descomprime, doble clic en `nuage-editor` (necesita OpenGL y
+   libxkbcommon, que los escritorios tienen; `nuage-editor.desktop` lo pone en el menú).
+3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo:
+   un clic, y tu sistema pide tu contraseña para leer su puerto y su token de gestión (el
+   archivo de ajustes está protegido, contiene la clave de cifrado; no se lee nada más).
+   Para un servidor en línea, escribe su dirección y su token de gestión,
+   `NUAGE_ADMIN_TOKEN` (en Heroku: Settings de la aplicación, **Reveal Config Vars**). El
+   editor recuerda la dirección; el token solo si marcas *Recordar en este equipo* (en un
+   archivo que solo tú puedes leer).
+
+Lo que cambia lo guarda el servidor, como desde la consola: vigente al instante, guardado
+con los datos. Los ajustes que el servidor lee al arrancar (la clave de cifrado, los
+puertos, las contraseñas, el destino de las copias) se muestran, y el editor dice cómo
+cambiarlos en ese alojamiento. Arrancado con `NUAGE_URL` y `NUAGE_ADMIN_TOKEN` en su
+entorno, se conecta al momento. Desde el código fuente: `cargo run --release -p nuage-editor`.
+
 ## Variables de entorno
 
 | Variable | Función | Por defecto |
@@ -785,8 +818,10 @@ instalador): el token viaja en una cabecera, y la cookie de la consola es `Secur
 │   ├── nuage/            el motor, el modo integrado, el servidor, la consola, la API de
 │   │                     estado, las copias (carpeta, S3), el binario `nuage`;
 │   │                     tests/common es la suite de pruebas de backends de Memoire
-│   └── nuage-site/       el sitio web: páginas, el panel /app (Rust/wasm, el bundle
-│                         precompilado en pkg/, regenerado por build-wasm.sh), PWA, tarjeta para compartir
+│   ├── nuage-site/       el sitio web: páginas, el panel /app (Rust/wasm, el bundle
+│   │                     precompilado en pkg/, regenerado por build-wasm.sh), PWA, tarjeta para compartir
+│   └── nuage-editor/     Nuage DB Editor, los ajustes en una ventana (egui); packaging/ para
+│                         la aplicación de macOS y el menú de Linux
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            cualquier alojamiento de contenedores
 ├── nuage.env.example     el entorno, comentado
@@ -803,6 +838,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p nuage-site --lib --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace --all-features
+cargo run -p nuage-editor           # el editor, frente a un servidor que arrancas
 crates/nuage-site/build-wasm.sh   # tras cambiar el panel (Rust 1.99, wasm-bindgen de Cargo.lock)
 ```
 

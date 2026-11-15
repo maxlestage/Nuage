@@ -43,8 +43,30 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Engine, embedded mode, server, console, backups, website (and doc tests)
+      - name: Engine, embedded mode, server, console, backups, website, editor (and doc tests)
         run: cargo test --workspace --all-features --locked
+
+  editor:
+    # Nuage DB Editor is a window: it is built, and driven headless through its accessibility
+    # tree against a real server, on the three systems people double-click it on.
+    name: Editor (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p nuage-editor --all-targets --locked -- -D warnings
+      - name: Tests (the window, against a server in the same process)
+        run: cargo test -p nuage-editor --locked
+      - name: The program builds
+        run: cargo build -p nuage-editor --bin nuage-editor --locked
 
   msrv:
     name: MSRV (1.95)

@@ -4,6 +4,29 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Nuage DB Editor: the settings in a window
+
+- **For those who would rather not use a terminal**: a program with a window, for macOS
+  (Apple silicon and Intel), Windows and Linux desktops, in English, French and Spanish
+  (the system's language, or the one chosen). It shows the server (memory, caches,
+  applications), changes its memory and its limits, makes applications and their tokens
+  (shown once, with Copy buttons and the connection lines), revokes a token after asking, and
+  says in plain words what the server refuses, with its figures.
+- **Connecting is one step.** A server installed on this computer by the installer is found
+  by itself: the system asks for the administrator's password in a window of its own, and
+  only the port and the management token are read from the settings file. A server online
+  takes its address and its management token; the address is remembered, the token only
+  when asked (in a file only its owner can read). A wrong token, an address that is no Nuage
+  DB server, a server that does not answer: each is said, with what to do.
+- What the editor saves goes through `/api/settings` and `/api/apps`, as the console's: in
+  force at once, kept with the data. The settings read when the server starts are listed,
+  with how to change them on that host. Without a screen it says why it cannot open, on the
+  terminal, in a log file next to its settings, and in a message box on Windows.
+- Released with the server: `nuage-editor-<system>.zip` (a signed-for-this-computer
+  `Nuage DB Editor.app` on macOS, `nuage-editor.exe` on Windows) and `.tar.gz` for Linux
+  (with a menu entry). Tested on Linux, macOS and Windows by driving the window through its
+  accessibility tree against a real server.
+
 ### Settings: yours to choose, and to change later
 
 - **A Settings page in the console** (`/admin/settings`, in English, French and Spanish):

@@ -1,0 +1,32 @@
+[package]
+name = "nuage-editor"
+description = "Nuage DB Editor: a window to set up and change a Nuage DB server, for those who would rather not use a terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "nuage-editor"
+path = "src/main.rs"
+
+[dependencies]
+# glow (OpenGL): the smallest renderer, and one every desktop of the last fifteen years has;
+# x11 and wayland are opened at run time (no library needed to build); accesskit: screen
+# readers, and the tests drive the window through it; clipboard: the Copy buttons; links: the
+# console opens in the browser; persistence: the language, the theme and the last address.
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "persistence", "wayland", "x11"] }
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sys-locale = "0.3"
+
+[dev-dependencies]
+# The editor against a real server, in the same process.
+nuage = { path = "../nuage", default-features = false, features = ["server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Drives the window as a person would (labels, clicks, typing), through AccessKit, headless.
+egui_kittest = "0.37"

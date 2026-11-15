@@ -710,6 +710,41 @@ sauvegardes se lisent une fois, au démarrage : une mauvaise valeur enregistrée
 console pourrait vous en fermer la porte. La page Réglages les liste (un secret s'affiche
 comme réglé, jamais sa valeur) et dit comment les changer sur cet hébergement.
 
+### Dans une fenêtre : Nuage DB Éditeur
+
+Pour celles et ceux qui préfèrent éviter le terminal, **Nuage DB Éditeur** est un programme
+avec une fenêtre, en français, en anglais et en espagnol : il montre le serveur, change sa
+mémoire et ses limites, crée des applications et leurs jetons (montrés une fois, avec un
+bouton Copier), et dit en clair ce qu'il refuse et pourquoi. Il fait ce que fait la page
+Réglages de la console, depuis votre bureau.
+
+1. **Téléchargez-le** depuis la [dernière version](https://github.com/maxlestage/Nuage/releases/latest) :
+   `nuage-editor-aarch64-apple-darwin.zip` (Mac à puce Apple) ou
+   `nuage-editor-x86_64-apple-darwin.zip` (Mac Intel), `nuage-editor-x86_64-pc-windows-msvc.zip`
+   (Windows), `nuage-editor-x86_64-unknown-linux-gnu.tar.gz` (bureau Linux).
+2. **Ouvrez-le.** macOS : décompressez, glissez *Nuage DB Editor* dans Applications ; la
+   première fois, clic droit puis **Ouvrir** (sur un macOS récent : Réglages Système,
+   Confidentialité et sécurité, **Ouvrir quand même**), car il n'est pas signé par un
+   certificat de développeur Apple. Windows : décompressez, double-cliquez sur
+   `nuage-editor.exe` ; si SmartScreen dit avoir protégé votre ordinateur, **Informations
+   complémentaires** puis **Exécuter quand même**. Linux : décompressez, double-cliquez sur
+   `nuage-editor` (il lui faut OpenGL et libxkbcommon, que les bureaux ont ;
+   `nuage-editor.desktop` le met dans le menu).
+3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installeur est trouvé
+   tout seul : un clic, et votre système demande votre mot de passe pour lire son port et
+   son jeton de gestion (le fichier de réglages est protégé, il contient la clé de
+   chiffrement ; rien d'autre n'est lu). Pour un serveur en ligne, tapez son adresse et son
+   jeton de gestion, `NUAGE_ADMIN_TOKEN` (sur Heroku : Settings de l'application,
+   **Reveal Config Vars**). L'éditeur retient l'adresse ; le jeton seulement si vous cochez
+   *Retenir sur cet ordinateur* (dans un fichier que vous seul pouvez lire).
+
+Ce qu'il change est enregistré par le serveur, comme depuis la console : en vigueur tout de
+suite, gardé avec les données. Les réglages lus au démarrage du serveur (la clé de
+chiffrement, les ports, les mots de passe, la destination des sauvegardes) sont affichés,
+et l'éditeur dit comment les changer sur cet hébergement. Lancé avec `NUAGE_URL` et
+`NUAGE_ADMIN_TOKEN` dans son environnement, il se connecte aussitôt. Depuis les sources :
+`cargo run --release -p nuage-editor`.
+
 ## Variables d'environnement
 
 | Variable | Rôle | Par défaut |
@@ -796,8 +831,10 @@ HTTPS.
 │   ├── nuage/            le moteur, le mode intégré, le serveur, la console, l'API de
 │   │                     statut, les sauvegardes (dossier, S3), le binaire `nuage` ;
 │   │                     tests/common est la suite de tests des backends de Memoire
-│   └── nuage-site/       le site : pages, tableau de bord /app (Rust/wasm, le bundle
-│                         précompilé dans pkg/, refait par build-wasm.sh), PWA, carte de partage
+│   ├── nuage-site/       le site : pages, tableau de bord /app (Rust/wasm, le bundle
+│   │                     précompilé dans pkg/, refait par build-wasm.sh), PWA, carte de partage
+│   └── nuage-editor/     Nuage DB Éditeur, les réglages dans une fenêtre (egui) ; packaging/
+│                         pour l'application macOS et le menu Linux
 ├── Procfile, RustConfig, heroku-build.sh, app.json    Heroku
 ├── Dockerfile            tout hébergeur de conteneurs
 ├── nuage.env.example     l'environnement, commenté
@@ -814,6 +851,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p nuage-site --lib --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace --all-features
+cargo run -p nuage-editor           # l'éditeur, face à un serveur que vous lancez
 crates/nuage-site/build-wasm.sh   # après une modification du tableau de bord (Rust 1.99, wasm-bindgen de Cargo.lock)
 ```
 
