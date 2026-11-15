@@ -116,6 +116,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Log in", "Se connecter", "Iniciar sesión"),
     ("Log in first.", "Connectez-vous d'abord.", "Inicia sesión primero."),
     ("Invalid request.", "Requête invalide.", "Petición no válida."),
+    ("This form is too large.", "Ce formulaire est trop grand.", "Este formulario es demasiado grande."),
     (
         "Too many failed attempts. Wait a few minutes.",
         "Trop d'essais manqués. Attendez quelques minutes.",
