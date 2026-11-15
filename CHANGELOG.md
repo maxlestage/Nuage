@@ -4,6 +4,8 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+## 0.4.2 (2026-11-15)
+
 ### Install on any computer, backups where you choose
 
 - `install.sh` installs on **macOS** too (Apple silicon, Intel): a launchd daemon started with
