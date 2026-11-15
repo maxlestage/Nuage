@@ -1497,6 +1497,19 @@ async fn files_through_signed_links() {
     // No token: no files.
     assert_eq!(http(addr, "GET", "/v1/files", &[], "").await.status, 401);
 
+    // The live status says what the application keeps: counted in the
+    // background, so the first answer may come before the count.
+    let mut counted = serde_json::Value::Null;
+    for _ in 0..100 {
+        let status = json(&http(addr, "GET", "/api/status", write, "").await);
+        counted = status["databases"][0]["files"].clone();
+        if !counted.is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(counted, serde_json::json!({ "count": 1, "bytes": 10 }));
+
     // Another application sees none of them.
     assert_eq!(json(&http(addr, "GET", "/v1/files", other, "").await)["count"], 0);
     assert_eq!(json(&http(addr, "GET", "/v1/files?prefix=..%2Fmaps", other, "").await)["count"], 0);

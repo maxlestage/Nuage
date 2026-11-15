@@ -783,6 +783,8 @@ fn app_card(tx: &'static Texts, db: &Database, history: &[f64], now: f64, detail
                 .child(fact(tx.db_tables, db.tables.to_string()))
                 .child(fact(tx.db_rows, status::group(db.rows)))
                 .child(fact(tx.app_size, status::bytes(db.file_bytes.max(db.bytes))))
+                .child(fact(tx.app_files, db.files_text().unwrap_or_else(|| DASH.to_owned())))
+                .child(fact(tx.app_kv, db.kv_text().unwrap_or_else(|| DASH.to_owned())))
                 .child(fact(tx.app_last_request, ago_of(tx, now, db.last_request_at.as_deref()))),
         );
     if !db.branches.is_empty() {
