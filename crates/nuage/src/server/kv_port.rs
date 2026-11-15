@@ -13,6 +13,11 @@
 //! reads. With a certificate (`NUAGE_TLS_CERT`, `NUAGE_TLS_KEY`) the same port
 //! also answers TLS: the first byte of a connection tells which. Commands sent
 //! together (a pipeline) are answered together.
+//!
+//! A client has 15 seconds to log in, with small commands; the port serves
+//! [`ServerOptions::kv_max_connections`](super::ServerOptions::kv_max_connections)
+//! connections at once, and a transaction (`MULTI`) queues what a request
+//! body may hold.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

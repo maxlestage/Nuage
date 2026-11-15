@@ -16,6 +16,12 @@
 //!   conflict answers SQLSTATE `40001`: run the transaction again.
 //! * The questions drivers ask when they connect (`SET`, `SHOW`, `version()`,
 //!   `current_schema()`...) get the answers PostgreSQL would give.
+//! * **Limits**: a client has 15 seconds to log in, with small messages; then
+//!   a message is as long as a request body may be
+//!   ([`ServerOptions::max_body_bytes`](super::ServerOptions::max_body_bytes)),
+//!   and a transaction left idle is rolled back after 5 minutes
+//!   ([`PgOptions::idle_in_transaction`]). A logged-in connection may stay
+//!   idle as long as it likes.
 //!
 //! The SQL is Nuage DB's (see [`crate::sql`]); the system catalogs
 //! (`pg_catalog`, `information_schema`) are not there.
@@ -106,6 +112,11 @@ const SEND_AT: usize = 1 << 16;
 const READ_AHEAD: usize = 16 << 10;
 /// The stack of a connection's thread: statements may nest deep.
 pub(super) const THREAD_STACK: usize = 8 << 20;
+/// Prepared statements, and portals, a session holds at once at most: far
+/// more than drivers keep (a few hundred). What the messages that made them
+/// come to together is bounded too ([`Session::may_hold`]).
+const SESSION_STATEMENTS: usize = 10_000;
+const SESSION_PORTALS: usize = 10_000;
 
 /// The client's socket. While a deadline is set (to log in), a read waits
 /// only for what is left of it; while `idle` is set (a transaction is open),
@@ -504,6 +515,7 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
         savepoints: Vec::new(),
         statements: HashMap::new(),
         portals: HashMap::new(),
+        held: 0,
         skip_to_sync: false,
     };
     s.ready(&mut out);
@@ -641,6 +653,9 @@ fn sqlstate(e: &Error) -> &'static str {
     if message.contains("can only be used in transaction blocks") {
         return "25P01";
     }
+    if message.contains("too many ") && message.contains(" in this session (") {
+        return "54000";
+    }
     match kind.as_str() {
         "unique_violation" => "23505",
         "constraint" if message.contains("NULL") || message.contains("null") => "23502",
@@ -677,10 +692,14 @@ struct Prepared {
     typed_names: Vec<String>,
     /// Types of the result columns, once described: execution sends these.
     columns: Option<Vec<(String, i32)>>,
+    /// The length of the message that made it.
+    size: usize,
 }
 
 struct Portal {
     stmt: Arc<Prepared>,
+    /// The length of the message that made it.
+    size: usize,
     /// Its parameters, until it runs.
     params: Vec<Value>,
     formats: Vec<i16>,
@@ -724,6 +743,8 @@ struct Session {
     savepoints: Vec<(String, Savepoint)>,
     statements: HashMap<String, Arc<Prepared>>,
     portals: HashMap<String, Portal>,
+    /// What the messages that made the statements and portals came to.
+    held: usize,
     skip_to_sync: bool,
 }
 
@@ -736,6 +757,8 @@ enum Plan {
     Savepoint(&'static str, String),
     /// A command answered at once (`SET`, `DISCARD ALL`...): its tag.
     Tag(String),
+    /// `DEALLOCATE [PREPARE] name` (`None`: `ALL`).
+    Deallocate(Option<String>),
     /// A query answered at once (`SHOW`, `version()`...): column and value.
     Value(String, String),
     Empty,
@@ -778,7 +801,7 @@ impl Session {
                 self.skip_to_sync = false;
                 if self.tx.is_none() {
                     // An implicit transaction ends at Sync: nothing to keep.
-                    self.portals.clear();
+                    self.forget_portals();
                 }
                 self.ready(out);
                 Step::Flush
@@ -811,7 +834,38 @@ impl Session {
         self.failed = false;
         self.savepoints.clear();
         // The portals of a transaction end with it.
-        self.portals.clear();
+        self.forget_portals();
+    }
+
+    /// Takes a statement or a portal of `size` bytes, in place of one of
+    /// `replaced` bytes (or of none, among `count` held of at most `most`):
+    /// refused past what a session may hold.
+    fn may_hold(&mut self, replaced: Option<usize>, size: usize, count: usize, most: usize, what: &str) -> Result<()> {
+        let bytes = self.state.options.max_body_bytes.saturating_mul(4).max(64 << 20);
+        let held = self.held.saturating_sub(replaced.unwrap_or(0)) + size;
+        if (replaced.is_none() && count >= most) || held > bytes {
+            return Err(Error::Validation(format!(
+                "too many {what} in this session ({most} at most, {} MiB of messages together): close some before making more",
+                bytes >> 20
+            )));
+        }
+        self.held = held;
+        Ok(())
+    }
+
+    fn forget_portals(&mut self) {
+        let sizes: usize = self.portals.drain().map(|(_, p)| p.size).sum();
+        self.held = self.held.saturating_sub(sizes);
+    }
+
+    /// Forgets the prepared statement `name` (`None`: all of them). One that
+    /// does not exist is no error: there is nothing to forget.
+    fn deallocate(&mut self, name: Option<&str>) {
+        let sizes: usize = match name {
+            Some(name) => self.statements.remove(name).map_or(0, |p| p.size),
+            None => self.statements.drain().map(|(_, p)| p.size).sum(),
+        };
+        self.held = self.held.saturating_sub(sizes);
     }
 
     /// A message longer than a request body may be, skipped: refused as a
@@ -863,7 +917,23 @@ impl Session {
             }
             "set" | "reset" => Plan::Tag(word.to_uppercase()),
             "discard" => Plan::Tag(norm.to_uppercase()),
-            "deallocate" => Plan::Tag("DEALLOCATE".into()),
+            "deallocate" => {
+                // The name as it was prepared: as written between double
+                // quotes, else in lower case, as PostgreSQL reads a name.
+                let name = sql
+                    .split_whitespace()
+                    .skip(1)
+                    .map(|w| w.trim_end_matches(';'))
+                    .find(|w| !w.is_empty() && !w.eq_ignore_ascii_case("prepare"));
+                match name {
+                    Some(all) if all.eq_ignore_ascii_case("all") => Plan::Deallocate(None),
+                    Some(n) => Plan::Deallocate(Some(match n.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+                        Some(quoted) => quoted.replace("\"\"", "\""),
+                        None => n.to_lowercase(),
+                    })),
+                    None => Plan::Tag("DEALLOCATE".into()),
+                }
+            }
             "show" => {
                 let name = norm.trim_start_matches("show ").replace(' ', "_");
                 let value = match name.as_str() {
@@ -1070,6 +1140,13 @@ impl Session {
                 }
                 complete(out, &tag);
             }
+            Plan::Deallocate(name) => {
+                if self.failed {
+                    return Err(Error::Validation("current transaction is aborted".into()));
+                }
+                self.deallocate(name.as_deref());
+                complete(out, if name.is_some() { "DEALLOCATE" } else { "DEALLOCATE ALL" });
+            }
             Plan::Value(name, value) => {
                 row_description(out, &[(name, 25)], &[]);
                 data_row(out, &[Value::Text(value)], &[25], &[])?;
@@ -1121,7 +1198,11 @@ impl Session {
                         inferred[i] = *t;
                     }
                 }
-                let stmt = Prepared { sql, script, param_types, inferred, typed_columns, typed_names, columns: None };
+                let size = body.len();
+                let replaced = self.statements.get(&name).map(|p| p.size);
+                self.may_hold(replaced, size, self.statements.len(), SESSION_STATEMENTS, "prepared statements")?;
+                let stmt =
+                    Prepared { sql, script, param_types, inferred, typed_columns, typed_names, columns: None, size };
                 self.statements.insert(name, Arc::new(stmt));
                 out.msg(b'1', |_| {});
             }
@@ -1161,7 +1242,10 @@ impl Session {
                 for _ in 0..nr {
                     formats.push(b.i16()?);
                 }
-                self.portals.insert(portal, Portal { stmt, params, formats, columns: None, ran: None });
+                let size = body.len();
+                let replaced = self.portals.get(&portal).map(|p| p.size);
+                self.may_hold(replaced, size, self.portals.len(), SESSION_PORTALS, "portals")?;
+                self.portals.insert(portal, Portal { stmt, size, params, formats, columns: None, ran: None });
                 out.msg(b'2', |_| {});
             }
             b'D' => {
@@ -1196,6 +1280,7 @@ impl Session {
                         typed_columns: stmt.typed_columns.clone(),
                         typed_names: stmt.typed_names.clone(),
                         columns: Some(columns.unwrap_or_default()),
+                        size: stmt.size,
                     };
                     self.statements.insert(name, Arc::new(described));
                 } else {
@@ -1240,6 +1325,10 @@ impl Session {
                                 complete(out, &tag);
                             }
                             Plan::Tag(tag) => complete(out, &tag),
+                            Plan::Deallocate(name) => {
+                                self.deallocate(name.as_deref());
+                                complete(out, if name.is_some() { "DEALLOCATE" } else { "DEALLOCATE ALL" });
+                            }
                             Plan::Value(_, value) => {
                                 let formats = self.portals[&name].formats.clone();
                                 data_row(out, &[Value::Text(value)], &[25], &formats)?;
@@ -1253,11 +1342,12 @@ impl Session {
             b'C' => {
                 let what = b.u8()?;
                 let name = b.str()?;
-                if what == b'S' {
-                    self.statements.remove(&name);
+                let size = if what == b'S' {
+                    self.statements.remove(&name).map(|p| p.size)
                 } else {
-                    self.portals.remove(&name);
-                }
+                    self.portals.remove(&name).map(|p| p.size)
+                };
+                self.held = self.held.saturating_sub(size.unwrap_or(0));
                 out.msg(b'3', |_| {});
             }
             other => {
