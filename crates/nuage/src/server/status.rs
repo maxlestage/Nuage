@@ -103,6 +103,11 @@ fn app_json(app: &App, env_token: bool) -> Json {
         .collect();
     let last = app.last_request.load(Ordering::Relaxed);
     let info = app.info(env_token);
+    let kv = app.kv.stats();
+    let kv = json!({
+        "keys": kv.keys, "bytes": kv.bytes, "max_bytes": kv.max_bytes,
+        "hits": kv.hits, "misses": kv.misses, "evictions": kv.evictions, "expired": kv.expired,
+    });
     json!({
         "name": app.name,
         "first": app.first,
@@ -125,6 +130,7 @@ fn app_json(app: &App, env_token: bool) -> Json {
             "read_only": c.read_only,
         })),
         "requests": requests_json(&app.metrics),
+        "kv": kv,
         "branches": branches,
     })
 }

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
-use super::{Metrics, random_token, same_secret};
+use super::{Metrics, random_token};
 use crate::engine::{BackupOptions, Engine, PrefixedStore, backup, check_branch_name, store::now_millis};
 
 const REGISTRY_PREFIX: &[u8] = b"app:";
@@ -56,6 +56,8 @@ pub(crate) struct App {
     pub last_request: AtomicI64,
     /// Who connected last, and how: the console shows it.
     pub last_connection: Mutex<Option<Connection>>,
+    /// Its key-value store, in memory (`/v1/kv`, the Redis protocol).
+    pub kv: crate::kv::Kv,
 }
 
 /// A connection of an application's client, as the console shows it.
@@ -96,6 +98,12 @@ fn digest(token: &str) -> [u8; 32] {
     crate::hash::sha256(token.as_bytes())
 }
 
+/// Two digests are the same. Every byte is compared: the time taken does not
+/// say where they differ. (Digests, not secrets: no need to hash them again.)
+fn same_digest(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -109,8 +117,16 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
 }
 
 impl App {
-    fn new(name: String, engine: Arc<Engine>, first: bool, created_at: i64, description: String) -> App {
+    fn new(
+        name: String,
+        engine: Arc<Engine>,
+        first: bool,
+        created_at: i64,
+        description: String,
+        kv_bytes: usize,
+    ) -> App {
         App {
+            kv: crate::kv::Kv::new(kv_bytes),
             name,
             description: Mutex::new(description),
             engine,
@@ -136,7 +152,7 @@ impl App {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .fold(None, |found, t| if same_secret(&t.digest, d) { Some(t.read_only) } else { found })
+            .fold(None, |found, t| if same_digest(&t.digest, d) { Some(t.read_only) } else { found })
     }
 
     /// The websites allowed to call it from the browser.
@@ -190,25 +206,29 @@ pub(crate) struct Apps {
     failed: Mutex<Vec<(String, String)>>,
     /// Serializes creations and deletions.
     changes: Mutex<()>,
+    /// Memory of each application's key-value store.
+    kv_bytes: usize,
 }
 
 impl Apps {
     /// The applications of `engine` (the first one): opens every other
     /// application it lists. One that cannot be opened is reported, not
     /// fatal.
-    pub(crate) fn open(engine: Arc<Engine>) -> Apps {
+    pub(crate) fn open(engine: Arc<Engine>, kv_bytes: usize) -> Apps {
         let first = Arc::new(App::new(
             engine.options().name.clone(),
             engine.clone(),
             true,
             crate::engine::store::now_millis() - engine.uptime().as_millis() as i64,
             String::new(),
+            kv_bytes,
         ));
         let apps = Apps {
             first,
             others: RwLock::new(BTreeMap::new()),
             failed: Mutex::new(Vec::new()),
             changes: Mutex::new(()),
+            kv_bytes,
         };
         let entries = match engine.meta_entries(REGISTRY_PREFIX) {
             Ok(e) => e,
@@ -230,7 +250,7 @@ impl Apps {
             match apps.open_engine(&name) {
                 Ok(e) => {
                     let created = record.get("createdAt").and_then(Json::as_i64).unwrap_or(0);
-                    let app = App::new(name.clone(), e, false, created, description_of(&record));
+                    let app = App::new(name.clone(), e, false, created, description_of(&record), kv_bytes);
                     *app.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
                     *app.origins.write().unwrap_or_else(|e| e.into_inner()) = origins_of(&record);
                     apps.others.write().unwrap_or_else(|e| e.into_inner()).insert(name, Arc::new(app));
@@ -271,10 +291,11 @@ impl Apps {
     /// application is tried, whatever matches.
     pub(crate) fn authenticate(&self, token: &str, env_token: Option<&str>) -> Option<(Arc<App>, bool)> {
         let mut found = None;
-        if env_token.is_some_and(|t| same_secret(t.as_bytes(), token.as_bytes())) {
+        // One hash of what was sent, compared to the hash of each secret.
+        let d = digest(token);
+        if env_token.is_some_and(|t| same_digest(&digest(t), &d)) {
             found = Some((self.first.clone(), false));
         }
-        let d = digest(token);
         for app in self.all() {
             if let Some(read_only) = app.token(&d)
                 && found.is_none()
@@ -359,7 +380,14 @@ impl Apps {
             )));
         }
         let engine = self.open_engine(name)?;
-        let app = Arc::new(App::new(name.to_owned(), engine, false, now_millis(), description.trim().to_owned()));
+        let app = Arc::new(App::new(
+            name.to_owned(),
+            engine,
+            false,
+            now_millis(),
+            description.trim().to_owned(),
+            self.kv_bytes,
+        ));
         let token = add_token(&app, false);
         self.save(&app)?;
         self.others.write().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned(), app.clone());

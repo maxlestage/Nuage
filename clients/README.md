@@ -50,7 +50,7 @@ each token opens only its own application.
 
 ```bash
 curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
-# {"ok": true, "message": "Connected to Nuage DB 0.4.3: application `blog`, read and write, ...", ...}
+# {"ok": true, "message": "Connected to Nuage DB 0.4.4: application `blog`, read and write, ...", ...}
 nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # the same, as one line, from any machine
 ```
 
@@ -74,6 +74,21 @@ management token a `401`. `GET /api/apps` lists the applications, `POST /api/app
 makes another token (`{"read_only": true}` for a website). The management token opens every
 application of the server: keep it in a deploy script or a terminal, never in an app or a page.
 See [Create an application in one command](../README.md#create-an-application-in-one-command).
+
+## The key-value store
+
+Each application also has a key-value store in memory, the way Redis is used (a cache,
+sessions, counters, locks). Every language reaches it over HTTP, with the same token:
+
+```bash
+curl -X PUT "$NUAGE_URL/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'
+curl "$NUAGE_URL/v1/kv/session:42" -H "Authorization: Bearer $NUAGE_TOKEN"                    # ada
+curl -X POST "$NUAGE_URL/v1/kv/hits?incr&ttl=60" -H "Authorization: Bearer $NUAGE_TOKEN"      # {"value":1}
+```
+
+Or with the language's own Redis client, when the server has `NUAGE_REDIS_PORT=6379`: the
+token is the password (`redis://default:<token>@host:6379`). See
+[Key-value store](../README.md#key-value-store).
 
 ## The protocol
 

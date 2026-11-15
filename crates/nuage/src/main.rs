@@ -208,6 +208,41 @@ fn main() -> ExitCode {
             }
             None => None,
         };
+        // The Redis protocol: every language's Redis client, on the key-value stores.
+        let redis = match config.redis_port {
+            Some(port) => {
+                let tls = match &config.tls {
+                    Some((cert, key)) => match nuage::tls_config(cert, key) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!("nuage: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => None,
+                };
+                let encrypted = tls.is_some();
+                match server.listen_redis((config.redis_bind.as_str(), port), nuage::RedisOptions { tls }).await {
+                    Ok(r) => {
+                        let how = if encrypted {
+                            "in clear and with TLS (rediss://)"
+                        } else {
+                            "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)"
+                        };
+                        log(&format!(
+                            "Redis protocol on {} {how}: any Redis client connects to an application's key-value store, its password a token",
+                            r.local_addr()
+                        ));
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("nuage: Redis protocol: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            None => None,
+        };
         // The engines' warnings and errors (a backup or a checkpoint that failed...) go to the
         // log too, not only to the dashboard: `heroku logs` and the services' log files show them.
         let server = std::sync::Arc::new(server);
@@ -245,6 +280,9 @@ fn main() -> ExitCode {
         running.shutdown().await;
         if let Some(pg) = pg {
             pg.shutdown().await;
+        }
+        if let Some(redis) = redis {
+            redis.shutdown().await;
         }
         // Every application, the server's own last (it holds the list of the others):
         // what was written since the last checkpoint goes to the backup before the disk is gone.

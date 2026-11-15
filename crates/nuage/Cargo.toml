@@ -23,7 +23,7 @@ site = ["server", "dep:nuage-site"]
 ## The server: the database protocol over HTTP(S) (`/v1`), the PostgreSQL protocol, the
 ## console, the live status, `Db::Remote` (Memoire's client) and the `nuage` binary.
 server = [
-    "s3", "memoire-orm/nuage", "tokio/net", "tokio/signal", "dep:flate2",
+    "s3", "memoire-orm/nuage", "tokio/net", "tokio/signal", "tokio/io-util", "dep:flate2",
     "hyper/server", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots",
 ]
 ## Backups to S3-compatible storage (a small HTTP/1.1 client over rustls).

@@ -1508,3 +1508,215 @@ async fn files_through_signed_links() {
     assert_eq!(json(&http(addr, "GET", "/v1/files", read, "").await)["count"], 0);
     running.shutdown().await;
 }
+
+/// `/v1/kv` and the Redis protocol: the key-value store of each application.
+#[tokio::test]
+async fn key_value_store() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
+    let server = Server::new(engine("kv"), ServerOptions { kv_bytes: 1 << 20, ..options() });
+    let (_, token) = server.create_app("shop", "").unwrap();
+    let read = server.new_app_read_only_token("shop").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let redis = server.listen_redis("127.0.0.1:0", nuage::RedisOptions::default()).await.unwrap();
+    let addr = running.local_addr();
+    let write = format!("Bearer {token}");
+    let write: &[(&str, &str)] = &[("authorization", &write)];
+    let read_header = format!("Bearer {read}");
+    let read_only: &[(&str, &str)] = &[("authorization", &read_header)];
+    let first: &[(&str, &str)] = &[("authorization", "Bearer t0ken")];
+
+    assert_eq!(json(&http(addr, "GET", "/v1/info", write, "").await)["kv"], true);
+
+    // A value, as it was written, with its expiry.
+    let set = http(addr, "PUT", "/v1/kv/session%3A42?ttl=60", write, "ada\n\u{e9}").await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(json(&set)["set"], true);
+    let got = http(addr, "GET", "/v1/kv/session:42", read_only, "").await;
+    assert_eq!((got.status, got.body.as_str()), (200, "ada\n\u{e9}"));
+    let ttl: u64 = got.headers["nuage-ttl-ms"].to_str().unwrap().parse().unwrap();
+    assert!(ttl > 50_000 && ttl <= 60_000, "{ttl}");
+    assert_eq!(http(addr, "GET", "/v1/kv/nope", read_only, "").await.status, 404);
+
+    // A lock, a counter with its window, an expiry changed.
+    assert_eq!(json(&http(addr, "PUT", "/v1/kv/lock?nx&ttl=0.5", write, "me").await)["set"], true);
+    assert_eq!(json(&http(addr, "PUT", "/v1/kv/lock?nx&ttl=0.5", write, "you").await)["set"], false);
+    assert_eq!(json(&http(addr, "POST", "/v1/kv/hits?incr&ttl=60", write, "").await)["value"], 1);
+    assert_eq!(json(&http(addr, "POST", "/v1/kv/hits?incr=9", write, "").await)["value"], 10);
+    assert_eq!(http(addr, "POST", "/v1/kv/session:42?incr", write, "").await.status, 400);
+    assert_eq!(json(&http(addr, "POST", "/v1/kv/session:42?persist", write, "").await)["set"], true);
+    assert!(!http(addr, "GET", "/v1/kv/session:42", write, "").await.headers.contains_key("nuage-ttl-ms"));
+    assert_eq!(json(&http(addr, "POST", "/v1/kv/session:42?expire=30", write, "").await)["set"], true);
+    assert_eq!(http(addr, "PUT", "/v1/kv/k?ttl=never", write, "v").await.status, 400);
+
+    // The commands of Redis as JSON: one, or several in one round trip.
+    let one = http(addr, "POST", "/v1/kv", write, r#"["SET", "greeting", "bonjour", "EX", 60]"#).await;
+    assert_eq!(json(&one)["result"], "OK", "{}", one.body);
+    let many = http(
+        addr,
+        "POST",
+        "/v1/kv",
+        write,
+        r#"[["GET", "greeting"], ["INCRBY", "hits", 5], ["TTL", "greeting"], ["GET", "nope"], ["LPUSH", "l", "x"]]"#,
+    )
+    .await;
+    let results = &json(&many)["results"];
+    assert_eq!(results[0], "bonjour");
+    assert_eq!(results[1], 15);
+    assert_eq!(results[2], 60);
+    assert!(results[3].is_null());
+    assert!(results[4]["error"].as_str().unwrap().contains("unknown command"));
+    assert_eq!(http(addr, "POST", "/v1/kv", write, r#"["GET"]"#).await.status, 400);
+    assert_eq!(http(addr, "POST", "/v1/kv", write, r#"{"commands": "GET"}"#).await.status, 400);
+
+    // The keys and the figures.
+    let list = json(&http(addr, "GET", "/v1/kv?prefix=s", read_only, "").await);
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["keys"][0]["key"], "session:42");
+    assert_eq!(list["keys"][0]["size"], 6);
+    assert_eq!(list["stats"]["keys"], 4);
+    assert_eq!(list["stats"]["max_bytes"], 1 << 20);
+
+    // A read-only token reads, and nothing else; no token, nothing.
+    assert_eq!(http(addr, "PUT", "/v1/kv/k", read_only, "v").await.status, 403);
+    assert_eq!(http(addr, "DELETE", "/v1/kv/hits", read_only, "").await.status, 403);
+    assert_eq!(http(addr, "POST", "/v1/kv/hits?incr", read_only, "").await.status, 403);
+    assert_eq!(http(addr, "POST", "/v1/kv", read_only, r#"["DEL", "hits"]"#).await.status, 403);
+    assert_eq!(json(&http(addr, "POST", "/v1/kv", read_only, r#"["GET", "hits"]"#).await)["result"], "15");
+    assert_eq!(http(addr, "GET", "/v1/kv/hits", &[], "").await.status, 401);
+
+    // Another application has its own store.
+    assert_eq!(http(addr, "GET", "/v1/kv/hits", first, "").await.status, 404);
+    assert_eq!(json(&http(addr, "GET", "/v1/kv", first, "").await)["count"], 0);
+
+    // The Redis protocol, on the same store: the token is the password.
+    let mut conn = TcpStream::connect(redis.local_addr()).await.unwrap();
+    let say = async |conn: &mut TcpStream, command: &[&str]| -> String {
+        let mut wire = format!("*{}\r\n", command.len());
+        for arg in command {
+            wire.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+        }
+        conn.write_all(wire.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = conn.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+    assert!(say(&mut conn, &["GET", "hits"]).await.starts_with("-NOAUTH"));
+    assert!(say(&mut conn, &["AUTH", "nope"]).await.starts_with("-WRONGPASS"));
+    assert_eq!(say(&mut conn, &["AUTH", "default", &token]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["PING"]).await, "+PONG\r\n");
+    assert_eq!(say(&mut conn, &["GET", "hits"]).await, "$2\r\n15\r\n");
+    assert_eq!(say(&mut conn, &["SET", "from-redis", "1", "EX", "30"]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["SELECT", "0"]).await, "+OK\r\n");
+    assert!(say(&mut conn, &["SELECT", "1"]).await.starts_with("-ERR"));
+    assert_eq!(say(&mut conn, &["CLIENT", "SETNAME", "essai"]).await, "+OK\r\n");
+    assert!(say(&mut conn, &["HELLO", "4"]).await.starts_with("-NOPROTO"));
+    assert!(say(&mut conn, &["HELLO", "2"]).await.starts_with("*14\r\n$6\r\nserver\r\n"));
+    assert_eq!(say(&mut conn, &["GET", "nope"]).await, "$-1\r\n");
+    // RESP3: a map, and its own "nothing".
+    assert!(say(&mut conn, &["HELLO", "3"]).await.starts_with("%7\r\n$6\r\nserver\r\n"));
+    assert_eq!(say(&mut conn, &["GET", "nope"]).await, "_\r\n");
+    assert!(say(&mut conn, &["HELLO", "2"]).await.starts_with("*14\r\n"));
+    // A pipeline: two commands sent together, answered together.
+    conn.write_all(b"*2\r\n$4\r\nINCR\r\n$4\r\nhits\r\nGET from-redis\r\n").await.unwrap();
+    let mut answer = String::new();
+    while !answer.ends_with("$1\r\n1\r\n") {
+        let mut buf = [0u8; 256];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n > 0, "{answer:?}");
+        answer.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert_eq!(answer, ":16\r\n$1\r\n1\r\n");
+    // A transaction: queued, then run as one.
+    assert!(say(&mut conn, &["EXEC"]).await.starts_with("-ERR EXEC without MULTI"));
+    assert_eq!(say(&mut conn, &["MULTI"]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["INCR", "hits"]).await, "+QUEUED\r\n");
+    assert_eq!(say(&mut conn, &["GET", "hits"]).await, "+QUEUED\r\n");
+    assert_eq!(http(addr, "GET", "/v1/kv/hits", read_only, "").await.body, "16", "not run before EXEC");
+    assert_eq!(say(&mut conn, &["EXEC"]).await, "*2\r\n:17\r\n$2\r\n17\r\n");
+    assert_eq!(say(&mut conn, &["MULTI"]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["DECR", "hits"]).await, "+QUEUED\r\n");
+    assert_eq!(say(&mut conn, &["DISCARD"]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["DECR", "hits"]).await, ":16\r\n");
+    assert_eq!(say(&mut conn, &["QUIT"]).await, "+OK\r\n");
+    // What Redis wrote, HTTP reads.
+    assert_eq!(http(addr, "GET", "/v1/kv/from-redis", read_only, "").await.body, "1");
+
+    // A read-only token over the Redis protocol; the HELLO that signs in.
+    let mut conn = TcpStream::connect(redis.local_addr()).await.unwrap();
+    assert!(say(&mut conn, &["HELLO", "2", "AUTH", "default", &read]).await.starts_with("*14\r\n"));
+    assert_eq!(say(&mut conn, &["GET", "hits"]).await, "$2\r\n16\r\n");
+    assert!(say(&mut conn, &["DEL", "hits"]).await.starts_with("-READONLY"));
+    drop(conn);
+
+    // Memoire's client, `NuageKv`, on the same store.
+    {
+        use memoire_orm::NuageKv;
+        use std::time::Duration;
+        let kv = NuageKv::new(&running.url(), &token).unwrap();
+        assert_eq!(kv.get_string("hits").await.unwrap().as_deref(), Some("16"));
+        assert_eq!(kv.get("nope").await.unwrap(), None);
+        kv.set("a/b c?d", [0u8, 159, 255]).await.unwrap();
+        assert_eq!(kv.get("a/b c?d").await.unwrap(), Some(vec![0, 159, 255]));
+        assert!(kv.get_string("a/b c?d").await.is_err(), "not text");
+        kv.set_for("short", "lived", Duration::from_millis(40)).await.unwrap();
+        let left = kv.ttl("short").await.unwrap().unwrap();
+        assert!(left <= Duration::from_millis(40), "{left:?}");
+        assert_eq!(kv.ttl("nope").await.unwrap(), None);
+        assert!(kv.set_if_absent("job", "me", Some(Duration::from_secs(30))).await.unwrap());
+        assert!(!kv.set_if_absent("job", "you", None).await.unwrap());
+        assert_eq!(kv.incr("visits").await.unwrap(), 1);
+        assert_eq!(kv.incr_by("visits", 41, Some(Duration::from_secs(60))).await.unwrap(), 42);
+        assert_eq!(kv.ttl("visits").await.unwrap(), None, "the window is for a counter the call creates");
+        assert_eq!(kv.incr_by("window", 1, Some(Duration::from_secs(60))).await.unwrap(), 1);
+        assert!(kv.ttl("window").await.unwrap().is_some());
+        assert!(kv.incr("job").await.is_err(), "not a number");
+        assert!(kv.expire("visits", Duration::from_secs(60)).await.unwrap());
+        assert!(kv.persist("visits").await.unwrap());
+        assert!(!kv.expire("nope", Duration::from_secs(60)).await.unwrap());
+        assert!(kv.exists("visits").await.unwrap() && !kv.exists("nope").await.unwrap());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(kv.get("short").await.unwrap(), None, "expired");
+        assert_eq!(kv.keys("vi").await.unwrap(), ["visits"]);
+        assert_eq!(kv.command(&["STRLEN", "job"]).await.unwrap(), 2);
+        let answers = kv.pipeline(&[vec!["SET", "p", "1"], vec!["INCR", "p"], vec!["NOPE"]]).await.unwrap();
+        assert_eq!((answers[0].as_str(), answers[1].as_i64()), (Some("OK"), Some(2)));
+        assert!(answers[2]["error"].is_string());
+        // JSON values, and a cache in one call.
+        kv.set_json("user", &serde_json::json!({ "name": "Ada" }), None).await.unwrap();
+        assert_eq!(kv.get_json::<serde_json::Value>("user").await.unwrap().unwrap()["name"], "Ada");
+        let mut computed = 0;
+        for _ in 0..3 {
+            let report: Vec<u32> = kv
+                .remember("report", Duration::from_secs(60), || {
+                    computed += 1;
+                    async { Ok(vec![1, 2, 3]) }
+                })
+                .await
+                .unwrap();
+            assert_eq!(report, [1, 2, 3]);
+        }
+        assert_eq!(computed, 1, "computed once, then read from the store");
+        // A read-only token reads; the database client gives the same store.
+        let reader = NuageKv::new(&running.url(), &read).unwrap();
+        assert_eq!(reader.get_string("visits").await.unwrap().as_deref(), Some("42"));
+        assert!(reader.set("visits", "0").await.is_err());
+        let db = NuageDb::connect(&running.url(), &token).await.unwrap();
+        assert_eq!(db.kv().get_string("visits").await.unwrap().as_deref(), Some("42"));
+        for key in ["a/b c?d", "job", "visits", "window", "p", "user", "report"] {
+            assert!(kv.delete(key).await.unwrap(), "{key}");
+        }
+        assert!(!kv.delete("job").await.unwrap());
+    }
+
+    // The status says what the store holds.
+    let status = json(&http(addr, "GET", "/api/status", write, "").await);
+    assert!(status.to_string().contains("\"kv\""), "{status}");
+
+    // Everything deleted.
+    assert_eq!(json(&http(addr, "DELETE", "/v1/kv/hits", write, "").await)["deleted"], 1);
+    assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 4);
+    assert_eq!(json(&http(addr, "GET", "/v1/kv", write, "").await)["count"], 0);
+    redis.shutdown().await;
+    running.shutdown().await;
+}
