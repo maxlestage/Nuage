@@ -1509,7 +1509,7 @@ async fn files_through_signed_links() {
     running.shutdown().await;
 }
 
-/// `/v1/kv` and the Redis protocol: the key-value store of each application.
+/// `/v1/kv` and the key-value port: the key-value store of each application.
 #[tokio::test]
 async fn key_value_store() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1518,7 +1518,7 @@ async fn key_value_store() {
     let (_, token) = server.create_app("shop", "").unwrap();
     let read = server.new_app_read_only_token("shop").unwrap();
     let running = server.listen("127.0.0.1:0").await.unwrap();
-    let redis = server.listen_redis("127.0.0.1:0", nuage::RedisOptions::default()).await.unwrap();
+    let port = server.listen_kv("127.0.0.1:0", nuage::KvOptions::default()).await.unwrap();
     let addr = running.local_addr();
     let write = format!("Bearer {token}");
     let write: &[(&str, &str)] = &[("authorization", &write)];
@@ -1549,7 +1549,7 @@ async fn key_value_store() {
     assert_eq!(json(&http(addr, "POST", "/v1/kv/session:42?expire=30", write, "").await)["set"], true);
     assert_eq!(http(addr, "PUT", "/v1/kv/k?ttl=never", write, "v").await.status, 400);
 
-    // The commands of Redis as JSON: one, or several in one round trip.
+    // Commands as JSON: one, or several in one round trip.
     let one = http(addr, "POST", "/v1/kv", write, r#"["SET", "greeting", "bonjour", "EX", 60]"#).await;
     assert_eq!(json(&one)["result"], "OK", "{}", one.body);
     let many = http(
@@ -1589,8 +1589,8 @@ async fn key_value_store() {
     assert_eq!(http(addr, "GET", "/v1/kv/hits", first, "").await.status, 404);
     assert_eq!(json(&http(addr, "GET", "/v1/kv", first, "").await)["count"], 0);
 
-    // The Redis protocol, on the same store: the token is the password.
-    let mut conn = TcpStream::connect(redis.local_addr()).await.unwrap();
+    // The key-value port (RESP), on the same store: the token is the password.
+    let mut conn = TcpStream::connect(port.local_addr()).await.unwrap();
     let say = async |conn: &mut TcpStream, command: &[&str]| -> String {
         let mut wire = format!("*{}\r\n", command.len());
         for arg in command {
@@ -1606,7 +1606,7 @@ async fn key_value_store() {
     assert_eq!(say(&mut conn, &["AUTH", "default", &token]).await, "+OK\r\n");
     assert_eq!(say(&mut conn, &["PING"]).await, "+PONG\r\n");
     assert_eq!(say(&mut conn, &["GET", "hits"]).await, "$2\r\n15\r\n");
-    assert_eq!(say(&mut conn, &["SET", "from-redis", "1", "EX", "30"]).await, "+OK\r\n");
+    assert_eq!(say(&mut conn, &["SET", "from-the-port", "1", "EX", "30"]).await, "+OK\r\n");
     assert_eq!(say(&mut conn, &["SELECT", "0"]).await, "+OK\r\n");
     assert!(say(&mut conn, &["SELECT", "1"]).await.starts_with("-ERR"));
     assert_eq!(say(&mut conn, &["CLIENT", "SETNAME", "essai"]).await, "+OK\r\n");
@@ -1618,7 +1618,7 @@ async fn key_value_store() {
     assert_eq!(say(&mut conn, &["GET", "nope"]).await, "_\r\n");
     assert!(say(&mut conn, &["HELLO", "2"]).await.starts_with("*14\r\n"));
     // A pipeline: two commands sent together, answered together.
-    conn.write_all(b"*2\r\n$4\r\nINCR\r\n$4\r\nhits\r\nGET from-redis\r\n").await.unwrap();
+    conn.write_all(b"*2\r\n$4\r\nINCR\r\n$4\r\nhits\r\nGET from-the-port\r\n").await.unwrap();
     let mut answer = String::new();
     while !answer.ends_with("$1\r\n1\r\n") {
         let mut buf = [0u8; 256];
@@ -1639,11 +1639,11 @@ async fn key_value_store() {
     assert_eq!(say(&mut conn, &["DISCARD"]).await, "+OK\r\n");
     assert_eq!(say(&mut conn, &["DECR", "hits"]).await, ":16\r\n");
     assert_eq!(say(&mut conn, &["QUIT"]).await, "+OK\r\n");
-    // What Redis wrote, HTTP reads.
-    assert_eq!(http(addr, "GET", "/v1/kv/from-redis", read_only, "").await.body, "1");
+    // What the port wrote, HTTP reads.
+    assert_eq!(http(addr, "GET", "/v1/kv/from-the-port", read_only, "").await.body, "1");
 
-    // A read-only token over the Redis protocol; the HELLO that signs in.
-    let mut conn = TcpStream::connect(redis.local_addr()).await.unwrap();
+    // A read-only token over the port; the HELLO that signs in.
+    let mut conn = TcpStream::connect(port.local_addr()).await.unwrap();
     assert!(say(&mut conn, &["HELLO", "2", "AUTH", "default", &read]).await.starts_with("*14\r\n"));
     assert_eq!(say(&mut conn, &["GET", "hits"]).await, "$2\r\n16\r\n");
     assert!(say(&mut conn, &["DEL", "hits"]).await.starts_with("-READONLY"));
@@ -1717,6 +1717,6 @@ async fn key_value_store() {
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv/hits", write, "").await)["deleted"], 1);
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 4);
     assert_eq!(json(&http(addr, "GET", "/v1/kv", write, "").await)["count"], 0);
-    redis.shutdown().await;
+    port.shutdown().await;
     running.shutdown().await;
 }

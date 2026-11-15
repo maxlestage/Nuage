@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nuage DB",
-    "version": "0.4.4",
+    "version": "0.4.5",
     "summary": "SQL over HTTP: any language that can send JSON can use Nuage DB.",
-    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, the way Redis is used, at `/v1/kv`: values with an expiry, counters, locks, and the commands of Redis as JSON.",
+    "description": "Send SQL with `?` (or `$1`) parameters to `POST /v1/sql` with the token of an application; rows come back as JSON objects. The token picks the application's database. Several statements (separated by `;`, or in `statements`) run in one transaction, all or nothing. Parameters are never parsed as SQL. Examples in many languages: https://github.com/maxlestage/Nuage/tree/master/clients Applications and their tokens are made with the management API, `/api/apps`, and the server's NUAGE_ADMIN_TOKEN. An application's files (map tiles, photos, archives) are at `/v1/files`: the server lists them and signs links to its S3-compatible bucket, and the bytes go straight between the client and the bucket. Each application also has a key-value store in memory, at `/v1/kv`: values with an expiry, counters, locks, and commands by name as JSON.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -283,7 +283,7 @@
       },
       "post": {
         "operationId": "kvCommand",
-        "summary": "Commands of Redis, as JSON",
+        "summary": "Commands by name, as JSON",
         "description": "One command (a list: `[\"SET\", \"k\", \"v\", \"EX\", 60]`) answers `{\"result\": ...}`. Several (a list of lists, or `{\"commands\": [...]}`) answer `{\"results\": [...]}`, in one round trip, each command alone on the store. A read-only token sends the commands that read.",
         "requestBody": {
           "required": true,
@@ -1898,7 +1898,7 @@
             "boolean"
           ]
         },
-        "description": "A command of Redis, its name first: `[\"SET\", \"key\", \"value\", \"EX\", 60]`. Strings and counters: GET, SET (EX, PX, NX, XX, KEEPTTL, GET), SETNX, SETEX, PSETEX, GETSET, GETDEL, GETEX, MGET, MSET, MSETNX, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, DEL, UNLINK, EXISTS, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST, TYPE, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, PING, ECHO, INFO."
+        "description": "A command, its name first (the names Redis clients know): `[\"SET\", \"key\", \"value\", \"EX\", 60]`. Strings and counters: GET, SET (EX, PX, NX, XX, KEEPTTL, GET), SETNX, SETEX, PSETEX, GETSET, GETDEL, GETEX, MGET, MSET, MSETNX, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, DEL, UNLINK, EXISTS, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST, TYPE, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, PING, ECHO, INFO."
       },
       "KvReply": {
         "description": "The answer of a command: text (`\"OK\"`, a value), a number, `null` for nothing, a list; in a list of commands, `{\"error\": \"ERR ...\"}` for one that was refused."

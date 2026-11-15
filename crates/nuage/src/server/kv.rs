@@ -1,5 +1,5 @@
 //! `/v1/kv`: the key-value store of an application, in memory (see
-//! [`crate::kv`]), the way Redis is used.
+//! [`crate::kv`]): a cache, counters, locks.
 //!
 //! | Request | What |
 //! |---|---|
@@ -9,7 +9,7 @@
 //! | `POST /v1/kv/<key>?incr` (`=5`, `&ttl=60`) | adds to a counter: `{"value": 6}`; `ttl` is the expiry of a counter it creates |
 //! | `POST /v1/kv/<key>?expire=60`, `?persist` | changes its expiry: `{"set": true}` |
 //! | `GET /v1/kv` (`?prefix=`, `&limit=`) | the keys, and the figures of the store |
-//! | `POST /v1/kv` | commands of Redis as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`, a list of commands answers `{"results": [...]}` in one round trip |
+//! | `POST /v1/kv` | commands as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`, a list of commands answers `{"results": [...]}` in one round trip |
 //! | `DELETE /v1/kv` | deletes every key |
 //!
 //! A read-only token reads; writing takes a read-write token.
