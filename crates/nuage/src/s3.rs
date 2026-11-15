@@ -648,10 +648,12 @@ impl S3Store {
     ) -> Result<T> {
         let mut exchange = std::pin::pin!(exchange);
         let started = Instant::now();
+        // Looked at often enough for either limit to be noticed soon after it is passed.
+        let every = self.limits.stall.min(self.limits.total) / 4;
         // What had moved when it last did, and when that was.
         let mut last = (moved.load(Ordering::Relaxed), started);
         loop {
-            if let Ok(done) = tokio::time::timeout(self.limits.stall / 4, &mut exchange).await {
+            if let Ok(done) = tokio::time::timeout(every, &mut exchange).await {
                 return done;
             }
             let now = moved.load(Ordering::Relaxed);
@@ -754,7 +756,9 @@ impl BackupStore for S3Store {
             200 => Ok(answer.length),
             404 => Err(s3_err(format!("HEAD {key}: the object is not there"))),
             // A service that does not answer HEAD cannot tell.
-            _ => Ok(None),
+            405 | 501 => Ok(None),
+            // Any other refusal (a bucket in trouble) is the backup's to retry, not a size unknown.
+            _ => Self::check(&answer, &format!("HEAD {key}")).map(|()| answer.length),
         }
     }
 
@@ -773,7 +777,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::{SocketAddr, TcpListener};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU16};
 
     use super::*;
     use crate::{BackupOptions, Embedded, EngineOptions};
@@ -786,6 +790,8 @@ mod tests {
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         /// It takes the requests and answers none.
         silent: Arc<AtomicBool>,
+        /// Unless 0, the status it answers every request with (a bucket in trouble).
+        failing: Arc<AtomicU16>,
     }
 
     impl StandIn {
@@ -793,14 +799,15 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let (objects, silent) = (Arc::<Mutex<HashMap<_, _>>>::default(), Arc::<AtomicBool>::default());
-            let (o, s) = (objects.clone(), silent.clone());
+            let failing = Arc::<AtomicU16>::default();
+            let (o, s, f) = (objects.clone(), silent.clone(), failing.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    let (o, s) = (o.clone(), s.clone());
-                    std::thread::spawn(move || serve(stream, &o, &s));
+                    let (o, s, f) = (o.clone(), s.clone(), f.clone());
+                    std::thread::spawn(move || serve(stream, &o, &s, &f));
                 }
             });
-            StandIn { addr, objects, silent }
+            StandIn { addr, objects, silent, failing }
         }
 
         fn store(&self) -> S3Store {
@@ -821,26 +828,39 @@ mod tests {
     }
 
     /// One request of a connection to a [`StandIn`].
-    fn serve(mut stream: std::net::TcpStream, objects: &Mutex<HashMap<String, Vec<u8>>>, silent: &AtomicBool) {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
+    fn serve(
+        mut stream: std::net::TcpStream,
+        objects: &Mutex<HashMap<String, Vec<u8>>>,
+        silent: &AtomicBool,
+        failing: &AtomicU16,
+    ) {
+        // A client that gave up leaves in the middle: nothing to answer then.
+        let Ok(copy) = stream.try_clone() else { return };
+        let mut reader = BufReader::new(copy);
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        if reader.read_line(&mut line).is_err() {
+            return;
+        }
         let mut parts = line.split_whitespace().map(str::to_owned);
         let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
         let (mut length, mut digest, mut signed) = (0usize, String::new(), false);
         loop {
             let mut header = String::new();
-            reader.read_line(&mut header).unwrap();
+            if reader.read_line(&mut header).is_err() {
+                return;
+            }
             let Some((name, value)) = header.trim_end().split_once(':') else { break };
             match name.to_ascii_lowercase().as_str() {
-                "content-length" => length = value.trim().parse().unwrap(),
+                "content-length" => length = value.trim().parse().unwrap_or(0),
                 "x-amz-content-sha256" => digest = value.trim().to_owned(),
                 "authorization" => signed = value.trim().starts_with("AWS4-HMAC-SHA256 Credential=key/"),
                 _ => {}
             }
         }
         let mut body = vec![0u8; length];
-        reader.read_exact(&mut body).unwrap();
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
         if silent.load(Ordering::SeqCst) {
             // The connection stays open, without a word, until the client leaves.
             let _ = reader.read(&mut [0u8; 1]);
@@ -851,7 +871,9 @@ mod tests {
         let mut objects = objects.lock().unwrap();
         let error = |code: &str| format!("<Error><Code>{code}</Code></Error>").into_bytes();
         // The status, the body, and the length announced (of the object, for HEAD).
+        let failing = failing.load(Ordering::SeqCst);
         let (status, answer, announced) = match method.as_str() {
+            _ if failing != 0 => (failing, error("ServiceUnavailable"), None),
             _ if !signed => (403, error("AccessDenied"), None),
             _ if sha256_hex(&body) != digest => (400, error("XAmzContentSHA256Mismatch"), None),
             "PUT" => {
@@ -934,6 +956,37 @@ mod tests {
         // A file that is not there to send is an error, and nothing is stored.
         assert!(store.put_file("snapshots/3.db", &dir.join("missing")).is_err());
         assert_eq!(s3.stored("prod/snapshots/3.db"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neither way is a file whole in memory: it leaves in pieces of at most
+    /// [`PIECE`] bytes, read as they are sent, and what comes back goes to its
+    /// file as it arrives, the answer keeping none of it.
+    #[test]
+    fn a_file_is_never_whole_in_memory() {
+        let s3 = StandIn::start();
+        let store = s3.store();
+        let dir = temp("pieces");
+        let data: Vec<u8> = (0..3 * PIECE + 12_345).map(|i| (i * 7 % 253) as u8).collect();
+        std::fs::write(dir.join("sent"), &data).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut upload = Upload::file(&dir.join("sent")).unwrap();
+        assert_eq!(upload.sha256, sha256_hex(&data));
+        assert_eq!(upload.size_hint().exact(), Some(data.len() as u64));
+        let mut pieces = Vec::new();
+        runtime.block_on(async {
+            while let Some(frame) = upload.frame().await {
+                pieces.push(frame.unwrap().into_data().unwrap());
+            }
+        });
+        assert!(pieces.iter().all(|p| p.len() <= PIECE), "{:?}", pieces.iter().map(Bytes::len).collect::<Vec<_>>());
+        assert!(pieces.concat() == data);
+        store.put_file("snapshots/1.db", &dir.join("sent")).unwrap();
+        let key = store.key("snapshots/1.db");
+        let into = dir.join("back");
+        let answer = store.block(store.send(Method::GET, &key, &[], Upload::memory(Vec::new()), Some(&into))).unwrap();
+        assert_eq!((answer.status, answer.length, answer.body.len()), (200, Some(data.len() as u64), 0));
+        assert!(std::fs::read(&into).unwrap() == data);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1057,6 +1110,29 @@ mod tests {
         for dir in [src, dst] {
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A bucket that refuses for a while (it answers, with an error) is a
+    /// failed request, the size of an object included: no snapshot is taken
+    /// for stored on the word of a bucket in trouble. A service that does not
+    /// know HEAD at all only cannot tell the size.
+    #[test]
+    fn a_bucket_in_trouble_is_an_error_not_a_size_unknown() {
+        let s3 = StandIn::start();
+        let store = s3.store();
+        store.put("snapshots/1.db", b"whole").unwrap();
+        for status in [500, 503, 403] {
+            s3.failing.store(status, Ordering::SeqCst);
+            let e = store.size("snapshots/1.db").unwrap_err().to_string();
+            assert!(e.contains(&format!("HEAD prod/snapshots/1.db: HTTP {status}")), "{e}");
+            assert!(store.put("snapshots/2.db", b"x").is_err());
+        }
+        for status in [405, 501] {
+            s3.failing.store(status, Ordering::SeqCst);
+            assert_eq!(store.size("snapshots/1.db").unwrap(), None);
+        }
+        s3.failing.store(0, Ordering::SeqCst);
+        assert_eq!(store.size("snapshots/1.db").unwrap(), Some(5));
     }
 
     /// The example of the AWS Signature Version 4 documentation.
