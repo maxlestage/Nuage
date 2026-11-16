@@ -353,7 +353,7 @@ fn m_pair(op: BinOp, l: M, r: M) -> Option<M> {
 }
 
 /// A column name for an expression without an alias.
-fn header(e: &Expr, n: usize) -> String {
+pub(super) fn header(e: &Expr, n: usize) -> String {
     match e {
         Expr::Col { name, .. } => name.clone(),
         Expr::Func { name, .. } => name.clone(),
@@ -363,7 +363,7 @@ fn header(e: &Expr, n: usize) -> String {
 }
 
 /// Unique names: a repeated name is qualified by its table (`users.id`).
-fn unique_headers(names: Vec<(String, Option<String>)>) -> Vec<String> {
+pub(super) fn unique_headers(names: Vec<(String, Option<String>)>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(names.len());
     for (name, table) in names {
         let taken = out.iter().any(|o| o.eq_ignore_ascii_case(&name));
