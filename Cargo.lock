@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "active"
-version = "0.3.0"
-source = "git+https://github.com/maxlestage/Active#b4993f5181516b47f283e117e5871c6c3117b145"
+version = "0.3.1"
+source = "git+https://github.com/maxlestage/Active#d7803665f09a820c847ec2d309e097cdf362c386"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -332,7 +332,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
