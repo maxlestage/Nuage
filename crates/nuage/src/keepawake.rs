@@ -403,7 +403,7 @@ fn settings_refusal(base: &str, status: u16, json: &serde_json::Value) -> String
     if matches!(status, 404 | 405)
         && (message.is_empty() || message.starts_with("no such route") || message.starts_with("no such page"))
     {
-        return format!("{base} has no settings to change: they came with Nuage DB 0.4.7.");
+        return format!("{base} has no settings to change: they came with Nuage DB 0.4.8.");
     }
     refusal(base, status, json)
 }

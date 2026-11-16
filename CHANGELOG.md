@@ -2,7 +2,7 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.4.8 (2026-11-16)
 
 ### Against quantum computers
 
@@ -133,6 +133,9 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - The installers say where the settings change later, and their settings file calls its
   memory and visibility lines starting values. `ServerOptions::settings_env`,
   `settings_read_only`, `startup`; `memory::declare`, `detected`.
+- **The memory guard** first returns what the allocator keeps of freed memory, which is often
+  all there was; and when the caches hold less than a tenth of the memory, they are not what
+  fills it (statements or answers in progress are): they keep their pages and only take no more.
 
 ### A second copy of the backups, chosen later
 
@@ -401,9 +404,6 @@ stop, as the README shows). Known limits:
   budget halved (16 MiB at least) and the freed memory returned to the system, while requests
   go on; for five minutes the budget does not grow again, and for an hour it stays under
   three quarters of the one that did not fit. Said in the event log and in the server's log.
-  It first returns what the allocator keeps of freed memory, which is often all there was;
-  and when the caches hold less than a tenth of the memory, they are not what fills it
-  (statements or answers in progress are): they keep their pages and only take no more.
 - **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
   memory held under load, for a few percent of throughput.
 - **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them

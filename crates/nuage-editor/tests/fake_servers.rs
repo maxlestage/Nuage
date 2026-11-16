@@ -469,7 +469,7 @@ fn a_status_that_fails_on_the_way_is_asked_again() {
         }
         "/api/status" if request.bearer() => json(
             "200 OK",
-            serde_json::json!({ "version": "0.4.7", "uptime_s": 60, "backup": { "enabled": false, "last_ok": true },
+            serde_json::json!({ "version": "0.4.8", "uptime_s": 60, "backup": { "enabled": false, "last_ok": true },
                                  "databases": [{ "name": "shop", "status": "ok" }] }),
         ),
         _ => older(request, base),
@@ -484,7 +484,7 @@ fn a_status_that_fails_on_the_way_is_asked_again() {
     assert!(has(&harness, "Actualisation impossible : L'hébergeur a répondu 503"));
     assert!(!has(&harness, "Les versions plus récentes de Nuage DB"), "not an older server");
     press(&mut harness, "Actualiser");
-    wait_for(&mut harness, "the status", |h| has(h, "version 0.4.7"));
+    wait_for(&mut harness, "the status", |h| has(h, "version 0.4.8"));
     assert!(!has(&harness, "Actualisation impossible"));
     click(&mut harness, "Applications");
     click(&mut harness, "shop");

@@ -12,7 +12,7 @@ use crate::theme::{self, Mark};
 
 /// What a page that needs the settings says on a server without them.
 pub const NO_SETTINGS: &str =
-    "Update the server to see this here: its version has no settings for the editor (they came with Nuage DB 0.4.7).";
+    "Update the server to see this here: its version has no settings for the editor (they came with Nuage DB 0.4.8).";
 
 /// The settings, or what the page says instead: the server has none (an
 /// older version), they failed, or they are on their way.
