@@ -455,7 +455,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Tools, Generate a token makes one. Then set it: on Heroku in Settings, Config Vars (Heroku restarts the server by itself); with Docker in the .env file, then restart the container; for a server installed with the installer, in its settings file, then restart its service.",
-        "L'API de gestion de ce serveur est désactivée : NUAGE_ADMIN_TOKEN n'y est pas réglé. Outils, Générer un jeton en crée un. Réglez-le ensuite : sur Heroku dans Settings, Config Vars (Heroku redémarre le serveur tout seul) ; avec Docker dans le fichier .env, puis redémarrez le conteneur ; pour un serveur installé avec l'installeur, dans son fichier de réglages, puis redémarrez son service.",
+        "L'API de gestion de ce serveur est désactivée : NUAGE_ADMIN_TOKEN n'y est pas réglé. Outils, Générer un jeton en crée un. Réglez-le ensuite : sur Heroku dans Settings, Config Vars (Heroku redémarre le serveur tout seul) ; avec Docker dans le fichier .env, puis redémarrez le conteneur ; pour un serveur installé avec l'installateur, dans son fichier de réglages, puis redémarrez son service.",
         "La API de gestión de este servidor está desactivada: NUAGE_ADMIN_TOKEN no está definido en él. Herramientas, Generar un token crea uno. Defínelo después: en Heroku en Settings, Config Vars (Heroku reinicia el servidor solo); con Docker en el archivo .env, y reinicia el contenedor; para un servidor instalado con el instalador, en su archivo de ajustes, y reinicia su servicio.",
     ),
     (
@@ -1417,7 +1417,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "A management token has {} characters at least: is part of it missing, or is this the console password (NUAGE_ADMIN_PASSWORD)? The editor needs NUAGE_ADMIN_TOKEN, 64 characters when the installer or Heroku made it.",
-        "Un jeton de gestion a au moins {} caractères : en manque-t-il une partie, ou est-ce le mot de passe de la console (NUAGE_ADMIN_PASSWORD) ? L'éditeur a besoin de NUAGE_ADMIN_TOKEN, 64 caractères quand l'installeur ou Heroku l'a créé.",
+        "Un jeton de gestion a au moins {} caractères : en manque-t-il une partie, ou est-ce le mot de passe de la console (NUAGE_ADMIN_PASSWORD) ? L'éditeur a besoin de NUAGE_ADMIN_TOKEN, 64 caractères quand l'installateur ou Heroku l'a créé.",
         "Un token de gestión tiene al menos {} caracteres: ¿falta una parte, o es la contraseña de la consola (NUAGE_ADMIN_PASSWORD)? El editor necesita NUAGE_ADMIN_TOKEN, 64 caracteres cuando lo creó el instalador o Heroku.",
     ),
     (
@@ -1443,6 +1443,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "A token was made, but it never reached the editor: nobody has it. Revoke the one marked never shown; make a new one if you need it.",
         "Un jeton a été créé, mais il n'est jamais arrivé jusqu'à l'éditeur : personne ne l'a. Révoquez celui marqué jamais montré ; créez-en un autre si vous en avez besoin.",
         "Se creó un token, pero nunca llegó al editor: nadie lo tiene. Revoca el marcado nunca mostrado; crea otro si lo necesitas.",
+    ),
+    (
+        "Whether the token was made is not known yet: the list could not be read again. Refresh to know.",
+        "On ne sait pas encore si le jeton a été créé : la liste n'a pas pu être relue. Actualisez pour le savoir.",
+        "Aún no se sabe si el token se creó: la lista no se pudo volver a leer. Actualiza para saberlo.",
     ),
     (
         "No new token was made: make it again if you need it.",

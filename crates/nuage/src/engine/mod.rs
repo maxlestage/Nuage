@@ -1249,7 +1249,9 @@ fn disk_free(_: &Path) -> Option<u64> {
 /// is dropped.
 fn upkeep(engine: Weak<Engine>) {
     let mut last_compact = Instant::now();
-    let mut last_backup_try = Instant::now() - Duration::from_secs(3600);
+    // Not `now - an hour`: on Windows an `Instant` counts from the machine's start,
+    // and a machine started less than an hour ago would make that panic.
+    let mut last_backup_try: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(200));
         let Some(e) = engine.upgrade() else { return };
@@ -1269,7 +1271,7 @@ fn upkeep(engine: Weak<Engine>) {
 }
 
 /// One round of [`upkeep`].
-fn upkeep_round(e: &Arc<Engine>, last_compact: &mut Instant, last_backup_try: &mut Instant) {
+fn upkeep_round(e: &Arc<Engine>, last_compact: &mut Instant, last_backup_try: &mut Option<Instant>) {
     {
         let (due, idle) = {
             let w = e.store.writer();
@@ -1280,8 +1282,9 @@ fn upkeep_round(e: &Arc<Engine>, last_compact: &mut Instant, last_backup_try: &m
         if due && let Err(err) = e.checkpoint() {
             e.event("error", format!("checkpoint failed: {err}"));
         }
-        if e.options.backup.is_some() && (due || last_backup_try.elapsed() >= Duration::from_secs(60)) {
-            *last_backup_try = Instant::now();
+        if e.options.backup.is_some() && (due || last_backup_try.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)))
+        {
+            *last_backup_try = Some(Instant::now());
             // Each destination on a thread of its own: one that hangs holds neither the other nor
             // the checkpoints.
             for i in 0..e.places.len() {

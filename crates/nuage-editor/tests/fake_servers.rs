@@ -644,3 +644,34 @@ fn servers_whose_token_is_kept_stay_listed() {
     assert_eq!(servers.len(), 9);
     assert!(servers[0].address == fake.address && servers.iter().skip(1).all(|s| s.token_kept));
 }
+
+/// A token whose answer is lost, and the list that cannot be read again
+/// either: the page says it does not know yet, never that no token was made.
+#[test]
+fn a_lost_token_is_not_said_missing_before_the_list_is_read_again() {
+    let asked = Arc::new(Mutex::new(false));
+    let state = asked.clone();
+    let fake = fake(move |request, base| {
+        let router = || reply("503 Service Unavailable", "text/html", "<html>Application error</html>");
+        match (request.method(), request.path.as_str()) {
+            ("POST", "/api/apps/shop/tokens") => {
+                *state.lock().unwrap() = true;
+                router()
+            }
+            // Once the token was asked, the list cannot be read either.
+            ("GET", "/api/apps") if request.bearer() && *state.lock().unwrap() => router(),
+            ("GET", "/api/apps") if request.bearer() => json(
+                "200 OK",
+                serde_json::json!({ "applications": [{ "name": "shop", "first": true, "tokens": [{ "id": "ab12cd34", "created_at": 1 }] }] }),
+            ),
+            _ => older(request, base),
+        }
+    });
+    let mut harness = connected_in_french(&fake.address);
+    click(&mut harness, "Applications");
+    click(&mut harness, "shop");
+    press(&mut harness, "Nouveau jeton (lecture et écriture)");
+    wait_for(&mut harness, "the answer", |h| has(h, "Le changement a peut-être été fait, ou peut-être pas"));
+    wait_for(&mut harness, "the list", |h| has(h, "On ne sait pas encore si le jeton a été créé"));
+    assert!(!has(&harness, "Aucun nouveau jeton n'a été créé"), "not said before the list is read again");
+}

@@ -551,6 +551,10 @@ impl Editor {
     /// and its server from the list, once the store has deleted it (else
     /// nothing would be left to try again).
     pub(super) fn forget(&mut self, ctx: &egui::Context, address: String, drop: bool) {
+        // A write of its token still under way deletes it again once written.
+        for k in self.keeping.iter().filter(|k| k.address == address) {
+            k.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let vault = self.vault.clone();
         self.forget_job = Some(super::Job::start(ctx, &self.calls, move || {
             let done = vault.delete(&address);

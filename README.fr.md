@@ -950,7 +950,7 @@ réglages, l'état, les sites web), l'éditeur dit qu'une mise à jour du serveu
    clic droit sur `nuage-editor`, **Exécuter comme un programme** (GNOME Fichiers ne lance pas
    un programme d'un double-clic) ; dans l'éditeur, **À propos**, puis **Ajouter l'éditeur au
    menu des applications** le met dans le menu (`README.txt` donne la même chose en commandes).
-3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installeur est trouvé
+3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installateur est trouvé
    tout seul : **Ouvrir**, avec une fenêtre du système au plus. L'éditeur ne tourne jamais en
    administrateur ; les outils du système lisent pour lui quatre lignes du fichier de
    réglages (`PORT`, `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND` ; jamais la clé de
@@ -959,7 +959,7 @@ réglages, l'état, les sites web), l'éditeur dit qu'une mise à jour du serveu
    après la fenêtre UAC, qui nomme *Processeur de commandes Windows*, de Microsoft ; l'éditeur
    le dit avant que la fenêtre s'ouvre. Pour un serveur ailleurs, tapez son adresse et son
    jeton de gestion, `NUAGE_ADMIN_TOKEN` : *Où le trouver ?* montre où il est sur Heroku
-   (Settings de l'application, **Reveal Config Vars**), sur un serveur posé par l'installeur,
+   (Settings de l'application, **Reveal Config Vars**), sur un serveur posé par l'installateur,
    et dans le `.env` de Docker, et en génère un quand il n'y en a pas. La connexion se fait pas
    à pas (le serveur, le jeton, ses réglages), avec **Ne plus attendre** après 3 secondes ;
    quand une étape échoue, l'éditeur dit laquelle, pourquoi, et quoi essayer. Il retient
