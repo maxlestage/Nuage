@@ -154,6 +154,20 @@ pub enum Section {
 }
 
 impl Section {
+    /// Its icon in the side bar.
+    fn icon(self) -> theme::Icon {
+        match self {
+            Section::Overview => theme::Icon::Overview,
+            Section::Applications => theme::Icon::Applications,
+            Section::Memory => theme::Icon::Memory,
+            Section::Limits => theme::Icon::Limits,
+            Section::Startup => theme::Icon::Startup,
+            Section::Computer => theme::Icon::Computer,
+            Section::Tools => theme::Icon::Tools,
+            Section::About => theme::Icon::About,
+        }
+    }
+
     fn label(self, l: Lang) -> &'static str {
         match self {
             Section::Overview => t(l, "Overview"),
@@ -164,6 +178,18 @@ impl Section {
             Section::Computer => t(l, "This computer"),
             Section::Tools => t(l, "Tools"),
             Section::About => t(l, "About"),
+        }
+    }
+
+    /// One line under the page's title: what the page is for.
+    fn about(self, l: Lang) -> Option<&'static str> {
+        match self {
+            Section::Overview => Some(t(l, "Your server at a glance.")),
+            Section::Applications => None,
+            Section::Memory => Some(t(l, "How much memory Nuage DB may use, and for which application.")),
+            Section::Limits => Some(t(l, "What an application may do, and who may reach the server.")),
+            Section::Startup => Some(t(l, "What the server was started with.")),
+            Section::Computer | Section::Tools | Section::About => None,
         }
     }
 }
@@ -910,21 +936,53 @@ impl Editor {
             // The seconds waited, and "Stop waiting", show while nothing else repaints.
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, l));
+        let p = *theme::of(ui);
+        let chrome = |inner: egui::Margin| {
+            egui::Frame::new().fill(p.chrome).inner_margin(inner).stroke(egui::Stroke::new(1.0, p.line))
+        };
+        egui::Panel::top("top").frame(chrome(egui::Margin::symmetric(16, 8))).show(ui, |ui| self.top_bar(ui, l));
         if self.session.is_some() {
-            egui::Panel::left("sections").resizable(false).show(ui, |ui| {
-                // Its last buttons stay within reach in a small window, or with a larger text.
-                egui::ScrollArea::vertical().auto_shrink([true, false]).show(ui, |ui| self.sections(ui, l));
-            });
+            // Narrower in a small window, so that the page keeps its room.
+            let width = if ui.available_width() < 760.0 { 196.0 } else { 236.0 };
+            egui::Panel::left("sections")
+                .resizable(false)
+                .exact_size(width)
+                .frame(chrome(egui::Margin::symmetric(12, 14)))
+                .show(ui, |ui| {
+                    // Its last buttons stay within reach in a small window, or with a larger text.
+                    egui::ScrollArea::vertical().auto_shrink([true, false]).show(ui, |ui| self.sections(ui, l));
+                });
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                // 900 at most, for lines that read well; never wider than the window
-                // (this scrolls only downwards: what is past its right edge is lost).
-                ui.set_max_width(ui.available_width().min(900.0));
-                self.page(ui, l);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+                left: 28,
+                right: 20,
+                top: 22,
+                bottom: 16,
+            }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    // 920 at most, for lines that read well; never wider than the window
+                    // (this scrolls only downwards: what is past its right edge is lost).
+                    let width = (ui.available_width() - 8.0).min(920.0);
+                    // Without the sidebar, the page sits in the middle of the window.
+                    let side =
+                        if self.session.is_none() { ((ui.available_width() - 8.0 - width) / 2.0).floor() } else { 0.0 };
+                    if side >= 1.0 {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(side);
+                            ui.vertical(|ui| {
+                                ui.set_max_width(width);
+                                self.page(ui, l);
+                            });
+                        });
+                    } else {
+                        ui.set_max_width(width);
+                        self.page(ui, l);
+                    }
+                    ui.add_space(24.0);
+                });
             });
-        });
         self.dialogs(&ctx, l);
     }
 
@@ -1497,7 +1555,6 @@ impl Editor {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, l: Lang) {
-        ui.add_space(4.0);
         // The language and the theme where there is room (About has them too): the
         // address and its lock always show, never under them.
         let roomy = ui.available_width() >= TOP_BAR_ROOMY;
@@ -1519,34 +1576,53 @@ impl Editor {
                 }
                 // What is left of the width, wrapped onto a second line when it must.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
-                    if roomy {
-                        ui.label(RichText::new(t(l, "Nuage DB Editor")).strong().size(17.0));
+                    // The editor's name where it leaves room for the connection's pill.
+                    if roomy && (connected.is_none() || ui.available_width() >= 640.0) {
+                        theme::logo(ui, 22.0);
+                        ui.label(theme::strong(t(l, "Nuage DB Editor")).size(16.0));
+                        ui.add_space(6.0);
                         ui.separator();
+                        ui.add_space(4.0);
                     }
                     match &connected {
                         Some((address, _)) => {
-                            theme::mark(ui, Mark::On);
-                            ui.label(tf(l, "Connected to {}", &[&host_of(address)]));
+                            let p = *theme::of(ui);
                             let (m, lock, why) = lock(l, address);
-                            // A short word in the bar (it wrapped on three lines), the sentence on hover.
-                            let color = m.color(theme::of(ui));
-                            theme::mark(ui, m);
-                            ui.label(RichText::new(lock).color(color)).on_hover_text(why);
+                            egui::Frame::new()
+                                .fill(p.card)
+                                .stroke(egui::Stroke::new(1.0, p.line))
+                                .corner_radius(egui::CornerRadius::same(255))
+                                .inner_margin(egui::Margin::symmetric(12, 5))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.horizontal(|ui| {
+                                        theme::mark(ui, Mark::On);
+                                        ui.label(tf(l, "Connected to {}", &[&host_of(address)]));
+                                        ui.label(RichText::new("·").color(p.muted));
+                                        // A short word in the bar, the sentence on hover.
+                                        theme::mark(ui, m);
+                                        ui.label(RichText::new(lock).color(m.color(&p))).on_hover_text(why);
+                                    });
+                                });
                         }
                         None => {
                             theme::mark(ui, Mark::Off);
-                            ui.label(t(l, "Not connected"));
+                            ui.label(RichText::new(t(l, "Not connected")).color(theme::of(ui).muted));
                         }
                     }
                 });
             });
         });
-        ui.add_space(2.0);
     }
 
     fn theme_combo(&mut self, ui: &mut egui::Ui, l: Lang) {
         ui.name_inputs(t(l, "Theme"), |ui| {
-            egui::ComboBox::from_id_salt("theme").selected_text(theme_label(l, self.prefs.theme)).show_ui(ui, |ui| {
+            let short = match self.prefs.theme {
+                Theme::System => t(l, "Auto"),
+                Theme::Light => t(l, "Light"),
+                Theme::Dark => t(l, "Dark"),
+            };
+            egui::ComboBox::from_id_salt("theme").selected_text(short).show_ui(ui, |ui| {
                 for theme in [Theme::System, Theme::Light, Theme::Dark] {
                     ui.selectable_value(&mut self.prefs.theme, theme, theme_label(l, theme));
                 }
@@ -1570,7 +1646,8 @@ impl Editor {
     fn sections(&mut self, ui: &mut egui::Ui, l: Lang) {
         let has_here = self.here.as_ref().is_some_and(|h| h.installed.is_some());
         let Some(session) = self.session.as_mut() else { return };
-        ui.add_space(8.0);
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.add_space(2.0);
         for section in [
             Section::Overview,
             Section::Applications,
@@ -1584,21 +1661,27 @@ impl Editor {
             if section == Section::Computer && !(session.local && has_here) {
                 continue;
             }
-            if ui.selectable_label(session.section == section, section.label(l)).clicked() {
+            if theme::nav_item(ui, section.icon(), section.label(l), session.section == section).clicked() {
                 session.section = section;
                 session.open_app = None;
                 session.notice = None;
             }
         }
-        ui.add_space(12.0);
-        ui.separator();
-        if ui.button(t(l, "Open the console in my browser")).clicked() {
+        ui.add_space(14.0);
+        ui.label(RichText::new(t(l, "Shortcuts")).size(12.0).color(theme::of(ui).muted));
+        ui.add_space(2.0);
+        if theme::nav_item(ui, theme::Icon::Console, t(l, "Web console"), false).clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(session.server.console_url()));
         }
-        if ui.button(t(l, "Open the live dashboard")).clicked() {
+        if theme::nav_item(ui, theme::Icon::Dashboard, t(l, "Live dashboard"), false).clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{}/app", session.server.address())));
         }
-        if ui.add_enabled(!session.loading(), egui::Button::new(t(l, "Refresh"))).clicked() {
+        let loading = session.loading();
+        if ui
+            .add_enabled_ui(!loading, |ui| theme::nav_item(ui, theme::Icon::Refresh, t(l, "Refresh"), false))
+            .inner
+            .clicked()
+        {
             session.reload(ui.ctx());
         }
     }
@@ -1826,7 +1909,7 @@ const OLDER_WEBSITES: &str = "This version of Nuage DB changes the websites in t
 fn session_page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lang) {
     ui.add_space(8.0);
     if session.open_app.is_none() || session.section != Section::Applications {
-        ui.heading(session.section.label(l));
+        theme::page_title(ui, session.section.label(l), session.section.about(l));
     }
     notices(ui, session, l);
     ui.add_space(6.0);

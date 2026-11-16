@@ -51,8 +51,28 @@ fn setting_field(ui: &mut egui::Ui, session: &mut Session, l: Lang, key: &str, l
     let ctx = ui.ctx().clone();
     let read_only = session.settings.as_ref().is_some_and(|s| s.read_only);
     let setting = session.settings.as_ref().and_then(|s| s.get(key)).cloned();
-    ui.add_space(6.0);
-    let name = ui.strong(label);
+    ui.add_space(4.0);
+    // Each setting in a card of its own: its name, its field, where its value comes from.
+    theme::card(ui).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        setting_body(ui, session, l, key, label, help_text, read_only, setting, &ctx);
+    });
+    ui.add_space(4.0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setting_body(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    l: Lang,
+    key: &str,
+    label: &str,
+    help_text: &str,
+    read_only: bool,
+    setting: Option<crate::api::Setting>,
+    ctx: &egui::Context,
+) {
+    let name = theme::strong_label(ui, label);
     let field = session.fields.entry(key.to_owned()).or_default();
     ui.add_enabled(!read_only, egui::TextEdit::singleline(field).desired_width(180.0)).labelled_by(name.id);
     help(ui, help_text);
@@ -73,7 +93,7 @@ fn setting_field(ui: &mut egui::Ui, session: &mut Session, l: Lang, key: &str, l
             };
             if ui.add_enabled(!session.busy(), egui::Button::new(back).small()).clicked() {
                 let key = key.to_owned();
-                session.act(&ctx, Doing::Settings, move |server| server.reset_setting(&key).map(Outcome::Settings));
+                session.act(ctx, Doing::Settings, move |server| server.reset_setting(&key).map(Outcome::Settings));
             }
         }
     });
@@ -192,7 +212,7 @@ pub(super) fn memory(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     for a in &settings.applications {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.strong(&a.name);
+            theme::strong_label(ui, &a.name);
             help(
                 ui,
                 tf(
@@ -317,16 +337,24 @@ pub(super) fn startup(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     let show_all_id = egui::Id::unique("startup-show-all");
     let mut show_all = ui.data(|d| d.get_temp::<bool>(show_all_id)).unwrap_or(false);
     // A line each, its value after the name or under it: a long path never runs past the window.
-    for s in settings.startup.iter().filter(|s| show_all || s.value.is_some()) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(&s.variable).monospace().strong());
-            match s.value.as_deref() {
-                Some("***") => ui.label(RichText::new(t(l, "set (a secret: not shown)")).weak()),
-                Some(value) => ui.monospace(value),
-                None => ui.label(RichText::new(t(l, "not set")).weak()),
-            };
-        });
-    }
+    theme::card(ui).inner_margin(egui::Margin::symmetric(18, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let shown: Vec<_> = settings.startup.iter().filter(|s| show_all || s.value.is_some()).collect();
+        for (i, s) in shown.iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&s.variable).monospace().strong());
+                match s.value.as_deref() {
+                    Some("***") => ui.label(RichText::new(t(l, "set (a secret: not shown)")).weak()),
+                    Some(value) => ui.monospace(value),
+                    None => ui.label(RichText::new(t(l, "not set")).weak()),
+                };
+            });
+        }
+    });
+    ui.add_space(6.0);
     if settings.startup.iter().any(|s| s.value.is_none())
         && ui.checkbox(&mut show_all, t(l, "Show the ones not set")).changed()
     {

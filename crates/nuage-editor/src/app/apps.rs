@@ -98,13 +98,13 @@ fn new_application(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     theme::card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         theme::subheading(ui, t(l, "New application"));
-        let label = ui.strong(t(l, "What is it for?"));
+        let label = theme::strong_label(ui, t(l, "What is it for?"));
         ui.add(egui::TextEdit::singleline(&mut session.new_what).hint_text(t(l, "My shop")).desired_width(360.0))
             .labelled_by(label.id);
         if !session.name_typed {
             session.new_name = api::suggest_name(&session.new_what);
         }
-        let label = ui.strong(t(l, "Name"));
+        let label = theme::strong_label(ui, t(l, "Name"));
         let field = ui
             .add(egui::TextEdit::singleline(&mut session.new_name).hint_text("ma-boutique").desired_width(360.0))
             .labelled_by(label.id);
@@ -444,7 +444,7 @@ fn websites_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l:
             );
         }
         if can {
-            let label = ui.strong(t(l, "Website to allow"));
+            let label = theme::strong_label(ui, t(l, "Website to allow"));
             let mut add = false;
             ui.horizontal_wrapped(|ui| {
                 let field = ui
@@ -530,14 +530,20 @@ fn memory_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
             .app_fields
             .entry(app.name.clone())
             .or_insert_with(|| (format::amount(l, app.memory.cache_mb), format::amount(l, app.memory.kv_mb)));
-        egui::Grid::new("app-memory").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            let label = ui.label(t(l, "Page cache"));
-            ui.add_enabled(!read_only, egui::TextEdit::singleline(cache).desired_width(140.0)).labelled_by(label.id);
-            ui.end_row();
-            let label = ui.label(t(l, "Key-value store"));
-            ui.add_enabled(!read_only, egui::TextEdit::singleline(kv).desired_width(140.0)).labelled_by(label.id);
-            ui.end_row();
-        });
+        // Side by side where there is room, the name above its field where there is not.
+        let side = ui.available_width() >= 360.0;
+        for (name, field) in [(t(l, "Page cache"), &mut *cache), (t(l, "Key-value store"), &mut *kv)] {
+            let mut row = |ui: &mut egui::Ui| {
+                let label = ui.add_sized([if side { 170.0 } else { 0.0 }, 20.0], egui::Label::new(name).wrap());
+                let width = ui.available_width().min(140.0);
+                ui.add_enabled(!read_only, egui::TextEdit::singleline(field).desired_width(width)).labelled_by(label.id);
+            };
+            if side {
+                ui.horizontal(row);
+            } else {
+                row(ui);
+            }
+        }
         let (cache, kv) = (cache.clone(), kv.clone());
         if ui.add_enabled(!session.busy() && !read_only, egui::Button::new(t(l, "Save its memory"))).clicked() {
             let name = app.name.clone();

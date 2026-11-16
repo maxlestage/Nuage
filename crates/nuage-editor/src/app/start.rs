@@ -33,12 +33,21 @@ impl Editor {
     pub(super) fn start_page(&mut self, ui: &mut egui::Ui, l: Lang) {
         let ctx = ui.ctx().clone();
         ui.add_space(12.0);
-        ui.heading(t(l, "Welcome"));
-        ui.label(t(
-            l,
-            "This editor looks after your Nuage DB server without a terminal: see that it works, create an application for your website, choose how much memory it uses.",
-        ));
-        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            theme::logo(ui, 52.0);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.heading(t(l, "Welcome"));
+                ui.label(
+                    RichText::new(t(
+                        l,
+                        "This editor looks after your Nuage DB server without a terminal: see that it works, create an application for your website, choose how much memory it uses.",
+                    ))
+                    .color(theme::of(ui).muted),
+                );
+            });
+        });
+        ui.add_space(14.0);
         if self.connect.job.is_some() || self.connect.failed {
             self.connecting(ui, &ctx, l);
             ui.add_space(10.0);
@@ -343,7 +352,7 @@ impl Editor {
             ui.set_width(ui.available_width());
             theme::subheading(ui, t(l, "My server is elsewhere: Heroku, a host, another computer"));
             let mut cleartext = None;
-            let label = ui.strong(t(l, "Server address"));
+            let label = theme::strong_label(ui, t(l, "Server address"));
             let id = egui::Id::unique("nuage-editor-address");
             let field = ui
                 .add(
@@ -380,7 +389,7 @@ impl Editor {
                 }
             }
             ui.add_space(6.0);
-            let label = ui.strong(t(l, "Management token"));
+            let label = theme::strong_label(ui, t(l, "Management token"));
             if kept_here {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(tf(l, "Token kept in {}.", &[&self.vault.store().place(l)]));

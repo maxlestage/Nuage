@@ -103,8 +103,7 @@ impl Editor {
     pub(super) fn tools_page(&mut self, ui: &mut egui::Ui, l: Lang) {
         ui.add_space(8.0);
         self.back_link(ui, l);
-        ui.heading(t(l, "Tools"));
-        ui.add_space(6.0);
+        theme::page_title(ui, t(l, "Tools"), None);
         let ctx = ui.ctx().clone();
         if self.token_test.address.is_empty() {
             self.token_test.address = self
@@ -118,7 +117,7 @@ impl Editor {
             ui.set_width(ui.available_width());
             theme::subheading(ui, t(l, "Test an application's connection"));
             help(ui, t(l, "What a website or a program does: it opens Nuage DB with an application's token."));
-            let label = ui.strong(t(l, "Server address"));
+            let label = theme::strong_label(ui, t(l, "Server address"));
             ui.add(egui::TextEdit::singleline(&mut self.token_test.address).desired_width(380.0)).labelled_by(label.id);
             // As for the management token: plain http to the Internet waits for a consent, each time.
             let cleartext = crate::address::normalize(&self.token_test.address)
@@ -137,7 +136,7 @@ impl Editor {
                 }
             }
             let consented = cleartext.is_none() || self.token_test.cleartext_ok == cleartext;
-            let label = ui.strong(t(l, "Application token"));
+            let label = theme::strong_label(ui, t(l, "Application token"));
             let field = ui
                 .add(
                     egui::TextEdit::singleline(&mut *self.token_test.token)
@@ -226,8 +225,7 @@ impl Editor {
     pub(super) fn about_page(&mut self, ui: &mut egui::Ui, l: Lang) {
         ui.add_space(8.0);
         self.back_link(ui, l);
-        ui.heading(t(l, "About"));
-        ui.add_space(6.0);
+        theme::page_title(ui, t(l, "About"), None);
         let ctx = ui.ctx().clone();
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
