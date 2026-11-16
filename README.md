@@ -384,11 +384,14 @@ the backups. The requests, the commands and the port stay the same. With `databa
   written;
 - **an expiry is a date**: a key set to live an hour expires an hour later, whether the server
   restarted in between or not. An expired key is never returned or counted, and background
-  passes remove it from the disk, as fast as keys expire;
+  passes remove it from the disk, one after the other while keys are due, as fast as keys
+  expire;
 - **`SCAN` answers page by page**: `COUNT` keys of the store at most per page (10 without it),
   and a cursor for the next page, `0` after the last, as Redis does: `scan_iter` and the like
-  go through any number of keys, even when they delete them on the way. `KEYS` answers at most
-  100,000 keys (16 MiB of them): past that, it says to use `SCAN`;
+  go through any number of keys, even when they delete them on the way. A cursor is kept 10
+  minutes at least, whatever the other clients scan meanwhile; one given before a restart is
+  refused (`ERR invalid cursor`: start again from `SCAN 0`), never taken for another page.
+  `KEYS` answers at most 100,000 keys (16 MiB of them): past that, it says to use `SCAN`;
 - **on a disk erased at each restart** (Heroku), a clean restart keeps every key: on `SIGTERM`
   the server stops taking writes, then ships its last log segment, so every write it answered
   is in it (one that comes after gets the storage error). After a crash, the keys come back as they were at the
@@ -634,19 +637,26 @@ before it serves. The installer asks where they go; or say it in the command:
   furthest (take it out of the settings to start from the other alone; a second that has not
   answered 5 seconds after the first counts as not answering), or when the two hold different
   databases. Without the first, `NUAGE_BACKUP2_*` is the only destination: adding the second,
-  waiting until it has everything, then removing the first moves the backups without a stop.
-  The console's *Storage* page shows each destination's last backup, and `/api/status` each
-  one in `backup.destinations`: a destination shows no time until it has received a whole
-  snapshot since the start, and the last backup shows none until both have. The stop sends to
-  the first, then gives the second 20 seconds at most.
+  waiting until it has everything, swapping the two, then removing the old one moves the
+  backups without a stop (see Heroku below). The console's *Storage* page shows each
+  destination's last backup, and `/api/status` each one in `backup.destinations`: a
+  destination shows no time until it has received a whole snapshot since the start, and the
+  last backup shows none until both have. A round to a destination that has not ended after
+  10 minutes (one that does not answer, or so slow it never keeps up) shows as its error, and
+  in the event log, until it ends. The stop sends to both at the same time: the first gets as
+  long as it takes, the second 20 seconds at most.
 - **Deleting an application** in the console empties its backup (`apps/<name>/`) in each
-  destination. One that cannot be emptied is named in the answer and the event log; until its
-  backup there is deleted by hand, no application of that name can be created, so that a new
-  one never starts with the deleted one's rows. On Linux, the installer's service may write
+  destination, once the backup round running to it, if any, has ended: nothing of it is
+  written there afterwards. One that cannot be emptied is named in the answer and the event
+  log; until its backup there is deleted by hand, no application of that name can be created,
+  so that a new one never starts with the deleted one's rows. One that has not answered
+  within 10 seconds is named too, and its emptying goes on: the name stays taken until it
+  ends. On Linux, the installer's service may write
   only to the data folder and `NUAGE_BACKUP_DIR`: there, make the second one a bucket.
 - **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors. A
   bucket that stops answering fails the round after 60 seconds with nothing moving, and the
-  next round tries again; an upload that keeps moving is never cut, however slow the line.
+  next round tries again; an upload is never cut while its bytes keep leaving the server (the
+  limit counts from the last byte that went on the line, not from what is waiting to go).
 - **Restore** on a new computer: install, put the old settings file's
   `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
   and restart the service: it restores the last snapshot and replays the log after it.
@@ -719,10 +729,14 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
   and sends a whole snapshot of every application to the new one; (2) wait until the
   console's *Storage* page, or `/app`, shows the last backup of every application with no
   error (it shows none until the new bucket has a whole snapshot of each), or until
-  `backup.destinations[1].last_at` of `/api/status` has a time; (3) remove the
-  old one, in one command (`heroku config:unset NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION
-  …`): the stopping dyno sends its last seconds to both, and the next one restores from the
-  new bucket, now the only destination.
+  `backup.destinations[1].last_at` of `/api/status` has a time; (3) swap them, in one command:
+  the new bucket's settings as `NUAGE_BACKUP_S3_*` and the old one's as `NUAGE_BACKUP2_S3_*`
+  (bucket, region, keys, prefix and endpoint of each): the stopping dyno sends its last
+  seconds to both, and the next one restores from the one that reaches furthest; (4) remove
+  the old one, now the second, in one command (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET
+  NUAGE_BACKUP2_S3_REGION …`): the stopping dyno sends its last seconds to the new bucket,
+  now the first, as long as that takes (the second only gets 20 seconds), and the next one
+  restores from it, the only destination.
 
 By hand:
 

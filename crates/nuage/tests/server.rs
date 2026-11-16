@@ -3054,7 +3054,9 @@ async fn applications_share_one_cache_budget() {
 /// hangs (a network folder that never answers: here, a file that cannot be
 /// read until something writes to it). The first gets every commit, the
 /// stop gives the second 20 seconds and says so, and the process ends: a
-/// new disk restored from the first alone has every row.
+/// new disk restored from the first alone has every row. A Back up now
+/// clicked meanwhile says, within seconds, that a round to the second is
+/// still running, and holds neither the stop nor the end of the process.
 #[cfg(unix)]
 #[test]
 fn the_stop_ends_while_the_second_destination_hangs() {
@@ -3080,8 +3082,14 @@ fn the_stop_ends_while_the_second_destination_hangs() {
         vars.extend_from_slice(extra);
         nuage_binary(&vars)
     };
-    let (server, _) =
-        running(binary(&data, &[("NUAGE_BACKUP_DIR", one_dir.as_str()), ("NUAGE_BACKUP2_DIR", two_dir.as_str())]));
+    let (server, _) = running(binary(
+        &data,
+        &[
+            ("NUAGE_BACKUP_DIR", one_dir.as_str()),
+            ("NUAGE_BACKUP2_DIR", two_dir.as_str()),
+            ("NUAGE_ADMIN_PASSWORD", "correct horse"),
+        ],
+    ));
     // The first round: the first gets its snapshot, the second hangs.
     for _ in 0..500 {
         if one.join("manifest.json").exists() {
@@ -3100,6 +3108,19 @@ fn the_stop_ends_while_the_second_destination_hangs() {
     for n in 0..20 {
         sql(&format!("INSERT INTO notes (body) VALUES ('note {n}')"));
     }
+    // Back up now, from the console, while the round to the second hangs.
+    let addr = server.addr;
+    let clicked = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut c = Console { addr, cookies: HashMap::new() };
+            let login = c.request("GET", "/admin/login", &[]).await;
+            c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+            let token = csrf(&c.request("GET", "/admin/apps/nuage/storage", &[]).await.body);
+            c.request("POST", "/admin/apps/nuage/storage/backup", &[("csrf", &token)]).await.body
+        })
+    });
+    std::thread::sleep(Duration::from_secs(2));
     let started = std::time::Instant::now();
     let (code, rest, err) = server.stop();
     let took = started.elapsed();
@@ -3107,6 +3128,8 @@ fn the_stop_ends_while_the_second_destination_hangs() {
     assert!(took < Duration::from_secs(28), "{took:?}");
     let rest = rest.join("\n");
     assert!(rest.contains("the second backup destination did not get everything within 20 seconds"), "{rest}");
+    let page = clicked.join().unwrap();
+    assert!(page.contains("a backup round to it has been running for"), "{page}");
     let (server, out) = running(binary(&again, &[("NUAGE_BACKUP_DIR", one_dir.as_str())]));
     assert!(out.join("\n").contains("restored from the backup"), "{out:?}");
     let body = serde_json::json!({ "sql": "SELECT COUNT(*) AS n FROM notes", "params": [] }).to_string();
@@ -3195,6 +3218,341 @@ async fn an_application_whose_backup_stays_is_not_created_again() {
     running.shutdown().await;
     closed(server).await;
     for d in [dir, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A backup folder that holds every call while `hang` is set (a network
+/// folder that stops answering), and takes `slow_snapshots` milliseconds to
+/// upload each snapshot (a slow line).
+struct Gate {
+    folder: nuage::DirectoryStore,
+    hang: std::sync::atomic::AtomicBool,
+    held: std::sync::atomic::AtomicUsize,
+    slow_snapshots: std::sync::atomic::AtomicU64,
+    snapshots_begun: std::sync::atomic::AtomicUsize,
+}
+
+impl Gate {
+    fn new(root: &std::path::Path) -> Arc<Gate> {
+        Arc::new(Gate {
+            folder: nuage::DirectoryStore::new(root),
+            hang: Default::default(),
+            held: Default::default(),
+            slow_snapshots: Default::default(),
+            snapshots_begun: Default::default(),
+        })
+    }
+
+    fn set_hang(&self, hang: bool) {
+        self.hang.store(hang, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn answer(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.hang.load(SeqCst) {
+            self.held.fetch_add(1, SeqCst);
+            while self.hang.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.held.fetch_sub(1, SeqCst);
+        }
+    }
+
+    /// Waits until a call is held.
+    fn wait_held(&self) {
+        for _ in 0..2000 {
+            if self.held.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no call reached {}", nuage::BackupStore::describe(&self.folder));
+    }
+
+    /// Waits until a snapshot upload begins after `before` began.
+    fn wait_snapshot(&self, before: usize) {
+        for _ in 0..2000 {
+            if self.snapshots_begun.load(std::sync::atomic::Ordering::SeqCst) > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no snapshot reached {}", nuage::BackupStore::describe(&self.folder));
+    }
+}
+
+impl nuage::BackupStore for Gate {
+    fn describe(&self) -> String {
+        self.folder.describe()
+    }
+    fn put(&self, name: &str, data: &[u8]) -> memoire_orm::Result<()> {
+        self.answer();
+        self.folder.put(name, data)
+    }
+    fn put_file(&self, name: &str, path: &std::path::Path) -> memoire_orm::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.answer();
+        if name.contains("snapshots/") {
+            // Read at once, as an upload does, then on the line for a while.
+            let data = std::fs::read(path).unwrap();
+            self.snapshots_begun.fetch_add(1, SeqCst);
+            std::thread::sleep(Duration::from_millis(self.slow_snapshots.load(SeqCst)));
+            return self.folder.put(name, &data);
+        }
+        self.folder.put_file(name, path)
+    }
+    fn get(&self, name: &str) -> memoire_orm::Result<Option<Vec<u8>>> {
+        self.answer();
+        self.folder.get(name)
+    }
+    fn list(&self, prefix: &str) -> memoire_orm::Result<Vec<String>> {
+        self.answer();
+        self.folder.list(prefix)
+    }
+    fn delete(&self, name: &str) -> memoire_orm::Result<()> {
+        self.answer();
+        self.folder.delete(name)
+    }
+}
+
+/// The files under `dir`, by their path from there (none when it is missing).
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// A server backed up to the folder `one` and to `two`, with its data in
+/// `dir`.
+fn server_backed_up_to(dir: &std::path::Path, one: &std::path::Path, two: Arc<Gate>) -> Server {
+    let store: Arc<dyn nuage::BackupStore> =
+        Arc::new(nuage::MirrorStore::new(Arc::new(nuage::DirectoryStore::new(one)), two));
+    let settings = EngineOptions { backup: Some(nuage::BackupOptions::new(store)), ..backed_up_to(one) };
+    Server::new(Engine::open(dir, settings).unwrap(), options())
+}
+
+/// Deleting an application while a backup round sends a snapshot of it: the
+/// deletion waits for that round, then empties each destination, so that
+/// nothing of the deleted application is written there afterwards. A new
+/// application of the same name then starts empty, and its backup is its
+/// own: the second destination alone restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_an_application_waits_for_its_backup_round() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (dir, one, two) = (temp_dir("delete-round-data"), temp_dir("delete-round-one"), temp_dir("delete-round-two"));
+    let gate = Gate::new(&two);
+    let server = server_backed_up_to(&dir, &one, gate.clone());
+    server.create_app("shop", "").unwrap();
+    let shop = server.app_engine("shop").unwrap();
+    let db = nuage::Embedded::from_engine(shop.clone());
+    db.sql("CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT)", &[]).unwrap();
+    db.sql("INSERT INTO notes (id, body) VALUES (1, 'the old shop')", &[]).unwrap();
+    drop(db);
+    shop.backup_now(true).unwrap();
+    // The server's own database has sent its first snapshots too.
+    for _ in 0..500 {
+        if server.engine().backup_status().last_at.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(server.engine().backup_status().last_at.is_some());
+    // A snapshot on its way to the second when it is deleted.
+    gate.slow_snapshots.store(3000, SeqCst);
+    let before = gate.snapshots_begun.load(SeqCst);
+    let sending = shop.clone();
+    let round = std::thread::spawn(move || sending.backup_to(1, true));
+    gate.wait_snapshot(before);
+    drop(shop);
+    let started = std::time::Instant::now();
+    assert!(server.delete_app("shop").unwrap());
+    assert!(started.elapsed() > Duration::from_secs(2), "it waited for the round: {:?}", started.elapsed());
+    assert!(round.is_finished(), "the round ended before the second was emptied");
+    let _ = round.join();
+    let said = "application `shop` deleted, with its data and backups";
+    assert!(server.engine().events().0.iter().any(|e| e.message == said), "{:?}", server.engine().events().0);
+    std::thread::sleep(Duration::from_millis(500));
+    for place in [&one, &two] {
+        assert_eq!(files_under(&place.join("apps/shop")), Vec::<String>::new(), "{}", place.display());
+    }
+    // A new one of that name, with a backup of its own.
+    gate.slow_snapshots.store(0, SeqCst);
+    server.create_app("shop", "").unwrap();
+    let shop = server.app_engine("shop").unwrap();
+    let db = nuage::Embedded::from_engine(shop.clone());
+    assert!(db.tables().unwrap().is_empty());
+    db.sql("CREATE TABLE fresh (id BIGINT PRIMARY KEY, body TEXT)", &[]).unwrap();
+    db.sql("INSERT INTO fresh (id, body) VALUES (1, 'the new shop')", &[]).unwrap();
+    drop(db);
+    shop.backup_now(true).unwrap();
+    drop(shop);
+    let fresh = temp_dir("delete-round-fresh");
+    let from_two: Arc<dyn nuage::BackupStore> =
+        Arc::new(nuage::PrefixedStore::new(Arc::new(nuage::DirectoryStore::new(&two)), "apps/shop/"));
+    let restored =
+        Engine::open(&fresh, EngineOptions { backup: Some(nuage::BackupOptions::new(from_two)), ..backed_up_to(&one) })
+            .unwrap();
+    let tables: Vec<String> =
+        nuage::Embedded::from_engine(restored.clone()).tables().unwrap().into_iter().map(|t| t.name).collect();
+    assert_eq!(tables, ["fresh"]);
+    let gone = Arc::downgrade(&restored);
+    drop(restored);
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+    closed(server).await;
+    for d in [dir, one, two, fresh] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A second destination that stops answering (a network folder that hangs)
+/// holds no other change to the applications: creating one says, within
+/// seconds, that the destination could not be checked; deleting one says
+/// which destination still holds its backup, whose emptying goes on; and
+/// meanwhile a token, a website or a description is changed at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_that_hangs_holds_no_other_change() {
+    let (dir, one, two) = (temp_dir("hang-apps-data"), temp_dir("hang-apps-one"), temp_dir("hang-apps-two"));
+    let gate = Gate::new(&two);
+    let server = server_backed_up_to(&dir, &one, gate.clone());
+    server.create_app("blog", "").unwrap();
+    server.app_engine("blog").unwrap().backup_now(true).unwrap();
+    gate.set_hang(true);
+    let at_once = |what: &str, change: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        change();
+        assert!(started.elapsed() < Duration::from_secs(2), "{what}: {:?}", started.elapsed());
+    };
+    std::thread::scope(|s| {
+        let started = std::time::Instant::now();
+        let creating = s.spawn(|| server.create_app("shop", ""));
+        gate.wait_held();
+        at_once("a token", &|| drop(server.new_app_token("blog").unwrap()));
+        at_once("a website", &|| drop(server.set_app_origins("blog", &["https://blog.example"]).unwrap()));
+        let e = creating.join().unwrap().unwrap_err().to_string();
+        let said = format!("cannot check that {}/apps/shop holds no backup", two.display());
+        assert!(e.contains(&said) && e.contains("did not answer within 10 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(server.app_engine("shop").is_none() && !dir.join("apps/shop").exists());
+
+        let started = std::time::Instant::now();
+        let deleting = s.spawn(|| server.delete_app("blog"));
+        std::thread::sleep(Duration::from_millis(300));
+        at_once("a token", &|| drop(server.new_app_token(&server.engine().options().name.clone()).unwrap()));
+        assert!(deleting.join().unwrap().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        let said =
+            format!("application `blog` deleted; its backup is still in {}/apps/blog (not emptied", two.display());
+        assert!(
+            server.engine().events().0.iter().any(|e| e.message.starts_with(&said)),
+            "{:?}",
+            server.engine().events().0
+        );
+        assert!(files_under(&one.join("apps/blog")).is_empty(), "the first is emptied");
+        let e = server.create_app("blog", "").unwrap_err().to_string();
+        assert!(e.contains("the application named `blog` is being deleted"), "{e}");
+    });
+    // It answers again: the deletion ends, and the name is free.
+    gate.set_hang(false);
+    let deleted = "application `blog` deleted, with its data and backups";
+    for _ in 0..500 {
+        if server.engine().events().0.iter().any(|e| e.message == deleted) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(files_under(&two.join("apps/blog")).is_empty() && !dir.join("apps/blog").exists());
+    server.create_app("blog", "").unwrap();
+    closed(server).await;
+    for d in [dir, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The binary's stop while its first backup destination hangs (a folder
+/// whose `encryption.json` is a FIFO): the upkeep kept sending to the
+/// second, the stop sends the last commits to the second at the same time
+/// as it waits for the first, and says so. A new disk restored from the
+/// second alone has every row.
+#[cfg(unix)]
+#[test]
+fn the_stop_sends_to_the_second_while_the_first_hangs() {
+    let (data, again, one, two) = (
+        temp_dir("bin-first-hang-data"),
+        temp_dir("bin-first-hang-again"),
+        temp_dir("bin-first-hang-one"),
+        temp_dir("bin-first-hang-two"),
+    );
+    for folder in [&one, &two] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let fifo = one.join("encryption.json");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let key = "07".repeat(32);
+    let (one_dir, two_dir) = (one.display().to_string(), two.display().to_string());
+    let binary = |data: &std::path::Path, extra: &[(&str, &str)]| {
+        let data = data.display().to_string();
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_TOKEN", "t0ken"),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend_from_slice(extra);
+        nuage_binary(&vars)
+    };
+    let (mut server, _) =
+        running(binary(&data, &[("NUAGE_BACKUP_DIR", one_dir.as_str()), ("NUAGE_BACKUP2_DIR", two_dir.as_str())]));
+    // The first round: the second gets its snapshot, the first hangs.
+    for _ in 0..500 {
+        if two.join("manifest.json").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(two.join("manifest.json").exists(), "no snapshot in the second");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let sql = |addr: SocketAddr, statement: &str| {
+        let body = serde_json::json!({ "sql": statement, "params": [] }).to_string();
+        runtime.block_on(http(addr, "POST", "/v1/sql", &[("authorization", "Bearer t0ken")], &body))
+    };
+    assert_eq!(sql(server.addr, "CREATE TABLE notes (id BIGINT PRIMARY KEY AUTOINCREMENT, body TEXT)").status, 200);
+    for n in 0..20 {
+        assert_eq!(sql(server.addr, &format!("INSERT INTO notes (body) VALUES ('note {n}')")).status, 200);
+    }
+    // SAFETY: the pid is our child's, still running.
+    assert_eq!(unsafe { libc::kill(server.child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    let waiting = "the first backup destination has not got everything after 20 seconds, and the second has \
+                   everything: the stop waits for it";
+    let mut seen = Vec::new();
+    while let Ok(line) = server.lines.recv_timeout(Duration::from_secs(40)) {
+        seen.push(line.clone());
+        if line.contains(waiting) {
+            break;
+        }
+    }
+    assert!(seen.iter().any(|l| l.contains(waiting)), "{seen:#?}");
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+    let (server, out) = running(binary(&again, &[("NUAGE_BACKUP_DIR", two_dir.as_str())]));
+    assert!(out.join("\n").contains("restored from the backup"), "{out:?}");
+    let res = sql(server.addr, "SELECT COUNT(*) AS n FROM notes");
+    assert!(res.status == 200 && res.body.contains("20"), "{}", res.body);
+    let _ = server.stop();
+    for d in [data, again, one, two] {
         let _ = std::fs::remove_dir_all(&d);
     }
 }

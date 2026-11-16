@@ -24,7 +24,7 @@ pub(crate) mod wal;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use memoire_orm::nuage::Branch;
@@ -77,6 +77,11 @@ pub struct BackupOptions {
     /// Restore the latest backup when the data directory is empty at startup
     /// (a fresh container, a new disk). Default: `true`.
     pub restore_when_empty: bool,
+    /// A round to a destination that has not ended after this long is
+    /// reported as failed, in the status and by an `error` event, until it
+    /// ends: a destination that does not answer (a network folder that hangs)
+    /// or one so slow that it never keeps up. Default: 10 minutes.
+    pub stuck_after: Duration,
 }
 
 impl std::fmt::Debug for BackupOptions {
@@ -91,7 +96,13 @@ impl std::fmt::Debug for BackupOptions {
 impl BackupOptions {
     /// Backups to `store`, with the default intervals.
     pub fn new(store: Arc<dyn BackupStore>) -> Self {
-        BackupOptions { store, snapshot_every: Duration::from_secs(3600), keep_snapshots: 2, restore_when_empty: true }
+        BackupOptions {
+            store,
+            snapshot_every: Duration::from_secs(3600),
+            keep_snapshots: 2,
+            restore_when_empty: true,
+            stuck_after: Duration::from_secs(600),
+        }
     }
 }
 
@@ -160,7 +171,9 @@ pub struct Event {
 
 /// State of the backups. With two destinations ([`MirrorStore`]), `target`,
 /// `last_at`, `last_ok` and `last_error` tell both; `shipped_lsn` and
-/// `last_snapshot_at` are the first's, and `destinations` tells each one.
+/// `last_snapshot_at` are the first's, and `destinations` tells each one. A
+/// round that has run longer than [`BackupOptions::stuck_after`] is a failure
+/// of its destination until it ends.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackupStatus {
     /// Where they go (`None`: backups are off); `A and B` with two
@@ -259,18 +272,18 @@ struct Progress {
 /// What a round to the second destination still needs from the log, said to
 /// the checkpoints ([`Engine::keep_after`]) while it runs, and forgotten when
 /// it ends, however it ends.
-struct Needs<'a>(&'a Mutex<Option<(u64, Instant)>>);
+struct Needs<'a>(&'a Mutex<Option<u64>>);
 
 impl<'a> Needs<'a> {
-    /// The round needs the segments after `lsn`, from now.
-    fn after(slot: &'a Mutex<Option<(u64, Instant)>>, lsn: u64) -> Needs<'a> {
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((lsn, Instant::now()));
+    /// The round needs the segments after `lsn`.
+    fn after(slot: &'a Mutex<Option<u64>>, lsn: u64) -> Needs<'a> {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(lsn);
         Needs(slot)
     }
 
     /// It now needs only the segments after `lsn` (a snapshot it sends).
     fn only_after(&self, lsn: u64) {
-        if let Some((at, _)) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(at) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             *at = lsn;
         }
     }
@@ -282,10 +295,53 @@ impl Drop for Needs<'_> {
     }
 }
 
-/// How long the checkpoints keep, at most, the log segments a round to the
-/// second destination has yet to send ([`Engine::keep_after`]): a round that
-/// hangs (a network folder that never answers) does not fill the disk.
-const SECOND_HOLD: Duration = Duration::from_secs(3600);
+/// A round to a destination is running: when it began, for the status
+/// ([`Engine::report_stuck`]); forgotten when it ends, however it ends.
+struct Running<'a> {
+    since: &'a Mutex<Option<Instant>>,
+    reported: &'a AtomicBool,
+}
+
+impl<'a> Running<'a> {
+    fn new(since: &'a Mutex<Option<Instant>>, reported: &'a AtomicBool) -> Running<'a> {
+        reported.store(false, Ordering::SeqCst);
+        *since.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Running { since, reported }
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.reported.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How long the console's Back up now waits for a round to a destination
+/// that is already running before it says so, instead of waiting for ever
+/// behind a destination that does not answer.
+const BUSY_WAIT: Duration = Duration::from_secs(10);
+
+/// `lock`, once it is free, or `None` after `limit`.
+fn lock_within<T>(lock: &Mutex<T>, limit: Duration) -> Option<MutexGuard<'_, T>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// `d` as the status says it: in seconds up to two minutes, then in minutes.
+fn for_how_long(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 120 => format!("{s} seconds"),
+        s => format!("{} minutes", s / 60),
+    }
+}
 
 /// Where `b` was looked for, said of an empty backup: `<place> holds no
 /// backup`, or `neither <first> nor <second> holds a backup`.
@@ -316,13 +372,24 @@ pub struct Engine {
     /// at a time, and a round to the second never waits for one to the
     /// first, nor the reverse. The status holds a copy of each.
     progress: [Mutex<Progress>; 2],
-    /// The upkeep's round to the second destination is running, on a thread
-    /// of its own: the next one is not started meanwhile.
-    second_running: AtomicBool,
+    /// The upkeep's round to each destination is running, on a thread of its
+    /// own: the next one to it is not started meanwhile.
+    running: [AtomicBool; 2],
+    /// When the round to each destination that runs now began (whoever runs
+    /// it), and whether the status already says it has run too long.
+    round_since: [Mutex<Option<Instant>>; 2],
+    stuck_reported: [AtomicBool; 2],
     /// While a round to the second destination runs: the LSN after which it
-    /// still needs the log segments, and when that began. The checkpoints
-    /// keep those segments ([`Engine::keep_after`]).
-    second_needs: Mutex<Option<(u64, Instant)>>,
+    /// still needs the log segments. The checkpoints keep those segments
+    /// ([`Engine::keep_after`]).
+    second_needs: Mutex<Option<u64>>,
+    /// The last copy of the page store a round made, while a round still
+    /// sends it: a round to the other destination due for a snapshot at the
+    /// same time sends it too, instead of copying the page store again.
+    copy: Mutex<Weak<backup::Taken>>,
+    /// Closed ([`Engine::close`]): no backup round starts any more, and one
+    /// that waited for its turn writes nothing.
+    closed: AtomicBool,
     last_compaction: Mutex<Option<(i64, bool)>>,
     started: Instant,
     started_at: SystemTime,
@@ -431,8 +498,12 @@ impl Engine {
             backup_status: Mutex::new(backup_status),
             places,
             progress,
-            second_running: AtomicBool::new(false),
+            running: [AtomicBool::new(false), AtomicBool::new(false)],
+            round_since: [Mutex::new(None), Mutex::new(None)],
+            stuck_reported: [AtomicBool::new(false), AtomicBool::new(false)],
             second_needs: Mutex::new(None),
+            copy: Mutex::new(Weak::new()),
+            closed: AtomicBool::new(false),
             last_compaction: Mutex::new(None),
             started: Instant::now(),
             started_at: SystemTime::now(),
@@ -563,7 +634,8 @@ impl Engine {
     /// segment. The segments the backup does not have yet are kept: those of
     /// the first destination, so that a second one that does not answer
     /// never fills the disk (it gets a snapshot instead), and those a round
-    /// to the second that is running still has to send.
+    /// to the second that is running still has to send, up to a size (see
+    /// [`keep_after`](Self::keep_after)).
     pub fn checkpoint(&self) -> Result<u64> {
         let lsn = self.store.checkpoint(self.keep_after())?;
         self.event("info", format!("checkpoint at {lsn}"));
@@ -573,15 +645,44 @@ impl Engine {
     /// The last LSN whose log segments a checkpoint may remove: `None`
     /// without a backup (all of them), else the last one the first
     /// destination has, or less while a round to the second needs older
-    /// ones (for [`SECOND_HOLD`] at most).
+    /// ones. Those are kept however long the round takes (a large snapshot
+    /// on a slow line), while they take no more than the page store itself
+    /// (and four times [`EngineOptions::checkpoint_wal_bytes`] at least):
+    /// past it, sending a new snapshot costs less than the log, and a round
+    /// that hangs (a network folder that never answers) does not fill the
+    /// disk.
     fn keep_after(&self) -> Option<u64> {
         self.options.backup.as_ref()?;
         let first = self.backup_status().shipped_lsn;
         let second = *self.second_needs.lock().unwrap_or_else(|e| e.into_inner());
+        // Once part of it is gone, the round needs a snapshot anyway: the rest goes too.
+        let held = |lsn: u64| {
+            lsn < first
+                && backup::can_continue(&self.store, lsn).unwrap_or(false)
+                && self.log_after(lsn) <= self.hold_budget()
+        };
         Some(match second {
-            Some((lsn, since)) if since.elapsed() < SECOND_HOLD => first.min(lsn),
+            Some(lsn) if held(lsn) => lsn,
             _ => first,
         })
+    }
+
+    /// Bytes of the log segments on this disk that hold commits after `lsn`.
+    fn log_after(&self, lsn: u64) -> u64 {
+        let segments = wal::segments(&self.store.dir.join("wal")).unwrap_or_default();
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| segments.get(i + 1).is_none_or(|(next, _)| next - 1 > lsn))
+            .filter_map(|(_, (_, path))| std::fs::metadata(path).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// The most bytes of log kept for a round to the second destination.
+    fn hold_budget(&self) -> u64 {
+        let pages = std::fs::metadata(self.store.dir.join(FILE)).map_or(0, |m| m.len());
+        pages.max(self.options.checkpoint_wal_bytes.saturating_mul(4))
     }
 
     /// Refuses every commit from now on (`the database is stopping: nothing
@@ -626,17 +727,19 @@ impl Engine {
 
     /// Ships the sealed log segments, and takes a snapshot when one is due
     /// (or `force_snapshot`). Rounds to one destination run one at a time: a
-    /// call made during another (the upkeep thread's, the console's Back up
-    /// now) waits for it to end, then makes its own. A location that holds
-    /// another database's backup is refused, and nothing is written there.
+    /// call made during another (the upkeep thread's) waits for it to end,
+    /// then makes its own; after 10 seconds, it says that a round to that
+    /// destination is still running instead of waiting behind a destination
+    /// that does not answer. A location that holds another database's backup
+    /// is refused, and nothing is written there.
     ///
     /// With two destinations ([`MirrorStore`]), the round goes to the first,
     /// then to the second ([`backup_to`](Self::backup_to)): one that fails
     /// never holds the other back, and when both are due for a snapshot, the
     /// page store is copied once and sent to each. It returns the first
-    /// error, if any. The upkeep thread does not call this: it sends to the
-    /// second on a thread of its own, so that a second that is slow, or does
-    /// not answer, never holds the first's rounds or the checkpoints.
+    /// error, if any. The upkeep thread does not call this: it sends to each
+    /// destination on a thread of its own, so that one that is slow, or does
+    /// not answer, never holds the other's rounds or the checkpoints.
     pub fn backup_now(&self, force_snapshot: bool) -> Result<()> {
         let Some(b) = &self.options.backup else {
             return Err(Error::Unsupported("no backup location is configured".into()));
@@ -646,11 +749,30 @@ impl Engine {
         let mut taken = None;
         let mut failed = None;
         for i in 0..self.places.len() {
-            if let Err(e) = self.round_to(b, i, force_snapshot, &mut taken) {
+            let round = match lock_within(&self.progress[i], BUSY_WAIT) {
+                Some(progress) => self.round_with(b, i, progress, force_snapshot, &mut taken),
+                None => Err(self.busy(i)),
+            };
+            if let Err(e) = round {
                 failed.get_or_insert(e);
             }
         }
         failed.map_or(Ok(()), Err)
+    }
+
+    /// The error of a call that found a round to destination `i` running.
+    fn busy(&self, i: usize) -> Error {
+        let since = *self.round_since[i].lock().unwrap_or_else(|e| e.into_inner());
+        let how_long = since.map_or_else(String::new, |at| format!(" for {}", for_how_long(at.elapsed())));
+        let place = self.places[i].describe();
+        let what = format!(
+            "a backup round to it has been running{how_long} and has not ended (the destination does not answer, \
+             or is slow): nothing more was sent, try again later"
+        );
+        match i {
+            0 => storage_err(format!("{place}: {what}")),
+            _ => storage_err(format!("second destination ({place}): {what}")),
+        }
     }
 
     /// A backup round to one destination: `0`, the first (the only one, with
@@ -661,9 +783,8 @@ impl Engine {
     /// this disk (they are kept for the first destination, and for a round to
     /// the second only while it runs, so a second that does not answer never
     /// fills the disk); it never receives a segment after a hole. A server's
-    /// stop sends to the first destination of every database before any
-    /// second one, so that a slow second cannot take the first's last
-    /// seconds.
+    /// stop sends to the first and to the second destinations at the same
+    /// time, on two threads: neither waits for the other.
     pub fn backup_to(&self, destination: usize, force_snapshot: bool) -> Result<()> {
         let Some(b) = &self.options.backup else {
             return Err(Error::Unsupported("no backup location is configured".into()));
@@ -677,43 +798,72 @@ impl Engine {
         self.round_to(b, destination, force_snapshot, &mut None)
     }
 
-    /// The upkeep's round to the second destination, on a thread of its own:
-    /// the first's rounds, the checkpoints and a server's stop never wait for
-    /// it, and none is started while the last one runs. `taken`: the copy of
-    /// the page store the first's round just made, if it made one.
-    fn second_round_soon(self: &Arc<Self>, taken: Option<Arc<backup::Taken>>) {
-        if self.places.len() < 2 || self.second_running.swap(true, Ordering::SeqCst) {
+    /// The upkeep's round to destination `i`, on a thread of its own: the
+    /// other destination's rounds, the checkpoints and a server's stop never
+    /// wait for it, and none is started while the last one runs.
+    fn round_soon(self: &Arc<Self>, i: usize) {
+        if i >= self.places.len() || self.running[i].swap(true, Ordering::SeqCst) {
             return;
         }
         let engine = self.clone();
-        let spawned = std::thread::Builder::new().name("nuage-backup-2".into()).spawn(move || {
-            let mut taken = taken;
+        let spawned = std::thread::Builder::new().name(format!("nuage-backup-{}", i + 1)).spawn(move || {
             if !engine.stop.load(Ordering::SeqCst)
                 && let Some(b) = &engine.options.backup
             {
                 let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = engine.round_to(b, 1, false, &mut taken);
+                    let _ = engine.round_to(b, i, false, &mut None);
                 }));
                 if round.is_err() {
                     engine.event(
                         "error",
-                        "upkeep: a round to the second backup destination failed unexpectedly (a bug); the next one \
-                         runs as usual",
+                        "upkeep: a backup round failed unexpectedly (a bug); the next one runs as usual".to_owned(),
                     );
                 }
             }
-            drop(taken);
-            engine.second_running.store(false, Ordering::SeqCst);
+            engine.running[i].store(false, Ordering::SeqCst);
         });
         if let Err(e) = spawned {
-            self.second_running.store(false, Ordering::SeqCst);
-            self.event("error", format!("backup failed: cannot start a round to the second destination: {e}"));
+            self.running[i].store(false, Ordering::SeqCst);
+            self.event("error", format!("backup failed: cannot start a backup round: {e}"));
         }
     }
 
-    /// A round to destination `i`, under its lock. `taken`: the copy of the
-    /// page store already made in this round, or where to keep the one made
-    /// here.
+    /// Says, in the status and once by an `error` event, each destination
+    /// whose round has run longer than [`BackupOptions::stuck_after`]: until
+    /// it ends, that destination is failing. The upkeep thread calls it.
+    fn report_stuck(&self) {
+        let Some(b) = &self.options.backup else { return };
+        for i in 0..self.places.len() {
+            // Under the status's lock: a round that ends says it is over before it takes it.
+            let mut s = self.backup_status.lock().unwrap_or_else(|e| e.into_inner());
+            let since = *self.round_since[i].lock().unwrap_or_else(|e| e.into_inner());
+            let Some(since) = since.filter(|at| at.elapsed() >= b.stuck_after) else { continue };
+            let place = self.places[i].describe();
+            let what = format!(
+                "a backup round has been running for {} and has not ended: the destination does not answer, or \
+                 is very slow",
+                for_how_long(since.elapsed())
+            );
+            let e = match i {
+                0 => storage_err(format!("{place}: {what}")),
+                _ => storage_err(format!("second destination ({place}): {what}")),
+            };
+            if let Some(d) = s.destinations.get_mut(i) {
+                d.error = Some(e.to_string());
+            }
+            let errors: Vec<String> = s.destinations.iter().filter_map(|d| d.error.clone()).collect();
+            s.last_ok = errors.is_empty();
+            s.last_error = (!errors.is_empty()).then(|| errors.join("; "));
+            drop(s);
+            if !self.stuck_reported[i].swap(true, Ordering::SeqCst) {
+                self.event("error", format!("backup failed: {e}"));
+            }
+        }
+    }
+
+    /// A round to destination `i`, under its lock (waiting for it as long as
+    /// it takes). `taken`: the copy of the page store already made in this
+    /// round, or where to keep the one made here.
     fn round_to(
         &self,
         b: &BackupOptions,
@@ -721,7 +871,28 @@ impl Engine {
         force_snapshot: bool,
         taken: &mut Option<Arc<backup::Taken>>,
     ) -> Result<()> {
-        let mut progress = self.progress[i].lock().unwrap_or_else(|e| e.into_inner());
+        let progress = self.progress[i].lock().unwrap_or_else(|e| e.into_inner());
+        self.round_with(b, i, progress, force_snapshot, taken)
+    }
+
+    /// A round to destination `i`, its lock held: nothing at all once the
+    /// database is closed (a round that waited for its turn while it was
+    /// closed writes nothing).
+    fn round_with(
+        &self,
+        b: &BackupOptions,
+        i: usize,
+        mut progress: MutexGuard<'_, Progress>,
+        force_snapshot: bool,
+        taken: &mut Option<Arc<backup::Taken>>,
+    ) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(storage_err(format!(
+                "the database is closed: nothing was sent to {}",
+                self.places[i].describe()
+            )));
+        }
+        let _running = Running::new(&self.round_since[i], &self.stuck_reported[i]);
         self.round(b, i, &mut progress, force_snapshot, taken)
     }
 
@@ -752,11 +923,23 @@ impl Engine {
                         ),
                     );
                 }
-                // A copy made for the other destination, while the log after it is still here.
-                let shared = taken.take().filter(|copy| backup::can_continue(&self.store, copy.lsn).unwrap_or(false));
-                let copy = match shared {
+                // A copy made for the other destination (by this call, or by a round to it that
+                // still sends it), while the log after it is still here; else a new one, which the
+                // other destination may then send too.
+                let usable = |copy: &Arc<backup::Taken>| backup::can_continue(&self.store, copy.lsn).unwrap_or(false);
+                let copy = match taken.take().filter(usable) {
                     Some(copy) => copy,
-                    None => Arc::new(backup::take(&self.store)?),
+                    None => {
+                        let mut last = self.copy.lock().unwrap_or_else(|e| e.into_inner());
+                        match last.upgrade().filter(usable) {
+                            Some(copy) => copy,
+                            None => {
+                                let copy = Arc::new(backup::take(&self.store)?);
+                                *last = Arc::downgrade(&copy);
+                                copy
+                            }
+                        }
+                    }
                 };
                 if let Some(needs) = &needs {
                     needs.only_after(copy.lsn);
@@ -777,6 +960,8 @@ impl Engine {
             0 => e,
             _ => storage_err(format!("second destination ({}): {}", place.describe(), reason(&e))),
         });
+        // Over: before the status's lock (see `report_stuck`).
+        *self.round_since[i].lock().unwrap_or_else(|e| e.into_inner()) = None;
         let now = store::now_millis();
         let moved = match &result {
             Ok((shipped, snap)) => {
@@ -954,10 +1139,23 @@ impl Engine {
         self.store.pages.drop_cache();
     }
 
-    /// Stops the upkeep thread and makes everything durable.
+    /// Stops the upkeep thread and makes everything durable. No backup round
+    /// starts after it: one already running ends as it would (see
+    /// [`wait_for_backups`](Self::wait_for_backups)), and one that was
+    /// waiting for its turn writes nothing.
     pub fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
         self.checkpoint().map(|_| ())
+    }
+
+    /// Waits until no backup round to `destination` runs: after
+    /// [`close`](Self::close), nothing more is written there once this
+    /// returns. What deleting a database does before it empties its backups.
+    pub fn wait_for_backups(&self, destination: usize) {
+        if let Some(progress) = self.progress.get(destination) {
+            drop(progress.lock().unwrap_or_else(|e| e.into_inner()));
+        }
     }
 }
 
@@ -1021,15 +1219,15 @@ fn upkeep_round(e: &Arc<Engine>, last_compact: &mut Instant, last_backup_try: &m
         if due && let Err(err) = e.checkpoint() {
             e.event("error", format!("checkpoint failed: {err}"));
         }
-        if let Some(b) = &e.options.backup
-            && (due || last_backup_try.elapsed() >= Duration::from_secs(60))
-        {
+        if e.options.backup.is_some() && (due || last_backup_try.elapsed() >= Duration::from_secs(60)) {
             *last_backup_try = Instant::now();
-            // The first here, the second on a thread of its own, with the copy made for the first.
-            let mut taken = None;
-            let _ = e.round_to(b, 0, false, &mut taken);
-            e.second_round_soon(taken);
+            // Each destination on a thread of its own: one that hangs holds neither the other nor
+            // the checkpoints.
+            for i in 0..e.places.len() {
+                e.round_soon(i);
+            }
         }
+        e.report_stuck();
         if idle && last_compact.elapsed() >= e.options.compact_every {
             *last_compact = Instant::now();
             let s = e.stats();

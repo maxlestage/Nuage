@@ -10,10 +10,11 @@
 //! tokens), is kept in the first application's metadata: written through its
 //! log, encrypted and backed up with it, and restored before the others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
@@ -27,6 +28,10 @@ const REGISTRY_PREFIX: &[u8] = b"app:";
 const TOKEN_ID_LEN: usize = 8;
 /// Tokens made by the server start with it (easy to spot in a leak scan).
 const TOKEN_PREFIX: &str = "nuage_";
+/// How long creating or deleting an application waits for the backup
+/// destinations (all of them at once): one that does not answer is said,
+/// and the other changes to the applications never queue behind it.
+const DESTINATION_WAIT: Duration = Duration::from_secs(10);
 
 /// A token of an application, as stored: a digest, never the token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +212,9 @@ pub(crate) struct Apps {
     failed: Mutex<Vec<(String, String)>>,
     /// Serializes creations and deletions.
     changes: Mutex<()>,
+    /// Applications deleted whose backups are still being emptied: no
+    /// application of the same name is created meanwhile.
+    deleting: Arc<Mutex<BTreeSet<String>>>,
     /// Memory of each application's key-value store.
     kv_bytes: usize,
     /// Memory the key-value stores of all the applications may hold
@@ -246,6 +254,7 @@ impl Apps {
             others: RwLock::new(BTreeMap::new()),
             failed: Mutex::new(Vec::new()),
             changes: Mutex::new(()),
+            deleting: Arc::new(Mutex::new(BTreeSet::new())),
             kv_bytes,
             kv_budget,
             cache_budget,
@@ -457,17 +466,17 @@ impl Apps {
         self.first.engine.set_meta(&key, Some(app.record().to_string().as_bytes()))
     }
 
-    /// Creates an application and its first token. Returns the token: it is
-    /// shown once, only its digest is kept.
-    pub(crate) fn create(&self, name: &str, description: &str) -> Result<(Arc<App>, String)> {
-        let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
-        check_branch_name(name).map_err(|_| {
-            Error::Validation(format!(
-                "invalid application name `{name}`: use 1 to 63 lowercase letters, digits, `-` and `_`"
-            ))
-        })?;
+    /// The name `name` is free for a new application: no application has
+    /// it, none is being deleted under it, and its folder is not there.
+    fn name_is_free(&self, name: &str) -> Result<()> {
         if self.get(name).is_some() || self.failed().iter().any(|(n, _)| n == name) {
             return Err(Error::Validation(format!("there is already an application named `{name}`")));
+        }
+        if self.deleting.lock().unwrap_or_else(|e| e.into_inner()).contains(name) {
+            return Err(Error::Validation(format!(
+                "the application named `{name}` is being deleted (its backup is being emptied): try again once it \
+                 is done"
+            )));
         }
         let dir = dir_of(&self.first.engine, name);
         if dir.exists() {
@@ -476,27 +485,47 @@ impl Apps {
                 dir.display()
             )));
         }
+        Ok(())
+    }
+
+    /// Creates an application and its first token. Returns the token: it is
+    /// shown once, only its digest is kept.
+    pub(crate) fn create(&self, name: &str, description: &str) -> Result<(Arc<App>, String)> {
+        check_branch_name(name).map_err(|_| {
+            Error::Validation(format!(
+                "invalid application name `{name}`: use 1 to 63 lowercase letters, digits, `-` and `_`"
+            ))
+        })?;
+        {
+            let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+            self.name_is_free(name)?;
+        }
         // A new application starts empty: a backup left under its name (a deletion that
-        // could not empty a destination) would otherwise be restored into it.
-        for place in self.backup_places(name) {
-            match place.get(backup::MANIFEST) {
-                Ok(None) => {}
-                Ok(Some(_)) => {
+        // could not empty a destination) would otherwise be restored into it. Asked of every
+        // destination at once, for a while at most, and without holding the other changes.
+        let places = self.backup_places(name);
+        let found = on_each(&places, DESTINATION_WAIT, |place| place.get(backup::MANIFEST).map(|m| m.is_some()));
+        for (place, found) in places.iter().zip(found) {
+            let why = match found {
+                Some(Ok(false)) => continue,
+                Some(Ok(true)) => {
                     return Err(Error::Validation(format!(
                         "{} still holds the backup of an application named `{name}`, deleted earlier: delete it \
                          there, or pick another name",
                         place.describe()
                     )));
                 }
-                Err(e) => {
-                    return Err(crate::engine::storage_err(format!(
-                        "cannot check that {} holds no backup of an application named `{name}`: {}",
-                        place.describe(),
-                        crate::engine::reason(&e)
-                    )));
-                }
-            }
+                Some(Err(e)) => crate::engine::reason(&e),
+                None => format!("it did not answer within {} seconds", DESTINATION_WAIT.as_secs()),
+            };
+            return Err(crate::engine::storage_err(format!(
+                "cannot check that {} holds no backup of an application named `{name}`: {why}",
+                place.describe()
+            )));
         }
+        let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        // Made, or being deleted, by another call meanwhile.
+        self.name_is_free(name)?;
         let engine = self.open_engine(name, true)?;
         let app = Arc::new(App::new(
             name.to_owned(),
@@ -551,50 +580,117 @@ impl Apps {
     /// first application cannot be deleted. Returns `None` when there is no
     /// such application, else the destinations that still hold its backup
     /// (they could not be emptied, and say why): none when it is all gone.
+    ///
+    /// Its database is closed first: no backup round starts after it, and
+    /// each destination is emptied once the round running to it, if any,
+    /// has ended, so that nothing is written there after it is emptied. The
+    /// destinations are emptied at the same time; a destination that has not
+    /// answered within 10 seconds (or whose round is still running) is said,
+    /// and its emptying goes on: until it ends, no application of that name
+    /// is created, and its folder stays.
     pub(crate) fn delete(&self, name: &str) -> Result<Option<Vec<String>>> {
-        let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
-        if name == self.first.name {
-            return Err(Error::Unsupported("the first application cannot be deleted".into()));
-        }
-        let app = self.others.write().unwrap_or_else(|e| e.into_inner()).remove(name);
-        let was_failed = {
-            let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-            let before = failed.len();
-            failed.retain(|(n, _)| n != name);
-            before != failed.len()
+        let app = {
+            let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+            if name == self.first.name {
+                return Err(Error::Unsupported("the first application cannot be deleted".into()));
+            }
+            let app = self.others.write().unwrap_or_else(|e| e.into_inner()).remove(name);
+            let was_failed = {
+                let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+                let before = failed.len();
+                failed.retain(|(n, _)| n != name);
+                before != failed.len()
+            };
+            if app.is_none() && !was_failed {
+                return Ok(None);
+            }
+            let mut key = REGISTRY_PREFIX.to_vec();
+            key.extend_from_slice(name.as_bytes());
+            self.first.engine.set_meta(&key, None)?;
+            self.deleting.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned());
+            app
         };
-        if app.is_none() && !was_failed {
-            return Ok(None);
+        self.share_cache();
+        let engine = app.map(|app| app.engine.clone());
+        let places = self.backup_places(name);
+        let described: Vec<String> = places.iter().map(|p| p.describe()).collect();
+        // Each destination's outcome once it is done: `None`, emptied; else why not.
+        let outcome: Arc<Mutex<Vec<Option<Option<String>>>>> = Arc::new(Mutex::new(vec![None; places.len()]));
+        let (first, deleting, dir) =
+            (self.first.engine.clone(), self.deleting.clone(), dir_of(&self.first.engine, name));
+        let (done, finished) = std::sync::mpsc::channel();
+        let (name_, outcome_) = (name.to_owned(), outcome.clone());
+        let deletion = move || {
+            if let Some(engine) = &engine {
+                let _ = engine.close();
+            }
+            let workers: Vec<_> = places
+                .into_iter()
+                .enumerate()
+                .map(|(i, place)| {
+                    let (engine, outcome) = (engine.clone(), outcome_.clone());
+                    std::thread::spawn(move || {
+                        if let Some(engine) = &engine {
+                            engine.wait_for_backups(i);
+                        }
+                        let kept = backup::delete_all(place.as_ref())
+                            .err()
+                            .map(|e| format!("{} ({})", place.describe(), crate::engine::reason(&e)));
+                        outcome.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(kept);
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let _ = worker.join();
+            }
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+            deleting.lock().unwrap_or_else(|e| e.into_inner()).remove(&name_);
+            let kept: Vec<String> =
+                outcome_.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().flatten().cloned().collect();
+            if kept.is_empty() {
+                first.event("warn", format!("application `{name_}` deleted, with its data and backups"));
+            } else {
+                first.event(
+                    "error",
+                    format!(
+                        "application `{name_}` deleted, with its data, but its backup is still in {}: delete it \
+                         there. Until then, no application named `{name_}` can be created",
+                        kept.join(" and ")
+                    ),
+                );
+            }
+            let _ = done.send(kept);
+        };
+        if let Err(e) = std::thread::Builder::new().name("nuage-delete".into()).spawn(deletion) {
+            self.deleting.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+            return Err(crate::engine::storage_err(format!("cannot delete the backups of `{name}`: {e}")));
         }
-        let mut key = REGISTRY_PREFIX.to_vec();
-        key.extend_from_slice(name.as_bytes());
-        self.first.engine.set_meta(&key, None)?;
-        if let Some(app) = app {
-            let _ = app.engine.close();
+        if let Ok(kept) = finished.recv_timeout(DESTINATION_WAIT) {
+            return Ok(Some(kept));
         }
-        // Each destination on its own: one that cannot be emptied is said, by name.
-        let kept: Vec<String> = self
-            .backup_places(name)
+        // Not done yet: what is, and what goes on.
+        let outcome = outcome.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let kept: Vec<String> = described
             .iter()
-            .filter_map(|place| {
-                let e = backup::delete_all(place.as_ref()).err()?;
-                Some(format!("{} ({})", place.describe(), crate::engine::reason(&e)))
+            .zip(outcome)
+            .filter_map(|(place, done)| match done {
+                Some(kept) => kept,
+                None => Some(format!(
+                    "{place} (not emptied after {} seconds: a backup round to it was running, or it does not \
+                     answer; its emptying goes on)",
+                    DESTINATION_WAIT.as_secs()
+                )),
             })
             .collect();
-        let _ = std::fs::remove_dir_all(dir_of(&self.first.engine, name));
-        self.share_cache();
-        if kept.is_empty() {
-            self.first.engine.event("warn", format!("application `{name}` deleted, with its data and backups"));
-        } else {
-            self.first.engine.event(
-                "error",
-                format!(
-                    "application `{name}` deleted, with its data, but its backup is still in {}: delete it there. \
-                     Until then, no application named `{name}` can be created",
-                    kept.join(" and ")
-                ),
-            );
-        }
+        self.first.engine.event(
+            "warn",
+            format!(
+                "application `{name}` deleted; its backup is still in {}: no application named `{name}` can be \
+                 created until it is gone",
+                kept.join(" and ")
+            ),
+        );
         Ok(Some(kept))
     }
 
@@ -614,6 +710,34 @@ impl Apps {
 
 fn dir_of(first: &Engine, name: &str) -> PathBuf {
     first.dir().join("apps").join(name)
+}
+
+/// `f` on each of `places` at the same time, each on a thread of its own:
+/// their results in order, `None` for those that have not ended after
+/// `limit` (their threads are left to end on their own).
+fn on_each<T: Send + 'static>(
+    places: &[Arc<dyn crate::engine::BackupStore>],
+    limit: Duration,
+    f: impl Fn(&dyn crate::engine::BackupStore) -> T + Send + Sync + 'static,
+) -> Vec<Option<T>> {
+    let f = Arc::new(f);
+    let (sent, results) = std::sync::mpsc::channel();
+    for (i, place) in places.iter().enumerate() {
+        let (place, f, sent) = (place.clone(), f.clone(), sent.clone());
+        let _ = std::thread::Builder::new().name("nuage-backup-check".into()).spawn(move || {
+            let _ = sent.send((i, f(place.as_ref())));
+        });
+    }
+    drop(sent);
+    let deadline = Instant::now() + limit;
+    let mut out: Vec<Option<T>> = places.iter().map(|_| None).collect();
+    while out.iter().any(Option::is_none) {
+        match results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((i, result)) => out[i] = Some(result),
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// `https://Site.fr/` → `https://site.fr`: what browsers send in `Origin`.

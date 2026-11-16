@@ -27,8 +27,8 @@
 //! database's.
 //!
 //! A backup can go to two places at once ([`MirrorStore`]). The engine ships
-//! to each one with its own progress and its own lock, the second on a
-//! thread of its own: one that does not answer never holds the other back,
+//! to each one with its own progress and its own lock, each on a thread of
+//! its own: one that does not answer never holds the other back,
 //! and one that missed log segments the data directory no longer has gets a
 //! whole snapshot before anything else ([`can_continue`]). An empty data
 //! directory is restored from ONE of them, whole, never a mix: the one that
@@ -479,14 +479,20 @@ pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u6
         if *first == current || next_first - 1 <= shipped {
             continue;
         }
-        if *first > last + 1 {
-            return Err(storage_err(format!(
+        let gone = || {
+            storage_err(format!(
                 "{}: the log after commit {last} is no longer on this disk, nothing after it was sent (a whole \
                  snapshot goes there next)",
                 backup.describe()
-            )));
+            ))
+        };
+        if *first > last + 1 {
+            return Err(gone());
         }
-        backup.put_file(&format!("wal/{}", segment_name(*first)), path)?;
+        // Removed while it was being sent (a destination that took too long to answer).
+        if let Err(e) = backup.put_file(&format!("wal/{}", segment_name(*first)), path) {
+            return Err(if path.exists() { e } else { gone() });
+        }
         last = last.max(next_first - 1);
     }
     Ok(last)

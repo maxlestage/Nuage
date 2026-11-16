@@ -29,8 +29,8 @@
 //! | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 //! | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | S3 credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 //! | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots (of each destination) | `60` |
-//! | `NUAGE_BACKUP2_DIR` | a second backup destination, kept in step with the first: this folder. Each destination gets the snapshots and the log with its own progress, the second on a thread of its own: one that does not answer never holds the other back, and gets a whole snapshot when it answers again; the stop gives the second 20 seconds at most once the first has everything. An empty data directory is restored from one destination, whole: the one that reaches furthest, the first on a tie; a destination that does not answer (a second that has not answered 5 seconds after the first), or two destinations that hold different databases, stop the start. Set alone, it is the only destination. Set with `NUAGE_BACKUP2_S3_BUCKET`, or naming the same place as the first, it stops the start. To move the backups without a stop: add the second, wait until the console shows each application's last backup with no error (it shows none until the second has a whole snapshot of each), then remove the first | none |
-//! | `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this S3 bucket (see `NUAGE_BACKUP2_DIR`) | |
+//! | `NUAGE_BACKUP2_DIR` | a second backup destination, kept in step with the first: this folder. Each destination gets the snapshots and the log with its own progress, on a thread of its own: one that does not answer, the first or the second, never holds the other back, and gets a whole snapshot when it answers again; the stop sends to both at once, the first for as long as it takes, the second for 20 seconds at most. An empty data directory is restored from one destination, whole: the one that reaches furthest, the first on a tie; a destination that does not answer (a second that has not answered 5 seconds after the first), or two destinations that hold different databases, stop the start. Set alone, it is the only destination. Set with `NUAGE_BACKUP2_S3_BUCKET`, or naming the same place as the first, it stops the start. To move the backups without a stop: add the second, wait until the console shows each application's last backup with no error (it shows none until the second has a whole snapshot of each), swap the two, then remove the old one, now the second | none |
+//! | `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this S3 bucket (see `NUAGE_BACKUP2_DIR`); one of the other `NUAGE_BACKUP2_S3_*` set without it stops the start | |
 //! | `NUAGE_BACKUP2_S3_ENDPOINT` | its endpoint URL (never the first's: set it for storage other than AWS) | `https://s3.<region>.amazonaws.com` |
 //! | `NUAGE_BACKUP2_S3_REGION` | its region (never the first's) | `us-east-1` |
 //! | `NUAGE_BACKUP2_S3_PREFIX` | its prefix (never the first's) | `nuage/` |
@@ -202,6 +202,22 @@ fn backup_store(get: &impl Fn(&str) -> Option<String>, base: &str) -> Result<Opt
             Ok(Some((Place::Folder(PathBuf::from(dir)), store)))
         }
         (None, Some(bucket)) => s3_store(get, base, bucket).map(Some),
+        (None, None) if base != FIRST => {
+            // The bucket mistyped or left out: the second's other settings say a
+            // destination was meant, and starting without it would end a move of
+            // the backups with none (these names are new: refusing them changes
+            // nothing for a server that sets none).
+            let stray = ["ENDPOINT", "REGION", "PREFIX", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY"]
+                .into_iter()
+                .find(|name| get(&format!("{base}_S3_{name}")).is_some());
+            match stray {
+                Some(name) => Err(Error::Validation(format!(
+                    "{base}_S3_{name} is set but {base}_S3_BUCKET is not: set it (or {base}_DIR), or remove the \
+                     {base}_* settings"
+                ))),
+                None => Ok(None),
+            }
+        }
         (None, None) => Ok(None),
     }
 }
@@ -655,6 +671,17 @@ mod tests {
         assert_eq!(first.backups, [("NUAGE_BACKUP", Some(PathBuf::from("/mnt/a")))]);
         let e = with(&[[("NUAGE_BACKUP2_DIR", "/mnt/b")].as_slice(), &s3].concat()).unwrap_err().to_string();
         assert!(e.contains("set NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_BUCKET, not both"), "{e}");
+        // Its bucket mistyped or left out: never ignored, whichever of its settings is there.
+        for (k, v) in &s3[1..] {
+            let typo = with(&[("NUAGE_BACKUP_DIR", "/mnt/backup"), ("NUAGE_BACKUP2_S3_BUKET", "other"), (k, v)]);
+            let e = typo.unwrap_err().to_string();
+            let said = format!("{k} is set but NUAGE_BACKUP2_S3_BUCKET is not: set it (or NUAGE_BACKUP2_DIR)");
+            assert!(e.contains(&said), "{e}");
+        }
+        let e = with(&[("NUAGE_BACKUP2_S3_ENDPOINT", "https://r2.example")]).unwrap_err().to_string();
+        assert!(e.contains("NUAGE_BACKUP2_S3_ENDPOINT is set but NUAGE_BACKUP2_S3_BUCKET is not"), "{e}");
+        // The first keeps its rule: its other settings alone are not looked at, as before.
+        assert!(with(&[("NUAGE_BACKUP_S3_REGION", "eu-west-3")]).unwrap().backups.is_empty());
 
         // The same place twice: one copy, though two were asked for.
         let e = with(&[("NUAGE_BACKUP_DIR", "/mnt/backup"), ("NUAGE_BACKUP2_DIR", "/mnt//backup/")])

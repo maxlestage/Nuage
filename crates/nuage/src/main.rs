@@ -55,10 +55,45 @@ const TAKE_OUT: [(&str, &str); 2] = [
     ("take the second out of the settings", "NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_*"),
 ];
 
-/// How long the stop waits for the second backup destination of every
-/// database, once the first ones have everything: one that does not answer
-/// does not keep the process from ending.
+/// How long the stop gives the second backup destination of every database,
+/// counted from the start of the last backups (it starts with the first's):
+/// one that does not answer does not keep the process from ending.
 const SECOND_PASS: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the process waits, once the stop's work is done, for the threads
+/// of requests that still wait on something (a backup destination that does
+/// not answer): it then ends without them.
+const LEFT_BEHIND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The last backups of `engines` to destination `destination`, on a thread
+/// of its own, one database after the other; the receiver says when they
+/// are done. `None` when none of them has that destination.
+fn last_backups(engines: &[std::sync::Arc<Engine>], destination: usize) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let engines: Vec<_> = engines
+        .iter()
+        .filter(|e| e.options().backup.as_ref().is_some_and(|b| destination == 0 || b.store.parts().is_some()))
+        .cloned()
+        .collect();
+    if engines.is_empty() {
+        return None;
+    }
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new().name(format!("nuage-stop-{}", destination + 1)).spawn(move || {
+        for engine in &engines {
+            if let Err(e) = engine.backup_to(destination, false) {
+                eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
+            }
+        }
+        let _ = done.send(());
+    });
+    match spawned {
+        Ok(_) => Some(finished),
+        Err(e) => {
+            eprintln!("nuage: cannot start the last backups: {e}");
+            None
+        }
+    }
+}
 
 fn main() -> ExitCode {
     // `nuage genkey`: a new encryption key, for NUAGE_ENCRYPTION_KEY.
@@ -150,7 +185,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    runtime.block_on(async move {
+    let code = runtime.block_on(async move {
         let backup = config.engine.backup.as_ref().map(|b| b.store.describe());
         // With two destinations, each one's place.
         let parts = config.engine.backup.as_ref().and_then(|b| b.store.parts()).map(|(a, b)| (a.describe(), b.describe()));
@@ -416,48 +451,44 @@ fn main() -> ExitCode {
         let mut engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
         engines.reverse();
         let engines = tokio::task::spawn_blocking(move || {
-            // Every one first (it waits for a commit under way).
+            // Every one first (it waits for a commit under way), then a checkpoint of each: the
+            // last commits are in sealed log segments, which both destinations read.
             for engine in &engines {
                 engine.stop_writes();
             }
-            // To the first destination of every one before any second one: a slow second
-            // destination cannot take the first's last seconds.
             for engine in &engines {
                 let _ = engine.checkpoint();
-                if engine.options().backup.is_some()
-                    && let Err(e) = engine.backup_to(0, false)
-                {
-                    eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
-                }
             }
             engines
         })
         .await
         .unwrap_or_default();
-        // The second ones on a thread of their own, given SECOND_PASS at most: a thread of the
-        // runtime that never ends would keep the process from exiting.
-        let seconds: Vec<_> = engines
-            .iter()
-            .filter(|e| e.options().backup.as_ref().is_some_and(|b| b.store.parts().is_some()))
-            .cloned()
-            .collect();
-        if !seconds.is_empty() {
-            let (done, finished) = tokio::sync::oneshot::channel();
-            let pass = std::thread::Builder::new().name("nuage-stop-2".into()).spawn(move || {
-                for engine in &seconds {
-                    if let Err(e) = engine.backup_to(1, false) {
-                        eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
-                    }
-                }
-                let _ = done.send(());
-            });
-            if pass.is_ok() && tokio::time::timeout(SECOND_PASS, finished).await.is_err() {
-                log(&format!(
-                    "the second backup destination did not get everything within {} seconds: the first has it, \
-                     and the second gets a whole snapshot at the next start",
-                    SECOND_PASS.as_secs()
-                ));
-            }
+        // To both destinations at the same time, each on a thread of its own: neither waits for
+        // the other, whichever is slow or does not answer. The first, as long as it takes (the
+        // host ends the process when it must); the second, SECOND_PASS at most.
+        let started = tokio::time::Instant::now();
+        let (first, second) = (last_backups(&engines, 0), last_backups(&engines, 1));
+        let second_done = match second {
+            Some(second) => Some(tokio::time::timeout_at(started + SECOND_PASS, second).await.is_ok()),
+            None => None,
+        };
+        if let Some(mut first) = first
+            && tokio::time::timeout_at(started + SECOND_PASS, &mut first).await.is_err()
+        {
+            let second = if second_done == Some(true) { ", and the second has everything" } else { "" };
+            log(&format!(
+                "the first backup destination has not got everything after {} seconds{second}: the stop waits for \
+                 it",
+                SECOND_PASS.as_secs()
+            ));
+            let _ = first.await;
+        }
+        if second_done == Some(false) {
+            log(&format!(
+                "the second backup destination did not get everything within {} seconds: the first has it, \
+                 and the second gets a whole snapshot at the next start",
+                SECOND_PASS.as_secs()
+            ));
         }
         let _ = tokio::task::spawn_blocking(move || {
             for engine in engines {
@@ -466,7 +497,11 @@ fn main() -> ExitCode {
         })
         .await;
         ExitCode::SUCCESS
-    })
+    });
+    // A request still waiting on a destination that does not answer (Back up now, creating or
+    // deleting an application) does not keep the process from ending.
+    runtime.shutdown_timeout(LEFT_BEHIND);
+    code
 }
 
 /// SIGTERM (what Heroku and container hosts send) or Ctrl-C.

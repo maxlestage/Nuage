@@ -27,8 +27,8 @@
 //! holds the writer lock of the application's database, reads its last
 //! commit, and is answered once its record is on disk. An expired key is
 //! never returned nor counted; it leaves the tree when a write touches it,
-//! or in the batches of a pass that runs at most every 30 seconds, and again
-//! at once while more keys are due than one pass removes.
+//! or in the batches of a pass that runs at most every 30 seconds, followed
+//! by the next one at once while more keys are due than one pass removes.
 //!
 //! Nothing is evicted: a value is 64 MiB at most, and the store is bounded
 //! by the disk, like the tables.
@@ -59,7 +59,7 @@ const SWEEP_EVERY_MS: i64 = 30_000;
 /// Expired keys removed by one log record.
 const SWEEP_BATCH: usize = 1000;
 /// Records one pass writes at most; what is left goes in the next pass, at
-/// once.
+/// once, on the same thread.
 const SWEEP_ROUNDS: usize = 20;
 /// The most one call may write, in bytes: what one log record carries.
 const MAX_WRITE: usize = 1 << 30;
@@ -73,11 +73,19 @@ const KEYS_MAX_BYTES: usize = 16 << 20;
 /// Entries of the tree one page of `SCAN` goes through when it is not given
 /// a `COUNT` (as many as Redis's own).
 const SCAN_COUNT: usize = 10;
-/// The `SCAN` cursors the store remembers: the oldest goes past it.
-const CURSORS: usize = 1024;
+/// How long the store remembers a `SCAN` cursor, at least: a client that
+/// pauses between two pages keeps its cursor, however many pages the other
+/// clients scan meanwhile ...
+const CURSOR_KEEP_MS: u64 = 10 * 60 * 1000;
+/// ... unless the cursors of the store take more than this many bytes: the
+/// oldest go first.
+const CURSORS_BYTES: usize = 4 << 20;
+/// What one cursor takes besides its key: its number, when it was given, and
+/// the key's own allocation.
+const CURSOR_BYTES: usize = 48;
 /// A `SCAN` cursor the store does not remember.
-const UNKNOWN_CURSOR: &str = "invalid cursor: this server does not know it (it was given long ago, or before a \
-                              restart): start again with SCAN 0";
+const UNKNOWN_CURSOR: &str = "invalid cursor: this server does not know it (it was given more than 10 minutes \
+                              ago, or before a restart): start again with SCAN 0";
 
 /// The clock of the expiries: Unix time in milliseconds.
 fn now_ms() -> u64 {
@@ -231,29 +239,52 @@ fn scan_count(options: &[Vec<u8>]) -> Result<usize, Reply> {
 }
 
 /// The cursors `SCAN` gave out: each number stands for the last key of its
-/// page. The [`CURSORS`] latest are kept, so a client that asks a page again
-/// gets it again.
-#[derive(Default)]
+/// page. Each one is kept [`CURSOR_KEEP_MS`] at least, so a client that asks
+/// a page again gets it again, and one that pauses between two pages goes
+/// on, whatever the other clients scan; [`CURSORS_BYTES`] bound them all.
+///
+/// The numbers of one opening of the store start at a value of their own
+/// (its time of opening, shifted): a cursor given by an earlier opening (before
+/// a restart, or by an application deleted since and made again) is not one
+/// this one gave, and is refused instead of standing for another client's
+/// page. They stay below 2^53, which a JavaScript client reads exactly.
 struct Cursors {
     last: u64,
-    given: std::collections::VecDeque<(u64, Vec<u8>)>,
+    /// Oldest first: the number, when it was given (Unix ms) and the key.
+    given: std::collections::VecDeque<(u64, u64, Vec<u8>)>,
+    /// Bytes they take ([`CURSOR_BYTES`] each, and their keys).
+    bytes: usize,
 }
 
 impl Cursors {
-    /// A new cursor for the page after `key`.
-    fn give(&mut self, key: Vec<u8>) -> u64 {
+    /// The cursors of a store opened at `now` (Unix ms): none yet.
+    fn new(now: u64) -> Cursors {
+        Cursors { last: now << 10, given: std::collections::VecDeque::new(), bytes: 0 }
+    }
+
+    /// A new cursor for the page after `key`, given at `now` (Unix ms).
+    fn give(&mut self, key: Vec<u8>, now: u64) -> u64 {
         // 0 means "from the start": never given.
         self.last = self.last.checked_add(1).unwrap_or(1);
-        if self.given.len() == CURSORS {
+        self.bytes += CURSOR_BYTES + key.len();
+        self.given.push_back((self.last, now, key));
+        // Those past their time, then the oldest while they take too much.
+        while let Some((_, at, key)) = self.given.front() {
+            let expired = now.saturating_sub(*at) > CURSOR_KEEP_MS;
+            if !expired && self.bytes <= CURSORS_BYTES || self.given.len() == 1 {
+                break;
+            }
+            self.bytes -= CURSOR_BYTES + key.len();
             self.given.pop_front();
         }
-        self.given.push_back((self.last, key));
         self.last
     }
 
     /// The key the cursor `n` stands for.
     fn find(&self, n: u64) -> Option<Vec<u8>> {
-        self.given.iter().find(|(c, _)| *c == n).map(|(_, key)| key.clone())
+        // Given in order: the numbers grow from front to back.
+        let i = self.given.binary_search_by_key(&n, |(c, _, _)| *c).ok()?;
+        self.given.get(i).map(|(_, _, key)| key.clone())
     }
 }
 
@@ -545,7 +576,7 @@ impl<'a> Run<'a> {
         keys.extend(self.alive_declared(pattern, &after, upto));
         keys.sort();
         let next = match (walked.complete, walked.last) {
-            (false, Some(last)) => self.kv.cursors.lock().unwrap_or_else(|e| e.into_inner()).give(last),
+            (false, Some(last)) => self.kv.cursors.lock().unwrap_or_else(|e| e.into_inner()).give(last, now_ms()),
             _ => 0,
         };
         Ok(Reply::Array(vec![
@@ -729,7 +760,7 @@ impl DatabaseKv {
             expired: AtomicU64::new(0),
             next_sweep: AtomicI64::new(0),
             sweeping: AtomicBool::new(false),
-            cursors: std::sync::Mutex::new(Cursors::default()),
+            cursors: std::sync::Mutex::new(Cursors::new(now_ms())),
         }
     }
 
@@ -870,25 +901,28 @@ impl DatabaseKv {
 
     /// Removes expired keys from the tree soon, on the blocking threads (or
     /// here, outside a runtime): at most every 30 seconds, never two passes
-    /// at once, and at the next call after a pass that stopped at its limit
-    /// with more keys due, so that the removals keep up with any number of
-    /// expiries. Meanwhile no read returns an expired key and the figures
-    /// leave them out.
+    /// at once. A pass that stops at its limit with more keys due is followed
+    /// by the next one at once, on the same thread, until none is due (the
+    /// writer lock is let go between two batches): the removals keep up with
+    /// the expiries, whatever their rate. Meanwhile no read returns an
+    /// expired key and the figures leave them out.
     pub(crate) fn sweep_soon(self: &Arc<Self>) {
         if now_millis() < self.next_sweep.load(Ordering::Relaxed) || self.sweeping.swap(true, Ordering::AcqRel) {
             return;
         }
         let kv = self.clone();
         let pass = move || {
-            let more = match kv.sweep_now() {
-                Ok((_, more)) => more,
-                Err(e) => {
-                    kv.engine.event("error", format!("key-value store: expired keys could not be removed: {e}"));
-                    false
+            loop {
+                match kv.sweep_now() {
+                    Ok((_, true)) => continue,
+                    Ok((_, false)) => break,
+                    Err(e) => {
+                        kv.engine.event("error", format!("key-value store: expired keys could not be removed: {e}"));
+                        break;
+                    }
                 }
-            };
-            let wait = if more { 0 } else { SWEEP_EVERY_MS };
-            kv.next_sweep.store(now_millis() + wait, Ordering::Relaxed);
+            }
+            kv.next_sweep.store(now_millis() + SWEEP_EVERY_MS, Ordering::Relaxed);
             kv.sweeping.store(false, Ordering::Release);
         };
         match tokio::runtime::Handle::try_current() {
@@ -1910,6 +1944,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A client that pauses between two pages of its scan keeps its cursor
+    /// while other clients scan many more pages (more than the 1,024 cursors
+    /// an earlier version kept for all of them): it finishes with every key.
+    /// The cursors stay bounded: past their time they go, and past their
+    /// bytes the oldest go.
+    #[test]
+    fn a_cursor_stays_while_other_clients_scan() {
+        let dir = temp("scan-others");
+        let engine = open(&dir, false);
+        let kv = DatabaseKv::new(engine.clone());
+        mset(&kv, (0..3000).map(|n| format!("job:{n:05}")));
+        let page = |cursor: &str, options: &[&str]| {
+            scanned(kv.command(&args(&[&["SCAN", cursor], options].concat()), false).unwrap())
+        };
+        let (mut cursor, mut mine) = page("0", &["MATCH", "job:*"]);
+        // Meanwhile, other clients go through 1,500 pages.
+        let mut given = 0;
+        for _ in 0..5 {
+            let mut other = "0".to_owned();
+            loop {
+                let (next, _) = page(&other, &["COUNT", "10"]);
+                if next == "0" {
+                    break;
+                }
+                given += 1;
+                other = next;
+            }
+        }
+        assert!(given > 1024, "{given}");
+        while cursor != "0" {
+            let (next, keys) = page(&cursor, &["MATCH", "job:*"]);
+            mine.extend(keys);
+            cursor = next;
+        }
+        assert_eq!(mine, (0..3000).map(|n| format!("job:{n:05}")).collect::<Vec<_>>());
+
+        // Bounded: those past their time go, and the oldest past the bytes.
+        let mut cursors = Cursors::new(1_000);
+        let first = cursors.give(b"a".to_vec(), 1_000);
+        let second = cursors.give(b"b".to_vec(), 1_000 + CURSOR_KEEP_MS);
+        assert_eq!((cursors.find(first), cursors.find(second)), (Some(b"a".to_vec()), Some(b"b".to_vec())));
+        cursors.give(b"c".to_vec(), 2_000 + CURSOR_KEEP_MS);
+        assert_eq!(cursors.find(first), None, "past its time");
+        assert_eq!(cursors.find(second), Some(b"b".to_vec()));
+        let big = vec![b'k'; 1000];
+        for _ in 0..(CURSORS_BYTES / 1000 + 10) {
+            cursors.give(big.clone(), 2_000 + CURSOR_KEEP_MS);
+        }
+        assert!(cursors.bytes <= CURSORS_BYTES && cursors.find(second).is_none(), "{}", cursors.bytes);
+        drop((kv, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cursor given before the store was opened again (a restart, an
+    /// application deleted and made again) is refused, never taken for a
+    /// page another client was given since: a client that sends it again
+    /// starts again from `SCAN 0` instead of missing keys. Cursors stay below
+    /// 2^53, what a JavaScript client reads exactly.
+    #[test]
+    fn a_cursor_of_an_earlier_opening_is_refused() {
+        let dir = temp("scan-restart");
+        let engine = open(&dir, false);
+        let kv = DatabaseKv::new(engine.clone());
+        mset(&kv, (0..100).map(|n| format!("job:{n:03}")));
+        let page = |kv: &DatabaseKv, cursor: &str, options: &[&str]| {
+            kv.command(&args(&[&["SCAN", cursor], options].concat()), false).unwrap()
+        };
+        let mut cursor = "0".to_owned();
+        for _ in 0..3 {
+            cursor = scanned(page(&kv, &cursor, &["MATCH", "job:*"])).0;
+        }
+        assert!(cursor.parse::<u64>().unwrap() < 1 << 53, "{cursor}");
+        drop(kv);
+        std::thread::sleep(Duration::from_millis(5));
+        // Opened again; another client scans first.
+        let again = DatabaseKv::new(engine.clone());
+        let mut other = "0".to_owned();
+        for _ in 0..5 {
+            other = scanned(page(&again, &other, &[])).0;
+        }
+        assert_ne!(other, cursor);
+        assert_eq!(page(&again, &cursor, &["MATCH", "job:*"]), Reply::err(UNKNOWN_CURSOR));
+        drop((again, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `KEYS` does not build a list of more than [`KEYS_MAX`] keys: past it,
     /// it says to use `SCAN`, and a `SCAN` with a larger `COUNT` gives a page
     /// of that size at most.
@@ -1933,8 +2053,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// More keys expire than one pass removes: the next pass comes at the
-    /// next call, not 30 seconds later, so the removals keep up.
+    /// More keys expire than one pass removes: the next pass follows at once,
+    /// not at the next call (the server's next tick) nor 30 seconds later, so
+    /// the removals keep up whatever the rate of expiries.
     #[test]
     fn the_sweep_keeps_up_with_many_expiries() {
         let dir = temp("sweep-more");
@@ -1958,10 +2079,8 @@ mod tests {
         }
         assert_eq!(kv.stats().unwrap().keys, 0, "expired: not counted");
         kv.sweep_soon();
-        assert_eq!(tree_of(&engine).unwrap().0.len(), 5000, "one pass: its limit");
-        kv.sweep_soon();
         let (keys, index, counts) = tree_of(&engine).unwrap();
-        assert_eq!((keys.len(), index.len(), counts), (0, 0, (0, 0)), "the next one, at once");
+        assert_eq!((keys.len(), index.len(), counts), (0, 0, (0, 0)), "one pass, then the next one at once");
         assert_eq!(kv.stats().unwrap().expired, n as u64);
         // Nothing more due: the next pass waits its 30 seconds.
         let before = lsn(&engine);

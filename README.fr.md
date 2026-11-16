@@ -402,12 +402,15 @@ port restent les mêmes. Avec `database` :
   jamais à moitié écrite ;
 - **une expiration est une date** : une clé faite pour vivre une heure expire une heure plus
   tard, que le serveur ait redémarré entre-temps ou non. Une clé expirée n'est jamais rendue
-  ni comptée, et des passages en arrière-plan l'effacent du disque, aussi vite que les clés
-  expirent ;
+  ni comptée, et des passages en arrière-plan l'effacent du disque, l'un après l'autre tant
+  que des clés sont échues, aussi vite que les clés expirent ;
 - **`SCAN` répond page par page** : `COUNT` clés du stockage au plus par page (10 sans lui),
   et un curseur pour la page suivante, `0` après la dernière, comme Redis : `scan_iter` et ses
-  pareils parcourent n'importe quel nombre de clés, même en les supprimant au passage. `KEYS`
-  répond 100 000 clés au plus (16 Mio de clés) : au-delà, il dit d'utiliser `SCAN` ;
+  pareils parcourent n'importe quel nombre de clés, même en les supprimant au passage. Un
+  curseur est gardé 10 minutes au moins, quoi que les autres clients parcourent entre-temps ;
+  celui donné avant un redémarrage est refusé (`ERR invalid cursor` : reprenez à `SCAN 0`),
+  jamais pris pour une autre page. `KEYS` répond 100 000 clés au plus (16 Mio de clés) :
+  au-delà, il dit d'utiliser `SCAN` ;
 - **sur un disque effacé à chaque redémarrage** (Heroku), un redémarrage propre garde toutes
   les clés : au `SIGTERM`, le serveur cesse de prendre les écritures, puis envoie son dernier
   segment de journal, qui contient donc chaque écriture à laquelle il a répondu (une qui
@@ -671,22 +674,28 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   depuis l'autre seule ; une seconde qui n'a pas répondu 5 secondes après la première compte
   comme ne répondant pas), ni quand les deux tiennent des bases différentes. Sans la première,
   `NUAGE_BACKUP2_*` est l'unique destination : ajouter la seconde, attendre qu'elle ait tout,
-  puis retirer la première déplace les sauvegardes sans arrêt. La page *Stockage* de la
-  console montre la dernière sauvegarde de chaque destination, et `/api/status` chacune dans
-  `backup.destinations` : une destination n'affiche pas d'heure tant qu'elle n'a pas reçu un
-  instantané complet depuis le démarrage, et la dernière sauvegarde n'en affiche pas tant que
-  les deux n'en ont pas reçu. L'arrêt envoie à la première, puis laisse 20 secondes au plus à
-  la seconde. Sur Linux, le service de l'installateur ne peut écrire que dans le dossier des
+  échanger les deux, puis retirer l'ancienne déplace les sauvegardes sans arrêt (voir Heroku
+  plus bas). La page *Stockage* de la console montre la dernière sauvegarde de chaque
+  destination, et `/api/status` chacune dans `backup.destinations` : une destination
+  n'affiche pas d'heure tant qu'elle n'a pas reçu un instantané complet depuis le démarrage,
+  et la dernière sauvegarde n'en affiche pas tant que les deux n'en ont pas reçu. Un tour vers
+  une destination qui n'est pas fini au bout de 10 minutes (elle ne répond pas, ou si
+  lentement qu'elle ne suit jamais) s'affiche comme son erreur, et dans le journal des
+  événements, jusqu'à ce qu'il finisse. L'arrêt envoie aux deux en même temps : la première a
+  le temps qu'il faut, la seconde 20 secondes au plus. Sur Linux, le service de l'installateur ne peut écrire que dans le dossier des
   données et dans `NUAGE_BACKUP_DIR` : là, prenez un bucket pour la seconde.
 - **Supprimer une application** dans la console vide sa sauvegarde (`apps/<nom>/`) dans chaque
-  destination. Celle qui ne peut pas être vidée est nommée dans la réponse et le journal des
-  événements ; tant que sa sauvegarde n'y est pas supprimée à la main, aucune application de
-  ce nom ne peut être créée, pour qu'une nouvelle ne démarre jamais avec les lignes de la
-  supprimée.
+  destination, une fois fini le tour de sauvegarde en cours vers elle, s'il y en a un : rien
+  d'elle n'y est écrit ensuite. Celle qui ne peut pas être vidée est nommée dans la réponse et
+  le journal des événements ; tant que sa sauvegarde n'y est pas supprimée à la main, aucune
+  application de ce nom ne peut être créée, pour qu'une nouvelle ne démarre jamais avec les
+  lignes de la supprimée. Celle qui n'a pas répondu en 10 secondes est nommée aussi, et son
+  effacement continue : le nom reste pris jusqu'à ce qu'il finisse.
 - **Vérifier** : la page *Stockage* de la console, et `/app`, montrent la dernière sauvegarde
   et ses erreurs. Un bucket qui ne répond plus fait échouer le tour au bout de 60 secondes
-  sans que rien ne bouge, et le tour suivant réessaie ; un envoi qui avance n'est jamais
-  coupé, si lente que soit la ligne.
+  sans que rien ne bouge, et le tour suivant réessaie ; un envoi n'est jamais coupé tant que
+  ses octets continuent de quitter le serveur (la limite compte depuis le dernier octet parti
+  sur la ligne, pas depuis ce qui attend de partir).
 - **Restaurer** sur un nouvel ordinateur : installez, mettez dans le nouveau fichier de
   réglages la `NUAGE_ENCRYPTION_KEY` de l'ancien et les mêmes réglages de sauvegarde, videz le
   dossier des données et redémarrez le service : il restaure le dernier instantané et rejoue
@@ -764,10 +773,15 @@ La racine de ce dépôt se déploie telle quelle : `Procfile`, `RustConfig` et
   complet de chaque application au nouveau ; (2) attendez que la page *Stockage* de la
   console, ou `/app`, montre la dernière sauvegarde de chaque application sans erreur (elle
   n'en montre pas tant que le nouveau bucket n'a pas un instantané complet de chacune), ou que
-  `backup.destinations[1].last_at` de `/api/status` ait une heure ; (3) retirez l'ancien, en une seule commande
-  (`heroku config:unset NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION …`) : le dyno qui
-  s'arrête envoie ses dernières secondes aux deux, et le suivant restaure depuis le nouveau
-  bucket, désormais l'unique destination.
+  `backup.destinations[1].last_at` de `/api/status` ait une heure ; (3) échangez-les, en une
+  seule commande : les réglages du nouveau bucket en `NUAGE_BACKUP_S3_*` et ceux de l'ancien
+  en `NUAGE_BACKUP2_S3_*` (bucket, région, clés, préfixe et point d'accès de chacun) : le dyno
+  qui s'arrête envoie ses dernières secondes aux deux, et le suivant restaure depuis celui qui
+  va le plus loin ; (4) retirez l'ancien, désormais le second, en une seule commande
+  (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET NUAGE_BACKUP2_S3_REGION …`) : le dyno qui
+  s'arrête envoie ses dernières secondes au nouveau bucket, désormais le premier, en prenant
+  le temps qu'il faut (le second n'a que 20 secondes), et le suivant restaure depuis lui,
+  l'unique destination.
 
 À la main :
 

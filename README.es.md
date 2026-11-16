@@ -399,12 +399,15 @@ siendo los mismos. Con `database`:
   nunca a medio escribir;
 - **una caducidad es una fecha**: una clave hecha para vivir una hora caduca una hora después,
   se haya reiniciado el servidor entretanto o no. Una clave caducada nunca se devuelve ni se
-  cuenta, y unas pasadas en segundo plano la borran del disco, tan rápido como caducan las
-  claves;
+  cuenta, y unas pasadas en segundo plano la borran del disco, una tras otra mientras haya
+  claves vencidas, tan rápido como caducan las claves;
 - **`SCAN` responde página a página**: `COUNT` claves del almacén como mucho por página (10
   sin él), y un cursor para la página siguiente, `0` tras la última, como Redis: `scan_iter` y
-  sus semejantes recorren cualquier número de claves, aunque las borren por el camino. `KEYS`
-  responde 100 000 claves como mucho (16 MiB de claves): más allá, dice que se use `SCAN`;
+  sus semejantes recorren cualquier número de claves, aunque las borren por el camino. Un
+  cursor se guarda 10 minutos como mínimo, recorran lo que recorran los demás clientes
+  entretanto; el dado antes de un reinicio se rechaza (`ERR invalid cursor`: vuelva a empezar
+  en `SCAN 0`), nunca se toma por otra página. `KEYS` responde 100 000 claves como mucho (16
+  MiB de claves): más allá, dice que se use `SCAN`;
 - **en un disco que se borra en cada reinicio** (Heroku), un reinicio limpio conserva todas las
   claves: con `SIGTERM`, el servidor deja de aceptar escrituras y luego envía su último
   segmento del registro, que contiene así cada escritura a la que respondió (una que llega
@@ -660,22 +663,29 @@ el comando:
   ya que puede ser el que llega más lejos (quítelo de los ajustes para arrancar desde el otro
   solo; un segundo que no ha respondido 5 segundos después del primero cuenta como que no
   responde), ni cuando los dos guardan bases distintas. Sin el primero, `NUAGE_BACKUP2_*` es
-  el único destino: añadir el segundo, esperar a que lo tenga todo y luego quitar el primero
-  mueve las copias sin detener nada. La página *Almacenamiento* de la consola muestra la
-  última copia de cada destino, y `/api/status` cada uno en `backup.destinations`: un destino
-  no muestra hora hasta que ha recibido una instantánea completa desde el arranque, y la
-  última copia no la muestra hasta que la han recibido los dos. La parada envía al primero, y
-  luego deja 20 segundos como mucho al segundo. En Linux, el servicio del
+  el único destino: añadir el segundo, esperar a que lo tenga todo, intercambiar los dos y
+  luego quitar el antiguo mueve las copias sin detener nada (vea Heroku más abajo). La página
+  *Almacenamiento* de la consola muestra la última copia de cada destino, y `/api/status` cada
+  uno en `backup.destinations`: un destino no muestra hora hasta que ha recibido una
+  instantánea completa desde el arranque, y la última copia no la muestra hasta que la han
+  recibido los dos. Una ronda hacia un destino que no ha terminado al cabo de 10 minutos (no
+  responde, o tan despacio que nunca se pone al día) se muestra como su error, y en el
+  registro de eventos, hasta que termina. La parada envía a los dos a la vez: el primero tiene
+  el tiempo que haga falta, el segundo 20 segundos como mucho. En Linux, el servicio del
   instalador solo puede escribir en la carpeta de datos y en `NUAGE_BACKUP_DIR`: allí, use
   un bucket para el segundo.
-- **Borrar una aplicación** en la consola vacía su copia (`apps/<nombre>/`) en cada destino.
-  El que no puede vaciarse se nombra en la respuesta y en el registro de eventos; mientras su
-  copia no se borre allí a mano, no se puede crear ninguna aplicación con ese nombre, para que
-  una nueva nunca arranque con las filas de la borrada.
+- **Borrar una aplicación** en la consola vacía su copia (`apps/<nombre>/`) en cada destino,
+  una vez terminada la ronda de copia en curso hacia él, si la hay: nada de ella se escribe
+  allí después. El que no puede vaciarse se nombra en la respuesta y en el registro de
+  eventos; mientras su copia no se borre allí a mano, no se puede crear ninguna aplicación con
+  ese nombre, para que una nueva nunca arranque con las filas de la borrada. El que no ha
+  respondido en 10 segundos se nombra también, y su vaciado continúa: el nombre sigue ocupado
+  hasta que termina.
 - **Comprobar**: la página *Almacenamiento* de la consola, y `/app`, muestran la última copia
   y sus errores. Un bucket que deja de responder hace fallar la ronda a los 60 segundos sin
-  que nada avance, y la ronda siguiente lo vuelve a intentar; un envío que avanza nunca se
-  corta, por lenta que sea la línea.
+  que nada avance, y la ronda siguiente lo vuelve a intentar; un envío nunca se corta
+  mientras sus bytes siguen saliendo del servidor (el límite cuenta desde el último byte que
+  salió por la línea, no desde lo que espera a salir).
 - **Restaurar** en un ordenador nuevo: instale, ponga en el nuevo fichero de ajustes la
   `NUAGE_ENCRYPTION_KEY` del antiguo y los mismos ajustes de copia, vacíe la carpeta de datos y
   reinicie el servicio: restaura la última instantánea y reproduce el registro posterior.
@@ -750,9 +760,15 @@ La raíz de este repositorio se despliega tal cual: `Procfile`, `RustConfig` y
   antiguo y envía una instantánea completa de cada aplicación al nuevo; (2) espere a que la
   página *Almacenamiento* de la consola, o `/app`, muestre la última copia de cada aplicación
   sin errores (no la muestra hasta que el nuevo bucket tiene una instantánea completa de
-  cada una), o a que `backup.destinations[1].last_at` de `/api/status` tenga una hora; (3) quite el antiguo, en un solo comando (`heroku config:unset
-  NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION …`): el dyno que se detiene envía sus últimos
-  segundos a los dos, y el siguiente restaura desde el nuevo bucket, ahora el único destino.
+  cada una), o a que `backup.destinations[1].last_at` de `/api/status` tenga una hora; (3)
+  intercámbielos, en un solo comando: los ajustes del nuevo bucket como `NUAGE_BACKUP_S3_*` y
+  los del antiguo como `NUAGE_BACKUP2_S3_*` (bucket, región, claves, prefijo y endpoint de
+  cada uno): el dyno que se detiene envía sus últimos segundos a los dos, y el siguiente
+  restaura desde el que llega más lejos; (4) quite el antiguo, ahora el segundo, en un solo
+  comando (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET NUAGE_BACKUP2_S3_REGION …`): el dyno
+  que se detiene envía sus últimos segundos al nuevo bucket, ahora el primero, con el tiempo
+  que haga falta (el segundo solo tiene 20 segundos), y el siguiente restaura desde él, el
+  único destino.
 
 A mano:
 
