@@ -4,7 +4,7 @@
 use eframe::egui;
 use zeroize::Zeroizing;
 
-use super::{COPIED, Doing, Made, Outcome, Reveal, Section, Session, help};
+use super::{COPIED, Doing, Lan, Made, Outcome, Reveal, Section, Session, help};
 use crate::address;
 use crate::api::{ApiError, Ping};
 use crate::clip::{Copied, CopySink};
@@ -98,7 +98,12 @@ pub(super) fn reveal(ctx: &egui::Context, session: &mut Session, l: Lang, clipbo
             }
             if reveal.connection.is_this_computer_only() {
                 let note = match (&reveal.lan, address::normalize(&reveal.connection.url)) {
-                    (Some(ip), Ok(url)) => tf(
+                    (Lan::HereOnly(bind), _) => tf(
+                        l,
+                        "This address works for a program on this computer: the server answers this computer only (NUAGE_BIND={}). For another device of your network, set NUAGE_BIND=0.0.0.0 in the server's settings, then restart it. A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
+                        &[bind],
+                    ),
+                    (Lan::At(ip), Ok(url)) => tf(
                         l,
                         "This address works for a program on this computer. On another device of your network, use http://{}:{} instead (if this computer's firewall lets it in). A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
                         &[ip, &url.port_or_default()],

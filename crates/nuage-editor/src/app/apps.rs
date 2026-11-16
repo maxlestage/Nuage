@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::{Confirm, Doing, OLDER_WEBSITES, Outcome, Session, TokenAsked, help, lan_for};
+use super::{Confirm, Doing, OLDER_WEBSITES, Outcome, Session, TokenAsked, bound_here, help, lan_for};
 use crate::api::{self, Application, DbStatus, LastConnection};
 use crate::format;
 use crate::i18n::{Lang, t, tf};
@@ -130,9 +130,10 @@ fn new_application(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
         if ui.add_enabled(valid && !session.busy(), theme::primary(label, ui)).clicked() {
             let description = session.new_what.trim().to_owned();
             session.new_error = None;
+            let bound = bound_here(session.settings.as_ref());
             session.act(&ctx, Doing::Create, move |server| {
                 let (app, connection) = server.create_application(&name, &description)?;
-                let lan = lan_for(&connection);
+                let lan = lan_for(&connection, bound.as_deref());
                 Ok(Outcome::Created(app, connection, lan))
             });
         }
@@ -367,9 +368,10 @@ fn tokens_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
                     let name = app.name.clone();
                     let known = app.tokens.iter().map(|t| t.id.clone()).collect();
                     session.token_asked = Some(TokenAsked { app: name.clone(), known, lost: false });
+                    let bound = bound_here(session.settings.as_ref());
                     session.act(&ctx, Doing::Token, move |server| {
                         let connection = server.new_token(&name, read_only)?;
-                        let lan = lan_for(&connection);
+                        let lan = lan_for(&connection, bound.as_deref());
                         Ok(Outcome::Token { app: name, read_only, connection, lan })
                     });
                 }

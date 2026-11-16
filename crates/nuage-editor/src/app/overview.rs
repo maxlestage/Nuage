@@ -4,11 +4,13 @@
 //! (0.4.7 and later); an older server is told apart, and the page says what
 //! updating it would show.
 
+use std::collections::BTreeMap;
+
 use eframe::egui::{self, RichText};
 
 use super::{Here, Section, Session, help};
 use crate::address;
-use crate::api::{Settings, Status};
+use crate::api::{LastConnection, Settings, Status};
 use crate::format;
 use crate::i18n::{Lang, t, tf};
 use crate::theme::{self, Mark};
@@ -63,7 +65,7 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
             ui.set_width(ui.available_width());
             theme::subheading(ui, t(l, "Applications"));
             let count = session.apps.as_ref().map_or(0, Vec::len) as u64;
-            ui.label(applications(l, count, status.as_ref(), now));
+            ui.label(applications(l, count, status.as_ref(), &session.sites, now));
             if ui.button(t(l, "See them")).clicked() {
                 go = Some(Section::Applications);
             }
@@ -145,20 +147,28 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
     }
 }
 
-/// "running for 3 days · version 0.4.7 · everything it stores is encrypted (…)".
+/// "running for 3 days · version 0.4.7 · everything it stores is encrypted".
 fn answers(l: Lang, s: &Status) -> String {
     let mut parts = vec![tf(l, "running for {}", &[&format::span(l, s.uptime_s)]), tf(l, "version {}", &[&s.version])];
     if s.encryption.enabled {
-        let scheme = s.encryption.scheme.clone().unwrap_or_default();
-        parts.push(tf(l, "everything it stores is encrypted ({})", &[&scheme]));
+        // The ciphers' names say nothing to the people this is for.
+        parts.push(t(l, "everything it stores is encrypted").to_owned());
     } else {
         parts.push(t(l, "its data is not encrypted on its disk").to_owned());
     }
     parts.join(" · ")
 }
 
-/// "3 applications · last connection 2 min ago (shop)".
-fn applications(l: Lang, count: u64, status: Option<&Status>, now: i64) -> String {
+/// "3 applications · last connection 2 min ago (shop)". A test from the
+/// editor is not a connection of a site: the one before it counts (`sites`:
+/// the last ones the editor saw that were not its own).
+fn applications(
+    l: Lang,
+    count: u64,
+    status: Option<&Status>,
+    sites: &BTreeMap<String, LastConnection>,
+    now: i64,
+) -> String {
     let apps = if format::singular(l, count) {
         tf(l, "{} application", &[&count])
     } else {
@@ -167,7 +177,10 @@ fn applications(l: Lang, count: u64, status: Option<&Status>, now: i64) -> Strin
     let last = status.and_then(|s| {
         s.databases
             .iter()
-            .filter_map(|d| Some((format::parse_time(&d.last_connection.as_ref()?.at)?, d.name.as_str())))
+            .filter_map(|d| {
+                let c = d.last_connection.as_ref().filter(|c| !c.by_the_editor()).or_else(|| sites.get(&d.name))?;
+                Some((format::parse_time(&c.at)?, d.name.as_str()))
+            })
             .max()
     });
     match last {
@@ -300,10 +313,26 @@ mod tests {
         let s = status();
         assert_eq!(
             answers(Lang::Fr, &s),
-            "en marche depuis 3 jours · version 0.4.7 · tout ce qu'il stocke est chiffré (XTS-AES-256, AES-256-GCM)"
+            "en marche depuis 3 jours · version 0.4.7 · tout ce qu'il stocke est chiffré"
         );
-        assert_eq!(applications(Lang::En, 3, Some(&s), now), "3 applications · last connection 2 min ago (shop)");
-        assert_eq!(applications(Lang::Fr, 1, None, now), "1 application");
+        assert_eq!(
+            applications(Lang::En, 3, Some(&s), &BTreeMap::new(), now),
+            "3 applications · last connection 2 min ago (shop)"
+        );
+        assert_eq!(applications(Lang::Fr, 1, None, &BTreeMap::new(), now), "1 application");
+        // A test from the editor is not the site's connection: the one seen before counts.
+        let mut tested = s.clone();
+        tested.databases[0].last_connection = Some(LastConnection {
+            at: "2026-11-15T21:03:58Z".into(),
+            client: "nuage-editor/0.4.7".into(),
+            ..LastConnection::default()
+        });
+        assert_eq!(applications(Lang::En, 3, Some(&tested), &BTreeMap::new(), now), "3 applications");
+        let seen = BTreeMap::from([("shop".to_owned(), s.databases[0].last_connection.clone().unwrap())]);
+        assert_eq!(
+            applications(Lang::En, 3, Some(&tested), &seen, now),
+            "3 applications · last connection 2 min ago (shop)"
+        );
         assert_eq!(
             memory(Lang::Fr, Some(&s), None).unwrap(),
             "Nuage DB occupe 0,8 Gio · ce serveur a 16,0 Gio, dont 6,2 Gio libres"

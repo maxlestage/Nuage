@@ -357,6 +357,10 @@ impl Editor {
                 field.request_focus();
                 self.connect.focus = None;
             }
+            // What was said of the last try is out of date once the address changes.
+            if field.changed() {
+                self.connect.notice = None;
+            }
             help(ui, t(l, "The address you type to open the console, without /admin."));
             // What will be called, before anything is.
             match address::normalize(&self.connect.address) {
@@ -404,6 +408,9 @@ impl Editor {
                     if self.connect.focus == Some(token_field()) {
                         field.request_focus();
                         self.connect.focus = None;
+                    }
+                    if field.changed() {
+                        self.connect.notice = None;
                     }
                     if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
@@ -513,12 +520,15 @@ impl Editor {
                 ui.add_enabled(false, egui::Checkbox::new(&mut no, t(l, "Remember on this computer")));
                 help(
                     ui,
-                    tf(
+                    t(
                         l,
-                        "Your system has no password store the editor can use ({}): the token is kept until you close the editor.",
-                        &[why],
+                        "Your system has no password store the editor can use: the token is kept until you close the editor.",
                     ),
                 );
+                // The system's own words, for whoever helps: not in the sentence.
+                egui::CollapsingHeader::new(t(l, "Details")).id_salt("vault-details").show(ui, |ui| {
+                    help(ui, why.to_string());
+                });
             }
             None => {
                 let mut no = false;

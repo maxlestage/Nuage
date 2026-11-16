@@ -494,9 +494,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "el Administrador de credenciales de Windows",
     ),
     (
-        "Your system has no password store the editor can use ({}): the token is kept until you close the editor.",
-        "Votre système n'a pas de gestionnaire de mots de passe que l'éditeur puisse utiliser ({}) : le jeton est gardé jusqu'à la fermeture de l'éditeur.",
-        "Tu sistema no tiene un almacén de contraseñas que el editor pueda usar ({}): el token se guarda hasta que cierres el editor.",
+        "Your system has no password store the editor can use: the token is kept until you close the editor.",
+        "Votre système n'a pas de gestionnaire de mots de passe que l'éditeur puisse utiliser : le jeton est gardé jusqu'à la fermeture de l'éditeur.",
+        "Tu sistema no tiene un almacén de contraseñas que el editor pueda usar: el token se guarda hasta que cierres el editor.",
     ),
     (
         "\"{}\" is not an address. Example: https://my-nuage.herokuapp.com",
@@ -576,6 +576,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("{} day", "{} jour", "{} día"),
     ("{} days", "{} jours", "{} días"),
     ("{} ago", "il y a {}", "hace {}"),
+    ("just now", "à l'instant", "ahora mismo"),
     (
         "An application is a database for one website or program: its own data, encrypted, and its own tokens. Applications never see each other's data.",
         "Une application, c'est une base de données pour un site ou un programme : ses propres données, chiffrées, et ses propres jetons. Les applications ne voient jamais les données des autres.",
@@ -740,6 +741,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Copy the token only", "Copier le jeton seul", "Copiar solo el token"),
     ("Test the token", "Tester le jeton", "Probar el token"),
     (
+        "This address works for a program on this computer: the server answers this computer only (NUAGE_BIND={}). For another device of your network, set NUAGE_BIND=0.0.0.0 in the server's settings, then restart it. A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
+        "Cette adresse fonctionne pour un programme de cet ordinateur : le serveur ne répond qu'à cet ordinateur (NUAGE_BIND={}). Pour un autre appareil de votre réseau, mettez NUAGE_BIND=0.0.0.0 dans les réglages du serveur, puis redémarrez-le. Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
+        "Esta dirección funciona para un programa de este equipo: el servidor solo responde a este equipo (NUAGE_BIND={}). Para otro dispositivo de tu red, pon NUAGE_BIND=0.0.0.0 en los ajustes del servidor y reinícialo. Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
+    ),
+    (
         "This address works for a program on this computer. On another device of your network, use http://{}:{} instead (if this computer's firewall lets it in). A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
         "Cette adresse fonctionne pour un programme de cet ordinateur. Sur un autre appareil de votre réseau, utilisez plutôt http://{}:{} (si le pare-feu de cet ordinateur le laisse entrer). Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
         "Esta dirección sirve para un programa de este equipo. En otro dispositivo de tu red, usa en su lugar http://{}:{} (si el cortafuegos de este equipo lo deja entrar). Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
@@ -851,9 +857,26 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Open the live dashboard", "Ouvrir le tableau de bord en direct", "Abrir el panel en directo"),
     ("Encrypted (HTTPS)", "Chiffré (HTTPS)", "Cifrado (HTTPS)"),
-    ("Not encrypted: this computer only", "Non chiffré : cet ordinateur seulement", "Sin cifrar: solo este equipo"),
-    ("Not encrypted: local network", "Non chiffré : réseau local", "Sin cifrar: red local"),
-    ("Not encrypted: Internet", "Non chiffré : Internet", "Sin cifrar: Internet"),
+    ("Encrypted", "Chiffré", "Cifrado"),
+    ("The connection is encrypted (HTTPS).", "La connexion est chiffrée (HTTPS).", "La conexión está cifrada (HTTPS)."),
+    ("Local only", "Local seulement", "Solo local"),
+    (
+        "The connection is not encrypted, but it never leaves this computer.",
+        "La connexion n'est pas chiffrée, mais elle ne quitte jamais cet ordinateur.",
+        "La conexión no está cifrada, pero nunca sale de este equipo.",
+    ),
+    ("Local network", "Réseau local", "Red local"),
+    (
+        "The connection is not encrypted: it crosses your local network.",
+        "La connexion n'est pas chiffrée : elle traverse votre réseau local.",
+        "La conexión no está cifrada: atraviesa tu red local.",
+    ),
+    ("Not encrypted", "Non chiffré", "Sin cifrar"),
+    (
+        "The connection is not encrypted and crosses the Internet: the token can be read on the way.",
+        "La connexion n'est pas chiffrée et traverse Internet : le jeton peut être lu en chemin.",
+        "La conexión no está cifrada y atraviesa Internet: el token puede leerse por el camino.",
+    ),
     ("Language: as the system ({})", "Langue : comme le système ({})", "Idioma: como el sistema ({})"),
     (
         "No website may call {} from a page any more.",
@@ -974,11 +997,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Updated {}", "Mis à jour {}", "Actualizado {}"),
     ("running for {}", "en marche depuis {}", "en marcha desde hace {}"),
     ("version {}", "version {}", "versión {}"),
-    (
-        "everything it stores is encrypted ({})",
-        "tout ce qu'il stocke est chiffré ({})",
-        "todo lo que guarda está cifrado ({})",
-    ),
+    ("everything it stores is encrypted", "tout ce qu'il stocke est chiffré", "todo lo que guarda está cifrado"),
     (
         "its data is not encrypted on its disk",
         "ses données ne sont pas chiffrées sur son disque",

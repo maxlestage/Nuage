@@ -125,6 +125,28 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   application's token still shows that application only. The management token already makes
   tokens for any application, so it sees nothing it could not open.
 
+### No request brings the server down
+
+- **SQL.** A statement holds what it reads, joins, groups and sorts against a budget
+  (`statement.memory_mb`, an eighth of the memory by default), the statements of all
+  requests within a quarter of the memory together, and it has a deadline
+  (`statement.seconds`, 60 s by default): past either, it fails with a clear error instead of
+  taking the server's memory or a thread for ever. Both are settings, changed at once from the
+  Settings page, `nuage settings` or `/api/settings`. Nesting is bounded (64 levels, a clear
+  error past it; flat lists of OR, AND, `+`, `||` and IN are not), functions build 64 MiB at
+  most, `x::type(` without `)` is an error instead of an endless loop, and a subquery is never
+  answered with another statement's rows (an UPDATE could change rows that were not its own).
+- **HTTP.** Each application has its share of the threads, read-only tokens never take a
+  writing one, the memory of requests in flight is bounded, a request that panics answers
+  500, and a server that is full answers 503 with `Retry-After` instead of stalling.
+- **PostgreSQL and key-value ports.** What sessions keep (prepared statements, portals, rows
+  between two Execute) is bounded per session and per port; a client that stops reading its
+  answers, or sends a message byte by byte, is disconnected; a transaction has a lifetime.
+- **Backups and shutdown.** One backup at a time per database, S3 requests that hang are given
+  up, files go to and from S3 in pieces, and a write that arrives while the server stops is
+  refused (503 over HTTP, 57P01 over PostgreSQL: nothing was written, try again) instead of
+  being acknowledged and lost.
+
 ## 0.4.7 (2026-11-16)
 
 ### Memory you can count on, and a steadier server
