@@ -27,7 +27,8 @@ use memoire_orm::{Error, Order, Query, TableSchema, Value};
 
 use super::apps::App;
 use super::i18n::{Lang, t, tf};
-use super::{HttpBody, State, full, random_token, read_body, same_secret};
+use super::limits::{FORM_BYTES, LOGIN_FORM_BYTES, refusal};
+use super::{HttpBody, State, body_of, full, random_token, same_secret};
 use crate::embedded::Embedded;
 use crate::engine::MAIN;
 
@@ -451,6 +452,12 @@ fn parse_form(body: &[u8]) -> HashMap<String, String> {
         .collect()
 }
 
+/// The status of the answer to a form that could not be read: 413 when it
+/// is too large, 408 when it came too slowly, else 400.
+fn form_status(e: &Error) -> u16 {
+    refusal(e).map_or(400, |r| r.status)
+}
+
 fn query_param(req: &Request<Incoming>, name: &str) -> Option<String> {
     parse_form(req.uri().query().unwrap_or_default().as_bytes()).remove(name)
 }
@@ -586,15 +593,18 @@ async fn route_inner(state: &Arc<State>, req: Request<Incoming>, peer: SocketAdd
             return login_page(l, secure, None, 200, next_param.as_deref());
         }
         let ip = client_ip(req.headers(), peer);
-        let expected = cookie(req.headers(), LOGIN_COOKIE).map(str::to_owned);
-        let Ok(body) = read_body(state, req).await else {
-            return login_page(l, secure, Some(t(l, "Invalid request.")), 400, None);
-        };
-        let form = parse_form(&body);
-        let next = form.get("next").map(String::as_str);
+        // The limiter first, then a body of a few KiB at most: a login costs
+        // nothing to whoever has not the password.
         if !state.admin.may_try(ip) {
-            return login_page(l, secure, Some(t(l, "Too many failed attempts. Wait a few minutes.")), 429, next);
+            return login_page(l, secure, Some(t(l, "Too many failed attempts. Wait a few minutes.")), 429, None);
         }
+        let expected = cookie(req.headers(), LOGIN_COOKIE).map(str::to_owned);
+        let body = match body_of(state, req, LOGIN_FORM_BYTES).await {
+            Ok(body) => body,
+            Err(e) => return login_page(l, secure, Some(t(l, "Invalid request.")), form_status(&e), None),
+        };
+        let form = parse_form(&body.bytes);
+        let next = form.get("next").map(String::as_str);
         let csrf_ok =
             matches!((&expected, form.get("csrf")), (Some(a), Some(b)) if same_secret(a.as_bytes(), b.as_bytes()));
         if !csrf_ok {
@@ -648,10 +658,15 @@ async fn route_inner(state: &Arc<State>, req: Request<Incoming>, peer: SocketAdd
     let origin = origin_of(req.headers());
     let cx = Cx { l, secure, csrf: csrf.clone(), here: path.clone() };
     if method == Method::POST {
-        let Ok(body) = read_body(state, req).await else {
-            return html(400, cx.page(t(l, "Error"), &format!("<p>{}</p>", t(l, "Invalid request."))));
+        let body = match body_of(state, req, FORM_BYTES).await {
+            Ok(body) => body,
+            Err(e) => {
+                let says = if form_status(&e) == 413 { "This form is too large." } else { "Invalid request." };
+                return html(form_status(&e), cx.page(t(l, "Error"), &format!("<p>{}</p>", t(l, says))));
+            }
         };
-        let form = parse_form(&body);
+        let form = parse_form(&body.bytes);
+        drop(body);
         if !form.get("csrf").is_some_and(|c| same_secret(c.as_bytes(), csrf.as_bytes())) {
             return html(
                 403,

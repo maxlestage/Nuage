@@ -12,7 +12,10 @@
 //! | `POST /v1/kv` | commands as JSON: `["SET", "k", "v", "EX", 60]` answers `{"result": "OK"}`, a list of commands answers `{"results": [...]}` in one round trip |
 //! | `DELETE /v1/kv` | deletes every key |
 //!
-//! A read-only token reads; writing takes a read-write token.
+//! A read-only token reads; writing takes a read-write token. A request
+//! takes 10,000 commands at most, and its answers 16 MiB
+//! ([`MAX_ANSWER`](crate::kv::MAX_ANSWER)): past that, the commands left are
+//! not run and answer an error.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +26,9 @@ use hyper::{Method, Request, Response};
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
-use super::{HttpBody, READ_ONLY, State, apps::App, forbidden, full, json_response, read_body};
-use crate::kv::{KvError, Reply, SetOptions, Ttl};
+use super::limits::{MAX_KV_COMMANDS, too_large, unblocked};
+use super::{HttpBody, READ_ONLY, State, apps::App, forbidden, full, json_body, json_response, read_body};
+use crate::kv::{KvError, MAX_ANSWER, Reply, SetOptions, Ttl};
 
 fn refusal(status: u16, kind: &str, message: impl Into<String>) -> Response<HttpBody> {
     json_response(status, &json!({ "error": { "kind": kind, "message": message.into() } }))
@@ -94,6 +98,15 @@ fn reply_json(reply: Reply) -> Json {
     }
 }
 
+/// An answer to commands, made as JSON from their replies: a large one
+/// (values of megabytes) off the runtime.
+async fn answer(size: usize, make: impl FnOnce() -> Json + Send + 'static) -> Result<Response<HttpBody>> {
+    if size < 256 << 10 {
+        return Ok(json_response(200, &make()));
+    }
+    unblocked(move || json_response(200, &make())).await
+}
+
 /// A command as JSON: a list of texts and numbers.
 fn command_of(j: &Json) -> Option<Vec<Vec<u8>>> {
     j.as_array()?
@@ -150,29 +163,55 @@ pub(super) async fn route(
             Method::DELETE if read_only => Ok(forbidden(READ_ONLY)),
             Method::DELETE => Ok(json_response(200, &json!({ "deleted": kv.clear() }))),
             Method::POST => {
-                let body = read_body(state, req).await?;
-                let body: Json =
-                    serde_json::from_slice(&body).map_err(|e| Error::Conversion(format!("invalid JSON: {e}")))?;
+                let (body, _held) = json_body(state, req).await?;
                 let list = body.get("commands").unwrap_or(&body);
                 let Some(items) = list.as_array() else {
                     return Ok(refusal(400, "validation", BAD_COMMAND));
                 };
                 // One command, or several: a list whose first item is a list.
                 if items.first().is_some_and(Json::is_array) || body.get("commands").is_some() {
+                    if items.len() > MAX_KV_COMMANDS {
+                        return Err(too_large(format!(
+                            "{} commands in one request: a request takes {MAX_KV_COMMANDS} at most",
+                            items.len()
+                        )));
+                    }
                     let Some(commands) = items.iter().map(command_of).collect::<Option<Vec<_>>>() else {
                         return Ok(refusal(400, "validation", BAD_COMMAND));
                     };
-                    let results: Vec<Json> = commands.iter().map(|c| reply_json(kv.command(c, read_only))).collect();
-                    return Ok(json_response(200, &json!({ "results": results })));
+                    drop(body);
+                    // The answers together are bounded as one command's are: past
+                    // the bound, the commands left are not run.
+                    let mut size = 0usize;
+                    let replies: Vec<Reply> = commands
+                        .iter()
+                        .map(|c| {
+                            if size > MAX_ANSWER {
+                                return Reply::Error(format!(
+                                    "ERR the answers of this request passed {} MiB: the commands after were not run",
+                                    MAX_ANSWER >> 20
+                                ));
+                            }
+                            let reply = kv.command(c, read_only);
+                            size = size.saturating_add(reply.weight());
+                            reply
+                        })
+                        .collect();
+                    return answer(
+                        size,
+                        move || json!({ "results": replies.into_iter().map(reply_json).collect::<Vec<_>>() }),
+                    )
+                    .await;
                 }
                 let Some(command) = command_of(list) else {
                     return Ok(refusal(400, "validation", BAD_COMMAND));
                 };
-                Ok(match kv.command(&command, read_only) {
-                    Reply::Error(e) if e.starts_with("READONLY") => forbidden(READ_ONLY),
-                    Reply::Error(e) => refusal(400, "validation", e.strip_prefix("ERR ").unwrap_or(&e)),
-                    reply => json_response(200, &json!({ "result": reply_json(reply) })),
-                })
+                drop(body);
+                match kv.command(&command, read_only) {
+                    Reply::Error(e) if e.starts_with("READONLY") => Ok(forbidden(READ_ONLY)),
+                    Reply::Error(e) => Ok(refusal(400, "validation", e.strip_prefix("ERR ").unwrap_or(&e))),
+                    reply => answer(reply.weight(), move || json!({ "result": reply_json(reply) })).await,
+                }
             }
             _ => Err(Error::NotFound),
         };
