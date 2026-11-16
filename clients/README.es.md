@@ -78,9 +78,9 @@ de despliegue o un terminal, nunca en una aplicación ni en una página. Ver
 
 ## El almacén clave-valor
 
-Cada aplicación tiene también un almacén clave-valor en memoria (una
-caché, sesiones, contadores, cerrojos). Todos los lenguajes llegan a él por HTTP, con el mismo
-token:
+Cada aplicación tiene también un almacén clave-valor (una caché, sesiones, contadores,
+cerrojos), en la memoria del servidor o en su base. Todos los lenguajes llegan a él por HTTP,
+con el mismo token:
 
 ```bash
 curl -X PUT "$NUAGE_URL/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'

@@ -1,13 +1,36 @@
 //! Backups to S3-compatible object storage (AWS S3, Cloudflare R2, MinIO,
 //! Scaleway, OVHcloud...): a small client signing its requests with AWS
 //! Signature Version 4, over HTTP/1.1 and rustls.
+//!
+//! Every request has a time limit, so a bucket that takes the connection and
+//! then says nothing cannot hold a backup round, a restore, the shutdown or
+//! `/v1/files` for ever. The limit counts from the last thing that moved on
+//! the connection, never from the start, and the clock starts once the
+//! request is signed (hashing a large body takes time of its own): a byte
+//! written to the connection or read from it is a move. The connection, the
+//! TLS handshake and the head of the request must move within the store's
+//! timeout (60 seconds); a body is written to the connection as the line
+//! takes it, and the next bytes must leave within the timeout; once the last
+//! byte has left the process, the head of the answer must come within the
+//! timeout, plus a second for each 64 KiB that the system's send queue may
+//! still hold on its way (4 seconds at most); the body of the answer is then
+//! read piece by piece, and a wait of more than the timeout for the next
+//! piece is an error too. What the HTTP client buffers is not progress: only
+//! the bytes that leave the process are. A large snapshot is never cut while
+//! its bytes keep leaving; the system sizes its send queue to the line, so
+//! what is left in it once the last byte has left takes seconds to go, not
+//! the timeout.
 
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
-use hyper::{Method, Request};
+use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use memoire_orm::{Error, Result};
 use tokio::net::TcpStream;
@@ -44,6 +67,185 @@ impl std::fmt::Debug for S3Options {
     }
 }
 
+/// How long a request may wait for the bucket, unless set otherwise with
+/// [`S3Store::with_timeout`].
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The pieces a body is sent in: each one the connection takes is progress.
+const PIECE: usize = 64 * 1024;
+
+/// What the system's send queue may still hold of a body once its last byte
+/// has left the process: the answer may take one more second per 64 KiB of
+/// it.
+const IN_FLIGHT: usize = 256 * 1024;
+
+/// How far a request has got: when something last moved on the connection,
+/// the bytes written to it, and the bytes of the body the HTTP client has
+/// taken (which it may still hold in its own buffer).
+struct Progress {
+    last: Mutex<Instant>,
+    taken: AtomicU64,
+    written: AtomicU64,
+}
+
+impl Progress {
+    fn new() -> Arc<Progress> {
+        Arc::new(Progress { last: Mutex::new(Instant::now()), taken: AtomicU64::new(0), written: AtomicU64::new(0) })
+    }
+
+    /// The clock starts again from now: the request is ready to go.
+    fn start(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// The HTTP client took `bytes` of the body: not a move, they may stay
+    /// in its buffer.
+    fn took(&self, bytes: usize) {
+        self.taken.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `bytes` left the process, on the connection: a move.
+    fn wrote(&self, bytes: usize) {
+        self.written.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.start();
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The connection to the bucket (under TLS, when there is one): each byte
+/// written to it or read from it is said to its [`Progress`].
+struct Counted<S> {
+    inner: S,
+    progress: Arc<Progress>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let read = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(read, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.progress.start();
+        }
+        read
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = written
+            && n > 0
+        {
+            this.progress.wrote(n);
+        }
+        written
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = written
+            && n > 0
+        {
+            this.progress.wrote(n);
+        }
+        written
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// The body of a request, given to the HTTP client [`PIECE`] by [`PIECE`]:
+/// each piece taken is said to its [`Progress`].
+struct Upload {
+    data: Bytes,
+    progress: Arc<Progress>,
+}
+
+impl hyper::body::Body for Upload {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.data.is_empty() {
+            return Poll::Ready(None);
+        }
+        let piece = this.data.split_to(this.data.len().min(PIECE));
+        this.progress.took(piece.len());
+        Poll::Ready(Some(Ok(Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
+/// Runs `work` until it ends, or until `progress` has not moved for
+/// `timeout`: the error then says how far the body got (`len` bytes in
+/// all).
+async fn while_moving<T>(
+    work: impl std::future::Future<Output = Result<T>>,
+    progress: &Progress,
+    timeout: Duration,
+    len: usize,
+    late: impl Fn(String) -> Error,
+) -> Result<T> {
+    let mut work = std::pin::pin!(work);
+    // Once the whole body is taken, its last bytes may still be in the system's send queue.
+    let drain = Duration::from_millis(len.min(IN_FLIGHT) as u64 * 1000 / PIECE as u64);
+    let limit = || match progress.taken.load(Ordering::Relaxed) as usize {
+        taken if taken < len => timeout,
+        _ => timeout + drain,
+    };
+    loop {
+        let deadline = tokio::time::Instant::from_std(progress.last() + limit());
+        match tokio::time::timeout_at(deadline, &mut work).await {
+            Ok(out) => return out,
+            // Something moved meanwhile: a new limit, from then.
+            Err(_) if progress.last() + limit() > Instant::now() => {}
+            Err(_) => {
+                let written = progress.written.load(Ordering::Relaxed);
+                return Err(late(if (progress.taken.load(Ordering::Relaxed) as usize) < len {
+                    format!(
+                        "stopped taking the upload for {} seconds ({written} bytes sent, for a body of {len})",
+                        timeout.as_secs_f64()
+                    )
+                } else {
+                    format!("did not answer within {} seconds", limit().as_secs_f64())
+                }));
+            }
+        }
+    }
+}
+
 /// A [`BackupStore`] in an S3 bucket (path-style requests:
 /// `<endpoint>/<bucket>/<key>`, which every S3-compatible service accepts).
 pub struct S3Store {
@@ -52,11 +254,16 @@ pub struct S3Store {
     host: String,
     port: u16,
     tls: tokio_rustls::TlsConnector,
+    timeout: Duration,
+    /// The system's send queue of a connection, when the tests set it: else
+    /// the system sizes it to the line.
+    #[cfg(test)]
+    send_queue: Option<u32>,
 }
 
 impl std::fmt::Debug for S3Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3Store").field("options", &self.options).finish()
+        f.debug_struct("S3Store").field("options", &self.options).field("timeout", &self.timeout).finish()
     }
 }
 
@@ -255,7 +462,23 @@ impl S3Store {
             .with_root_certificates(roots)
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(S3Store { options, https, host, port, tls: tokio_rustls::TlsConnector::from(Arc::new(config)) })
+        Ok(S3Store {
+            options,
+            https,
+            host,
+            port,
+            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            timeout: TIMEOUT,
+            #[cfg(test)]
+            send_queue: None,
+        })
+    }
+
+    /// The same store with another time limit (60 seconds by default): the
+    /// longest wait for anything to move, whatever the size of the request
+    /// (see the module's text: an answer to a body has a few seconds more).
+    pub fn with_timeout(self, timeout: Duration) -> S3Store {
+        S3Store { timeout, ..self }
     }
 
     fn key(&self, name: &str) -> String {
@@ -335,8 +558,38 @@ impl S3Store {
         Self::check(status, &body, &format!("DELETE {key}"))
     }
 
-    /// Sends one signed request; returns the status and the body.
+    /// Sends one signed request; returns the status and the body. It fails
+    /// when the bucket does not answer in time (see the module's text).
     async fn send(&self, method: Method, key: &str, query: &[(&str, &str)], body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        let what = if key.is_empty() { "LIST".to_owned() } else { format!("{method} {key}") };
+        let late = |how: String| s3_err(format!("{what}: {} {how}", self.describe()));
+        let (len, progress) = (body.len(), Progress::new());
+        let request = self.request(method, key, query, body, progress.clone())?;
+        // Signed (its body hashed): the clock starts now.
+        progress.start();
+        let response = while_moving(self.open(request, &progress), &progress, self.timeout, len, late).await?;
+        let status = response.status().as_u16();
+        let mut answer = response.into_body();
+        let mut body = Vec::new();
+        while let Some(frame) = tokio::time::timeout(self.timeout, answer.frame()).await.map_err(|_| {
+            s3_err(format!("{what}: {} stopped answering for {} seconds", self.describe(), self.timeout.as_secs_f64()))
+        })? {
+            if let Ok(data) = frame.map_err(s3_err)?.into_data() {
+                body.extend_from_slice(&data);
+            }
+        }
+        Ok((status, body))
+    }
+
+    /// The signed request `method` on `key` (the bucket itself when empty).
+    fn request(
+        &self,
+        method: Method,
+        key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        progress: Arc<Progress>,
+    ) -> Result<Request<Upload>> {
         let path = if key.is_empty() {
             format!("/{}", self.options.bucket)
         } else {
@@ -365,7 +618,7 @@ impl S3Store {
                 query.iter().map(|(k, v)| format!("{}={}", uri_encode(k, false), uri_encode(v, false))).collect();
             uri = format!("{uri}?{}", q.join("&"));
         }
-        let request = Request::builder()
+        Request::builder()
             .method(method)
             .uri(uri)
             .header("host", &host)
@@ -373,32 +626,64 @@ impl S3Store {
             .header("x-amz-date", &amz_date)
             .header("authorization", auth)
             .header("content-length", body.len())
-            .body(Full::new(Bytes::from(body)))
-            .map_err(s3_err)?;
-        let tcp = TcpStream::connect((self.host.as_str(), self.port)).await.map_err(s3_err)?;
-        let response = if self.https {
+            .body(Upload { data: Bytes::from(body), progress })
+            .map_err(s3_err)
+    }
+
+    /// Connects to the bucket, sends `request` and waits for the head of the
+    /// answer; its body comes after. Each byte that goes on the connection
+    /// or comes from it is said to `progress`. A request given up (its future
+    /// or its body dropped) closes the connection: hyper's connection task
+    /// stops when nobody waits for the answer any more.
+    async fn open(&self, request: Request<Upload>, progress: &Arc<Progress>) -> Result<Response<Incoming>> {
+        let tcp = Counted { inner: self.connect().await?, progress: progress.clone() };
+        if self.https {
             let name = rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(s3_err)?;
             let stream = self.tls.connect(name, tcp).await.map_err(s3_err)?;
             let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.map_err(s3_err)?;
             tokio::spawn(conn);
-            sender.send_request(request).await.map_err(s3_err)?
+            sender.send_request(request).await.map_err(s3_err)
         } else {
             let (mut sender, conn) = http1::handshake(TokioIo::new(tcp)).await.map_err(s3_err)?;
             tokio::spawn(conn);
-            sender.send_request(request).await.map_err(s3_err)?
-        };
-        let status = response.status().as_u16();
-        let body = response.into_body().collect().await.map_err(s3_err)?.to_bytes().to_vec();
-        Ok((status, body))
+            sender.send_request(request).await.map_err(s3_err)
+        }
+    }
+
+    /// A connection to the bucket.
+    async fn connect(&self) -> Result<TcpStream> {
+        #[cfg(test)]
+        if let Some(bytes) = self.send_queue {
+            let address = tokio::net::lookup_host((self.host.as_str(), self.port))
+                .await
+                .map_err(s3_err)?
+                .next()
+                .ok_or_else(|| s3_err("no address"))?;
+            let socket = match address {
+                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }
+            .map_err(s3_err)?;
+            socket.set_send_buffer_size(bytes).map_err(s3_err)?;
+            return socket.connect(address).await.map_err(s3_err);
+        }
+        TcpStream::connect((self.host.as_str(), self.port)).await.map_err(s3_err)
     }
 
     /// Runs `f` on a private runtime, on its own thread: backups are called
     /// from synchronous code, which may itself run inside another runtime.
+    /// The runtime is shut down without waiting for its blocking pool, so a
+    /// name lookup that hangs cannot hold the caller past the time limit.
     fn block<T: Send>(&self, f: impl std::future::Future<Output = Result<T>> + Send) -> Result<T> {
         std::thread::scope(|s| {
-            s.spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(s3_err)?.block_on(f))
-                .join()
-                .unwrap_or_else(|_| Err(s3_err("the request panicked")))
+            s.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(s3_err)?;
+                let out = runtime.block_on(f);
+                runtime.shutdown_background();
+                out
+            })
+            .join()
+            .unwrap_or_else(|_| Err(s3_err("the request panicked")))
         })
     }
 
@@ -424,10 +709,19 @@ impl BackupStore for S3Store {
         Self::check(status, &body, &format!("PUT {key}"))
     }
 
+    // A missing object is `None`; a missing bucket is an error, never an
+    // empty backup: a mistyped bucket name must not start an empty database.
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let key = self.key(name);
         let (status, body) = self.block(self.send(Method::GET, &key, &[], Vec::new()))?;
         if status == 404 {
+            let code = xml_values(&String::from_utf8_lossy(&body), "Code").into_iter().next();
+            if code.as_deref() == Some("NoSuchBucket") {
+                return Err(s3_err(format!(
+                    "GET {key}: the bucket `{}` does not exist (HTTP 404 NoSuchBucket)",
+                    self.options.bucket
+                )));
+            }
             return Ok(None);
         }
         Self::check(status, &body, &format!("GET {key}"))?;
@@ -508,6 +802,239 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(xml_values(blocks[0], "ETag"), vec!["\"e1\""]);
         assert_eq!(xml_values(blocks[1], "Size"), vec!["3"]);
+    }
+
+    /// A bucket that takes connections and never answers: it reads what it
+    /// is sent, and says on the channel each time a client hangs up.
+    fn stalled_bucket() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (hung_up, closed) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (mut stream, hung_up) = (stream.unwrap(), hung_up.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0; 4096];
+                    while stream.read(&mut buf).is_ok_and(|n| n > 0) {}
+                    let _ = hung_up.send(());
+                });
+            }
+        });
+        (endpoint, closed)
+    }
+
+    /// `/v1/files` asks the bucket from the server's own runtime: a bucket
+    /// that stalls fails the request in time, and the connection is closed.
+    #[tokio::test]
+    async fn a_stalled_bucket_times_out_inside_a_runtime() {
+        let (endpoint, mut closed) = stalled_bucket();
+        let store = S3Store::new(S3Options {
+            endpoint,
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            prefix: "files/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let e = store.objects("app/").await.unwrap_err().to_string();
+        assert!(e.contains("LIST: s3://bucket/files/ did not answer within 0.2 seconds"), "{e}");
+        let e = store.remove("app/a.txt").await.unwrap_err().to_string();
+        assert!(e.contains("DELETE files/app/a.txt: s3://bucket/files/ did not answer within 0.2 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        for _ in 0..2 {
+            let hung_up = tokio::time::timeout(Duration::from_secs(1), closed.recv()).await;
+            assert_eq!(hung_up, Ok(Some(())), "the connection of a request that timed out is closed");
+        }
+    }
+
+    /// A store at `endpoint` with a time limit of `timeout`.
+    fn store_at(endpoint: String, timeout: Duration) -> S3Store {
+        S3Store::new(S3Options {
+            endpoint,
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            prefix: "nuage/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+        .with_timeout(timeout)
+    }
+
+    /// The limit counts from the last thing that moved, never from the start:
+    /// work that keeps moving goes on for as long as it takes, whatever the
+    /// limit; work that stops moving is cut one limit after its last move,
+    /// with how far its upload got.
+    #[tokio::test]
+    async fn the_limit_counts_from_the_last_move() {
+        let late = |how: String| s3_err(how);
+        let limit = Duration::from_millis(300);
+        let work = |moves: usize, then_stop: bool| {
+            let progress = Progress::new();
+            let moving = progress.clone();
+            let work = async move {
+                for _ in 0..moves {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    moving.took(PIECE);
+                    moving.wrote(PIECE);
+                }
+                if then_stop {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            };
+            (progress, work)
+        };
+        // Four times the limit, moving all along.
+        let (progress, moving) = work(12, false);
+        let started = Instant::now();
+        while_moving(moving, &progress, limit, 12 * PIECE, late).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1200), "{:?}", started.elapsed());
+        // Three moves, then nothing.
+        let (progress, stalled) = work(3, true);
+        let started = Instant::now();
+        let e = while_moving(stalled, &progress, limit, 12 * PIECE, late).await.unwrap_err().to_string();
+        assert!(
+            e.contains("stopped taking the upload for 0.3 seconds (196608 bytes sent, for a body of 786432)"),
+            "{e}"
+        );
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(600) && took < Duration::from_millis(1500), "{took:?}");
+        // Nothing moves at all.
+        let (progress, silent) = work(0, true);
+        let e = while_moving(silent, &progress, limit, 0, late).await.unwrap_err().to_string();
+        assert!(e.contains("did not answer within 0.3 seconds"), "{e}");
+        // The whole body went and no answer comes: its last 128 KiB may still be on their way.
+        let (progress, silent) = work(2, true);
+        let started = Instant::now();
+        let e = while_moving(silent, &progress, limit, 2 * PIECE, late).await.unwrap_err().to_string();
+        assert!(e.contains("did not answer within 2.3 seconds"), "{e}");
+        assert!(started.elapsed() >= Duration::from_millis(2500), "{:?}", started.elapsed());
+        // What the HTTP client takes without writing it is no move.
+        let (progress, buffered) = work(0, true);
+        progress.took(12 * PIECE);
+        let started = Instant::now();
+        let e = while_moving(buffered, &progress, limit, 24 * PIECE, late).await.unwrap_err().to_string();
+        assert!(e.contains("stopped taking the upload for 0.3 seconds (0 bytes sent, for a body of 1572864)"), "{e}");
+        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+    }
+
+    /// A body goes to the connection in pieces of 64 KiB at most, each one
+    /// counted, its whole length said beforehand.
+    #[tokio::test]
+    async fn a_body_goes_in_pieces() {
+        let progress = Progress::new();
+        let mut body = Upload { data: Bytes::from(vec![7u8; 200 * 1024]), progress: progress.clone() };
+        assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(200 * 1024));
+        let mut pieces = Vec::new();
+        while let Some(frame) = body.frame().await {
+            pieces.push(frame.unwrap().into_data().unwrap().len());
+        }
+        assert_eq!(pieces, [PIECE, PIECE, PIECE, 200 * 1024 - 3 * PIECE]);
+        assert_eq!(progress.taken.load(Ordering::Relaxed), 200 * 1024);
+        assert_eq!(progress.written.load(Ordering::Relaxed), 0, "taken, not sent");
+        assert!(hyper::body::Body::is_end_stream(&body));
+    }
+
+    /// A bucket that takes a large upload and never answers: the request
+    /// fails one limit (and the 4 seconds its last bytes may take) after the
+    /// last byte went, not after a time that grows with the size of the body.
+    /// The clock starts once the request is signed: hashing the body is not
+    /// waiting for the bucket.
+    #[test]
+    fn a_bucket_that_takes_an_upload_and_never_answers_fails_in_time() {
+        let (endpoint, _closed) = stalled_bucket();
+        let store = store_at(endpoint, Duration::from_secs(1));
+        let started = Instant::now();
+        let e = store.put("snapshots/big.db", &vec![0u8; 1 << 20]).unwrap_err().to_string();
+        assert!(e.contains("PUT nuage/snapshots/big.db: s3://bucket/nuage/ did not answer within 5 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// A bucket that reads its upload slowly, 16 KiB at a time, through
+    /// small buffers (a slow line), then answers.
+    fn slow_bucket(pause: Duration) -> String {
+        use std::io::{Read, Write};
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // The system's buffers kept small, set before `listen` so the connections have them.
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let listener = runtime.block_on(async {
+            let addr = socket.local_addr().unwrap();
+            drop(socket);
+            let small = tokio::net::TcpSocket::new_v4().unwrap();
+            small.set_recv_buffer_size(16 * 1024).unwrap();
+            small.set_reuseaddr(true).unwrap();
+            small.bind(addr).unwrap();
+            small.listen(8).unwrap().into_std().unwrap()
+        });
+        listener.set_nonblocking(false).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                stream.set_nonblocking(false).unwrap();
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let mut left: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().unwrap());
+                    let mut piece = [0; 16 * 1024];
+                    while left > 0 {
+                        std::thread::sleep(pause);
+                        match stream.read(&mut piece[..left.min(16 * 1024)]) {
+                            Ok(n) if n > 0 => left -= n,
+                            _ => return,
+                        }
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+                });
+            }
+        });
+        endpoint
+    }
+
+    /// An upload is not cut while its bytes keep leaving the process, even
+    /// when the HTTP client took the whole body at once into its own buffer
+    /// (448 KiB or so) and the line then takes longer than the limit and its
+    /// margin to carry it: what moves is what goes on the connection.
+    #[test]
+    fn a_slow_upload_is_not_cut_while_its_bytes_leave() {
+        let mut store = store_at(slow_bucket(Duration::from_millis(250)), Duration::from_secs(1));
+        store.send_queue = Some(16 * 1024);
+        let started = Instant::now();
+        // 512 KiB at 64 KiB a second: 8 seconds, past the 1 + 4 seconds counted from the last
+        // piece the client took.
+        store.put("snapshots/big.db", &vec![7u8; 512 * 1024]).unwrap();
+        assert!(started.elapsed() > Duration::from_secs(6), "{:?}", started.elapsed());
+    }
+
+    /// Signing a large body (hashing it: long in a build without
+    /// optimisations) is not waiting for the bucket: the clock starts once the
+    /// request is ready, and a bucket that takes the body at once is not cut
+    /// before its first byte, whatever the limit.
+    #[test]
+    fn the_clock_starts_once_the_request_is_signed() {
+        let store = store_at(slow_bucket(Duration::ZERO), Duration::from_millis(300));
+        let body = vec![7u8; 32 << 20];
+        let started = Instant::now();
+        sha256_hex(&body);
+        let hashing = started.elapsed();
+        store.put("snapshots/big.db", &body).unwrap();
+        // Says what the test shows on this machine: a hash longer than the limit.
+        println!("hashing 32 MiB took {hashing:?}, the limit is 300 ms");
     }
 
     #[test]

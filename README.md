@@ -34,8 +34,8 @@ server in production, without changing a line.
 | **Memoire semantics** | Statements run on Memoire's own evaluator over the rows read from disk: Nuage DB behaves exactly like Memoire's in-memory engine, on data of any size. |
 | **Transactions** | Snapshot reads, optimistic commits (`Error::Conflict`, retried by `db.transaction(...)`), interactive transactions over HTTP, all-or-nothing batches. |
 | **Branches** | A full copy of the database for a preview, a test or an experiment, made in an instant: it shares its parent's pages and stores only its own changes. |
-| **Backups, restored at boot** | Snapshots plus log segments, to a folder or to S3-compatible storage. An empty data directory is restored automatically at startup, which makes hosts with an ephemeral disk work. |
-| **Key-value store** | Each application has a store in memory: values with an expiry, counters, locks, a cache, over HTTP (`/v1/kv`) and on a port of its own ([Key-value store](#key-value-store)). |
+| **Backups, restored at boot** | Snapshots plus log segments, to a folder or to S3-compatible storage, in one place or two kept in step. An empty data directory is restored automatically at startup, which makes hosts with an ephemeral disk work. A database never writes over another database's backup. |
+| **Key-value store** | Each application has a store, in the server's memory or in its own database (`NUAGE_KV_STORAGE`): values with an expiry, counters, locks, a cache, over HTTP (`/v1/kv`) and on a port of its own ([Key-value store](#key-value-store)). |
 | **Files** | Each application keeps files of any size (map tiles, photos, archives) in an S3-compatible bucket such as Cloudflare R2: the server lists them and signs the links, the bytes go straight between the client and the bucket ([Files](#files)). |
 | **Server** | One binary, configured by environment variables: the database protocol (`/v1`), the live status (`/api/status`, `/api/status/stream`), the console (`/admin`) and the website with its live dashboard (`/app`), on one port. |
 | **WebAssembly client** | `memoire_orm::NuageDb` speaks HTTP(S): natively with Tokio, and in the browser through `fetch`. |
@@ -362,11 +362,52 @@ seconds).
 
 ## Key-value store
 
-Next to its database, each application has a **key-value store in memory**: a cache in front of anything slow, sessions, counters, rate limits, locks. Nothing
-touches the disk: a read or a write costs one round trip, and the server answers more than
-140 000 of them a second on 4 cores. A restart empties it; what must survive goes in the
-database. Memory is bounded for each application (`NUAGE_KV_MB`): past the limit, the keys that
-expired go first, then the least recently used ones.
+Next to its database, each application has a **key-value store**: a cache in front of
+anything slow, sessions, counters, rate limits, locks. By default it is in the server's
+memory. Nothing touches the disk: a read or a write costs one round trip, and the server
+answers more than 140 000 of them a second on 4 cores. A restart empties it. Memory is bounded
+for each application (`NUAGE_KV_MB`): past the limit, the keys that expired go first, then the
+least recently used ones.
+
+**In memory or in the database.** `NUAGE_KV_STORAGE` says where the stores of all the
+applications are kept. `memory`, the default, is the store above: the fastest, and emptied by
+a restart. `database` keeps each application's keys in its own database, on disk. They are
+written through the same log as its rows, so they survive a restart, are encrypted and are in
+the backups. The requests, the commands and the port stay the same. With `database`:
+
+- **a write waits for the disk**, like an update of a row: it is answered once it is synced
+  (writes made at the same time share one sync). A read does not wait;
+- **nothing is evicted**, and `NUAGE_KV_MB` is not used: the store is bounded by the disk, like
+  the tables, so give cache entries an expiry. A value is 64 MiB at most;
+- **a list of commands, or `MULTI` ... `EXEC`, is one commit**: all of it or nothing. A write
+  the disk refuses is an error (`500` over HTTP, `-ERR storage: …` on the port), never half
+  written;
+- **an expiry is a date**: a key set to live an hour expires an hour later, whether the server
+  restarted in between or not. An expired key is never returned or counted, and background
+  passes remove it from the disk, one after the other while keys are due, as fast as keys
+  expire;
+- **`SCAN` answers page by page**: `COUNT` keys of the store at most per page (10 without it),
+  and a cursor for the next page, `0` after the last, as Redis does: `scan_iter` and the like
+  go through any number of keys, even when they delete them on the way. A cursor is kept 10
+  minutes at least, whatever the other clients scan meanwhile; one given before a restart is
+  refused (`ERR invalid cursor`: start again from `SCAN 0`), never taken for another page.
+  `KEYS` answers at most 100,000 keys (16 MiB of them): past that, it says to use `SCAN`;
+- **on a disk erased at each restart** (Heroku), a clean restart keeps every key: on `SIGTERM`
+  the server stops taking writes, then ships its last log segment, so every write it answered
+  is in it (one that comes after gets the storage error). After a crash, the keys come back as they were at the
+  last segment shipped, like the rows (30 seconds by default): a lock released in that window is
+  held again, a counter raised in it is back to its earlier value;
+- the figures (`GET /v1/kv`, `/api/status`) say `"storage": "database"`, with `max_bytes` 0;
+  `INFO` says `maxmemory:0` and `maxmemory_policy:noeviction`. Branches and SQL do not see the
+  keys.
+
+To change it, set the line in the settings file and restart the server (see the restart line
+of [Install on any computer](#install-on-any-computer)); on Heroku, `heroku config:set
+NUAGE_KV_STORAGE=database`, which restarts the dyno. The startup log says `key-value stores
+are kept in each application's database`. Going from `memory` to `database` starts with what
+the database already holds, nothing the first time: the keys in memory are not copied. Going
+back to `memory` leaves the keys in the database, unread, and they are found again when
+`database` comes back. Any other value stops the server at startup.
 
 **Over HTTP**, from any language, with a token of the application (a read-only token reads):
 
@@ -472,6 +513,11 @@ computer**: nobody can read the data, nor its backups, without its key.
 | settings | `/etc/nuage/nuage.env` | `/usr/local/etc/nuage/nuage.env` | `C:\ProgramData\Nuage\nuage.env` |
 | data | `/var/lib/nuage` | `/usr/local/var/nuage` | `C:\ProgramData\Nuage\data` |
 | logs | `journalctl -u nuage -f` | `tail -f /usr/local/var/log/nuage.log` | `Get-Content -Wait C:\ProgramData\Nuage\nuage.log` |
+| restart | `sudo systemctl restart nuage` | `sudo launchctl kickstart -k system/io.github.maxlestage.nuage` | `Stop-ScheduledTask -TaskName 'Nuage DB'; Get-Process nuage -ErrorAction SilentlyContinue \| Stop-Process -Force; Start-ScheduledTask -TaskName 'Nuage DB'` |
+
+A change of the settings file is applied when the service restarts (with Docker:
+`docker compose up -d` after a change of `.env`). On Windows the stop is forced: what was
+written is replayed from the log at the next start.
 
 On Linux it also **creates swap** when the server has none (the size of the memory, 1 to 4
 GiB; `vm.swappiness=10`, so the memory goes to the database) and a `nuage` system user. On
@@ -559,15 +605,66 @@ before it serves. The installer asks where they go; or say it in the command:
   disk fail (in the log), add `/usr/local/bin/nuage` in System Settings → Privacy & Security
   → Full Disk Access. On Windows, a NAS share (`\\nas\backup\nuage`) must let the computer's
   account (`COMPUTER$`) write.
-- **Change** where they go: run the installer again with the new option; it replaces the old
-  one in the settings file and restarts the service. Without an option, it keeps them.
-- **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors.
+- **Change** where they go, on a disk that is not erased (your computer, a server): run the
+  installer again with the new option. It replaces the old one in the settings file and
+  restarts the service; without an option, it keeps them. For a bucket, changing the settings
+  file and restarting the service does the same. On Linux, a new folder goes through the
+  installer, which also lets the service write there. Right after the start, the server sends
+  a whole snapshot of every application to the new place. The old place is left as it is:
+  delete it once the console shows the new one's backups.
+- **A database never writes over another database's backup.** Before each snapshot, the
+  server compares the destination's `encryption.json` with its own. A place that holds
+  another database's backup is refused, and nothing is written there. The event log says
+  `backup failed: … holds the backup of another database (its encryption.json is not this
+  one's): nothing was written there`, and the console and `/app` show the backup failing.
+  Give this database a place of its own, or empty that one. A bucket that does not exist is an
+  error too, never an empty backup.
+- **An empty start is said, and can be refused.** When the data folder is empty and the backup
+  holds nothing to restore, the server starts a new, empty database and says so in its log
+  (`warning: the data directory was empty and … holds no backup: this is a NEW, EMPTY
+  database`) and in the event log; so does an application whose backup holds nothing. With
+  `NUAGE_RESTORE_REQUIRED=true`, that start is refused instead: the server stops and says what
+  to check, having created nothing and written nothing. A registered application whose backup
+  holds nothing is not served either: the server starts without it, and the console lists it
+  as one that cannot be opened (complete its backup and restart, or delete it there). Set it
+  once the server holds data: a first start has nothing to restore.
+- **Two places at once** (experimental): `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` and the other
+  `NUAGE_BACKUP2_S3_*`, add a second destination kept in step with the first. Each one gets
+  the snapshots and the log with its own progress: one that does not answer never holds the
+  other back (each has its own thread), and gets a whole snapshot when it answers again. An
+  empty data folder is restored from one of them, whole: the one that reaches furthest. The
+  server does not start when either does not answer, since it may be the one that reaches
+  furthest (take it out of the settings to start from the other alone; a second that has not
+  answered 5 seconds after the first counts as not answering), or when the two hold different
+  databases. Without the first, `NUAGE_BACKUP2_*` is the only destination. It is still
+  experimental: it is not yet a safe way to move the backups to another place (move them with
+  a stop, as shown under Heroku), and its known limits are listed in the CHANGELOG. The console's *Storage* page shows each
+  destination's last backup, and `/api/status` each one in `backup.destinations`: a
+  destination shows no time until it has received a whole snapshot since the start, and the
+  last backup shows none until both have. A round to a destination that has not ended after
+  an hour (one that does not answer, or so slow it never keeps up) shows as its error, and
+  in the event log, until it ends. The stop sends to both at the same time: the first gets as
+  long as it takes, the second 20 seconds at most.
+- **Deleting an application** in the console empties its backup (`apps/<name>/`) in each
+  destination, once the backup round running to it, if any, has ended: nothing of it is
+  written there afterwards. One that cannot be emptied is named in the answer and the event
+  log; until its backup there is deleted by hand, no application of that name can be created,
+  so that a new one never starts with the deleted one's rows. One that has not answered
+  within 10 seconds is named too, and its emptying goes on: the name stays taken until it
+  ends. On Linux, the installer's service may write
+  only to the data folder and `NUAGE_BACKUP_DIR`: there, make the second one a bucket.
+- **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors. A
+  bucket that stops answering fails the round after 60 seconds with nothing moving, and the
+  next round tries again; an upload is never cut while its bytes keep leaving the server (the
+  limit counts from the last byte that went on the line, not from what is waiting to go).
 - **Restore** on a new computer: install, put the old settings file's
   `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
   and restart the service: it restores the last snapshot and replays the log after it.
 - **One writer per backup**: two servers must never back up to the same folder or bucket
-  prefix (each would overwrite the other's). A computer next to a Heroku server uses a
-  folder, bucket or `NUAGE_BACKUP_S3_PREFIX` of its own.
+  prefix. A server with a different database is refused there (see above), but two copies of
+  one database, such as two dynos restored from the same backup, would overwrite each other.
+  A computer next to a Heroku server uses a folder, bucket or `NUAGE_BACKUP_S3_PREFIX` of its
+  own.
 
 ## Quick start
 
@@ -610,7 +707,24 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
   (`NUAGE_BACKUP_DIR`).
 - **Loss window.** Commits since the last shipped log segment (30 seconds by default) are
   lost only if the dyno stops without the `SIGTERM` Heroku sends first: on `SIGTERM` the
-  server checkpoints and ships the last segment.
+  server stops taking writes (one that comes after gets an error, never an answer the backup
+  lacks), checkpoints and ships the last segment. The keys of the key-value stores follow the
+  same rule with `NUAGE_KV_STORAGE=database`; in memory, a restart empties them.
+- **A change of settings restarts the dyno.** Each `heroku config:set` or `config:unset`
+  restarts it: its disk is erased and the database is restored from the backup that the new
+  settings name. So never point the backup variables, in one command, at a place that does
+  not hold the backup: the dyno would find nothing there and start a new, empty database
+  (its log says so, and the old place keeps its backups). Move them as below.
+- **Refuse an empty start.** Once the server holds data, set
+  `heroku config:set NUAGE_RESTORE_REQUIRED=true`. From then on, a dyno that finds nothing to
+  restore (a mistyped bucket or prefix, the backup variables removed) does not start, and
+  creates and writes nothing. Heroku shows it as crashed, `heroku logs --tail` says what to
+  check, and putting the settings back starts it from its backup. Not on a first deployment,
+  which has nothing to restore: `app.json` leaves it unset.
+- **Move the backups with a stop.** Changing the backup variables restarts the dyno on the new
+  place: stop it first, copy the backup there with the storage's own tools, then change the
+  settings and start it again (the commands are below). The second destination
+  (`NUAGE_BACKUP2_*`) is still experimental and is not a safe way to move them yet.
 
 By hand:
 
@@ -624,7 +738,19 @@ git push heroku master
 ```
 
 For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
-`https://my-nuage.herokuapp.com/admin`.
+`https://my-nuage.herokuapp.com/admin`: its *Storage* page (or `backup.last_ok` in
+`/api/status`) should show the first backup with no error.
+
+To move the backups to another bucket:
+
+```bash
+heroku config:set NUAGE_RESTORE_REQUIRED=true        # once: from now on an empty start is refused
+heroku ps:scale web=0                                # the server ships its last backup and stops
+aws s3 sync s3://old-bucket/nuage/ s3://new-bucket/nuage/   # every object (or rclone sync)
+heroku config:set NUAGE_BACKUP_S3_BUCKET=new-bucket NUAGE_BACKUP_S3_REGION=… \
+  NUAGE_BACKUP_S3_ACCESS_KEY_ID=… NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…   # all of them, in one command
+heroku ps:scale web=1                                # it restores from the new bucket, or does not start
+```
 
 ## Environment variables
 
@@ -652,10 +778,16 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 | `NUAGE_BACKUP_S3_REGION` | region | `us-east-1` |
 | `NUAGE_BACKUP_S3_PREFIX` | prefix of the backup objects | `nuage/` |
 | `NUAGE_BACKUP_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP_S3_SECRET_ACCESS_KEY` | credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
-| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots | `60` |
+| `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots (of each destination) | `60` |
+| `NUAGE_BACKUP2_DIR` | a second backup destination kept in step with the first: this folder (see the backups above); alone, it is the only destination | |
+| `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this bucket (with `NUAGE_BACKUP2_DIR` too, or the same place as the first, the server does not start) | |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | its endpoint, region and prefix, set for it: never the first's | `https://s3.<region>.amazonaws.com`, `us-east-1`, `nuage/` |
+| `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
+| `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; with nothing to restore, or no backup set, the server does not start, and creates and writes nothing (nor does it serve a registered application whose backup holds nothing). For a disk erased at each restart, once the server holds data (see [Deploy on Heroku](#deploy-on-heroku)) | `false`: an empty start is allowed, and said in the log |
 | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the wire Redis clients speak: one connects to an application's store, a token as the password | off |
 | `NUAGE_KV_BIND` | its address | `NUAGE_BIND` |
-| `NUAGE_KV_MB` | memory of each application's key-value store, in MiB, or `auto`; past it, the least recently used keys go | `auto`: a sixteenth of the memory, 4 to 256 MiB |
+| `NUAGE_KV_MB` | memory of each application's key-value store, in MiB, or `auto`; past it, the least recently used keys go. Not used with `NUAGE_KV_STORAGE=database` | `auto`: a sixteenth of the memory, 4 to 256 MiB |
+| `NUAGE_KV_STORAGE` | where the key-value stores of all the applications are kept: `memory` (the fastest; a restart empties them) or `database` (in each application's database: kept across restarts and in the backups; a write waits for the disk; see [Key-value store](#key-value-store)) | `memory` |
 | `NUAGE_FILES_S3_BUCKET` | keep the applications' files (`/v1/files`) in this S3-compatible bucket (see [Files](#files)) | none: no files |
 | `NUAGE_FILES_S3_ENDPOINT` | its endpoint (`https://<account id>.r2.cloudflarestorage.com` on R2) | `https://s3.<region>.amazonaws.com` |
 | `NUAGE_FILES_S3_REGION` | its region | `auto` on R2, else `us-east-1` |
@@ -690,7 +822,7 @@ travels in a header, and the console's cookie is `Secure` over HTTPS.
 |---|---|---|
 | `/v1/*` | the database protocol, on the database of the application the token opens | `Authorization: Bearer <token of an application>` |
 | `POST /v1/sql` | SQL with `?` parameters, rows as JSON objects (websites, any language) | a token of the application; a read-only token reads only |
-| `/v1/kv` | the application's key-value store, in memory (see [Key-value store](#key-value-store)) | a token of the application; a read-only token reads |
+| `/v1/kv` | the application's key-value store (see [Key-value store](#key-value-store)) | a token of the application; a read-only token reads |
 | `/v1/files` | the application's files, through signed links to its bucket (see [Files](#files)) | a token of the application; a read-only token lists and downloads |
 | `/api/health` | `{"status":"ok"}` | public |
 | `/api/status`, `/api/status/stream` | live status, JSON and Server-Sent Events | an application's token (that application) or a console session (all of them) |

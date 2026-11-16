@@ -10,6 +10,91 @@ fn log(message: &str) {
     println!("nuage: {message}");
 }
 
+/// The end of the engine's error when `Engine::open_existing` refuses an
+/// empty data directory.
+const EMPTY_REFUSED: &str = "an empty database is not started here";
+
+/// The settings that name where the backup was looked for (`backups`, as
+/// `Config::backups` lists them), with what to check in each.
+fn settings_to_check(backups: &[(&str, Option<std::path::PathBuf>)]) -> String {
+    let places: Vec<String> = backups
+        .iter()
+        .map(|(base, folder)| match folder {
+            Some(_) => {
+                format!("{base}_DIR (an external disk must be plugged in: without it, its folder is missing or empty)")
+            }
+            None => {
+                format!("{base}_S3_BUCKET and {base}_S3_PREFIX (used as written: `nuage` and `nuage/` are two places)")
+            }
+        })
+        .collect();
+    places.join("; and ")
+}
+
+/// What to do when NUAGE_RESTORE_REQUIRED refused an empty start: where the
+/// backup was looked for (`backups`, as `Config::backups` lists them), and how
+/// to get out.
+fn restore_required_help(backups: &[(&str, Option<std::path::PathBuf>)]) -> String {
+    let check = if backups.is_empty() {
+        "No backup destination is set: put the backup settings (NUAGE_BACKUP_DIR or NUAGE_BACKUP_S3_*) back as they \
+         were"
+            .to_owned()
+    } else {
+        format!("Check {}, or put the backup settings back as they were", settings_to_check(backups))
+    };
+    format!(
+        "NUAGE_RESTORE_REQUIRED is set. Nothing was created and nothing was written. {check}; for the first start \
+         of a new server, remove NUAGE_RESTORE_REQUIRED"
+    )
+}
+
+/// What the engine's error says when a backup destination could not be read
+/// at a restore, and the settings to remove to start from the other alone.
+const TAKE_OUT: [(&str, &str); 2] = [
+    ("take the first out of the settings", "NUAGE_BACKUP_DIR or NUAGE_BACKUP_S3_*"),
+    ("take the second out of the settings", "NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_*"),
+];
+
+/// How long the stop gives the second backup destination of every database,
+/// counted from the start of the last backups (it starts with the first's):
+/// one that does not answer does not keep the process from ending.
+const SECOND_PASS: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the process waits, once the stop's work is done, for the threads
+/// of requests that still wait on something (a backup destination that does
+/// not answer): it then ends without them.
+const LEFT_BEHIND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The last backups of `engines` to destination `destination`, on a thread
+/// of its own, one database after the other; the receiver says when they
+/// are done. `None` when none of them has that destination.
+fn last_backups(engines: &[std::sync::Arc<Engine>], destination: usize) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let engines: Vec<_> = engines
+        .iter()
+        .filter(|e| e.options().backup.as_ref().is_some_and(|b| destination == 0 || b.store.parts().is_some()))
+        .cloned()
+        .collect();
+    if engines.is_empty() {
+        return None;
+    }
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new().name(format!("nuage-stop-{}", destination + 1)).spawn(move || {
+        for engine in &engines {
+            if let Err(e) = engine.backup_to(destination, false) {
+                eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
+            }
+        }
+        let _ = done.send(());
+    });
+    match spawned {
+        Ok(_) => Some(finished),
+        Err(e) => {
+            eprintln!("nuage: cannot start the last backups: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // `nuage genkey`: a new encryption key, for NUAGE_ENCRYPTION_KEY.
     if std::env::args().nth(1).as_deref() == Some("genkey") {
@@ -100,12 +185,28 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    runtime.block_on(async move {
+    let code = runtime.block_on(async move {
         let backup = config.engine.backup.as_ref().map(|b| b.store.describe());
-        let engine = match Engine::open(&config.data_dir, config.engine) {
+        // With two destinations, each one's place.
+        let parts = config.engine.backup.as_ref().and_then(|b| b.store.parts()).map(|(a, b)| (a.describe(), b.describe()));
+        let opened = if config.restore_required {
+            Engine::open_existing(&config.data_dir, config.engine)
+        } else {
+            Engine::open(&config.data_dir, config.engine)
+        };
+        let engine = match opened {
             Ok(e) => e,
             Err(e) => {
+                let e = e.to_string();
                 eprintln!("nuage: cannot open the data directory {}: {e}", config.data_dir.display());
+                if config.restore_required && e.contains(EMPTY_REFUSED) {
+                    eprintln!("nuage: {}", restore_required_help(&config.backups));
+                }
+                for (said, settings) in TAKE_OUT {
+                    if e.contains(said) {
+                        eprintln!("nuage: that destination is {settings}: remove them to start without it");
+                    }
+                }
                 return ExitCode::FAILURE;
             }
         };
@@ -120,24 +221,66 @@ fn main() -> ExitCode {
         }
         match &backup {
             Some(target) => {
-                log(&format!("backups go to {target}; an empty data directory is restored from there at startup"));
-                if let Some(folder) = &config.backup_dir
-                    && nuage::config::same_disk(&config.data_dir, folder) == Some(true)
-                {
+                if parts.is_some() {
+                    log(&format!(
+                        "backups go to {target}, kept in step; an empty data directory is restored from the one that \
+                         reaches furthest"
+                    ));
+                } else {
+                    log(&format!("backups go to {target}; an empty data directory is restored from there at startup"));
+                }
+                // Every destination a folder on the data's disk: one disk that fails loses it all.
+                let on_this_disk: Vec<_> = config
+                    .backups
+                    .iter()
+                    .filter_map(|(base, folder)| {
+                        let folder = folder.as_ref()?;
+                        (nuage::config::same_disk(&config.data_dir, folder) == Some(true)).then_some((base, folder))
+                    })
+                    .collect();
+                if !on_this_disk.is_empty() && on_this_disk.len() == config.backups.len() {
+                    let folders: Vec<String> = on_this_disk.iter().map(|(_, f)| f.display().to_string()).collect();
+                    let names: Vec<String> = on_this_disk.iter().map(|(base, _)| format!("{base}_DIR")).collect();
                     log(&format!(
                         "warning: the backups ({}) are on the same disk as the data: if this disk fails, both are lost. \
-                         Put NUAGE_BACKUP_DIR on another disk (and plug it in: an external disk that is not plugged in \
-                         leaves its folder on this disk), or back up to S3 (NUAGE_BACKUP_S3_*)",
-                        folder.display()
+                         Put {} on another disk (and plug it in: an external disk that is not plugged in leaves its \
+                         folder on this disk), or back up to S3 (NUAGE_BACKUP_S3_*)",
+                        folders.join(", "),
+                        names.join(" or ")
                     ));
                 }
-                if engine.backup_status().restored {
-                    log("the data directory was empty: restored from the backup");
+                let status = engine.backup_status();
+                // Printed here, like the lines below: the log of the engines' events starts after them.
+                match (&status.restored_from, &parts) {
+                    (Some(from), Some(_)) => log(&format!(
+                        "the data directory was empty: restored from the backup in {from}, the destination that \
+                         reaches furthest"
+                    )),
+                    (Some(_), None) => log("the data directory was empty: restored from the backup"),
+                    (None, _) => {}
+                }
+                if status.started_empty {
+                    let nothing = match &parts {
+                        Some((first, second)) => format!("neither {first} nor {second} holds a backup"),
+                        None => format!("{target} holds no backup"),
+                    };
+                    log(&format!(
+                        "warning: the data directory was empty and {nothing}: this is a NEW, EMPTY database. If this \
+                         server had data, stop it now and check {}: its backups are still where they were. \
+                         NUAGE_RESTORE_REQUIRED=true refuses to start in this case",
+                        settings_to_check(&config.backups)
+                    ));
                 }
             }
             None => log(
                 "no backup is configured: if this disk is ephemeral (Heroku dynos), set NUAGE_BACKUP_S3_* or NUAGE_BACKUP_DIR, or the data is lost at the next restart",
             ),
+        }
+        if engine.options().kv_in_database {
+            log(
+                "key-value stores are kept in each application's database (NUAGE_KV_STORAGE=database): they survive a \
+                 restart and are in the backups; a write waits for the disk",
+            );
         }
         if let Some(files) = &config.server.files {
             log(&format!(
@@ -166,6 +309,15 @@ fn main() -> ExitCode {
             let tables = nuage::Embedded::from_engine(e.clone()).tables().unwrap_or_default();
             let rows: i64 = tables.iter().map(|t| t.rows).sum();
             log(&format!("application `{}`: {} table(s), {rows} row(s)", app.name, tables.len()));
+            // The first application is the server's own engine, said above.
+            let status = e.backup_status();
+            if !app.first && status.started_empty {
+                log(&format!(
+                    "warning: application `{}` is registered but its backup ({}) holds nothing: it starts empty",
+                    app.name,
+                    status.target.unwrap_or_default()
+                ));
+            }
             if let Some(i) = e.imported() {
                 log(&format!(
                     "application `{}`: its data was written by an earlier version; it was imported and compared \
@@ -294,22 +446,62 @@ fn main() -> ExitCode {
         }
         // Every application, the server's own last (it holds the list of the others):
         // what was written since the last checkpoint goes to the backup before the disk is gone.
+        // Connections already open are still served: from here, every commit is refused, so
+        // that none is acknowledged after the last checkpoint and never sent.
         let mut engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
         engines.reverse();
+        let engines = tokio::task::spawn_blocking(move || {
+            // Every one first (it waits for a commit under way), then a checkpoint of each: the
+            // last commits are in sealed log segments, which both destinations read.
+            for engine in &engines {
+                engine.stop_writes();
+            }
+            for engine in &engines {
+                let _ = engine.checkpoint();
+            }
+            engines
+        })
+        .await
+        .unwrap_or_default();
+        // To both destinations at the same time, each on a thread of its own: neither waits for
+        // the other, whichever is slow or does not answer. The first, as long as it takes (the
+        // host ends the process when it must); the second, SECOND_PASS at most.
+        let started = tokio::time::Instant::now();
+        let (first, second) = (last_backups(&engines, 0), last_backups(&engines, 1));
+        let second_done = match second {
+            Some(second) => Some(tokio::time::timeout_at(started + SECOND_PASS, second).await.is_ok()),
+            None => None,
+        };
+        if let Some(mut first) = first
+            && tokio::time::timeout_at(started + SECOND_PASS, &mut first).await.is_err()
+        {
+            let second = if second_done == Some(true) { ", and the second has everything" } else { "" };
+            log(&format!(
+                "the first backup destination has not got everything after {} seconds{second}: the stop waits for \
+                 it",
+                SECOND_PASS.as_secs()
+            ));
+            let _ = first.await;
+        }
+        if second_done == Some(false) {
+            log(&format!(
+                "the second backup destination did not get everything within {} seconds: the first has it, \
+                 and the second gets a whole snapshot at the next start",
+                SECOND_PASS.as_secs()
+            ));
+        }
         let _ = tokio::task::spawn_blocking(move || {
             for engine in engines {
-                let _ = engine.checkpoint();
-                if engine.options().backup.is_some()
-                    && let Err(e) = engine.backup_now(false)
-                {
-                    eprintln!("nuage: database `{}`: last backup: {e}", engine.options().name);
-                }
                 let _ = engine.close();
             }
         })
         .await;
         ExitCode::SUCCESS
-    })
+    });
+    // A request still waiting on a destination that does not answer (Back up now, creating or
+    // deleting an application) does not keep the process from ending.
+    runtime.shutdown_timeout(LEFT_BEHIND);
+    code
 }
 
 /// SIGTERM (what Heroku and container hosts send) or Ctrl-C.

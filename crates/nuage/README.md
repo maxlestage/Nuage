@@ -43,7 +43,8 @@ NUAGE_ENCRYPTION_KEY=$(openssl rand -hex 32) NUAGE_TOKEN=... NUAGE_ADMIN_PASSWOR
   from disk.
 - **Branches**: instant, they share their parent's pages and store only their own changes.
 - **Backups**: snapshots plus log segments, restored automatically into an empty data
-  directory (hosts with an ephemeral disk, such as Heroku).
+  directory (hosts with an ephemeral disk, such as Heroku); to one place, or to two kept in
+  step (`MirrorStore`), an empty directory then restored from the one that reaches furthest.
 - **Server**: `/v1` (the database protocol, for `memoire_orm::NuageDb`), `/api/status`
   and `/api/status/stream`, the console at `/admin`, and with the `site` feature (on by
   default) the website of Nuage DB with its live dashboard at `/app`.

@@ -45,9 +45,10 @@
 //! * **Branches**: a branch shares every page of its parent and stores only
 //!   its own changes, so making one is instant.
 //! * **Upkeep**: a background thread checkpoints, ships backups (to a
-//!   directory or S3-compatible storage) and compacts the file. An empty data
-//!   directory is restored from the backup at startup, which makes hosts with
-//!   ephemeral disks (Heroku) work.
+//!   directory or S3-compatible storage, or to two places kept in step:
+//!   [`MirrorStore`]) and compacts the file. An empty data directory is
+//!   restored from the backup at startup, which makes hosts with ephemeral
+//!   disks (Heroku) work.
 
 #![warn(missing_docs, rust_2018_idioms)]
 
@@ -75,7 +76,8 @@ use memoire_orm::{NuageDb, NuageTransaction};
 pub use crypto::Encryption;
 pub use embedded::{Embedded, EmbeddedTransaction, TableInfo};
 pub use engine::{
-    BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, PrefixedStore, StorageStats,
+    BackupInfo, BackupOptions, BackupStatus, BackupStore, DestinationStatus, DirectoryStore, Engine, EngineOptions,
+    Event, MirrorStore, PrefixedStore, StorageStats,
 };
 pub use memoire_orm::nuage::Branch;
 #[cfg(feature = "server")]
