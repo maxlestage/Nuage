@@ -139,10 +139,11 @@ impl Editor {
             }
         });
         if stop {
-            // The call ends by itself; its answer is dropped.
+            // The call ends by itself; its answer is dropped, and its token is not kept.
             self.connect.job = None;
             self.connect.with_kept = false;
             self.connect.with_local = false;
+            self.connect.with_remember = false;
             self.connect.failed = true;
             self.connect.notice =
                 Some(Notice::warn(t(l, "Stopped waiting. The server may still answer later; nothing was changed.")));
@@ -243,6 +244,8 @@ impl Editor {
         }
         if cancel {
             self.connect.asking = false;
+            // Ticked for this card only.
+            self.connect.remember = false;
         }
     }
 
@@ -380,14 +383,15 @@ impl Editor {
                     if let Some(base) = self.typed_base()
                         && ui.add_enabled(self.forget_job.is_none(), egui::Button::new(t(l, "Forget this token"))).clicked()
                     {
-                        self.forget(ctx, base);
+                        self.forget(ctx, base, false);
                     }
                     if ui.button(t(l, "Type another token")).clicked() {
                         self.connect.use_kept = false;
                     }
                 });
             } else {
-                ui.horizontal(|ui| {
+                // Show goes under the field when the window is narrow.
+                ui.horizontal_wrapped(|ui| {
                     let field = ui
                         .add(
                             egui::TextEdit::singleline(&mut *self.connect.token)
@@ -533,12 +537,14 @@ impl Editor {
         help(ui, t(l, "This token can make tokens for every application: remember it only on your own computer."));
     }
 
-    /// Forgets the token kept for `address`, in the password store.
-    pub(super) fn forget(&mut self, ctx: &egui::Context, address: String) {
+    /// Forgets the token kept for `address`, in the password store; `drop`:
+    /// and its server from the list, once the store has deleted it (else
+    /// nothing would be left to try again).
+    pub(super) fn forget(&mut self, ctx: &egui::Context, address: String, drop: bool) {
         let vault = self.vault.clone();
         self.forget_job = Some(super::Job::start(ctx, &self.calls, move || {
             let done = vault.delete(&address);
-            Ok((address, done))
+            Ok((address, drop, done))
         }));
     }
 
@@ -556,8 +562,10 @@ impl Editor {
             theme::subheading(ui, t(l, "Servers you used"));
             for saved in &self.prefs.servers {
                 ui.horizontal_wrapped(|ui| {
-                    // The address connects (its name is what a screen reader says).
-                    let link = ui.add_enabled(!waiting, egui::Link::new(RichText::new(&saved.address).monospace()));
+                    // The address connects; a screen reader says what each one does, and to which server.
+                    let link = ui
+                        .add_enabled(!waiting, egui::Link::new(RichText::new(&saved.address).monospace()))
+                        .accessible_name(tf(l, "Connect to {}", &[&saved.address]));
                     if link.on_hover_text(t(l, "Connect")).clicked() {
                         chosen = Some(saved.clone());
                     }
@@ -567,7 +575,12 @@ impl Editor {
                         ui.label(RichText::new(t(l, "read from this computer")).weak());
                     }
                     let forget_button = egui::Button::new(t(l, "Forget")).small();
-                    if ui.add_enabled(self.forget_job.is_none(), forget_button).clicked() {
+                    let forget_button = ui.add_enabled(self.forget_job.is_none(), forget_button).accessible_name(tf(
+                        l,
+                        "Forget {}",
+                        &[&saved.address],
+                    ));
+                    if forget_button.clicked() {
                         forget = Some(saved.clone());
                     }
                 });
@@ -604,7 +617,7 @@ impl Editor {
                 ui.label(if saved.token_kept {
                     tf(
                         l,
-                        "Forget {}? Its kept token is deleted from {}.",
+                        "Forget {}? Its token kept in {} is deleted.",
                         &[&saved.address, &self.vault.store().place(l)],
                     )
                 } else {
@@ -624,11 +637,11 @@ impl Editor {
             }
             if let Some(yes) = answer {
                 self.forget_ask = None;
-                if yes {
-                    self.prefs.servers.retain(|s| s.address != saved.address);
-                    if saved.token_kept {
-                        self.forget(ctx, saved.address);
-                    }
+                match (yes, saved.token_kept) {
+                    // Out of the list once the store has deleted its token.
+                    (true, true) => self.forget(ctx, saved.address, true),
+                    (true, false) => self.prefs.servers.retain(|s| s.address != saved.address),
+                    (false, _) => {}
                 }
             }
         }
@@ -639,7 +652,7 @@ impl Editor {
                 theme::subheading(ui, t(l, "Forget everything on this computer?"));
                 ui.label(tf(
                     l,
-                    "The servers you used and the language and theme chosen are forgotten, and every token the editor kept is deleted from {}. Your servers are not changed.",
+                    "The servers you used and the language and theme chosen are forgotten, and every token the editor kept in {} is deleted. Your servers are not changed.",
                     &[&self.vault.store().place(l)],
                 ));
                 ui.horizontal(|ui| {
@@ -657,8 +670,18 @@ impl Editor {
             if let Some(yes) = answer {
                 self.forget_all_ask = false;
                 if yes {
-                    let kept: Vec<String> =
+                    let mut kept: Vec<String> =
                         self.prefs.servers.iter().filter(|s| s.token_kept).map(|s| s.address.clone()).collect();
+                    // A token being written goes too; a connection on its way would put its
+                    // server back in the list (and keep its token): its answer is dropped.
+                    for keeping in std::mem::take(&mut self.keeping) {
+                        keeping.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
+                        kept.push(keeping.address);
+                    }
+                    self.connect.job = None;
+                    self.connect.with_kept = false;
+                    self.connect.with_local = false;
+                    self.connect.with_remember = false;
                     self.prefs = super::Prefs::default();
                     self.session = None;
                     let vault = self.vault.clone();

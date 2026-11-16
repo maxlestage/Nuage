@@ -372,14 +372,44 @@ fn a_person_makes_an_application_and_tests_its_token() {
     assert!(!has(&harness, "Copiez ce jeton maintenant"), "shown once");
     assert!(!shows_anywhere(&harness, &token), "in no node once closed");
     assert!(!format!("{:?}", harness.state()).contains(&token));
-    // Its row says the editor tested it, and that the site has not connected yet.
+    // Its row says the editor tested it, and nothing of the site (the test took its place).
     wait_for(&mut harness, "the test in its row", |h| has(h, "Testée depuis l'éditeur il y a"));
-    assert!(has(&harness, "votre site ne s'est pas encore connecté"));
+    assert!(!has(&harness, "votre site"));
 
     // The same name again: refused, under the field.
     type_into(&mut harness, "À quoi sert-elle ?", "Ma boutique");
     press(&mut harness, "Créer l'application");
     wait_for(&mut harness, "the refusal", |h| has(h, "Il y a déjà une application « ma-boutique »"));
+}
+
+#[test]
+fn a_test_from_the_editor_does_not_hide_the_site() {
+    let running = start("site");
+    let admin = client(&running.address, ADMIN, Lang::En);
+    let (_, connection) = admin.create_application("blog", "").unwrap();
+    // The site connects, as its server does (with its own User-Agent).
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let ping = agent
+        .get(&format!("{}/v1/ping", running.address))
+        .header("authorization", &format!("Bearer {}", connection.token.expose()))
+        .header("user-agent", "mon-site/1.0")
+        .call()
+        .unwrap();
+    assert_eq!(ping.status(), 200);
+    let mut harness = connected(&running, french(), FakeSink::default());
+    click(&mut harness, "Applications");
+    assert!(has(&harness, "(mon-site/1.0)"));
+    // The same token tested from the editor (Tools): the server keeps one last client, the editor now.
+    click(&mut harness, "Outils");
+    type_into(&mut harness, "Jeton de l'application", connection.token.expose());
+    press(&mut harness, "Tester");
+    wait_for(&mut harness, "the test", |h| has(h, "Connecté à Nuage DB"));
+    assert!(admin.status().unwrap().database("blog").unwrap().last_connection.as_ref().unwrap().by_the_editor());
+    press(&mut harness, "Actualiser");
+    wait_for(&mut harness, "the refresh", |h| !h.state().waiting_for_server());
+    // The row still says when the site connected, as the editor saw it: never that it did not.
+    click(&mut harness, "Applications");
+    assert!(has(&harness, "(mon-site/1.0)") && !has(&harness, "Testée depuis l'éditeur"));
 }
 
 #[test]
@@ -396,13 +426,15 @@ fn a_web_page_gets_a_read_only_token_and_its_website() {
     press(&mut harness, "Nouveau jeton en lecture seule, pour une page web");
     wait_for(&mut harness, "the token card", |h| has(h, "Nouveau jeton en lecture seule pour shop"));
     assert!(has(&harness, "Aucun site ne peut encore appeler cette application"));
-    assert!(has(&harness, "Collez ceci dans le script de la page"));
+    assert!(has(&harness, "Collez ceci dans le HTML de la page"));
     click(&mut harness, "Copier pour la page web");
     let page = clipboard.copies().pop().unwrap();
     assert!(
         page.contains(&format!("const NUAGE_URL = \"{}\";", running.address)) && page.contains("/v1/sql"),
         "{page}"
     );
+    // Its `await` stands outside a function: a module script, ready to paste in the HTML.
+    assert!(page.starts_with("<script type=\"module\">") && page.ends_with("</script>"), "{page}");
     let token = token_in(&page);
     let shop = client(&running.address, ADMIN, Lang::En);
     assert!(shop.ping_with(&Secret::new(token.clone())).unwrap().read_only());
@@ -424,24 +456,29 @@ fn a_web_page_gets_a_read_only_token_and_its_website() {
     click(&mut harness, "Ajouter");
     assert!(has(&harness, "https://monsite.fr est déjà autorisé."));
 
-    // Revoked after asking: Escape keeps the token.
-    let revokes = harness.query_all_by_role_and_label(Role::Button, "Révoquer").count();
-    assert_eq!(revokes, 2, "shop's first token, and the read-only one");
-    harness.query_all_by_role_and_label(Role::Button, "Révoquer").last().unwrap().click();
+    // Revoked after asking: Escape keeps the token. Each button says which token it revokes.
+    let listed = running.server.apps().into_iter().find(|a| a.name == "shop").unwrap().tokens;
+    assert_eq!(listed.len(), 2, "shop's first token, and the read-only one");
+    for t in &listed {
+        let name = format!("Révoquer nuage_{}…", t.id);
+        assert_eq!(harness.query_all_by_role_and_label(Role::Button, &name).count(), 1, "{name}");
+    }
+    let reader = format!("Révoquer nuage_{}…", listed.iter().find(|t| token.contains(&t.id)).unwrap().id);
+    harness.get_by_role_and_label(Role::Button, &reader).click();
     harness.run();
     assert!(has(&harness, "Révoquer ce jeton ?"));
     harness.key_press(egui::Key::Escape);
     harness.run();
     assert!(!has(&harness, "Révoquer ce jeton ?"), "Escape keeps it");
     assert!(shop.ping_with(&Secret::new(token.clone())).is_ok());
-    harness.query_all_by_role_and_label(Role::Button, "Révoquer").last().unwrap().click();
+    harness.get_by_role_and_label(Role::Button, &reader).click();
     harness.run();
     press_last(&mut harness, "Révoquer");
     wait_for(&mut harness, "the revocation", |h| has(h, "révoqué : il n'ouvre plus rien"));
     assert_eq!(shop.ping_with(&Secret::new(token)).unwrap_err(), ApiError::TokenRefused);
 
-    // The website removed: none may call it any more.
-    press(&mut harness, "Retirer");
+    // The website removed (its button says which): none may call it any more.
+    press(&mut harness, "Retirer https://monsite.fr");
     wait_for(&mut harness, "the removal", |h| has(h, "Plus aucun site ne peut appeler shop"));
     assert!(running.server.apps().into_iter().find(|a| a.name == "shop").unwrap().origins.is_empty());
 }
@@ -546,6 +583,22 @@ fn without_a_password_store_nothing_is_kept() {
 }
 
 #[test]
+fn a_server_stays_listed_until_the_store_forgets_its_token() {
+    // The store refuses (locked, Allow denied): the server stays, Forget can be pressed again.
+    let address = "https://nuage.example.com";
+    let kept = Prefs { servers: vec![SavedServer { token_kept: true, ..SavedServer::at(address) }], ..french() };
+    let mut harness = window(kept, Arc::new(Unavailable("the keyring is locked".into())), FakeSink::default());
+    // Each Forget says which server it forgets.
+    click(&mut harness, &format!("Oublier {address}"));
+    assert!(has(&harness, "Oublier ce serveur ?"));
+    press_last(&mut harness, "Oublier");
+    wait_for(&mut harness, "the store's answer", |h| has(h, "the keyring is locked"));
+    assert!(has(&harness, "Le gestionnaire de mots de passe n'a pas oublié le jeton"));
+    assert_eq!(harness.state().prefs.servers, vec![SavedServer { token_kept: true, ..SavedServer::at(address) }]);
+    assert!(harness.query_by_label(&format!("Oublier {address}")).is_some(), "it can be pressed again");
+}
+
+#[test]
 fn a_token_the_store_no_longer_has() {
     // Removed from the store by hand (the system's password manager): said, and the field comes back.
     let kept =
@@ -558,49 +611,109 @@ fn a_token_the_store_no_longer_has() {
     assert_eq!(harness.query_all_by_role(Role::PasswordInput).count(), 1);
 }
 
+/// The sections of a connected server, in `lang` (Overview last: the page left open).
+fn sections(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Fr => &[
+            "Applications",
+            "Mémoire",
+            "Limites et visibilité",
+            "Réglés au démarrage",
+            "Outils",
+            "À propos",
+            "Vue d'ensemble",
+        ],
+        Lang::Es => &[
+            "Aplicaciones",
+            "Memoria",
+            "Límites y visibilidad",
+            "Definidos al arrancar",
+            "Herramientas",
+            "Acerca de",
+            "Resumen",
+        ],
+        Lang::En => &["Applications", "Memory", "Limits and visibility", "Started with", "Tools", "About", "Overview"],
+    }
+}
+
+/// What the window shows lies within its width: the pages scroll downwards
+/// only, so whatever passes the right edge could be neither read nor reached.
+fn fits_across(harness: &egui_kittest::Harness<'_, nuage_editor::Editor>, what: &str) {
+    let width = harness.ctx.content_rect().width();
+    for node in harness.root().children_recursive() {
+        let role = node.accesskit_node().role();
+        let shown = [
+            Role::Label,
+            Role::Button,
+            Role::Link,
+            Role::TextInput,
+            Role::PasswordInput,
+            Role::CheckBox,
+            Role::ComboBox,
+        ];
+        if shown.contains(&role) {
+            let rect = node.rect();
+            assert!(
+                rect.min.x >= -0.5 && rect.max.x <= width + 0.5,
+                "{what}: {role:?} {:?} spans x {}..{} in a window {width} wide",
+                node.accesskit_node().label().or(node.accesskit_node().value()),
+                rect.min.x,
+                rect.max.x
+            );
+        }
+    }
+}
+
+/// The window at `size`, in `prefs`, connected to `running` with its management token.
+fn connected_at(
+    running: &Running,
+    prefs: Prefs,
+    size: [f32; 2],
+) -> egui_kittest::Harness<'static, nuage_editor::Editor> {
+    let (address, token, connect) = match prefs.lang.unwrap_or_default() {
+        Lang::Fr => ("Adresse du serveur", "Jeton de gestion", "Se connecter"),
+        Lang::Es => ("Dirección del servidor", "Token de gestión", "Conectar"),
+        Lang::En => ("Server address", "Management token", "Connect"),
+    };
+    let setup = Setup::with(Arc::new(MemoryVault::default()), Box::new(FakeSink::default()));
+    let mut harness = sized(prefs, setup, size);
+    fits_across(&harness, "the start");
+    type_into(&mut harness, address, &running.address);
+    type_into(&mut harness, token, ADMIN);
+    press(&mut harness, connect);
+    wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
+    harness
+}
+
+/// Opens each section from the panel (it scrolls when the window is short), and
+/// checks that its page opened, and fits.
+fn every_page_fits(harness: &mut egui_kittest::Harness<'static, nuage_editor::Editor>, lang: Lang, what: &str) {
+    for section in sections(lang) {
+        let before = harness.state().section();
+        click(harness, section);
+        assert!(harness.state().failure().is_none(), "{what} {section}: {:?}", harness.state().failure());
+        assert_ne!(harness.state().section(), before, "{what}: {section} did not open");
+        fits_across(harness, &format!("{what}, {section}"));
+    }
+    click(harness, sections(lang)[0]);
+    click(harness, "ma-boutique-en-ligne-des-vacances");
+    fits_across(harness, &format!("{what}, an application's page"));
+    click(harness, sections(lang)[0]);
+}
+
 #[test]
 fn the_pages_fit_the_smallest_window_and_every_language() {
     // 640×480, the window's smallest, in the longest languages and both themes: every
-    // page draws (a missing glyph or translation would stop it), the token card included.
+    // page draws (a missing glyph or translation would stop it), fits the width, and its
+    // section can be reached, the token card included.
     let running = start("small");
+    // The name suggested for "Ma boutique en ligne des vacances": a long one.
+    client(&running.address, ADMIN, Lang::En).create_application("ma-boutique-en-ligne-des-vacances", "").unwrap();
     for (lang, theme) in [(Lang::Fr, nuage_editor::app::Theme::Dark), (Lang::Es, nuage_editor::app::Theme::Light)] {
         let prefs = Prefs { lang: Some(lang), theme, ..Prefs::default() };
-        let setup = Setup::with(Arc::new(MemoryVault::default()), Box::new(FakeSink::default()));
-        let mut harness = sized(prefs, setup, [640.0, 480.0]);
-        let (address, token, connect) = match lang {
-            Lang::Fr => ("Adresse du serveur", "Jeton de gestion", "Se connecter"),
-            _ => ("Dirección del servidor", "Token de gestión", "Conectar"),
-        };
-        type_into(&mut harness, address, &running.address);
-        type_into(&mut harness, token, ADMIN);
-        press(&mut harness, connect);
-        wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
-        let sections: &[&str] = match lang {
-            Lang::Fr => &[
-                "Applications",
-                "Mémoire",
-                "Limites et visibilité",
-                "Réglés au démarrage",
-                "Outils",
-                "À propos",
-                "Vue d'ensemble",
-            ],
-            _ => &[
-                "Aplicaciones",
-                "Memoria",
-                "Límites y visibilidad",
-                "Definidos al arrancar",
-                "Herramientas",
-                "Acerca de",
-                "Resumen",
-            ],
-        };
-        for section in sections {
-            click(&mut harness, section);
-            assert!(harness.state().failure().is_none(), "{lang:?} {section}: {:?}", harness.state().failure());
-        }
+        let mut harness = connected_at(&running, prefs, [640.0, 480.0]);
+        every_page_fits(&mut harness, lang, &format!("{lang:?} 640×480"));
         // The token card: its buttons stay reachable in the smallest window.
-        click(&mut harness, sections[0]);
         click(&mut harness, "shop");
         let new =
             if lang == Lang::Fr { "Nouveau jeton (lecture et écriture)" } else { "Nuevo token (lectura y escritura)" };
@@ -619,6 +732,34 @@ fn the_pages_fit_the_smallest_window_and_every_language() {
         harness.get_by_role_and_label(Role::Button, close).click();
         harness.run();
         assert!(harness.state().failure().is_none());
+    }
+}
+
+#[test]
+fn the_default_window_shows_the_lock_and_a_larger_text_still_fits() {
+    let running = start("default-size");
+    client(&running.address, ADMIN, Lang::En).create_application("ma-boutique-en-ligne-des-vacances", "").unwrap();
+    // The window as it opens (1000×760): whether the token crosses the network in clear is
+    // always said in words, beside the address, never under the language and the theme.
+    for (lang, lock) in
+        [(Lang::En, "Not encrypted: this computer only"), (Lang::Fr, "Non chiffré : cet ordinateur seulement")]
+    {
+        let mut harness = connected_at(&running, in_lang(lang), [1000.0, 760.0]);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 760.0));
+        let word = harness.get_by_label(lock).rect();
+        assert!(window.contains_rect(word), "{lang:?}: the lock at {word:?}");
+        for combo in harness.query_all_by_role(Role::ComboBox) {
+            assert!(!combo.rect().intersects(word), "{lang:?}: {:?} over the lock", combo.accesskit_node().label());
+        }
+        every_page_fits(&mut harness, lang, &format!("{lang:?} 1000×760"));
+    }
+    // A larger text: 150 % in the window as it opens, then in the smallest one, where the
+    // sections scroll and each still opens.
+    for size in [[1000.0, 760.0], [640.0, 480.0]] {
+        let prefs = Prefs { text_size: 150, ..french() };
+        let mut harness = connected_at(&running, prefs, size);
+        assert!(harness.query_by_label("Non chiffré : cet ordinateur seulement").is_some());
+        every_page_fits(&mut harness, Lang::Fr, &format!("150 % {size:?}"));
     }
 }
 

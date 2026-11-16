@@ -20,14 +20,16 @@ pub use tools::genkey;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 use zeroize::Zeroizing;
 
 use crate::address::{self, Class};
-use crate::api::{self, ApiError, Application, Caps, Connected, Connection, Ping, Server, Settings, Status, Transport};
+use crate::api::{
+    self, ApiError, Application, Caps, Connected, Connection, LastConnection, Ping, Server, Settings, Status, Transport,
+};
 use crate::clip::{ArboardSink, Copied, CopySink, FakeSink};
 use crate::format;
 use crate::guard::{self, Failure};
@@ -206,9 +208,18 @@ enum Given {
     File(Secret),
 }
 
-/// What a connection comes back with: the server, and how keeping its
-/// token went (`None`: it was not asked).
-type Connecting = (Connected, Option<Result<(), String>>);
+/// The most servers "Servers you used" lists (those whose token is kept stay
+/// until they are forgotten: their entry in the password store would be left behind).
+const MAX_SERVERS: usize = 8;
+
+/// A management token being written to the password store, once its
+/// connection was taken (never before: a connection given up keeps nothing).
+struct Keeping {
+    address: String,
+    job: Job<Result<(), String>>,
+    /// "Forget everything" came meanwhile: what is written is deleted again.
+    forgotten: Arc<AtomicBool>,
+}
 
 /// A read of the settings file of this computer, and, when it is for
 /// administrators only, whether the system can ask for one (else why not).
@@ -252,13 +263,16 @@ struct ConnectForm {
     cleartext_ok: Option<String>,
     /// The public address (`SITE_URL`) of the server of this computer: its address, and it.
     public: Option<(String, String)>,
-    job: Option<Job<Connecting>>,
+    job: Option<Job<Connected>>,
     /// The step the connection running is at ([`api::Step`]).
     step: Arc<AtomicU8>,
     /// The connection running uses the kept token.
     with_kept: bool,
     /// The connection running was read from this computer's settings file.
     with_local: bool,
+    /// The token of the connection running is kept once it is taken
+    /// ("Remember on this computer", as it was ticked when it started).
+    with_remember: bool,
     notice: Option<Notice>,
     /// The last connection failed: the ways on are offered.
     failed: bool,
@@ -368,6 +382,15 @@ impl Reveal {
     }
 }
 
+/// A new token asked for an application: the tokens it had then, and
+/// whether the answer was lost on the way (a token may have been made that
+/// nobody has).
+struct TokenAsked {
+    app: String,
+    known: Vec<String>,
+    lost: bool,
+}
+
 /// A token about to be revoked: its owner confirms.
 struct Confirm {
     app: String,
@@ -390,6 +413,9 @@ struct Session {
     settings_error: Option<ApiError>,
     apps: Option<Vec<Application>>,
     status: Option<Status>,
+    /// The last connection of each application that was not the editor's own
+    /// test, as the editor saw it (the server keeps only the last one).
+    sites: BTreeMap<String, LastConnection>,
     load_settings: Option<Job<Settings>>,
     load_apps: Option<Job<Vec<Application>>>,
     load_status: Option<Job<Status>>,
@@ -411,8 +437,10 @@ struct Session {
     name_typed: bool,
     /// Why the last creation failed, under its fields.
     new_error: Option<String>,
-    /// The application of the last creation that timed out: "Check" looks for it.
+    /// The application of the last creation whose answer was lost: "Check" looks for it.
     unsure: Option<String>,
+    /// The last new token asked.
+    token_asked: Option<TokenAsked>,
     /// The website being added, and why the last change of websites failed.
     origin_field: String,
     origin_error: Option<String>,
@@ -422,7 +450,7 @@ struct Session {
 
 impl Session {
     fn new(connected: Connected, local: bool, lang: Lang, calls: Calls) -> Session {
-        let Connected { server, apps, settings, settings_error, status } = connected;
+        let Connected { server, apps, settings, settings_error, status, status_error } = connected;
         let mut session = Session {
             server,
             local,
@@ -432,11 +460,13 @@ impl Session {
             settings: None,
             settings_error,
             apps: Some(apps),
-            status,
+            status: None,
+            sites: BTreeMap::new(),
             load_settings: None,
             load_apps: None,
             load_status: None,
-            stale: None,
+            // The status failed on the way: said, and asked again at Refresh.
+            stale: status_error,
             updated: Some((Instant::now(), format::now_ms())),
             action: None,
             notice: None,
@@ -448,6 +478,7 @@ impl Session {
             name_typed: false,
             new_error: None,
             unsure: None,
+            token_asked: None,
             origin_field: String::new(),
             origin_error: None,
             reveal: None,
@@ -456,7 +487,20 @@ impl Session {
         if let Some(settings) = settings {
             session.take_settings(settings, lang);
         }
+        if let Some(status) = status {
+            session.take_status(status);
+        }
         session
+    }
+
+    /// The server's status is in: the sites' connections are noted.
+    fn take_status(&mut self, status: Status) {
+        for db in &status.databases {
+            if let Some(c) = db.last_connection.as_ref().filter(|c| !c.by_the_editor()) {
+                self.sites.insert(db.name.clone(), c.clone());
+            }
+        }
+        self.status = Some(status);
     }
 
     /// The server's settings are in: the fields show them.
@@ -471,12 +515,17 @@ impl Session {
             };
             self.fields.insert(s.key.clone(), shown);
         }
-        self.public = settings.get("status.public").is_some_and(|s| s.shown() == "true");
         for a in &settings.applications {
             self.app_fields.insert(a.name.clone(), (format::amount(lang, a.cache_mb), format::amount(lang, a.kv_mb)));
         }
         self.settings = Some(settings);
         self.settings_error = None;
+        self.public_as_saved();
+    }
+
+    /// The "Public status" box as the server has it (also after a change of it that failed).
+    fn public_as_saved(&mut self) {
+        self.public = self.settings.as_ref().and_then(|s| s.get("status.public")).is_some_and(|s| s.shown() == "true");
     }
 
     /// Reads again what the pages show (after a change, on Refresh, on focus).
@@ -549,6 +598,10 @@ struct Generated {
     copied: Option<Copied>,
 }
 
+/// A kept token forgotten: its address, whether its server goes from the
+/// list once it is, and the store's answer.
+type Forgetting = (String, bool, Result<(), String>);
+
 /// How forgetting each kept token went: its address, and the store's answer.
 type Forgotten = Vec<(String, Result<(), String>)>;
 
@@ -557,6 +610,8 @@ type Forgotten = Vec<(String, Result<(), String>)>;
 struct TokenTest {
     address: String,
     token: Zeroizing<String>,
+    /// The address whose plain http was accepted, for the next test only.
+    cleartext_ok: Option<String>,
     job: Option<Job<Ping>>,
     answer: Option<Result<Ping, ApiError>>,
 }
@@ -574,10 +629,13 @@ pub struct Editor {
     /// Whether tokens can be kept (`None`: still asking the system).
     vault_status: Option<Result<(), String>>,
     vault_job: Option<Job<Result<(), String>>>,
-    /// A kept token being forgotten: its address, and how it went.
-    forget_job: Option<Job<(String, Result<(), String>)>>,
+    /// A kept token being forgotten.
+    forget_job: Option<Job<Forgetting>>,
     /// Everything being forgotten (About): how it went for each address.
     forget_all_job: Option<Job<Forgotten>>,
+    /// The tokens of the servers just connected to, being kept (each is
+    /// waited for: one dropped would be kept with nothing in the window to forget it).
+    keeping: Vec<Keeping>,
     old_file_job: Option<Job<Result<bool, String>>>,
     clipboard: Box<dyn CopySink>,
     transport: Transport,
@@ -645,6 +703,7 @@ impl Editor {
             vault_job: None,
             forget_job: None,
             forget_all_job: None,
+            keeping: Vec::new(),
             old_file_job: None,
             clipboard: setup.clipboard,
             transport: setup.transport,
@@ -697,6 +756,12 @@ impl Editor {
         self.session.as_ref().map(|s| s.server.address())
     }
 
+    /// The page shown: a section of the server connected to, or one opened
+    /// before connecting (`None`: the start).
+    pub fn section(&self) -> Option<Section> {
+        self.session.as_ref().map(|s| s.section).or(self.aside)
+    }
+
     /// What the server connected to has.
     pub fn caps(&self) -> Option<&Caps> {
         self.session.as_ref().map(|s| s.server.caps())
@@ -707,9 +772,10 @@ impl Editor {
         self.vault_status.as_ref()
     }
 
-    /// Whether a call of the connected server is still on its way.
+    /// Whether a call for the connected server (to it, or keeping its token)
+    /// is still on its way.
     pub fn waiting_for_server(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.busy() || s.loading())
+        !self.keeping.is_empty() || self.session.as_ref().is_some_and(|s| s.busy() || s.loading())
     }
 
     /// Whether the search for a server installed on this computer is over.
@@ -816,11 +882,16 @@ impl Editor {
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, l));
         if self.session.is_some() {
-            egui::Panel::left("sections").resizable(false).show(ui, |ui| self.sections(ui, l));
+            egui::Panel::left("sections").resizable(false).show(ui, |ui| {
+                // Its last buttons stay within reach in a small window, or with a larger text.
+                egui::ScrollArea::vertical().auto_shrink([true, false]).show(ui, |ui| self.sections(ui, l));
+            });
         }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                ui.set_max_width(900.0);
+                // 900 at most, for lines that read well; never wider than the window
+                // (this scrolls only downwards: what is past its right edge is lost).
+                ui.set_max_width(ui.available_width().min(900.0));
                 self.page(ui, l);
             });
         });
@@ -936,6 +1007,7 @@ impl Editor {
         self.connect.job.is_some()
             || self.connect.local_job.is_some()
             || self.vault_job.is_some()
+            || !self.keeping.is_empty()
             || self.starting.is_some()
             || self.session.as_ref().is_some_and(|s| s.busy() || s.loading())
     }
@@ -984,10 +1056,11 @@ impl Editor {
             self.here = Some(answer.unwrap_or_default());
         }
         self.poll_forget(l);
-        self.poll_tools(l);
+        self.poll_tools(ctx, l);
         if let Some(answer) = take(&mut self.connect.job) {
             self.connected(ctx, answer);
         }
+        self.poll_keeping(l);
         if let Some(answer) = take(&mut self.connect.local_job) {
             self.connect.local_stop = None;
             match answer {
@@ -995,6 +1068,8 @@ impl Editor {
                 Ok((Err(local::ReadError::NeedsAdministrator(file)), can_ask)) => {
                     self.connect.needs_admin = Some((file, can_ask.unwrap_or(Ok(()))));
                     self.connect.asking = true;
+                    // Ticked on this card, where it is shown (else the system asks at every
+                    // start); unticked again once connected, or when the card is cancelled.
                     self.connect.remember = true;
                 }
                 Ok((Err(e), _)) => {
@@ -1034,7 +1109,12 @@ impl Editor {
         if let Some(answer) = take(&mut session.load_status) {
             done = true;
             match answer {
-                Ok(status) => session.status = Some(status),
+                Ok(status) => {
+                    session.server.learned_status(Some(status.version.clone()));
+                    session.take_status(status);
+                }
+                // Never read since connecting, and the server's own no: an older server after all.
+                Err(e) if session.status.is_none() && e.from_the_server() => session.server.learned_status(None),
                 Err(ApiError::TokenRefused) => refused = true,
                 Err(e) => session.stale = Some(e),
             }
@@ -1047,49 +1127,99 @@ impl Editor {
             match answer {
                 Ok(outcome) => took(ctx, session, outcome, l),
                 Err(ApiError::TokenRefused) => refused = true,
-                Err(ApiError::Timeout { .. }) => {
-                    // A write without an answer may have been made: what is in force is read again.
-                    let text = if doing == Doing::Create {
-                        session.unsure = Some(session.new_name.trim().to_owned());
-                        t(l, "The server did not answer in time. The application may have been created anyway.")
-                    } else {
-                        t(
-                            l,
-                            "The server did not answer in time: the change may or may not have been made. The page is read again to show what is in force.",
-                        )
-                    };
-                    session.notice = Some(Notice::bad(text));
-                    session.reload(ctx);
-                }
+                Err(e) if e.change_unknown() => unknown_change(ctx, session, doing, &e, l),
                 Err(e) => failed_change(ctx, session, doing, &e, l),
             }
         }
         if refused {
             // Back to the start: the token was changed on the server.
-            let address = session.server.address().to_owned();
+            let (address, local) = (session.server.address().to_owned(), session.local);
             self.session = None;
             self.connect.address = address;
             self.connect.use_kept = false;
             self.connect.failed = true;
-            self.connect.notice = Some(Notice::bad(t(
-                l,
-                "The server no longer accepts this token: it was changed on the server. Type the new one.",
-            )));
+            self.connect.notice = Some(Notice::bad(if local {
+                // Its token was read from the settings file, never typed: read it again.
+                t(
+                    l,
+                    "The server no longer accepts this token: it was changed in its settings file. Open it again from On this computer: the editor reads the new token from the file.",
+                )
+            } else {
+                t(l, "The server no longer accepts this token: it was changed on the server. Type the new one.")
+            }));
         }
+    }
+
+    /// The answers of the password store, for the tokens of the servers just connected to.
+    fn poll_keeping(&mut self, l: Lang) {
+        let mut answers = Vec::new();
+        self.keeping.retain(|k| match k.job.poll() {
+            Some(answer) => {
+                answers.push((k.address.clone(), answer));
+                false
+            }
+            None => true,
+        });
+        for (address, answer) in answers {
+            let why = match answer {
+                Ok(Ok(())) => {
+                    for s in self.prefs.servers.iter_mut().filter(|s| s.address == address) {
+                        s.token_kept = true;
+                    }
+                    if self.typed_base().as_deref() == Some(address.as_str()) {
+                        self.connect.use_kept = true;
+                    }
+                    continue;
+                }
+                Ok(Err(why)) => why,
+                Err(e) => e.explain(l),
+            };
+            let notice = Notice::warn(tf(
+                l,
+                "Connected, but the token could not be kept in {} ({}): it is used until you close the editor.",
+                &[&self.vault.store().place(l), &why],
+            ));
+            match self.session.as_mut().filter(|s| s.server.address() == address) {
+                Some(session) => session.notice = Some(notice),
+                None => self.connect.notice = Some(notice),
+            }
+        }
+    }
+
+    /// Writes the token of `server`, just connected to, in the password store (on a job:
+    /// the system may show an Allow window, or ask to unlock the keyring).
+    fn keep(&mut self, ctx: &egui::Context, server: &Server) {
+        let (vault, server) = (self.vault.clone(), server.clone());
+        let address = server.address().to_owned();
+        let forgotten = Arc::new(AtomicBool::new(false));
+        let undo = forgotten.clone();
+        let job = Job::start(ctx, &self.calls, move || {
+            let kept = vault.set(server.address(), server.token());
+            // "Forget everything" came while it was written: its own delete may have run first.
+            if undo.load(Ordering::SeqCst) {
+                let _ = vault.delete(server.address());
+            }
+            Ok(kept)
+        });
+        self.keeping.push(Keeping { address, job, forgotten });
     }
 
     /// The answers of the jobs that forget kept tokens.
     fn poll_forget(&mut self, l: Lang) {
         if let Some(answer) = take(&mut self.forget_job) {
             match answer {
-                Ok((address, Ok(()))) => {
+                Ok((address, drop, Ok(()))) => {
+                    if drop {
+                        self.prefs.servers.retain(|s| s.address != address);
+                    }
                     for s in self.prefs.servers.iter_mut().filter(|s| s.address == address) {
                         s.token_kept = false;
                     }
                     self.connect.notice =
                         Some(Notice::ok(t(l, "Token forgotten: it is no longer kept on this computer.")));
                 }
-                Ok((_, Err(why))) => {
+                // The server stays in the list, its token marked kept: Forget can be pressed again.
+                Ok((_, _, Err(why))) => {
                     self.connect.notice =
                         Some(Notice::bad(tf(l, "The password store did not forget the token: {}", &[&why])))
                 }
@@ -1110,7 +1240,7 @@ impl Editor {
             } else {
                 Notice::bad(tf(
                     l,
-                    "The token of {} could not be removed from {}. Remove the entry io.github.maxlestage.nuage-editor yourself in Keychain Access, Credential Manager or your keyring.",
+                    "The token of {} could not be removed: it is still in {}. Remove the entry io.github.maxlestage.nuage-editor yourself in Keychain Access, Credential Manager or your keyring.",
                     &[&failed.join(", "), &store],
                 ))
             });
@@ -1118,31 +1248,32 @@ impl Editor {
     }
 
     /// A connection came back.
-    fn connected(&mut self, ctx: &egui::Context, answer: Result<Connecting, ApiError>) {
+    fn connected(&mut self, ctx: &egui::Context, answer: Result<Connected, ApiError>) {
         let l = self.lang();
         let with_kept = std::mem::take(&mut self.connect.with_kept);
         let with_local = std::mem::take(&mut self.connect.with_local);
+        let with_remember = std::mem::take(&mut self.connect.with_remember);
         match answer {
-            Ok((connected, kept)) => {
+            Ok(connected) => {
                 let address = connected.server.address().to_owned();
-                let was_kept = self.saved(&address).is_some_and(|s| s.token_kept);
-                let mut notice = None;
-                let token_kept = match kept {
-                    Some(Ok(())) => true,
-                    Some(Err(why)) => {
-                        notice = Some(Notice::warn(tf(
-                            l,
-                            "Connected, but the token could not be kept in {} ({}): it is used until you close the editor.",
-                            &[&self.vault.store().place(l), &why],
-                        )));
-                        was_kept
-                    }
-                    None => was_kept || with_kept,
-                };
+                // Counted as kept once the store says it is (see poll_keeping).
+                let token_kept = with_kept || self.saved(&address).is_some_and(|s| s.token_kept);
+                if with_remember {
+                    self.keep(ctx, &connected.server);
+                }
                 let local = with_local || self.saved(&address).is_some_and(|s| s.local);
                 self.prefs.servers.retain(|s| s.address != address);
                 self.prefs.servers.insert(0, SavedServer { address: address.clone(), token_kept, local });
-                self.prefs.servers.truncate(8);
+                // The oldest go first; never the one just used.
+                while self.prefs.servers.len() > MAX_SERVERS {
+                    let oldest = self.prefs.servers.iter().enumerate().skip(1).rev().find(|(_, s)| !s.token_kept);
+                    match oldest.map(|(i, _)| i) {
+                        Some(i) => {
+                            self.prefs.servers.remove(i);
+                        }
+                        None => break,
+                    }
+                }
                 // The typed token is wiped (Zeroizing), and egui's state of its field with it.
                 self.connect.token = Zeroizing::new(String::new());
                 ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(token_field()));
@@ -1150,14 +1281,14 @@ impl Editor {
                 self.connect.show_token = false;
                 self.connect.cleartext_ok = None;
                 self.connect.use_kept = token_kept;
+                // A choice for that connection: the next one asks again.
+                self.connect.remember = false;
                 self.connect.notice = None;
                 self.connect.failed = false;
                 self.connect.read_note = None;
                 self.connect.asking = false;
                 self.aside = None;
-                let mut session = Session::new(connected, local, l, self.calls.clone());
-                session.notice = notice;
-                self.session = Some(session);
+                self.session = Some(Session::new(connected, local, l, self.calls.clone()));
             }
             Err(ApiError::TokenRefused) if with_kept => {
                 // Kept until a new one works: never deleted without a word.
@@ -1267,6 +1398,8 @@ impl Editor {
         self.connect.step = step.clone();
         self.connect.with_kept = token.is_none();
         self.connect.with_local = with_local;
+        // Kept once it worked and its answer is taken: "Stop waiting" keeps nothing.
+        self.connect.with_remember = remember;
         self.connect.notice = None;
         self.connect.failed = false;
         self.connect.stepped = true;
@@ -1276,10 +1409,7 @@ impl Editor {
                 Some(token) => token,
                 None => vault.get(&base).map_err(ApiError::Keystore)?.ok_or(ApiError::NotKept)?,
             };
-            let connected = Server::new(&base, token, l, &transport)?.with_public(public).connect_reporting(&step)?;
-            // Kept only once it worked.
-            let kept = remember.then(|| vault.set(connected.server.address(), connected.server.token()));
-            Ok((connected, kept))
+            Server::new(&base, token, l, &transport)?.with_public(public).connect_reporting(&step)
         }));
     }
 
@@ -1323,22 +1453,11 @@ impl Editor {
 
     fn top_bar(&mut self, ui: &mut egui::Ui, l: Lang) {
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(t(l, "Nuage DB Editor")).strong().size(17.0));
-            ui.separator();
-            let connected = self.session.as_ref().map(|s| (s.server.address().to_owned(), s.busy()));
-            match &connected {
-                Some((address, _)) => {
-                    theme::mark(ui, Mark::On);
-                    ui.label(tf(l, "Connected to {}", &[&host_of(address)]));
-                    let (m, lock) = lock(l, address);
-                    theme::status(ui, m, lock);
-                }
-                None => {
-                    theme::mark(ui, Mark::Off);
-                    ui.label(t(l, "Not connected"));
-                }
-            }
+        // The language and the theme where there is room (About has them too): the
+        // address and its lock always show, never under them.
+        let roomy = ui.available_width() >= TOP_BAR_ROOMY;
+        let connected = self.session.as_ref().map(|s| (s.server.address().to_owned(), s.busy()));
+        ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((_, busy)) = connected {
                     // Not while a change is on its way: its answer would be lost.
@@ -1349,8 +1468,29 @@ impl Editor {
                         self.session = None;
                     }
                 }
-                self.theme_combo(ui, l);
-                self.lang_combo(ui, l);
+                if roomy {
+                    self.theme_combo(ui, l);
+                    self.lang_combo(ui, l, true);
+                }
+                // What is left of the width, wrapped onto a second line when it must.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
+                    if roomy {
+                        ui.label(RichText::new(t(l, "Nuage DB Editor")).strong().size(17.0));
+                        ui.separator();
+                    }
+                    match &connected {
+                        Some((address, _)) => {
+                            theme::mark(ui, Mark::On);
+                            ui.label(tf(l, "Connected to {}", &[&host_of(address)]));
+                            let (m, lock) = lock(l, address);
+                            theme::status(ui, m, lock);
+                        }
+                        None => {
+                            theme::mark(ui, Mark::Off);
+                            ui.label(t(l, "Not connected"));
+                        }
+                    }
+                });
             });
         });
         ui.add_space(2.0);
@@ -1366,9 +1506,11 @@ impl Editor {
         });
     }
 
-    fn lang_combo(&mut self, ui: &mut egui::Ui, l: Lang) {
+    /// The language; `short`: the combo says only the language in use, in its own words.
+    fn lang_combo(&mut self, ui: &mut egui::Ui, l: Lang, short: bool) {
+        let selected = if short { lang_label(l, Some(l)) } else { lang_label(l, self.prefs.lang) };
         ui.name_inputs(t(l, "Language"), |ui| {
-            egui::ComboBox::from_id_salt("lang").selected_text(lang_label(l, self.prefs.lang)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("lang").selected_text(selected).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.prefs.lang, None, lang_label(l, None));
                 for lang in Lang::ALL {
                     ui.selectable_value(&mut self.prefs.lang, Some(lang), lang_label(l, Some(lang)));
@@ -1423,6 +1565,9 @@ impl Editor {
         self.quit_dialog(ctx, l);
     }
 }
+
+/// The width (in points) from which the top bar has the language and the theme.
+const TOP_BAR_ROOMY: f32 = 760.0;
 
 /// The host of an address, as the top bar names the server.
 fn host_of(address: &str) -> String {
@@ -1484,10 +1629,15 @@ fn took(ctx: &egui::Context, session: &mut Session, outcome: Outcome, l: Lang) {
         }
         Outcome::Token { app, read_only, connection, lan } => {
             let notice = tf(l, "New token for {}.", &[&app]);
+            session.token_asked = None;
             session.reveal = Some(Reveal::new(app, Made::Token, read_only, connection, lan));
             Notice::ok(notice)
         }
         Outcome::Revoked { app, id } => {
+            // The token nobody has, once revoked, is no longer said.
+            if session.token_asked.as_ref().is_some_and(|a| a.app == app && !a.known.contains(&id)) {
+                session.token_asked = None;
+            }
             Notice::ok(tf(l, "Token {}… of {} revoked: it opens nothing any more.", &[&id, &app]))
         }
         Outcome::Memory(app) => Notice::ok(tf(l, "Memory of {} saved: in force now.", &[&app.name])),
@@ -1511,9 +1661,54 @@ fn took(ctx: &egui::Context, session: &mut Session, outcome: Outcome, l: Lang) {
     session.reload(ctx);
 }
 
+/// The answer of a change was lost on the way (a timeout, a reset, a page of
+/// the host): it may or may not have been made. What is in force is read
+/// again, and a secret that may have been made without reaching the editor
+/// (a new application's token, a new token) is said.
+fn unknown_change(ctx: &egui::Context, session: &mut Session, doing: Doing, e: &ApiError, l: Lang) {
+    let timeout = matches!(e, ApiError::Timeout { .. });
+    let text = match doing {
+        Doing::Create => {
+            session.unsure = Some(session.new_name.trim().to_owned());
+            if timeout {
+                t(l, "The server did not answer in time. The application may have been created anyway.").to_owned()
+            } else {
+                format!("{} {}", e.explain(l), t(l, "The application may have been created anyway: the list is read again."))
+            }
+        }
+        _ if timeout => t(
+            l,
+            "The server did not answer in time: the change may or may not have been made. The page is read again to show what is in force.",
+        )
+        .to_owned(),
+        _ => format!(
+            "{} {}",
+            e.explain(l),
+            t(l, "The change may or may not have been made: the page is read again to show what is in force.")
+        ),
+    };
+    if doing == Doing::Token
+        && let Some(asked) = session.token_asked.as_mut()
+    {
+        asked.lost = true;
+    }
+    if doing == Doing::Settings {
+        session.public_as_saved();
+    }
+    session.notice = Some(Notice::bad(text));
+    session.reload(ctx);
+}
+
 /// A change was refused: said where it was asked.
 fn failed_change(ctx: &egui::Context, session: &mut Session, doing: Doing, e: &ApiError, l: Lang) {
     let said = e.explain(l);
+    match doing {
+        // Refused: nothing was made.
+        Doing::Token => session.token_asked = None,
+        // The box shows what the server has, not what was asked.
+        Doing::Settings => session.public_as_saved(),
+        _ => {}
+    }
     match (doing, e) {
         (Doing::Create, ApiError::Conflict(_)) => {
             session.new_error = Some(tf(
@@ -1595,7 +1790,7 @@ fn notices(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
         notice(ui, n);
     }
     if let Some((doing, action)) = &session.action {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spinner();
             let what = match doing {
                 Doing::Create => t(l, "Creating…"),

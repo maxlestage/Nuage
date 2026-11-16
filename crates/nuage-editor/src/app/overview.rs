@@ -45,10 +45,15 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
                     ));
                     help(
                         ui,
-                        t(
-                            l,
-                            "Newer versions of Nuage DB tell the editor their version, their memory and whether the last backup worked: update the server to see it here.",
-                        ),
+                        if caps.status {
+                            // It has a status: the last read of it failed on the way.
+                            t(l, "Its version, its memory and its backups could not be read this time: Refresh asks again.")
+                        } else {
+                            t(
+                                l,
+                                "Newer versions of Nuage DB tell the editor their version, their memory and whether the last backup worked: update the server to see it here.",
+                            )
+                        },
                     );
                 }
             }
@@ -79,8 +84,12 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             theme::subheading(ui, t(l, "Backups"));
-            for (m, line) in backups(l, status.as_ref(), settings.as_ref(), heroku, now) {
-                theme::status(ui, m, line);
+            if status.is_none() && caps.status {
+                help(ui, t(l, "Not read this time: Refresh asks again."));
+            } else {
+                for (m, line) in backups(l, status.as_ref(), settings.as_ref(), heroku, now) {
+                    theme::status(ui, m, line);
+                }
             }
             egui::CollapsingHeader::new(t(l, "How to change where they go")).id_salt("backup-where").show(ui, |ui| {
                 ui.label(t(

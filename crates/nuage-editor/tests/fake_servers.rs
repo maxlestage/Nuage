@@ -8,10 +8,12 @@ mod common;
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{click, has, type_into, wait_for, window};
+use common::{click, has, press, type_into, wait_for, window};
+use eframe::egui::accesskit::Toggled;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use nuage_editor::api::{self, ApiError, Caps, Transport};
 use nuage_editor::clip::FakeSink;
@@ -39,6 +41,10 @@ impl Request {
 
     fn bearer(&self) -> bool {
         self.header("authorization") == Some(format!("Bearer {ADMIN}").as_str())
+    }
+
+    fn method(&self) -> &str {
+        self.head.split_whitespace().next().unwrap_or_default()
     }
 }
 
@@ -385,4 +391,256 @@ fn plain_http_to_the_internet_waits_for_consent() {
     // The consent is for this time only: never in the preferences.
     let written = serde_json::to_string(&harness.state().prefs).unwrap();
     assert!(!written.contains("anyway") && !written.contains("cleartext"), "{written}");
+}
+
+/// The window in French, connected to the fake at `address`.
+fn connected_in_french(address: &str) -> egui_kittest::Harness<'static, nuage_editor::Editor> {
+    let prefs = Prefs { lang: Some(Lang::Fr), ..Prefs::default() };
+    let mut harness = window(prefs, Arc::new(MemoryVault::default()), FakeSink::default());
+    type_into(&mut harness, "Adresse du serveur", address);
+    type_into(&mut harness, "Jeton de gestion", ADMIN);
+    harness.get_by_label("Se connecter").click();
+    wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
+    harness
+}
+
+/// The test run again in a program of its own, whose environment has a proxy
+/// (`HTTPS_PROXY`, no `NO_PROXY`): its address, given to the child run.
+const PROXY_CHILD: &str = "NUAGE_EDITOR_TEST_SERVER_BEHIND_A_PROXY";
+
+#[test]
+fn a_proxy_is_for_the_internet_only() {
+    if let Ok(address) = std::env::var(PROXY_CHILD) {
+        // This computer is called directly: the proxy's own computer is not this one.
+        let connected = connect(&address).unwrap();
+        assert_eq!(connected.apps[0].name, "shop");
+        // An address on the Internet goes through it (the proxy here refuses it).
+        let public = client("https://nuage.example.com", &Transport::default()).health();
+        assert!(matches!(public, Err(ApiError::Network(_))), "{public:?}");
+        return;
+    }
+    let server = fake(older);
+    // A proxy that notes the first line of each connection, and refuses it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let noted = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // The request may come in pieces: up to the end of its headers.
+            let (mut head, mut buffer) = (Vec::new(), [0u8; 4096]);
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buffer[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            noted.lock().unwrap().push(head.lines().next().unwrap_or_default().to_owned());
+            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", "a_proxy_is_for_the_internet_only", "--test-threads=1"]).env(PROXY_CHILD, &server.address);
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        child.env(name, &proxy);
+    }
+    for name in ["NO_PROXY", "no_proxy"] {
+        child.env_remove(name);
+    }
+    let out = child.output().unwrap();
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"), "the child ran the test");
+    assert_eq!(*seen.lock().unwrap(), ["CONNECT nuage.example.com:443 HTTP/1.1"], "only the Internet's address");
+    let requests = server.requests();
+    assert!(requests.iter().any(|r| r.path == "/api/apps" && r.bearer()), "{requests:?}");
+}
+
+#[test]
+fn a_status_that_fails_on_the_way_is_asked_again() {
+    // A server that has the status, whose router answers its page once (it was waking).
+    let fail = Arc::new(AtomicBool::new(true));
+    let failing = fail.clone();
+    let fake = fake(move |request, base| match request.path.as_str() {
+        "/api/status" if failing.swap(false, Ordering::SeqCst) => {
+            reply("503 Service Unavailable", "text/html", "<html>Application error</html>")
+        }
+        "/api/status" if request.bearer() => json(
+            "200 OK",
+            serde_json::json!({ "version": "0.4.7", "uptime_s": 60, "backup": { "enabled": false, "last_ok": true },
+                                 "databases": [{ "name": "shop", "status": "ok" }] }),
+        ),
+        _ => older(request, base),
+    });
+    let connected = connect(&fake.address).unwrap();
+    assert!(connected.status.is_none() && connected.server.caps().status, "{:?}", connected.server.caps());
+    assert_eq!(connected.status_error, Some(ApiError::HostAnswered(503)));
+
+    // In the window: said, never taken for an older server, and asked again at Refresh.
+    fail.store(true, Ordering::SeqCst);
+    let mut harness = connected_in_french(&fake.address);
+    assert!(has(&harness, "Actualisation impossible : L'hébergeur a répondu 503"));
+    assert!(!has(&harness, "Les versions plus récentes de Nuage DB"), "not an older server");
+    press(&mut harness, "Actualiser");
+    wait_for(&mut harness, "the status", |h| has(h, "version 0.4.7"));
+    assert!(!has(&harness, "Actualisation impossible"));
+    click(&mut harness, "Applications");
+    click(&mut harness, "shop");
+    assert!(harness.query_by_label("Site à autoriser").is_some(), "its websites change here");
+    let asked = fake.requests().iter().filter(|r| r.path == "/api/status").count();
+    assert_eq!(asked, 3, "once by the API test, then at the connection and at Refresh");
+}
+
+#[test]
+fn a_change_whose_answer_is_lost_is_read_again() {
+    // Heroku's router gives up after 30 s with its own page, while the server goes on.
+    let made = Arc::new(Mutex::new((false, false)));
+    let state = made.clone();
+    let fake = fake(move |request, base| {
+        let router = || reply("503 Service Unavailable", "text/html", "<html>Application error</html>");
+        match (request.method(), request.path.as_str()) {
+            ("POST", "/api/apps") => {
+                state.lock().unwrap().0 = true;
+                router()
+            }
+            ("POST", "/api/apps/shop/tokens") => {
+                state.lock().unwrap().1 = true;
+                router()
+            }
+            ("GET", "/api/apps") if request.bearer() => {
+                let (app, token) = *state.lock().unwrap();
+                let mut shop_tokens =
+                    vec![serde_json::json!({ "id": "ab12cd34", "created_at": 1, "read_only": false })];
+                if token {
+                    shop_tokens.push(serde_json::json!({ "id": "99ff00aa", "created_at": 2, "read_only": false }));
+                }
+                let mut apps = vec![serde_json::json!({ "name": "shop", "first": true, "tokens": shop_tokens })];
+                if app {
+                    apps.push(serde_json::json!({ "name": "blog", "tokens": [{ "id": "ef567890", "created_at": 3 }] }));
+                }
+                json("200 OK", serde_json::json!({ "applications": apps }))
+            }
+            _ => older(request, base),
+        }
+    });
+    let mut harness = connected_in_french(&fake.address);
+    click(&mut harness, "Applications");
+    type_into(&mut harness, "À quoi sert-elle ?", "Blog");
+    press(&mut harness, "Créer l'application");
+    wait_for(&mut harness, "the answer", |h| {
+        has(h, "L'application a peut-être été créée quand même : la liste est relue")
+    });
+    // Read again: it was made, and its token never came.
+    assert!(has(&harness, "Elle a été créée, mais son jeton n'est jamais arrivé jusqu'à l'éditeur"));
+    click(&mut harness, "Ouvrir blog");
+    assert!(has(&harness, "jamais montré") && has(&harness, "Un jeton a été créé, mais il n'est jamais arrivé"));
+
+    // Another token, the same way: the one made, which nobody has, is marked.
+    click(&mut harness, "Applications");
+    click(&mut harness, "shop");
+    assert!(!has(&harness, "jamais montré"));
+    press(&mut harness, "Nouveau jeton (lecture et écriture)");
+    wait_for(&mut harness, "the answer", |h| has(h, "Le changement a peut-être été fait, ou peut-être pas"));
+    assert!(has(&harness, "jamais montré"), "the token made while the editor waited");
+    let marked = harness.query_all_by_label("jamais montré").count();
+    assert_eq!(marked, 1, "not the token it had before");
+}
+
+#[test]
+fn a_refused_change_of_the_public_status_puts_the_box_back() {
+    // Refused first (a value it does not take), then failing on the server's side.
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = posts.clone();
+    let fake = fake(move |request, base| match (request.method(), request.path.as_str()) {
+        ("GET", "/api/settings") if request.bearer() => json(
+            "200 OK",
+            serde_json::json!({ "read_only": false, "memory": {}, "applications": [], "startup": [],
+                "settings": [{ "key": "status.public", "variable": "NUAGE_PUBLIC_STATUS", "value": "false",
+                               "source": "default", "default": "false" }] }),
+        ),
+        ("POST", "/api/settings") if counted.fetch_add(1, Ordering::SeqCst) == 0 => {
+            json("400 Bad Request", serde_json::json!({ "error": { "kind": "invalid", "message": "not this one" } }))
+        }
+        ("POST", "/api/settings") => json(
+            "500 Internal Server Error",
+            serde_json::json!({ "error": { "kind": "internal", "message": "disk full" } }),
+        ),
+        _ => older(request, base),
+    });
+    let mut harness = connected_in_french(&fake.address);
+    click(&mut harness, "Limites et visibilité");
+    let label = "État public : /api/status et le tableau de bord montrent l'essentiel sans connexion";
+    assert_eq!(harness.get_by_label(label).accesskit_node().toggled(), Some(Toggled::False));
+    for answer in ["Non enregistré : (not this one)", "Le serveur a échoué (HTTP 500). (disk full)"] {
+        harness.get_by_label(label).click();
+        harness.step();
+        wait_for(&mut harness, answer, |h| has(h, answer));
+        // What the server has: still not public.
+        assert_eq!(harness.get_by_label(label).accesskit_node().toggled(), Some(Toggled::False), "{answer}");
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn stop_waiting_keeps_nothing() {
+    // A server that wakes slowly; "Remember" ticked; the person stops waiting.
+    let fake = fake(|request, base| {
+        if request.path == "/api/apps" {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        older(request, base)
+    });
+    let vault = Arc::new(MemoryVault::default());
+    let prefs = Prefs { lang: Some(Lang::Fr), ..Prefs::default() };
+    let mut harness = window(prefs, vault.clone(), FakeSink::default());
+    type_into(&mut harness, "Adresse du serveur", &fake.address);
+    type_into(&mut harness, "Jeton de gestion", ADMIN);
+    harness.get_by_label("Retenir sur cet ordinateur").click();
+    harness.run();
+    harness.get_by_label("Se connecter").click();
+    harness.step();
+    // Offered after 3 s (the window keeps repainting meanwhile: it shows the seconds).
+    let started = Instant::now();
+    while harness.query_by_label("Ne plus attendre").is_none() {
+        assert!(started.elapsed() < Duration::from_secs(10), "no Stop waiting");
+        std::thread::sleep(Duration::from_millis(50));
+        harness.step();
+    }
+    harness.get_by_role_and_label(eframe::egui::accesskit::Role::Button, "Ne plus attendre").click();
+    harness.step();
+    harness.run();
+    assert!(has(&harness, "Attente arrêtée"));
+    // The server answers after all: its answer is dropped, and nothing is kept.
+    let answered = Instant::now();
+    while fake.requests().iter().filter(|r| r.path == "/api/apps").count() == 0
+        || answered.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+        harness.step();
+    }
+    harness.run();
+    assert!(vault.addresses().is_empty(), "no token written");
+    assert!(harness.state().connected_to().is_none() && harness.state().prefs.servers.is_empty());
+}
+
+#[test]
+fn servers_whose_token_is_kept_stay_listed() {
+    // Eight servers whose tokens are kept: a ninth connection pushes none out (its store
+    // entry would be left behind, with nothing in the window to remove it).
+    let fake = fake(older);
+    let kept: Vec<SavedServer> = (1..=8)
+        .map(|i| SavedServer { token_kept: true, ..SavedServer::at(&format!("https://n{i}.example.com")) })
+        .collect();
+    let prefs = Prefs { lang: Some(Lang::Fr), servers: kept, ..Prefs::default() };
+    let mut harness = window(prefs, Arc::new(MemoryVault::default()), FakeSink::default());
+    // Another address: its token is typed.
+    type_into(&mut harness, "Adresse du serveur", &fake.address);
+    type_into(&mut harness, "Jeton de gestion", ADMIN);
+    harness.get_by_label("Se connecter").click();
+    wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
+    let servers = &harness.state().prefs.servers;
+    assert_eq!(servers.len(), 9);
+    assert!(servers[0].address == fake.address && servers.iter().skip(1).all(|s| s.token_kept));
 }

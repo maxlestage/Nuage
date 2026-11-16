@@ -187,31 +187,32 @@ pub(super) fn memory(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     ));
     ui.add_space(6.0);
     let ctx = ui.ctx().clone();
-    egui::Grid::new("memory-by-app").striped(true).num_columns(6).spacing([14.0, 6.0]).show(ui, |ui| {
-        for h in [
-            t(l, "Application"),
-            t(l, "Its cache holds"),
-            t(l, "may hold"),
-            t(l, "Page cache"),
-            t(l, "Key-value store"),
-            "",
-        ] {
-            ui.strong(h);
-        }
-        ui.end_row();
-        for a in &settings.applications {
-            ui.label(&a.name);
-            ui.label(format::bytes(l, a.cache_bytes));
-            ui.label(format::bytes(l, a.cache_capacity_bytes));
+    // One block per application: a table of six columns
+    // would run past the right edge of a small window.
+    for a in &settings.applications {
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(&a.name);
+            help(
+                ui,
+                tf(
+                    l,
+                    "Its cache holds {} of {} now.",
+                    &[&format::bytes(l, a.cache_bytes), &format::bytes(l, a.cache_capacity_bytes)],
+                ),
+            );
             let (cache, kv) =
                 session.app_fields.entry(a.name.clone()).or_insert_with(|| ("auto".into(), "auto".into()));
-            ui.name_inputs(format!("{} · {}", a.name, t(l, "Page cache")), |ui| {
-                ui.add_enabled(!settings.read_only, egui::TextEdit::singleline(cache).desired_width(100.0))
-            });
-            ui.name_inputs(format!("{} · {}", a.name, t(l, "Key-value store")), |ui| {
-                ui.add_enabled(!settings.read_only, egui::TextEdit::singleline(kv).desired_width(100.0))
-            });
-            let (cache, kv) = (cache.clone(), kv.clone());
+            // One line for each field, with its words: they never part, and fit a small window.
+            for (what, field) in [(t(l, "Page cache"), cache), (t(l, "Key-value store"), kv)] {
+                ui.horizontal(|ui| {
+                    ui.label(what);
+                    ui.name_inputs(format!("{} · {what}", a.name), |ui| {
+                        ui.add_enabled(!settings.read_only, egui::TextEdit::singleline(field).desired_width(100.0))
+                    });
+                });
+            }
+            let (cache, kv) = session.app_fields.get(&a.name).cloned().unwrap_or_default();
             let label = format!("{} · {}", t(l, "Save"), a.name);
             if ui.add_enabled(!session.busy() && !settings.read_only, egui::Button::new(label)).clicked() {
                 let name = a.name.clone();
@@ -219,9 +220,9 @@ pub(super) fn memory(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
                     server.set_memory(&name, Some(&cache), Some(&kv)).map(Outcome::Memory)
                 });
             }
-            ui.end_row();
-        }
-    });
+        });
+        ui.add_space(4.0);
+    }
     if !settings.ignored.is_empty() {
         ui.add_space(8.0);
         help(
@@ -315,20 +316,17 @@ pub(super) fn startup(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     ui.add_space(8.0);
     let show_all_id = egui::Id::unique("startup-show-all");
     let mut show_all = ui.data(|d| d.get_temp::<bool>(show_all_id)).unwrap_or(false);
-    egui::Grid::new("startup").num_columns(2).striped(true).spacing([18.0, 4.0]).show(ui, |ui| {
-        ui.strong(t(l, "Variable"));
-        ui.strong(t(l, "Value"));
-        ui.end_row();
-        for s in settings.startup.iter().filter(|s| show_all || s.value.is_some()) {
-            ui.monospace(&s.variable);
+    // A line each, its value after the name or under it: a long path never runs past the window.
+    for s in settings.startup.iter().filter(|s| show_all || s.value.is_some()) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&s.variable).monospace().strong());
             match s.value.as_deref() {
                 Some("***") => ui.label(RichText::new(t(l, "set (a secret: not shown)")).weak()),
                 Some(value) => ui.monospace(value),
                 None => ui.label(RichText::new(t(l, "not set")).weak()),
             };
-            ui.end_row();
-        }
-    });
+        });
+    }
     if settings.startup.iter().any(|s| s.value.is_none())
         && ui.checkbox(&mut show_all, t(l, "Show the ones not set")).changed()
     {

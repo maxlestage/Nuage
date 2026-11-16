@@ -717,7 +717,8 @@ y no cambia nada por su cuenta: cada cambio es un botón que pulsas, y dice lo q
   Sus dos líneas (`NUAGE_URL`, `NUAGE_TOKEN`) se muestran una sola vez, ocultas hasta que las
   muestres, y se copian pidiendo al historial del portapapeles que las ignore. **Probar el
   token** llama al servidor con él desde este equipo; la página de la aplicación dice luego que
-  se probó desde el editor, y que tu sitio aún no se ha conectado.
+  se probó desde el editor, y cuándo se conectó tu sitio por última vez tal como lo vio el
+  editor (el servidor solo guarda la última conexión).
 - **Conectar una página web**: un token de solo lectura, el sitio que autorizar
   (`https://misitio.es`), y el script que pegar en la página. Un token se revoca tras una
   pregunta.
@@ -743,7 +744,8 @@ el estado, los sitios web), el editor dice que actualizar el servidor lo mostrar
    no se descarga a menudo: **Conservar**; SmartScreen dice que protegió tu PC: **Más
    información** y **Ejecutar de todas formas**. Linux: descomprime y haz clic derecho en
    `nuage-editor`, **Ejecutar como un programa** (Archivos de GNOME no abre un programa con
-   doble clic); `README.txt` lo pone en el menú.
+   doble clic); en el editor, **Acerca de** y luego **Añadir el editor al menú de
+   aplicaciones** lo pone en el menú (`README.txt` da lo mismo en órdenes).
 3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo:
    **Abrir**, con una ventana del sistema como mucho. El editor nunca se ejecuta como
    administrador; las herramientas del sistema leen por él cuatro líneas del archivo de ajustes

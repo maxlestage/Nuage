@@ -205,7 +205,12 @@ jobs:
               codesign --verify --deep --strict --verbose=2 "$app"
               mkdir dmg && cp -R "$app" dmg/ && ln -s /Applications dmg/Applications
               name=Nuage-DB-Editor-macOS.dmg
-              hdiutil create -volname "Nuage DB Editor" -srcfolder dmg -ov -format UDZO "out/$name"
+              # hdiutil fails now and then on the runners ("Resource busy"): three tries.
+              for try in 1 2 3; do
+                hdiutil create -volname "Nuage DB Editor" -srcfolder dmg -ov -format UDZO "out/$name" && break
+                [ "$try" -lt 3 ] || exit 1
+                sleep 10
+              done
               ;;
             Linux)
               name=nuage-editor-x86_64-linux.tar.gz
