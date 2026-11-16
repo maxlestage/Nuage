@@ -31,7 +31,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 
 use memoire_orm::{Error, Result};
 
@@ -1130,11 +1130,21 @@ pub(crate) struct Pages {
     visible: RwLock<Arc<Version>>,
     live: Arc<Live>,
     state: Mutex<State>,
+    /// Held by whatever writes the page file (a checkpoint, a compaction) for
+    /// as long as it does, and by whoever needs the file to stay as it is
+    /// ([`hold_file`](Pages::hold_file)). Taken before every other lock here.
+    file: Mutex<()>,
     /// Bytes of the nodes changed since the last checkpoint, about.
     dirty: AtomicUsize,
+    /// The figures [`stats`](Pages::stats) last read under the locks: stored
+    /// bytes, free bytes, pages.
+    seen: [AtomicU64; 3],
     /// Checkpoints fail (tests of a disk that cannot be written).
     #[cfg(test)]
     pub(crate) fail_checkpoints: std::sync::atomic::AtomicBool,
+    /// Copies of the file take their time (tests of what happens meanwhile).
+    #[cfg(test)]
+    pub(crate) slow_copies: std::sync::atomic::AtomicBool,
 }
 
 /// What a file holds: its header, its trees and the pages they use.
@@ -1289,7 +1299,7 @@ impl Pages {
         let live = Arc::new(Live::default());
         let state = State::of(&loaded);
         let version = Version::new(0, 0, loaded.trees, &live);
-        Ok(Pages {
+        let pages = Pages {
             path: path.to_owned(),
             disk: RwLock::new(disk),
             sync,
@@ -1298,20 +1308,36 @@ impl Pages {
             visible: RwLock::new(version),
             live,
             state: Mutex::new(state),
+            file: Mutex::new(()),
             dirty: AtomicUsize::new(0),
+            seen: Default::default(),
             #[cfg(test)]
             fail_checkpoints: std::sync::atomic::AtomicBool::new(false),
-        })
+            #[cfg(test)]
+            slow_copies: std::sync::atomic::AtomicBool::new(false),
+        };
+        // The figures of the file as it was opened, for whoever asks while the locks are held.
+        pages.stats();
+        Ok(pages)
     }
 
     fn disk(&self) -> std::sync::RwLockReadGuard<'_, Disk> {
         self.disk.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Keeps the page file as it is until the guard is dropped: checkpoints
+    /// and compactions, the only writers of the file, wait for it. Commits do
+    /// not: they change nodes in memory, which reach the file at a checkpoint.
+    /// For a snapshot, which copies the file as a checkpoint just left it.
+    pub(crate) fn hold_file(&self) -> MutexGuard<'_, ()> {
+        lock(&self.file)
+    }
+
     /// Copies the page file, byte for byte (encrypted as it is), to `dest`, through the handle
     /// this store holds: the file is locked for it alone, and Windows refuses to let another
-    /// handle read a locked file (Unix only advises). A snapshot of the backups.
-    pub(crate) fn copy_file_to(&self, dest: &Path) -> Result<()> {
+    /// handle read a locked file (Unix only advises). A snapshot of the backups. Returns the
+    /// bytes copied: the size of the file.
+    pub(crate) fn copy_file_to(&self, dest: &Path) -> Result<u64> {
         let disk = self.disk();
         let fail = |e: std::io::Error| err(format!("cannot copy {} to {}: {e}", disk.path.display(), dest.display()));
         let len = disk.len()?;
@@ -1323,8 +1349,13 @@ impl Pages {
             read_at(&disk.file, &mut buf[..n], offset).map_err(fail)?;
             std::io::Write::write_all(&mut out, &buf[..n]).map_err(fail)?;
             offset += n as u64;
+            #[cfg(test)]
+            if self.slow_copies.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        out.sync_all().map_err(fail)
+        out.sync_all().map_err(fail)?;
+        Ok(len)
     }
 
     /// The trees as of the last commit.
@@ -1496,6 +1527,12 @@ impl Pages {
     /// Makes every commit so far durable: writes the changed nodes to free
     /// pages, then the header that points to them.
     pub(crate) fn checkpoint(&self) -> Result<()> {
+        let _file = lock(&self.file);
+        self.checkpoint_held()
+    }
+
+    /// [`checkpoint`](Self::checkpoint), for a caller that holds `file`.
+    fn checkpoint_held(&self) -> Result<()> {
         #[cfg(test)]
         if self.fail_checkpoints.load(Ordering::Relaxed) {
             return Err(err("no checkpoint (test)"));
@@ -1580,7 +1617,8 @@ impl Pages {
     /// Rewrites the file without its free pages. `false` when a reader is at
     /// work: it would lose its pages.
     pub(crate) fn compact(&self) -> Result<bool> {
-        self.checkpoint()?;
+        let _file = lock(&self.file);
+        self.checkpoint_held()?;
         let mut st = lock(&self.state);
         let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
         // Only the two handles of this store on one version: no reader.
@@ -1652,14 +1690,36 @@ impl Pages {
         Ok(())
     }
 
+    /// Figures for whoever shows them. It never waits: a checkpoint, a
+    /// compaction and an integrity check hold the locks for as long as they
+    /// write or read the file, and the status asks every second, for every
+    /// application. While one of them runs, the figures are the ones read
+    /// just before it.
     pub(crate) fn stats(&self) -> PageStats {
-        let st = lock(&self.state);
-        let waiting: u64 = st.pending.iter().map(|(_, e)| u64::from(e.pages)).sum();
-        let free = st.free_pages + waiting;
+        let [stored, free, pages] = &self.seen;
+        let state = match self.state.try_lock() {
+            Ok(st) => Some(st),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(st) = state {
+            let waiting: u64 = st.pending.iter().map(|(_, e)| u64::from(e.pages)).sum();
+            let unused = st.free_pages + waiting;
+            free.store(unused * PAGE as u64, Ordering::Relaxed);
+            pages.store(st.end.saturating_sub(unused), Ordering::Relaxed);
+        }
+        let current = match self.current.try_read() {
+            Ok(v) => Some(v),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(version) = current {
+            stored.store(version.trees.values().map(|t| t.bytes).sum(), Ordering::Relaxed);
+        }
         PageStats {
-            stored_bytes: self.version().trees.values().map(|t| t.bytes).sum(),
-            free_bytes: free * PAGE as u64,
-            pages: st.end.saturating_sub(free),
+            stored_bytes: stored.load(Ordering::Relaxed),
+            free_bytes: free.load(Ordering::Relaxed),
+            pages: pages.load(Ordering::Relaxed),
             cache_bytes: self.cache.used.load(Ordering::Relaxed) as u64,
             cache_hits: self.cache.hits.load(Ordering::Relaxed),
             cache_misses: self.cache.misses.load(Ordering::Relaxed),
@@ -2162,6 +2222,35 @@ mod tests {
                 .unwrap();
         }
         out
+    }
+
+    /// The figures never wait: asked for while a checkpoint, a compaction or
+    /// an integrity check holds the locks, they are the ones read last.
+    #[test]
+    fn figures_are_given_while_the_locks_are_held() {
+        let path = temp("figures");
+        let pages = Arc::new(Pages::open(&path, 1 << 20, None, false).unwrap());
+        pages.apply(&[put(b"a", &[1; 5000])], 1).unwrap();
+        pages.checkpoint().unwrap();
+        let before = pages.stats();
+        assert!(before.stored_bytes > 5000 && before.pages > 0, "{before:?}");
+        let state = lock(&pages.state);
+        let current = pages.current.write().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = pages.clone();
+        std::thread::spawn(move || tx.send(asked.stats()));
+        let during =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the figures came while the locks were held");
+        drop((state, current));
+        assert_eq!(
+            (during.stored_bytes, during.free_bytes, during.pages),
+            (before.stored_bytes, before.free_bytes, before.pages)
+        );
+        // Free again: the figures follow what was written since.
+        pages.apply(&[put(b"b", &[2; 5000])], 2).unwrap();
+        assert!(pages.stats().stored_bytes > before.stored_bytes);
+        drop(pages);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A small generator (xorshift): the same run each time.
