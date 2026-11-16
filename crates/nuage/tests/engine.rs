@@ -1888,7 +1888,18 @@ async fn copies_left_by_a_stop_are_removed() {
     for name in ["snapshot-7.partial", "snapshot.partial"] {
         std::fs::write(dir.join(name), b"half a copy").unwrap();
     }
-    let db = Embedded::open_with(&dir, backed_up(&folder, 1)).unwrap();
+    // The last handle gone, its files may be let go a moment later (the end of its drop).
+    let mut tries = 0;
+    let db = loop {
+        match Embedded::open_with(&dir, backed_up(&folder, 1)) {
+            Ok(db) => break db,
+            Err(e) if tries < 200 && e.to_string().contains("already open") => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
     for name in ["snapshot-7.partial", "snapshot.partial"] {
         assert!(!dir.join(name).exists(), "{name}");
     }
