@@ -256,14 +256,14 @@ fn a_person_connects_and_sees_that_it_works_in_french() {
     assert!(has(&harness, "en marche depuis"));
     assert!(has(&harness, "2 applications"));
     assert!(has(&harness, "Nuage DB occupe"), "the memory, from the status");
-    assert!(has(&harness, "Non chiffré : cet ordinateur seulement"));
+    assert!(has(&harness, "Local seulement"));
     // The engine may have made its first copy already.
-    assert!(has(&harness, "En attente de la première copie, vers") || has(&harness, "Dernière copie il y a"));
+    assert!(has(&harness, "En attente de la première copie, vers") || has(&harness, "Dernière copie "));
     running.back_up();
     press(&mut harness, "Actualiser");
-    wait_for(&mut harness, "the backups", |h| has(h, "Dernière copie il y a"));
+    wait_for(&mut harness, "the backups", |h| has(h, "Dernière copie "));
     assert!(has(&harness, &running.dir.join("backups").display().to_string()));
-    assert!(has(&harness, "Mis à jour il y a"));
+    assert!(has(&harness, "Mis à jour "));
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn a_person_makes_an_application_and_tests_its_token() {
     assert!(!shows_anywhere(&harness, &token), "in no node once closed");
     assert!(!format!("{:?}", harness.state()).contains(&token));
     // Its row says the editor tested it, and nothing of the site (the test took its place).
-    wait_for(&mut harness, "the test in its row", |h| has(h, "Testée depuis l'éditeur il y a"));
+    wait_for(&mut harness, "the test in its row", |h| has(h, "Testée depuis l'éditeur "));
     assert!(!has(&harness, "votre site"));
 
     // The same name again: refused, under the field.
@@ -573,6 +573,10 @@ fn without_a_password_store_nothing_is_kept() {
     let vault = Arc::new(Unavailable("no Secret Service on this session".into()));
     let mut harness = window(french(), vault, FakeSink::default());
     assert!(has(&harness, "Votre système n'a pas de gestionnaire de mots de passe que l'éditeur puisse utiliser"));
+    // The system's own words are under Details, not in the sentence.
+    assert!(!has(&harness, "no Secret Service on this session"));
+    harness.get_by_label("Détails").click();
+    harness.run();
     assert!(has(&harness, "no Secret Service on this session"));
     assert!(harness.get_by_label("Retenir sur cet ordinateur").accesskit_node().is_disabled());
     type_into(&mut harness, "Adresse du serveur", &running.address);
@@ -741,9 +745,7 @@ fn the_default_window_shows_the_lock_and_a_larger_text_still_fits() {
     client(&running.address, ADMIN, Lang::En).create_application("ma-boutique-en-ligne-des-vacances", "").unwrap();
     // The window as it opens (1000×760): whether the token crosses the network in clear is
     // always said in words, beside the address, never under the language and the theme.
-    for (lang, lock) in
-        [(Lang::En, "Not encrypted: this computer only"), (Lang::Fr, "Non chiffré : cet ordinateur seulement")]
-    {
+    for (lang, lock) in [(Lang::En, "Local only"), (Lang::Fr, "Local seulement")] {
         let mut harness = connected_at(&running, in_lang(lang), [1000.0, 760.0]);
         let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 760.0));
         let word = harness.get_by_label(lock).rect();
@@ -758,7 +760,7 @@ fn the_default_window_shows_the_lock_and_a_larger_text_still_fits() {
     for size in [[1000.0, 760.0], [640.0, 480.0]] {
         let prefs = Prefs { text_size: 150, ..french() };
         let mut harness = connected_at(&running, prefs, size);
-        assert!(harness.query_by_label("Non chiffré : cet ordinateur seulement").is_some());
+        assert!(harness.query_by_label("Local seulement").is_some());
         every_page_fits(&mut harness, Lang::Fr, &format!("150 % {size:?}"));
     }
 }

@@ -5,7 +5,7 @@
 
 use chrono::TimeZone as _;
 
-use crate::i18n::{Lang, tf};
+use crate::i18n::{Lang, t, tf};
 
 /// An amount of memory: `0.50 GiB`, `128 MiB` (`Gio`, `Mio` in French; a
 /// decimal comma outside English).
@@ -92,6 +92,9 @@ pub fn span(l: Lang, seconds: u64) -> String {
 /// How long ago `ms` (Unix milliseconds) was, from `now`: `4 min ago`.
 pub fn ago(l: Lang, ms: i64, now: i64) -> String {
     let seconds = u64::try_from(now.saturating_sub(ms) / 1000).unwrap_or(0);
+    if seconds < 5 {
+        return t(l, "just now").to_owned();
+    }
     tf(l, "{} ago", &[&span(l, seconds)])
 }
 
@@ -156,6 +159,7 @@ mod tests {
         assert_eq!(ago(Lang::Fr, 0, 240_000), "il y a 4 min");
         assert_eq!(ago(Lang::Es, 0, 240_000), "hace 4 min");
         assert_eq!(ago(Lang::En, 0, 240_000), "4 min ago");
+        assert_eq!(ago(Lang::Fr, 0, 2_000), "à l'instant", "never « il y a 0 s »");
         assert_eq!(parse_time("2026-11-15T21:04:00Z"), Some(1_794_776_640_000));
         assert_eq!(parse_time("yesterday"), None);
         let noon = parse_time("2026-11-12T12:00:00Z").unwrap();

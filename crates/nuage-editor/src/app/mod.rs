@@ -323,8 +323,8 @@ enum Doing {
 /// What a change sent to the server comes back with.
 enum Outcome {
     Settings(Settings),
-    Created(Application, Connection, Option<String>),
-    Token { app: String, read_only: bool, connection: Connection, lan: Option<String> },
+    Created(Application, Connection, Lan),
+    Token { app: String, read_only: bool, connection: Connection, lan: Lan },
     Revoked { app: String, id: String },
     Memory(Application),
     Origins(Application),
@@ -345,8 +345,8 @@ struct Reveal {
     made: Made,
     read_only: bool,
     connection: Connection,
-    /// This computer's address on its network, when `NUAGE_URL` reaches this computer only.
-    lan: Option<String>,
+    /// How another device of the network reaches the server, when `NUAGE_URL` reaches this computer only.
+    lan: Lan,
     /// The token is shown in clear (else masked).
     shown: bool,
     copied: Option<Copied>,
@@ -360,7 +360,7 @@ struct Reveal {
 }
 
 impl Reveal {
-    fn new(app: String, made: Made, read_only: bool, connection: Connection, lan: Option<String>) -> Reveal {
+    fn new(app: String, made: Made, read_only: bool, connection: Connection, lan: Lan) -> Reveal {
         Reveal {
             app,
             made,
@@ -584,10 +584,37 @@ impl Session {
     }
 }
 
-/// This computer's address on its network, for a `NUAGE_URL` that reaches
+/// How another device of the network reaches a server whose `NUAGE_URL`
+/// reaches this computer only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Lan {
+    /// Not known (or not asked: the address is not this computer's).
+    Unknown,
+    /// This computer's address on its network.
+    At(String),
+    /// The server listens on this computer only (`NUAGE_BIND=127.0.0.1`).
+    HereOnly(String),
+}
+
+/// What the server listens on, when it says a loopback address
+/// (`NUAGE_BIND` in its startup settings): it answers this computer only.
+pub(super) fn bound_here(settings: Option<&Settings>) -> Option<String> {
+    let bind = settings?.startup.iter().find(|s| s.variable == "NUAGE_BIND")?.value.clone()?;
+    let host = bind.trim().trim_start_matches('[').trim_end_matches(']').to_owned();
+    let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    loopback.then_some(bind)
+}
+
+/// How another device reaches the server, for a `NUAGE_URL` that reaches
 /// this computer only (run in the job that made the token).
-fn lan_for(connection: &Connection) -> Option<String> {
-    connection.is_this_computer_only().then(address::lan_ip).flatten().map(|ip| ip.to_string())
+fn lan_for(connection: &Connection, bound_here: Option<&str>) -> Lan {
+    if !connection.is_this_computer_only() {
+        return Lan::Unknown;
+    }
+    if let Some(bind) = bound_here {
+        return Lan::HereOnly(bind.to_owned());
+    }
+    address::lan_ip().map_or(Lan::Unknown, |ip| Lan::At(ip.to_string()))
 }
 
 /// A generated token (Tools, and the help of the connection form): shown
@@ -1482,8 +1509,11 @@ impl Editor {
                         Some((address, _)) => {
                             theme::mark(ui, Mark::On);
                             ui.label(tf(l, "Connected to {}", &[&host_of(address)]));
-                            let (m, lock) = lock(l, address);
-                            theme::status(ui, m, lock);
+                            let (m, lock, why) = lock(l, address);
+                            // A short word in the bar (it wrapped on three lines), the sentence on hover.
+                            let color = m.color(theme::of(ui));
+                            theme::mark(ui, m);
+                            ui.label(RichText::new(lock).color(color)).on_hover_text(why);
                         }
                         None => {
                             theme::mark(ui, Mark::Off);
@@ -1578,13 +1608,24 @@ fn host_of(address: &str) -> String {
     }
 }
 
-/// Whether the token crosses the network encrypted: always a word, never a color alone.
-fn lock(l: Lang, address: &str) -> (Mark, &'static str) {
+/// Whether the token crosses the network encrypted: always a word, never a
+/// color alone, and the sentence that says what it means.
+fn lock(l: Lang, address: &str) -> (Mark, &'static str, &'static str) {
     match address::normalize(address) {
-        Ok(a) if a.scheme == address::Scheme::Https => (Mark::Ok, t(l, "Encrypted (HTTPS)")),
-        Ok(a) if a.class() == Class::Loopback => (Mark::Off, t(l, "Not encrypted: this computer only")),
-        Ok(a) if a.class() == Class::Private => (Mark::Warn, t(l, "Not encrypted: local network")),
-        _ => (Mark::Bad, t(l, "Not encrypted: Internet")),
+        Ok(a) if a.scheme == address::Scheme::Https => {
+            (Mark::Ok, t(l, "Encrypted"), t(l, "The connection is encrypted (HTTPS)."))
+        }
+        Ok(a) if a.class() == Class::Loopback => {
+            (Mark::Off, t(l, "Local only"), t(l, "The connection is not encrypted, but it never leaves this computer."))
+        }
+        Ok(a) if a.class() == Class::Private => {
+            (Mark::Warn, t(l, "Local network"), t(l, "The connection is not encrypted: it crosses your local network."))
+        }
+        _ => (
+            Mark::Bad,
+            t(l, "Not encrypted"),
+            t(l, "The connection is not encrypted and crosses the Internet: the token can be read on the way."),
+        ),
     }
 }
 
@@ -1961,7 +2002,8 @@ mod tests {
         assert_eq!(lock(Lang::En, "https://n.example.com").0, Mark::Ok);
         assert_eq!(lock(Lang::En, "http://127.0.0.1:8080").0, Mark::Off);
         assert_eq!(lock(Lang::En, "http://192.168.1.5:8080").0, Mark::Warn);
-        assert_eq!(lock(Lang::Fr, "http://n.example.com"), (Mark::Bad, "Non chiffré : Internet"));
+        assert_eq!(lock(Lang::Fr, "http://n.example.com").1, "Non chiffré");
+        assert_eq!(lock(Lang::Fr, "http://127.0.0.1:8080").1, "Local seulement");
         assert_eq!(host_of("https://n.example.com"), "n.example.com");
         assert_eq!(host_of("http://127.0.0.1:8080"), "127.0.0.1:8080");
     }
