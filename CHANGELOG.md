@@ -22,6 +22,11 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ### Nuage DB Editor: the settings in a window
 
+- **A new look**: the fonts of the website (Inter, Space Grotesk, JetBrains Mono, under the
+  SIL Open Font License, built in), a sidebar with icons, the connection and its lock in a pill,
+  an overview of a card and three tiles (applications, memory with its gauge, backups), each
+  setting in a card of its own, a welcome page in the middle of the window, and light and dark
+  themes made for each other. Every page still fits a 640×480 window and a text at 150 %.
 - **For those who would rather not use a terminal**: a program with a window, for macOS
   (Apple silicon and Intel), Windows and Linux desktops, in English, French and Spanish
   (the system's language, or the one chosen), light, dark or as the system, in the console's

@@ -29,80 +29,151 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
             // What could not be read again stays, greyed.
             ui.multiply_opacity(0.55);
         }
+        // The server: it answers, how long it has run, its version, its encryption.
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::mark(ui, Mark::Ok);
-                theme::subheading(ui, t(l, "Nuage DB answers"));
-            });
-            match &status {
-                Some(s) => {
-                    ui.label(answers(l, s));
-                }
-                None => {
-                    ui.label(tf(
-                        l,
-                        "The server at {} answers, and its management token is right.",
-                        &[&session.server.address()],
-                    ));
-                    help(
-                        ui,
-                        if caps.status {
-                            // It has a status: the last read of it failed on the way.
-                            t(l, "Its version, its memory and its backups could not be read this time: Refresh asks again.")
-                        } else {
-                            t(
+                theme::logo(ui, 34.0);
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::subheading(ui, t(l, "Nuage DB answers"));
+                        theme::pill(ui, Mark::On, t(l, "Online"));
+                        if let Some(s) = &status {
+                            if s.encryption.enabled {
+                                theme::pill(ui, Mark::Ok, t(l, "Encrypted"));
+                            }
+                            theme::pill(ui, Mark::Off, format!("v{}", s.version));
+                        }
+                    });
+                    match &status {
+                        Some(s) => {
+                            ui.label(RichText::new(answers(l, s)).color(theme::of(ui).muted));
+                        }
+                        None => {
+                            ui.label(tf(
                                 l,
-                                "Newer versions of Nuage DB tell the editor their version, their memory and whether the last backup worked: update the server to see it here.",
-                            )
-                        },
-                    );
-                }
-            }
-        });
-        ui.add_space(8.0);
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::subheading(ui, t(l, "Applications"));
-            let count = session.apps.as_ref().map_or(0, Vec::len) as u64;
-            ui.label(applications(l, count, status.as_ref(), &session.sites, now));
-            if ui.button(t(l, "See them")).clicked() {
-                go = Some(Section::Applications);
-            }
-        });
-        ui.add_space(8.0);
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::subheading(ui, t(l, "Memory"));
-            match memory(l, status.as_ref(), settings.as_ref()) {
-                Some(line) => ui.label(line),
-                None => ui.label(RichText::new(t(l, "This server does not say its memory to the editor.")).weak()),
-            };
-            if caps.settings && ui.button(t(l, "Change")).clicked() {
-                go = Some(Section::Memory);
-            }
-        });
-        ui.add_space(8.0);
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::subheading(ui, t(l, "Backups"));
-            if status.is_none() && caps.status {
-                help(ui, t(l, "Not read this time: Refresh asks again."));
-            } else {
-                for (m, line) in backups(l, status.as_ref(), settings.as_ref(), heroku, now) {
-                    theme::status(ui, m, line);
-                }
-            }
-            egui::CollapsingHeader::new(t(l, "How to change where they go")).id_salt("backup-where").show(ui, |ui| {
-                ui.label(t(
-                    l,
-                    "The destination is chosen when Nuage DB is installed: run the installer again with another destination (the guide shows the line). On Heroku: Settings, then Config Vars, the NUAGE_BACKUP_S3_* variables. The server restarts and keeps its data.",
-                ));
-                if ui.button(t(l, "Open the guide")).clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(super::start::GUIDE));
-                }
+                                "The server at {} answers, and its management token is right.",
+                                &[&session.server.address()],
+                            ));
+                            help(
+                                ui,
+                                if caps.status {
+                                    // It has a status: the last read of it failed on the way.
+                                    t(l, "Its version, its memory and its backups could not be read this time: Refresh asks again.")
+                                } else {
+                                    t(
+                                        l,
+                                        "Newer versions of Nuage DB tell the editor their version, their memory and whether the last backup worked: update the server to see it here.",
+                                    )
+                                },
+                            );
+                        }
+                    }
+                });
             });
         });
+        ui.add_space(14.0);
+        // Three tiles side by side where there is room, one under the other where there is not.
+        let columns = if ui.available_width() >= 640.0 { 3 } else { 1 };
+        let count = session.apps.as_ref().map_or(0, Vec::len) as u64;
+        let apps_line = applications(l, count, status.as_ref(), &session.sites, now);
+        let memory_line = memory(l, status.as_ref(), settings.as_ref());
+        let used = status.as_ref().and_then(|s| Some((s.memory.process_bytes?, s.memory.total_bytes?)));
+        let backup_lines =
+            if status.is_none() && caps.status { None } else { Some(backups(l, status.as_ref(), settings.as_ref(), heroku, now)) };
+        let mut tile = |ui: &mut egui::Ui, which: usize| match which {
+            0 => tile_card(ui, (columns == 3).then_some(0), theme::Icon::Applications, t(l, "Applications"), &count.to_string(), |ui| {
+                ui.label(RichText::new(&apps_line).color(theme::of(ui).muted));
+                if ui.button(t(l, "See them")).clicked() {
+                    go = Some(Section::Applications);
+                }
+            }),
+            1 => {
+                let value = used.map_or_else(|| "—".to_owned(), |(u, _)| format::bytes(l, u));
+                tile_card(ui, (columns == 3).then_some(1), theme::Icon::Memory, t(l, "Memory"), &value, |ui| {
+                    if let Some((u, total)) = used {
+                        theme::meter(ui, u as f32 / total.max(1) as f32);
+                    }
+                    match &memory_line {
+                        Some(line) => ui.label(RichText::new(line).color(theme::of(ui).muted)),
+                        None => ui.label(RichText::new(t(l, "This server does not say its memory to the editor.")).weak()),
+                    };
+                    if caps.settings && ui.button(t(l, "Change")).clicked() {
+                        go = Some(Section::Memory);
+                    }
+                })
+            }
+            _ => {
+                let value = match backup_lines.as_ref().and_then(|lines| lines.first()) {
+                    Some((Mark::Ok, _)) => t(l, "Working"),
+                    Some((Mark::Bad, _)) => t(l, "None"),
+                    Some((Mark::Warn, _)) => t(l, "To look at"),
+                    _ => "—",
+                };
+                tile_card(ui, (columns == 3).then_some(2), theme::Icon::Backup, t(l, "Backups"), value, |ui| {
+                    match &backup_lines {
+                        None => help(ui, t(l, "Not read this time: Refresh asks again.")),
+                        Some(lines) => {
+                            for (m, line) in lines {
+                                theme::status(ui, *m, line.clone());
+                            }
+                        }
+                    }
+                    // A header as wide as its words (a CollapsingHeader takes the whole width, and more).
+                    let id = egui::Id::unique("backup-where");
+                    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                    ui.horizontal(|ui| {
+                        // The arrow opens it (it toggles itself), the words too; what it says goes under the tiles.
+                        state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                        let words = theme::strong(t(l, "How to change where they go"));
+                        if ui.add(egui::Label::new(words).wrap().sense(egui::Sense::click())).clicked() {
+                            state.toggle(ui);
+                        }
+                    });
+                    state.store(ui.ctx());
+                })
+            }
+        };
+        if columns == 3 {
+            // Three equal widths, within the page's width.
+            let gap = 12.0;
+            let width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+            let spacing = ui.spacing().item_spacing;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for i in 0..3 {
+                    if i > 0 {
+                        ui.add_space(gap);
+                    }
+                    ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing = spacing;
+                        ui.set_width(width);
+                        tile(ui, i);
+                    });
+                }
+            });
+        } else {
+            for i in 0..3 {
+                tile(ui, i);
+                ui.add_space(10.0);
+            }
+        }
+        let where_open = egui::collapsing_header::CollapsingState::load(ui.ctx(), egui::Id::unique("backup-where"))
+            .is_some_and(|state| state.is_open());
+        if where_open {
+            ui.add_space(12.0);
+            theme::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::subheading(ui, t(l, "How to change where they go"));
+                        ui.label(t(
+                            l,
+                            "The destination is chosen when Nuage DB is installed: run the installer again with another destination (the guide shows the line). On Heroku: Settings, then Config Vars, the NUAGE_BACKUP_S3_* variables. The server restarts and keeps its data.",
+                        ));
+                        if ui.button(t(l, "Open the guide")).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(super::start::GUIDE));
+                        }
+            });
+        }
     });
     ui.add_space(8.0);
     if !caps.settings {
@@ -297,6 +368,48 @@ fn second_copy(l: Lang, c: &SecondCopy, now: i64) -> (Mark, String) {
         None if c.running => (Mark::Off, tf(l, "The second copy is being written, to {}", &[&c.target])),
         None => (Mark::Off, tf(l, "The second copy starts in a moment, to {}", &[&c.target])),
     }
+}
+
+/// A tile of the overview: its icon and name, a figure, and what follows.
+fn tile_card(
+    ui: &mut egui::Ui,
+    side_by_side: Option<usize>,
+    icon: theme::Icon,
+    label: &str,
+    value: &str,
+    rest: impl FnOnce(&mut egui::Ui),
+) {
+    // Side by side, the three tiles take the height of the tallest (as measured the frame before).
+    let heights_id = egui::Id::unique("overview-tile-heights");
+    let heights: [f32; 3] = ui.data(|d| d.get_temp(heights_id)).unwrap_or_default();
+    theme::card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if side_by_side.is_some() {
+            ui.set_min_height(heights.iter().copied().fold(0.0, f32::max));
+        }
+        // Not justified: the text keeps its spaces, the buttons their width.
+        let content = ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                theme::icon_badge(ui, icon);
+                ui.label(RichText::new(label).color(theme::of(ui).muted));
+            });
+            ui.add_space(2.0);
+            ui.label(RichText::new(value).size(26.0).family(egui::FontFamily::Name(theme::TITLE.into())));
+            ui.add_space(4.0);
+            rest(ui);
+        });
+        if let Some(i) = side_by_side {
+            let height = content.response.rect.height();
+            if heights.get(i).is_some_and(|known| (known - height).abs() > 0.5) {
+                ui.data_mut(|d| {
+                    if let Some(known) = d.get_temp_mut_or_default::<[f32; 3]>(heights_id).get_mut(i) {
+                        *known = height;
+                    }
+                });
+                ui.ctx().request_repaint();
+            }
+        }
+    });
 }
 
 #[cfg(test)]
