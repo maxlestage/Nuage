@@ -18,10 +18,16 @@
 //!   `current_schema()`...) get the answers PostgreSQL would give.
 //! * **Limits**: a client has 15 seconds to log in, with small messages; then
 //!   a message is as long as a request body may be
-//!   ([`ServerOptions::max_body_bytes`](super::ServerOptions::max_body_bytes)),
-//!   and a transaction left idle is rolled back after 5 minutes
-//!   ([`PgOptions::idle_in_transaction`]). A logged-in connection may stay
-//!   idle as long as it likes.
+//!   ([`ServerOptions::max_body_bytes`](super::ServerOptions::max_body_bytes))
+//!   and comes at a pace, an SQL text is 1 MiB at most, and a transaction
+//!   left idle is rolled back after about 5 minutes
+//!   ([`PgOptions::idle_in_transaction`]), however busy after an hour
+//!   ([`PgOptions::transaction_timeout`]). A client that takes nothing of
+//!   its answers for a minute is disconnected. What the sessions hold
+//!   together (prepared statements, portals, messages being read) is bounded
+//!   ([`PgOptions::memory`]), and read-only tokens have half of the
+//!   connections at most. A logged-in connection may stay idle as long as it
+//!   likes.
 //!
 //! The SQL is Nuage DB's (see [`crate::sql`]); the system catalogs
 //! (`pg_catalog`, `information_schema`) are not there.
@@ -31,7 +37,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -40,6 +46,7 @@ use memoire_orm::{Error, Result, Value};
 
 use super::State;
 use super::apps::App;
+use super::net::{PortMemory, Share};
 use crate::embedded::{Embedded, EmbeddedTransaction, Savepoint};
 use crate::sql::{Script, SqlResult};
 
@@ -51,8 +58,23 @@ pub struct PgOptions {
     /// How long a transaction (`BEGIN`) may wait for its client's next
     /// message: past it, it is rolled back and that message is told so
     /// (SQLSTATE `25P03`), as PostgreSQL's `idle_in_transaction_session_timeout`
-    /// does. Default (`None`): 5 minutes.
+    /// does. Default (`None`): 5 minutes (a little more at times: the
+    /// system's timers have some slack).
     pub idle_in_transaction: Option<Duration>,
+    /// How long a transaction may stay open, however busy: an open one keeps
+    /// every page it sees, and the database's file grows meanwhile. Past it,
+    /// it is rolled back and the client's next message is told so (SQLSTATE
+    /// `25P04`), as PostgreSQL's `transaction_timeout` does. Default
+    /// (`None`): an hour.
+    pub transaction_timeout: Option<Duration>,
+    /// What the sessions of the port may hold together beyond a little each,
+    /// in bytes: the messages being read past their first 64 KiB, the
+    /// prepared statements, the portals and the rows they keep between
+    /// messages. Past it a message or a statement is refused (SQLSTATE
+    /// `53200`) instead of the server running out of memory; one session
+    /// holds half of it at most. Default (`None`): an eighth of the server's
+    /// memory, and room for four of the largest messages.
+    pub memory: Option<usize>,
     /// Set by the listener for a connection past the limit: it is told
     /// `too_many_connections` and closed.
     #[doc(hidden)]
@@ -64,7 +86,38 @@ impl std::fmt::Debug for PgOptions {
         f.debug_struct("PgOptions")
             .field("tls", &self.tls.is_some())
             .field("idle_in_transaction", &self.idle_in_transaction)
+            .field("transaction_timeout", &self.transaction_timeout)
+            .field("memory", &self.memory)
             .finish()
+    }
+}
+
+/// What the sessions of one PostgreSQL port share: its memory, and the
+/// count of sessions logged in with a read-only token.
+pub(crate) struct Port {
+    memory: Arc<PortMemory>,
+    read_only: AtomicUsize,
+}
+
+impl Port {
+    pub(crate) fn new(options: &PgOptions, max_body: usize) -> Arc<Port> {
+        Arc::new(Port { memory: PortMemory::new(options.memory, max_body), read_only: AtomicUsize::new(0) })
+    }
+}
+
+/// A read-only session's place among those read-only tokens may have.
+struct ReadOnlyPlace<'p>(&'p Port);
+
+impl ReadOnlyPlace<'_> {
+    /// A place among `most`, if one is left.
+    fn take(port: &Port, most: usize) -> Option<ReadOnlyPlace<'_>> {
+        super::net::add_within(&port.read_only, 1, most).then_some(ReadOnlyPlace(port))
+    }
+}
+
+impl Drop for ReadOnlyPlace<'_> {
+    fn drop(&mut self) {
+        self.0.read_only.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -105,50 +158,87 @@ const LOGIN_MESSAGE: usize = 10_000;
 /// back ([`PgOptions::idle_in_transaction`]): an open one keeps every page it
 /// sees, and the database's file grows meanwhile.
 const IDLE_IN_TRANSACTION: Duration = Duration::from_secs(300);
+/// A transaction is rolled back this long after it began, however busy
+/// ([`PgOptions::transaction_timeout`]): a client that sends a message now
+/// and then would otherwise keep one open for days.
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(3600);
+/// A client that takes nothing of its answers this long, or sends nothing
+/// more of a message it started, is gone: its session ends (its transaction
+/// rolled back).
+const STALLED: Duration = Duration::from_secs(60);
+/// The slowest pace a long message may come at, in bytes a second, besides
+/// [`STALLED`]: a 16 MiB message has some five minutes.
+const MESSAGE_PACE: usize = 64 << 10;
 /// Bytes of answers held before they are sent: a long result goes out as it
 /// is written, not once all of it is.
 const SEND_AT: usize = 1 << 16;
 /// What is read from the socket at once, after login.
 const READ_AHEAD: usize = 16 << 10;
+/// A message body up to this is read at once; past it, it grows as its bytes
+/// arrive, each part taken from the port's memory ([`PgOptions::memory`]).
+const LARGE_MESSAGE: usize = 64 << 10;
+/// The longest SQL text of a statement (a query, a prepared statement), as
+/// on `/v1/sql`: a longer one is a dump, to send in parts. Its syntax tree
+/// takes some fifty times its size.
+const MAX_SQL_TEXT: usize = 1 << 20;
 /// The stack of a connection's thread: statements may nest deep.
 pub(super) const THREAD_STACK: usize = 8 << 20;
 /// Prepared statements, and portals, a session holds at once at most: far
-/// more than drivers keep (a few hundred). What the messages that made them
-/// come to together is bounded too ([`Session::may_hold`]).
+/// more than drivers keep (a few hundred). What they hold in memory is
+/// bounded too ([`Session::account`]).
 const SESSION_STATEMENTS: usize = 10_000;
 const SESSION_PORTALS: usize = 10_000;
+/// What a session holds (prepared statements, portals, a statement being
+/// read) without taking it from the port's memory: ordinary sessions never
+/// need to, and keep working when large ones have used it all.
+const SESSION_FREE: usize = 256 << 10;
 
 /// The client's socket. While a deadline is set (to log in), a read waits
-/// only for what is left of it; while `idle` is set (a transaction is open),
-/// a read waits that long at most. Either way a read that waited too long
-/// fails with [`timed_out`], and nothing was read.
+/// only for what is left of it; within a message, its next bytes are
+/// expected within [`STALLED`] and before `within`; between messages (in a
+/// transaction), a read waits `idle` at most and ends by `idle_until`. A read
+/// that waited too long fails with [`timed_out`], and nothing was read.
 struct Socket {
     stream: TcpStream,
     deadline: Option<Instant>,
+    within: Option<Instant>,
     idle: Option<Duration>,
+    idle_until: Option<Instant>,
     /// The read timeout set on the socket now.
     armed: Option<Duration>,
+    /// An answer being sent must be taken by then: a client that takes a few
+    /// bytes now and then keeps each write going, not the whole of it.
+    sending: Option<Instant>,
 }
 
 impl Socket {
     fn new(stream: TcpStream) -> Socket {
-        Socket { stream, deadline: None, idle: None, armed: None }
+        Socket { stream, deadline: None, within: None, idle: None, idle_until: None, armed: None, sending: None }
+    }
+
+    /// How long the next read may wait (`None`: as long as it takes).
+    fn wait(&self) -> io::Result<Option<Duration>> {
+        let left = |at: Instant| {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() { Err(io::Error::from(io::ErrorKind::TimedOut)) } else { Ok(left) }
+        };
+        Ok(match (self.deadline, self.within, self.idle_until) {
+            (Some(at), _, _) => Some(left(at)?),
+            (None, Some(at), _) => Some(left(at)?.min(STALLED)),
+            (None, None, Some(at)) => {
+                let left = left(at)?;
+                Some(self.idle.map_or(left, |idle| idle.min(left)))
+            }
+            (None, None, None) => self.idle,
+        })
     }
 }
 
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let wait = match self.deadline {
-            Some(at) => {
-                let left = at.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(io::ErrorKind::TimedOut.into());
-                }
-                Some(left)
-            }
-            None => self.idle,
-        };
-        // Set again only when it changes: once per transaction, not per read.
+        let wait = self.wait()?;
+        // Set again only when it changes: once per transaction, and per
+        // message that does not come in one read, not per read.
         if wait != self.armed {
             self.stream.set_read_timeout(wait)?;
             self.armed = wait;
@@ -159,6 +249,9 @@ impl Read for Socket {
 
 impl Write for Socket {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.sending.is_some_and(|by| Instant::now() >= by) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
         self.stream.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -177,12 +270,29 @@ enum Conn {
     Tls(Box<rustls::StreamOwned<rustls::ServerConnection, Socket>>),
 }
 
-impl Conn {
+/// What reads from the client's socket, and sets how long its reads wait.
+trait Wire: Read {
+    fn socket(&mut self) -> &mut Socket;
+}
+
+impl Wire for Socket {
+    fn socket(&mut self) -> &mut Socket {
+        self
+    }
+}
+
+impl Wire for Conn {
     fn socket(&mut self) -> &mut Socket {
         match self {
             Conn::Plain(s) => s,
             Conn::Tls(s) => &mut s.sock,
         }
+    }
+}
+
+impl Wire for BufReader<Conn> {
+    fn socket(&mut self) -> &mut Socket {
+        self.get_mut().socket()
     }
 }
 
@@ -240,7 +350,7 @@ impl<'c> Out<'c> {
         if self.buf.len() >= SEND_AT
             && let Some(conn) = self.to.as_deref_mut()
         {
-            if let Err(e) = conn.write_all(&self.buf) {
+            if let Err(e) = send(conn, &self.buf, false) {
                 self.failed = Some(e);
             }
             self.buf.clear();
@@ -254,11 +364,20 @@ impl<'c> Out<'c> {
             return Err(e);
         }
         let Some(conn) = self.to.take() else { return Ok(()) };
-        if !self.buf.is_empty() {
-            conn.write_all(&self.buf)?;
-        }
-        if flush || self.sent { conn.flush() } else { Ok(()) }
+        send(conn, &self.buf, flush || self.sent)
     }
+}
+
+/// Writes `buf` (and flushes it): the client has [`STALLED`] to take it,
+/// however little it takes at a time.
+fn send(conn: &mut Conn, buf: &[u8], flush: bool) -> io::Result<()> {
+    conn.socket().sending = Some(Instant::now() + STALLED);
+    let mut sent = if buf.is_empty() { Ok(()) } else { conn.write_all(buf) };
+    if flush && sent.is_ok() {
+        sent = conn.flush();
+    }
+    conn.socket().sending = None;
+    sent
 }
 
 fn cstr(b: &mut Vec<u8>, s: &str) {
@@ -271,15 +390,25 @@ enum Incoming {
     Message(u8, Vec<u8>),
     /// Nothing came in the time a read may wait.
     Quiet,
-    /// A message longer than may be read: its type and length, its body
-    /// still to be read (or skipped).
-    TooLong(u8, usize),
+    /// A message read through, not kept: its type, and why.
+    Skipped(u8, Skip),
+}
+
+/// Why a message was not kept.
+enum Skip {
+    /// It is longer than a message may be: its length.
+    TooLong(usize),
+    /// The port's memory is all held by other messages and sessions.
+    NoMemory,
 }
 
 /// Reads a client message, of at most `max` bytes: its type and body. The
-/// body grows as its bytes arrive, so a message announced and never sent
-/// holds no memory.
-fn read_msg(conn: &mut impl Read, max: usize) -> io::Result<Incoming> {
+/// body grows as its bytes arrive, each part past [`LARGE_MESSAGE`] held in
+/// `share`, so a message announced and never sent holds no memory. Once its
+/// first byte is in, the rest must follow at a pace. A longer message is
+/// read through and let go when `skip_long`, else an error (before login: a
+/// client nobody knows is not read for long).
+fn read_msg(conn: &mut impl Wire, max: usize, share: &mut Share, skip_long: bool) -> io::Result<Incoming> {
     let mut head = [0u8; 5];
     // The first byte apart: a wait that ends before it leaves the stream as it was.
     loop {
@@ -291,30 +420,79 @@ fn read_msg(conn: &mut impl Read, max: usize) -> io::Result<Incoming> {
             Err(e) => return Err(e),
         }
     }
+    let started = Instant::now();
+    conn.socket().within = Some(started + STALLED);
+    let read = read_rest(conn, head, max, share, started, skip_long);
+    conn.socket().within = None;
+    read
+}
+
+fn read_rest(
+    conn: &mut impl Wire,
+    mut head: [u8; 5],
+    max: usize,
+    share: &mut Share,
+    started: Instant,
+    skip_long: bool,
+) -> io::Result<Incoming> {
     conn.read_exact(&mut head[1..])?;
     let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
     if len < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad message length"));
     }
+    // A long message may take its time, at a pace.
+    conn.socket().within = Some(started + STALLED + Duration::from_secs((len / MESSAGE_PACE) as u64));
     if len > max {
-        return Ok(Incoming::TooLong(head[0], len));
+        if !skip_long {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too long"));
+        }
+        skip(conn, len - 4)?;
+        return Ok(Incoming::Skipped(head[0], Skip::TooLong(len)));
     }
-    Ok(Incoming::Message(head[0], read_body(conn, len - 4)?))
+    Ok(match read_body(conn, len - 4, share)? {
+        Some(body) => Incoming::Message(head[0], body),
+        None => Incoming::Skipped(head[0], Skip::NoMemory),
+    })
 }
 
-/// `len` bytes of a message's body.
-fn read_body(conn: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
-    if len <= 64 << 10 {
-        let mut body = vec![0u8; len];
-        conn.read_exact(&mut body)?;
-        return Ok(body);
-    }
-    let mut body = Vec::with_capacity(64 << 10);
-    conn.by_ref().take(len as u64).read_to_end(&mut body)?;
-    if body.len() < len {
+/// Reads `len` bytes and lets them go.
+fn skip(conn: &mut impl Read, len: usize) -> io::Result<()> {
+    let skipped = io::copy(&mut conn.by_ref().take(len as u64), &mut io::sink())?;
+    if skipped < len as u64 {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(body)
+    Ok(())
+}
+
+/// `len` bytes of a message's body (`None`: read through and let go, for
+/// want of memory). Past [`LARGE_MESSAGE`], what it takes is held in `share`
+/// as it grows, doubling at most up to its length.
+fn read_body(conn: &mut impl Read, len: usize, share: &mut Share) -> io::Result<Option<Vec<u8>>> {
+    if len <= LARGE_MESSAGE {
+        let mut body = vec![0u8; len];
+        conn.read_exact(&mut body)?;
+        return Ok(Some(body));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut room = 0;
+    while body.len() < len {
+        if body.len() == room {
+            room = (room * 2).clamp(LARGE_MESSAGE, len);
+            if !share.hold_waiting(room) {
+                let rest = len - body.len();
+                drop(body);
+                share.hold(0);
+                skip(conn, rest)?;
+                return Ok(None);
+            }
+            body.reserve_exact(room - body.len());
+        }
+        let got = conn.by_ref().take((room - body.len()) as u64).read_to_end(&mut body)?;
+        if got == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+    }
+    Ok(Some(body))
 }
 
 /// A cursor over a message body.
@@ -338,6 +516,10 @@ impl<'a> Body<'a> {
     fn i16(&mut self) -> Result<i16> {
         Ok(i16::from_be_bytes(self.take(2)?.try_into().map_err(|_| Self::bad())?))
     }
+    /// A count (of parameters, of formats): PostgreSQL reads it unsigned.
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| Self::bad())?))
+    }
     fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_be_bytes(self.take(4)?.try_into().map_err(|_| Self::bad())?))
     }
@@ -356,7 +538,7 @@ const PROTOCOL_3: i32 = 196608;
 
 /// Serves one connection until the client leaves (blocking). The listener
 /// counted it in `pg_connections`; it is counted out here.
-pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
+pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions, port: Arc<Port>) {
     /// Counts a connection for as long as it lives, a panic included.
     struct Open<'a>(&'a State);
     impl Drop for Open<'_> {
@@ -371,7 +553,7 @@ pub(crate) fn serve(state: Arc<State>, stream: TcpStream, options: PgOptions) {
     super::net::keep_alive(&stream);
     // A bug met by one session ends that session alone (its client is told
     // why when the session got that far), not the process's thread count.
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| session(&state, stream, &options)));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| session(&state, stream, &options, &port)));
 }
 
 /// The text of a panic.
@@ -379,7 +561,7 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
     panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("")
 }
 
-fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Result<()> {
+fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions, port: &Port) -> io::Result<()> {
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     // Until the password is checked, each read waits only for what is left
     // of the time to log in, and the few answers the client is sent must go
@@ -450,7 +632,8 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
     let mut out = Out::default();
     out.msg(b'R', |b| b.extend_from_slice(&3i32.to_be_bytes()));
     conn.write_all(&out.buf)?;
-    let Incoming::Message(kind, body) = read_msg(&mut conn, LOGIN_MESSAGE)? else { return Ok(()) };
+    let mut share = Share::new(&port.memory);
+    let Incoming::Message(kind, body) = read_msg(&mut conn, LOGIN_MESSAGE, &mut share, false)? else { return Ok(()) };
     let token = if kind == b'p' { Body(&body).str().unwrap_or_default() } else { String::new() };
     let mut out = Out::default();
     let Some((app, read_only)) = state.apps.authenticate(&token, state.options.token.as_deref()) else {
@@ -474,10 +657,33 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
         );
         return conn.write_all(&out.buf);
     };
-    // Logged in: no more deadline.
+    // Read-only tokens may be public (in web pages): they get half of the
+    // connections at most, so that their holders, however many, never keep
+    // the application's own clients out.
+    let max_connections = state.pg_max_connections();
+    let read_only_most = max_connections.div_ceil(2).max(1);
+    let _read_only_place = match read_only {
+        false => None,
+        true => match ReadOnlyPlace::take(port, read_only_most) {
+            Some(place) => Some(place),
+            None => {
+                error(
+                    &mut out,
+                    "53300",
+                    &format!(
+                        "too many read-only connections: this server serves {read_only_most} of them at once, half of its {max_connections} PostgreSQL connections (NUAGE_PG_MAX_CONNECTIONS), so that read-write clients always find a place; use a connection pool, or close idle ones"
+                    ),
+                );
+                return conn.write_all(&out.buf);
+            }
+        },
+    };
+    // Logged in: no more deadline. A client may stay idle as long as it
+    // likes, but not leave its answers unread: a write that makes no
+    // progress for a minute ends the session.
     let socket = conn.socket();
     socket.deadline = None;
-    let _ = socket.stream.set_write_timeout(None);
+    let _ = socket.stream.set_write_timeout(Some(STALLED));
     out.msg(b'R', |b| b.extend_from_slice(&0i32.to_be_bytes()));
     let app_name = params.get("application_name").cloned().unwrap_or_default();
     for (k, v) in server_params(&app_name) {
@@ -504,44 +710,67 @@ fn session(state: &Arc<State>, stream: TcpStream, options: &PgOptions) -> io::Re
         b.extend_from_slice(&pid.to_be_bytes());
         b.extend_from_slice(&rand_i32().to_be_bytes());
     });
+    // A message is as long as a request body may be.
+    let max = state.options.max_body_bytes.max(LARGE_MESSAGE);
     let mut s = Session {
         state: state.clone(),
         app,
         read_only,
         branch,
         tx: None,
+        since: None,
         failed: false,
-        idled: None,
+        ended: None,
         savepoints: Vec::new(),
         statements: HashMap::new(),
         portals: HashMap::new(),
         held: 0,
+        // Half of the port's memory, and room for a parameter as long as a message.
+        most: (port.memory.total() / 2).max(max + (1 << 20)),
+        share: Share::new(&port.memory),
+        reading: share,
         skip_to_sync: false,
     };
     s.ready(&mut out);
     conn.write_all(&out.buf)?;
-    // A message is as long as a request body may be.
-    let max = state.options.max_body_bytes.max(64 << 10);
     let idle = options.idle_in_transaction.unwrap_or(IDLE_IN_TRANSACTION).max(Duration::from_millis(1));
+    let lifetime = options.transaction_timeout.unwrap_or(TRANSACTION_TIMEOUT).max(Duration::from_millis(1));
     let mut conn = BufReader::with_capacity(READ_AHEAD, conn);
     loop {
-        conn.get_mut().socket().idle = s.tx.is_some().then_some(idle);
-        let (kind, body) = match read_msg(&mut conn, max)? {
+        let socket = conn.socket();
+        socket.idle = s.tx.is_some().then_some(idle);
+        socket.idle_until = s.since.map(|since| since + lifetime);
+        let (kind, body) = match read_msg(&mut conn, max, &mut s.reading, true)? {
             Incoming::Message(kind, body) => (kind, body),
             Incoming::Quiet => {
-                s.idle_too_long(idle);
+                s.timed_out(idle, lifetime);
+                // On Windows a receive that timed out leaves its socket in no
+                // known state: the session ends there, as PostgreSQL ends it.
+                if cfg!(windows) {
+                    let mut out = Out::to(conn.get_mut());
+                    if let Some(ended) = s.ended.take() {
+                        ended.tell(&mut out, "FATAL");
+                    }
+                    return out.end(true);
+                }
                 continue;
             }
-            Incoming::TooLong(kind, len) => {
-                // Read through, not kept: the session goes on, the message refused.
-                io::copy(&mut conn.by_ref().take(len as u64 - 4), &mut io::sink())?;
+            Incoming::Skipped(kind, why) => {
                 let mut out = Out::to(conn.get_mut());
-                s.too_long(&mut out, kind, len, max);
+                s.skipped(&mut out, kind, why, max);
                 out.end(true)?;
                 continue;
             }
         };
-        if answer_guarded(conn.get_mut(), |out| s.message(out, kind, &body))? == Step::Close {
+        // A transaction kept busy past its lifetime ends all the same.
+        if s.since.is_some_and(|since| since.elapsed() >= lifetime) {
+            s.end_transaction(Ended::Lifetime(lifetime));
+        }
+        let step = answer_guarded(conn.get_mut(), |out| s.message(out, kind, &body))?;
+        // The message, and what reading its statement took, are let go.
+        drop(body);
+        s.reading.hold(0);
+        if step == Step::Close {
             return Ok(());
         }
     }
@@ -634,13 +863,52 @@ fn server_params(app_name: &str) -> Vec<(&'static str, String)> {
 }
 
 fn error(out: &mut Out<'_>, code: &str, message: &str) {
+    report(out, "ERROR", code, message);
+}
+
+/// An error of `severity` (`ERROR`, or `FATAL` when the session ends with it).
+fn report(out: &mut Out<'_>, severity: &str, code: &str, message: &str) {
     out.msg(b'E', |b| {
-        for (f, v) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', code), (b'M', message)] {
+        for (f, v) in [(b'S', severity), (b'V', severity), (b'C', code), (b'M', message)] {
             b.push(f);
             cstr(b, v);
         }
         b.push(0);
     });
+}
+
+/// Why a transaction was rolled back without its client asking.
+#[derive(Clone, Copy)]
+enum Ended {
+    /// It was left idle this long.
+    Idle(Duration),
+    /// It was open this long.
+    Lifetime(Duration),
+}
+
+impl Ended {
+    /// Tells the client, as PostgreSQL tells it.
+    fn tell(self, out: &mut Out<'_>, severity: &str) {
+        let (code, message) = match self {
+            Ended::Idle(idle) => (
+                "25P03",
+                format!(
+                    "the transaction was rolled back: it was left idle for more than {} seconds \
+                     (idle_in_transaction_session_timeout); run it again",
+                    idle.as_secs_f64()
+                ),
+            ),
+            Ended::Lifetime(lifetime) => (
+                "25P04",
+                format!(
+                    "the transaction was rolled back: it was open for more than {} seconds \
+                     (transaction_timeout); run it again, in shorter transactions",
+                    lifetime.as_secs_f64()
+                ),
+            ),
+        };
+        report(out, severity, code, &message);
+    }
 }
 
 /// The SQLSTATE of an error.
@@ -653,8 +921,18 @@ fn sqlstate(e: &Error) -> &'static str {
     if message.contains("can only be used in transaction blocks") {
         return "25P01";
     }
-    if message.contains("too many ") && message.contains(" in this session (") {
+    if message.contains("too many ") && message.contains(" in this session (")
+        || message.contains("this session holds ")
+        || message.contains("a statement is 1 MiB at most")
+        || message.contains(" of memory once read, ")
+    {
         return "54000";
+    }
+    if message.contains("the server holds many ") {
+        return "53200";
+    }
+    if message.contains("bind message supplies ") || message.contains("bind message has ") {
+        return "08P01";
     }
     match kind.as_str() {
         "unique_violation" => "23505",
@@ -692,13 +970,14 @@ struct Prepared {
     typed_names: Vec<String>,
     /// Types of the result columns, once described: execution sends these.
     columns: Option<Vec<(String, i32)>>,
-    /// The length of the message that made it.
+    /// About what it holds (see [`statement_bytes`]).
     size: usize,
 }
 
 struct Portal {
     stmt: Arc<Prepared>,
-    /// The length of the message that made it.
+    /// About what it holds: its parameters until it runs, then the rows it
+    /// keeps between messages (counted in [`Session::held`]).
     size: usize,
     /// Its parameters, until it runs.
     params: Vec<Value>,
@@ -716,6 +995,9 @@ struct Ran {
     rows: VecDeque<Vec<Value>>,
     /// Its command tag (`SELECT 3`), for when the last row is sent.
     tag: String,
+    /// What of those rows is counted in the portal's size (none until they
+    /// are kept from one message to the next).
+    counted: usize,
 }
 
 /// A statement's columns, as known before it runs.
@@ -734,17 +1016,26 @@ struct Session {
     branch: String,
     /// The transaction `BEGIN` opened.
     tx: Option<EmbeddedTransaction>,
+    /// When it began.
+    since: Option<Instant>,
     /// A statement of that transaction failed: only `ROLLBACK` is accepted.
     failed: bool,
-    /// The transaction was rolled back for having been left idle this long:
-    /// the client's next message is told so.
-    idled: Option<Duration>,
+    /// The transaction was rolled back by a timer: the client's next message
+    /// is told why.
+    ended: Option<Ended>,
     /// Its savepoints, in order.
     savepoints: Vec<(String, Savepoint)>,
     statements: HashMap<String, Arc<Prepared>>,
     portals: HashMap<String, Portal>,
-    /// What the messages that made the statements and portals came to.
+    /// About what the statements and portals hold in memory, in bytes.
     held: usize,
+    /// What `held` may come to.
+    most: usize,
+    /// The part of `held` past [`SESSION_FREE`], taken from the port's memory.
+    share: Share,
+    /// The message being answered, and what reading its statement takes,
+    /// past what is free: let go once it is answered.
+    reading: Share,
     skip_to_sync: bool,
 }
 
@@ -772,18 +1063,10 @@ impl Session {
             b'H' => return Step::Flush,
             _ => {}
         }
-        if let Some(idle) = self.idled.take() {
+        if let Some(ended) = self.ended.take() {
             // Whatever it asks (a `COMMIT` above all), the transaction it
             // thinks open is gone: it is told before anything runs.
-            let secs = idle.as_secs_f64();
-            error(
-                out,
-                "25P03",
-                &format!(
-                    "the transaction was rolled back: it was left idle for more than {secs} seconds \
-                     (idle_in_transaction_session_timeout); run it again"
-                ),
-            );
+            ended.tell(out, "ERROR");
             match kind {
                 b'Q' => {
                     self.ready(out);
@@ -823,39 +1106,101 @@ impl Session {
         }
     }
 
-    /// The client left its transaction idle too long: rolled back, so that
-    /// it keeps no pages from being reused; the client hears of it at its
-    /// next message.
-    fn idle_too_long(&mut self, idle: Duration) {
+    /// No message came in the time a read may wait in a transaction: it was
+    /// left idle too long, or it reached its lifetime.
+    fn timed_out(&mut self, idle: Duration, lifetime: Duration) {
+        let old = self.since.is_some_and(|since| since.elapsed() >= lifetime);
+        self.end_transaction(if old { Ended::Lifetime(lifetime) } else { Ended::Idle(idle) });
+    }
+
+    /// Rolls back the transaction its client did not end in time, so that it
+    /// keeps no pages from being reused; the client hears of it at its next
+    /// message.
+    fn end_transaction(&mut self, why: Ended) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.rollback_now();
-            self.idled = Some(idle);
+            self.ended = Some(why);
         }
+        self.since = None;
         self.failed = false;
         self.savepoints.clear();
         // The portals of a transaction end with it.
         self.forget_portals();
     }
 
-    /// Takes a statement or a portal of `size` bytes, in place of one of
-    /// `replaced` bytes (or of none, among `count` held of at most `most`):
-    /// refused past what a session may hold.
-    fn may_hold(&mut self, replaced: Option<usize>, size: usize, count: usize, most: usize, what: &str) -> Result<()> {
-        let bytes = self.state.options.max_body_bytes.saturating_mul(4).max(64 << 20);
-        let held = self.held.saturating_sub(replaced.unwrap_or(0)) + size;
-        if (replaced.is_none() && count >= most) || held > bytes {
-            return Err(Error::Validation(format!(
-                "too many {what} in this session ({most} at most, {} MiB of messages together): close some before making more",
-                bytes >> 20
-            )));
+    /// Holds `after` bytes in place of `before` (a statement or a portal
+    /// replaced, grown or let go): refused past what a session may hold, or
+    /// when the port's memory is all held by others.
+    fn account(&mut self, before: usize, after: usize) -> Result<()> {
+        let held = self.held.saturating_sub(before).saturating_add(after);
+        if after > before {
+            if held > self.most {
+                return Err(Error::Validation(format!(
+                    "this session holds {} MiB of prepared statements, portals and the rows they keep, and may hold {} MiB: close some (or read results whole) before making more",
+                    held >> 20,
+                    self.most >> 20
+                )));
+            }
+            if !self.share.hold(held.saturating_sub(SESSION_FREE)) {
+                return Err(Error::Validation(format!(
+                    "the server holds many prepared statements, portals and results at once ({} MiB in all): close some, or try again in a moment",
+                    self.share.total() >> 20
+                )));
+            }
+        } else {
+            self.share.hold(held.saturating_sub(SESSION_FREE));
         }
         self.held = held;
         Ok(())
     }
 
+    /// Takes one more statement or portal, among `count` of at most `most`
+    /// (`replaced`: the size of the one of the same name it takes the place of).
+    fn may_hold(&mut self, replaced: Option<usize>, size: usize, count: usize, most: usize, what: &str) -> Result<()> {
+        if replaced.is_none() && count >= most {
+            return Err(Error::Validation(format!(
+                "too many {what} in this session ({most} at most): close some before making more"
+            )));
+        }
+        self.account(replaced.unwrap_or(0), size)
+    }
+
+    /// Reading an SQL text takes about [`statement_bytes`]: refused when
+    /// longer than a statement may be, or when it would take more than the
+    /// session may hold (`kept`: it is kept, a prepared statement in place
+    /// of one of that size) or the port has, before it is parsed; past what
+    /// is free, held until the message is answered.
+    fn read_sql(&mut self, sql: &str, kept: Option<usize>) -> Result<usize> {
+        if sql.len() > MAX_SQL_TEXT {
+            return Err(Error::Validation(format!(
+                "the SQL text is {} bytes: a statement is 1 MiB at most; send a long script in several parts",
+                sql.len()
+            )));
+        }
+        let bytes = statement_bytes(sql);
+        let most = match kept {
+            Some(replaced) => self.most.saturating_sub(self.held.saturating_sub(replaced)),
+            None => self.reading.total(),
+        };
+        if bytes > most {
+            return Err(Error::Validation(format!(
+                "this statement would take about {} MiB of memory once read, and this session has {} MiB left for it: send it in smaller parts",
+                bytes.div_ceil(1 << 20),
+                most >> 20
+            )));
+        }
+        if bytes > SESSION_FREE && !self.reading.hold_waiting(self.reading.held() + bytes) {
+            return Err(Error::Validation(format!(
+                "the server holds many large statements and messages at once ({} MiB in all): try again in a moment",
+                self.reading.total() >> 20
+            )));
+        }
+        Ok(bytes)
+    }
+
     fn forget_portals(&mut self) {
         let sizes: usize = self.portals.drain().map(|(_, p)| p.size).sum();
-        self.held = self.held.saturating_sub(sizes);
+        let _ = self.account(sizes, 0);
     }
 
     /// Forgets the prepared statement `name` (`None`: all of them). One that
@@ -865,16 +1210,28 @@ impl Session {
             Some(name) => self.statements.remove(name).map_or(0, |p| p.size),
             None => self.statements.drain().map(|(_, p)| p.size).sum(),
         };
-        self.held = self.held.saturating_sub(sizes);
+        let _ = self.account(sizes, 0);
     }
 
-    /// A message longer than a request body may be, skipped: refused as a
-    /// statement is.
-    fn too_long(&mut self, out: &mut Out<'_>, kind: u8, len: usize, max: usize) {
-        let message = format!(
-            "message too long: {len} bytes, this server reads {max} at most (the largest request body); send less at once"
-        );
-        error(out, "54000", &message);
+    /// A message read through and not kept: refused as a statement is.
+    fn skipped(&mut self, out: &mut Out<'_>, kind: u8, why: Skip, max: usize) {
+        match why {
+            Skip::TooLong(len) => error(
+                out,
+                "54000",
+                &format!(
+                    "message too long: {len} bytes, this server reads {max} at most (the largest request body); send less at once"
+                ),
+            ),
+            Skip::NoMemory => error(
+                out,
+                "53200",
+                &format!(
+                    "the server holds many large messages and statements at once ({} MiB in all): try again in a moment",
+                    self.reading.total() >> 20
+                ),
+            ),
+        }
         if self.tx.is_some() {
             self.failed = true;
         }
@@ -1035,15 +1392,18 @@ impl Session {
 
     fn control(&mut self, what: &str) -> Result<String> {
         self.savepoints.clear();
-        match what {
-            "begin" => {
-                if self.tx.is_none() {
-                    self.tx =
-                        Some(Embedded::from_engine(self.app.engine.clone()).on_branch(&self.branch)?.begin_now()?);
-                    self.failed = false;
-                }
-                Ok("BEGIN".into())
+        if what == "begin" {
+            if self.tx.is_none() {
+                self.tx = Some(Embedded::from_engine(self.app.engine.clone()).on_branch(&self.branch)?.begin_now()?);
+                self.since = Some(Instant::now());
+                self.failed = false;
             }
+            return Ok("BEGIN".into());
+        }
+        // The portals of a transaction end with it, as PostgreSQL's do.
+        self.since = None;
+        self.forget_portals();
+        match what {
             "commit" => {
                 let failed = std::mem::take(&mut self.failed);
                 match self.tx.take() {
@@ -1074,6 +1434,7 @@ impl Session {
     }
 
     fn simple_inner(&mut self, out: &mut Out<'_>, sql: &str) -> Result<()> {
+        self.read_sql(sql, None)?;
         match self.plan(sql) {
             Ok(Plan::Empty) => {
                 out.msg(b'I', |_| {});
@@ -1171,11 +1532,12 @@ impl Session {
             b'P' => {
                 let name = b.str()?;
                 let sql = b.str()?;
-                let n = b.i16()?.max(0) as usize;
+                let n = b.u16()? as usize;
                 let mut param_types = Vec::with_capacity(n);
                 for _ in 0..n {
                     param_types.push(b.i32()?);
                 }
+                let size = self.read_sql(&sql, Some(self.statements.get(&name).map_or(0, |p| p.size)))?;
                 let script = match self.plan(&sql)? {
                     Plan::Run(s) => {
                         if s.len() > 1 {
@@ -1198,7 +1560,7 @@ impl Session {
                         inferred[i] = *t;
                     }
                 }
-                let size = body.len();
+                let size = size + 8 * param_types.len();
                 let replaced = self.statements.get(&name).map(|p| p.size);
                 self.may_hold(replaced, size, self.statements.len(), SESSION_STATEMENTS, "prepared statements")?;
                 let stmt =
@@ -1214,12 +1576,26 @@ impl Session {
                     .get(&name)
                     .cloned()
                     .ok_or_else(|| Error::Validation(format!("prepared statement \"{name}\" does not exist")))?;
-                let nf = b.i16()?.max(0) as usize;
+                let nf = b.u16()? as usize;
                 let mut pformats = Vec::with_capacity(nf);
                 for _ in 0..nf {
                     pformats.push(b.i16()?);
                 }
-                let np = b.i16()?.max(0) as usize;
+                // As many values as the statement has parameters, as PostgreSQL
+                // checks: a few bytes per `NULL` would otherwise hold a slot of
+                // memory each, for parameters nothing reads.
+                let np = b.u16()? as usize;
+                let wanted = stmt.param_types.len();
+                if np != wanted {
+                    return Err(Error::Validation(format!(
+                        "bind message supplies {np} parameters, but prepared statement \"{name}\" requires {wanted}"
+                    )));
+                }
+                if nf > 1 && nf != np {
+                    return Err(Error::Validation(format!(
+                        "bind message has {nf} parameter formats but {np} parameters"
+                    )));
+                }
                 let mut params = Vec::with_capacity(np);
                 for i in 0..np {
                     let len = b.i32()?;
@@ -1237,12 +1613,12 @@ impl Session {
                     };
                     params.push(if len < 0 { Value::Null } else { decode_param(b.take(len as usize)?, oid, format)? });
                 }
-                let nr = b.i16()?.max(0) as usize;
+                let nr = b.u16()? as usize;
                 let mut formats = Vec::with_capacity(nr);
                 for _ in 0..nr {
                     formats.push(b.i16()?);
                 }
-                let size = body.len();
+                let size = PORTAL_BYTES + 2 * formats.len() + params.iter().map(value_bytes).sum::<usize>();
                 let replaced = self.portals.get(&portal).map(|p| p.size);
                 self.may_hold(replaced, size, self.portals.len(), SESSION_PORTALS, "portals")?;
                 self.portals.insert(portal, Portal { stmt, size, params, formats, columns: None, ran: None });
@@ -1302,14 +1678,24 @@ impl Session {
                         let n = if max > 0 { ran.rows.len().min(max) } else { ran.rows.len() };
                         // Each row is let go once written: a portal read in
                         // batches holds less and less.
+                        let mut sent = 0;
                         for row in ran.rows.drain(..n) {
+                            if ran.counted > 0 {
+                                sent += row_bytes(&row);
+                            }
                             data_row(out, &row, &types, &p.formats)?;
                         }
-                        if ran.rows.is_empty() {
+                        let left = if ran.rows.is_empty() {
                             ran.rows = VecDeque::new();
                             complete(out, &ran.tag);
+                            0
                         } else {
                             out.msg(b's', |_| {});
+                            // The rows left wait for the next Execute: counted until then.
+                            if ran.counted == 0 { rows_bytes(&ran.rows) } else { ran.counted.saturating_sub(sent) }
+                        };
+                        if left != ran.counted {
+                            self.keep_rows(&name, left)?;
                         }
                     }
                     _ => {
@@ -1347,7 +1733,7 @@ impl Session {
                 } else {
                     self.portals.remove(&name).map(|p| p.size)
                 };
-                self.held = self.held.saturating_sub(size.unwrap_or(0));
+                let _ = self.account(size.unwrap_or(0), 0);
                 out.msg(b'3', |_| {});
             }
             other => {
@@ -1367,23 +1753,51 @@ impl Session {
         let Some(script) = p.stmt.script.clone() else { return Ok(()) };
         // It runs once: its parameters are not needed after.
         let params = std::mem::take(&mut p.params);
+        let size = p.size.saturating_sub(params.iter().map(value_bytes).sum());
         let results = self.run(&script, &params)?;
+        drop(params);
         let Some(p) = self.portals.get_mut(name) else { return Ok(()) };
+        let before = std::mem::replace(&mut p.size, size);
         let ran = match results.into_iter().next() {
             Some(r) => {
                 let told = p.columns.take().filter(|cols| cols.len() == r.columns.len());
                 p.columns = if r.returns_rows { told.or_else(|| Some(found_columns(&p.stmt, &r))) } else { None };
-                Ran { tag: script.tag(0, &r), rows: r.rows.into() }
+                Ran { tag: script.tag(0, &r), rows: r.rows.into(), counted: 0 }
             }
-            None => Ran { rows: VecDeque::new(), tag: "SELECT 0".into() },
+            None => Ran { rows: VecDeque::new(), tag: "SELECT 0".into(), counted: 0 },
         };
         p.ran = Some(ran);
+        let _ = self.account(before, size);
+        Ok(())
+    }
+
+    /// Counts `counted` bytes for the rows portal `name` keeps for a later
+    /// message, in place of what was counted for them. Past what may be
+    /// held, the portal ends here (refused), its rows let go.
+    fn keep_rows(&mut self, name: &str, counted: usize) -> Result<()> {
+        let Some((before, was)) = self.portals.get(name).and_then(|p| Some((p.size, p.ran.as_ref()?.counted))) else {
+            return Ok(());
+        };
+        let after = before.saturating_sub(was) + counted;
+        if let Err(e) = self.account(before, after) {
+            if let Some(p) = self.portals.remove(name) {
+                let _ = self.account(p.size, 0);
+            }
+            return Err(e);
+        }
+        if let Some(p) = self.portals.get_mut(name) {
+            p.size = after;
+            if let Some(ran) = p.ran.as_mut() {
+                ran.counted = counted;
+            }
+        }
         Ok(())
     }
 
     /// The columns of a portal, for `Describe`: as its statement's say when
     /// they are known; else, for a statement that reads, from its run (which
-    /// `Execute` sends); for one that writes, as the statement names them.
+    /// `Execute` sends, its rows counted until then); for one that writes, as
+    /// the statement names them.
     fn describe_portal(&mut self, name: &str) -> Result<Option<Vec<(String, i32)>>> {
         let p = self.portals.get(name).ok_or_else(|| Error::Validation(format!("portal \"{name}\" does not exist")))?;
         if p.ran.is_none() {
@@ -1400,6 +1814,10 @@ impl Session {
                 return Ok(columns);
             }
             self.run_portal(name)?;
+            let rows = self.portals.get(name).and_then(|p| p.ran.as_ref()).map_or(0, |ran| rows_bytes(&ran.rows));
+            if rows > 0 {
+                self.keep_rows(name, rows)?;
+            }
         }
         Ok(self.portals.get(name).and_then(|p| p.columns.clone()))
     }
@@ -1419,15 +1837,11 @@ impl Session {
         if !script.returns_rows() {
             return Columns::None;
         }
+        // The names are a run's (see `sql::typing`); `EXPLAIN` answers with a
+        // plan, which only a run tells.
         let (names, types) = (&stmt.typed_names, &stmt.typed_columns);
-        // A run names an expression and a name met twice its own way, and
-        // `EXPLAIN` answers with a plan: those, only a run tells.
         let explains = stmt.sql.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
-        let complete = !names.is_empty()
-            && names.len() == types.len()
-            && !types.contains(&0)
-            && !names.iter().any(|n| n == "?column?")
-            && !names.iter().enumerate().any(|(i, n)| names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)));
+        let complete = !names.is_empty() && names.len() == types.len() && !types.contains(&0);
         if complete && !explains {
             Columns::Known(names.iter().cloned().zip(types.iter().copied()).collect())
         } else {
@@ -1511,6 +1925,82 @@ fn columns_of(r: &SqlResult, typed: &[i32]) -> Vec<(String, i32)> {
             (c.clone(), oid)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// What sessions hold
+// ---------------------------------------------------------------------------
+
+/// What a portal holds besides its parameters and rows.
+const PORTAL_BYTES: usize = 256;
+/// What the allocator adds to a text or a list it gives room to.
+const BLOCK: usize = 16;
+
+/// About what a prepared statement of `sql` holds: its text twice (as sent,
+/// and as the statement keeps it), and its syntax tree, some fifty bytes a
+/// token (`IN (1,1,1,...)` takes fifty times its text). Counted on the text,
+/// before it is parsed: a statement too large to keep is refused without
+/// building it.
+fn statement_bytes(sql: &str) -> usize {
+    1024 + 2 * sql.len() + 64 * tokens(sql)
+}
+
+/// About how many tokens an SQL text has: words and numbers, quoted texts
+/// and names, and signs, one each.
+fn tokens(sql: &str) -> usize {
+    let b = sql.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' || c >= 0x80;
+    let (mut n, mut i) = (0, 0);
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        n += 1;
+        if c == b'\'' || c == b'"' {
+            while i < b.len() && b[i] != c {
+                i += 1;
+            }
+            i += 1;
+        } else if word(c) {
+            while i < b.len() && word(b[i]) {
+                i += 1;
+            }
+        }
+    }
+    n
+}
+
+/// About what a value takes in memory.
+fn value_bytes(v: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match v {
+            Value::Text(s) => s.len() + BLOCK,
+            Value::Bytes(b) => b.len() + BLOCK,
+            Value::Json(j) => json_bytes(j) + BLOCK,
+            _ => 0,
+        }
+}
+
+/// About what a JSON value takes besides its slot.
+fn json_bytes(j: &serde_json::Value) -> usize {
+    use serde_json::Value as J;
+    match j {
+        J::String(s) => s.len() + BLOCK,
+        J::Array(a) => a.iter().map(|x| std::mem::size_of::<J>() + json_bytes(x)).sum::<usize>() + BLOCK,
+        J::Object(o) => o.iter().map(|(k, x)| k.len() + 2 * BLOCK + std::mem::size_of::<J>() + json_bytes(x)).sum(),
+        _ => 0,
+    }
+}
+
+/// About what a row takes in memory.
+fn row_bytes(row: &[Value]) -> usize {
+    std::mem::size_of::<Vec<Value>>() + BLOCK + row.iter().map(value_bytes).sum::<usize>()
+}
+
+fn rows_bytes<'r>(rows: impl IntoIterator<Item = &'r Vec<Value>>) -> usize {
+    rows.into_iter().map(|r| row_bytes(r)).sum()
 }
 
 fn complete(out: &mut Out<'_>, tag: &str) {
@@ -1885,20 +2375,95 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let mut socket = Socket::new(listener.accept().unwrap().0);
+        let memory = PortMemory::new(Some(1 << 20), 0);
+        let mut share = Share::new(&memory);
         socket.idle = Some(Duration::from_millis(50));
         let started = Instant::now();
-        assert!(matches!(read_msg(&mut socket, 1 << 20).unwrap(), Incoming::Quiet));
+        assert!(matches!(read_msg(&mut socket, 1 << 20, &mut share, true).unwrap(), Incoming::Quiet));
         assert!(started.elapsed() < Duration::from_secs(5));
         client.write_all(b"Q\0\0\0\x0dselect 1\0").unwrap();
-        let Incoming::Message(kind, body) = read_msg(&mut socket, 1 << 20).unwrap() else { panic!("a message") };
+        let Incoming::Message(kind, body) = read_msg(&mut socket, 1 << 20, &mut share, true).unwrap() else {
+            panic!("a message")
+        };
         assert_eq!((kind, body.as_slice()), (b'Q', &b"select 1\0"[..]));
-        // A message longer than may be read is not read.
-        client.write_all(b"Q\0\x10\0\x01").unwrap();
-        assert!(matches!(read_msg(&mut socket, 1 << 20).unwrap(), Incoming::TooLong(b'Q', 0x10_0001)));
+        assert!(socket.within.is_none(), "no clock between messages");
+        // A message longer than may be read is read through, not kept: the next one is read.
+        client.write_all(b"Q\0\0\0\x0aabcdefQ\0\0\0\x05x").unwrap();
+        assert!(matches!(
+            read_msg(&mut socket, 8, &mut share, true).unwrap(),
+            Incoming::Skipped(b'Q', Skip::TooLong(10))
+        ));
+        assert!(matches!(read_msg(&mut socket, 8, &mut share, true).unwrap(), Incoming::Message(b'Q', b) if b == b"x"));
+        // Before login it is not read at all.
+        client.write_all(b"p\0\0\0\x0aabcdef").unwrap();
+        assert!(read_msg(&mut socket, 8, &mut share, false).is_err());
+        // Within a message, the clock runs: its time over, the read fails at once.
+        socket.within = Some(Instant::now());
+        let e = socket.read(&mut [0u8; 1]).unwrap_err();
+        assert!(timed_out(&e), "{e}");
+        socket.within = None;
         // A deadline passed: the read fails at once.
         socket.deadline = Some(Instant::now());
         let e = socket.read(&mut [0u8; 1]).unwrap_err();
         assert!(timed_out(&e), "{e}");
+    }
+
+    /// A large message takes its memory from the port's as it arrives; when
+    /// the port has none left, it is read through and refused, and the
+    /// session reads the next one.
+    #[test]
+    fn large_messages_take_the_ports_memory() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut socket = Socket::new(listener.accept().unwrap().0);
+        let memory = PortMemory::new(Some(1 << 20), 0);
+        let mut share = Share::new(&memory);
+        let large = |n: usize| {
+            let mut m = vec![b'Q'];
+            m.extend_from_slice(&(n as u32 + 4).to_be_bytes());
+            m.extend(std::iter::repeat_n(b'x', n));
+            m
+        };
+        let writer = std::thread::spawn({
+            let mut client = client.try_clone().unwrap();
+            move || {
+                client.write_all(&large(700 << 10)).unwrap();
+                client.write_all(&large(700 << 10)).unwrap();
+            }
+        });
+        let Incoming::Message(_, body) = read_msg(&mut socket, 4 << 20, &mut share, true).unwrap() else { panic!() };
+        assert_eq!(body.len(), 700 << 10);
+        assert!(share.held() >= 700 << 10, "held while it is answered: {}", share.held());
+        // Another session holds the port's memory meanwhile.
+        let mut other = Share::new(&memory);
+        assert!(other.hold(1 << 20) || { share.hold(0) && other.hold(1 << 20) });
+        assert!(matches!(
+            read_msg(&mut socket, 4 << 20, &mut share, true).unwrap(),
+            Incoming::Skipped(b'Q', Skip::NoMemory)
+        ));
+        writer.join().unwrap();
+        drop(other);
+        client.write_all(&large(100 << 10)).unwrap();
+        let Incoming::Message(_, body) = read_msg(&mut socket, 4 << 20, &mut share, true).unwrap() else { panic!() };
+        assert_eq!(body.len(), 100 << 10);
+    }
+
+    /// What a statement is counted at follows its tokens, not only its
+    /// length: a list of numbers counts far more than a text.
+    #[test]
+    fn statements_are_counted_by_their_tokens() {
+        assert_eq!(tokens("SELECT id, name FROM t WHERE id = $1 AND n = 'a b c'"), 14);
+        assert_eq!(tokens("select \"Weird name\" from x.y"), 4);
+        let list = format!("SELECT id FROM t WHERE id IN ({})", vec!["1"; 1000].join(","));
+        let text = format!("SELECT '{}'", "x".repeat(list.len()));
+        assert!(
+            statement_bytes(&list) > 20 * statement_bytes(&text) / 2,
+            "{} {}",
+            statement_bytes(&list),
+            statement_bytes(&text)
+        );
+        assert!(statement_bytes(&list) > 60 * list.len());
+        assert!(statement_bytes("SELECT 1") < 2048);
     }
 
     /// Values a driver may send that no value here stands for are refused,

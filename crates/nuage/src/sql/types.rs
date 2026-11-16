@@ -5,7 +5,7 @@
 use memoire_orm::ColumnType;
 
 use super::ast::*;
-use super::exec::Runner;
+use super::exec::{Runner, header, unique_headers};
 
 /// Types found for a statement: of each parameter, and of each result column.
 #[derive(Debug, Default, PartialEq)]
@@ -14,6 +14,22 @@ pub(crate) struct Typing {
     pub columns: Vec<Option<ColumnType>>,
     /// Names of the result columns (empty when some are unknown).
     pub names: Vec<String>,
+}
+
+/// A table a `SELECT` reads, as `*` expands it: its alias, and its name or
+/// the `SELECT` it is made of.
+struct Own<'s> {
+    alias: Option<String>,
+    source: &'s Source,
+}
+
+/// The tables of a `SELECT` core that `*` expands to.
+fn own_of(c: &Core) -> Vec<Own<'_>> {
+    c.from
+        .iter()
+        .chain(c.joins.iter().map(|j| &j.table))
+        .map(|t| Own { alias: t.alias.clone(), source: &t.source })
+        .collect()
 }
 
 struct Infer<'r, 'a> {
@@ -182,47 +198,97 @@ impl Infer<'_, '_> {
     }
 
     /// The result columns of `items`, `*` expanding to the columns of `own`
-    /// (the tables of that `SELECT`, or the table of `RETURNING`).
-    fn items(&self, items: &[SelItem], own: &[(Option<String>, String)]) -> (Vec<Option<ColumnType>>, Vec<String>) {
+    /// (the tables of that `SELECT`, or the table of `RETURNING`), named as a
+    /// run names them: an expression without an alias after its place
+    /// (`column2`), and in a `SELECT` (`qualify`), a name met twice after its
+    /// table (`b.id`). Empty when some are unknown.
+    fn items(&self, items: &[SelItem], own: &[Own<'_>], qualify: bool) -> (Vec<Option<ColumnType>>, Vec<String>) {
         let mut out = Vec::new();
-        let mut names = Vec::new();
-        for item in items {
+        // Each name, and the table that qualifies it if it is met twice:
+        // `Some(None)` for a table a run may spell its own way.
+        let mut names: Vec<(String, Option<Option<String>>)> = Vec::new();
+        for (n, item) in items.iter().enumerate() {
             match item {
                 SelItem::Expr(e, alias) => {
                     out.push(self.type_of(e));
-                    names.push(match (alias, e) {
-                        (Some(a), _) => a.clone(),
-                        (None, Expr::Col { name, .. }) => name.clone(),
-                        (None, Expr::Func { name, .. }) => name.clone(),
-                        (None, Expr::Cast(inner, _)) => match &**inner {
-                            Expr::Col { name, .. } => name.clone(),
-                            _ => "?column?".into(),
-                        },
-                        _ => "?column?".into(),
-                    });
+                    let table = match e {
+                        Expr::Col { table: Some(t), .. } => Some(Some(t.clone())),
+                        _ => None,
+                    };
+                    names.push((alias.clone().unwrap_or_else(|| header(e, n)), table));
                 }
                 SelItem::All | SelItem::TableAll(_) => {
                     let wanted = match item {
                         SelItem::TableAll(t) => Some(t.as_str()),
                         _ => None,
                     };
-                    for (alias, t) in own {
-                        if wanted.is_some_and(|w| !(alias.as_deref() == Some(w) || t.eq_ignore_ascii_case(w))) {
+                    for o in own {
+                        let name = match o.source {
+                            Source::Table(name) => Some(name.as_str()),
+                            Source::Select(_) => None,
+                        };
+                        if wanted.is_some_and(|w| {
+                            !(o.alias.as_deref() == Some(w) || name.is_some_and(|t| t.eq_ignore_ascii_case(w)))
+                        }) {
                             continue;
                         }
-                        match self.runner.schema(t) {
-                            Ok(schema) => {
-                                out.extend(schema.columns.iter().map(|c| Some(c.kind)));
-                                names.extend(schema.columns.iter().map(|c| c.name.to_owned()));
+                        let (kinds, columns, spelled) = match o.source {
+                            Source::Table(t) => match self.runner.schema(t) {
+                                Ok(schema) => (
+                                    schema.columns.iter().map(|c| Some(c.kind)).collect(),
+                                    schema.columns.iter().map(|c| c.name.to_owned()).collect(),
+                                    schema.name == t.as_str(),
+                                ),
+                                Err(_) => return (Vec::new(), Vec::new()),
+                            },
+                            // A derived table: the columns of its `SELECT`.
+                            Source::Select(sub) => {
+                                let (kinds, columns) = self.select_items(sub);
+                                if columns.is_empty() {
+                                    return (Vec::new(), Vec::new());
+                                }
+                                (kinds, columns, false)
                             }
-                            // A derived table: its columns are unknown here.
-                            Err(_) => return (Vec::new(), Vec::new()),
-                        }
+                        };
+                        let table = match (&o.alias, name) {
+                            (Some(alias), _) => Some(alias.clone()),
+                            (None, Some(t)) if spelled => Some(t.to_owned()),
+                            _ => None,
+                        };
+                        out.extend(kinds);
+                        names.extend(columns.into_iter().map(|c| (c, Some(table.clone()))));
                     }
                 }
             }
         }
-        (out, names)
+        if !qualify {
+            return (out, names.into_iter().map(|(n, _)| n).collect());
+        }
+        let unique = unique_headers(names.iter().map(|(n, t)| (n.clone(), t.clone().flatten())).collect());
+        // A name met twice whose table a run may spell otherwise: unknown.
+        for (i, (name, table)) in names.iter().enumerate() {
+            if *table == Some(None) && unique[..i].iter().any(|u| u.eq_ignore_ascii_case(name)) {
+                return (Vec::new(), Vec::new());
+            }
+        }
+        (out, unique)
+    }
+
+    /// The result columns of `RETURNING items` of `table`: a run names them
+    /// without their table.
+    fn returning(
+        &self,
+        items: &[SelItem],
+        alias: Option<String>,
+        table: &str,
+    ) -> (Vec<Option<ColumnType>>, Vec<String>) {
+        let source = Source::Table(table.to_owned());
+        self.items(items, &[Own { alias, source: &source }], false)
+    }
+
+    /// The result columns of a `SELECT`: those of its first part.
+    fn select_items(&self, s: &Select) -> (Vec<Option<ColumnType>>, Vec<String>) {
+        self.items(&s.first.items, &own_of(&s.first), true)
     }
 }
 
@@ -284,14 +350,7 @@ pub(crate) fn infer(runner: &Runner<'_>, stmt: &Stmt, params: usize) -> Typing {
     let (columns, names) = match stmt {
         Stmt::Select(s) => {
             inf.select(s);
-            let mut own = Vec::new();
-            for t in s.first.from.iter().chain(s.first.joins.iter().map(|j| &j.table)) {
-                match &t.source {
-                    Source::Table(name) => own.push((t.alias.clone(), name.clone())),
-                    Source::Select(_) => own.push((t.alias.clone(), String::new())),
-                }
-            }
-            inf.items(&s.first.items, &own)
+            inf.select_items(s)
         }
         Stmt::Insert { table, columns, source, on_conflict, returning, .. } => {
             let names: Vec<String> = match columns {
@@ -320,20 +379,20 @@ pub(crate) fn infer(runner: &Runner<'_>, stmt: &Stmt, params: usize) -> Typing {
                     inf.expr(f);
                 }
             }
-            returning.as_deref().map(|r| inf.items(r, &[(None, table.clone())])).unwrap_or_default()
+            returning.as_deref().map(|r| inf.returning(r, None, table)).unwrap_or_default()
         }
         Stmt::Update { table, alias, sets, filter, returning } => {
             inf.assign(table, sets);
             if let Some(f) = filter {
                 inf.expr(f);
             }
-            returning.as_deref().map(|r| inf.items(r, &[(alias.clone(), table.clone())])).unwrap_or_default()
+            returning.as_deref().map(|r| inf.returning(r, alias.clone(), table)).unwrap_or_default()
         }
         Stmt::Delete { table, alias, filter, returning } => {
             if let Some(f) = filter {
                 inf.expr(f);
             }
-            returning.as_deref().map(|r| inf.items(r, &[(alias.clone(), table.clone())])).unwrap_or_default()
+            returning.as_deref().map(|r| inf.returning(r, alias.clone(), table)).unwrap_or_default()
         }
         _ => (Vec::new(), Vec::new()),
     };

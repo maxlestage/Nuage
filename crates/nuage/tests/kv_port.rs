@@ -155,3 +155,84 @@ async fn a_long_pipeline_is_answered_in_order() {
     assert_eq!(said.len(), expected.len());
     assert!(said == expected, "the answers came out of order");
 }
+
+/// Before AUTH a client has a few commands, each answered; past them it is
+/// told so and closed. Logging in takes one.
+#[tokio::test]
+async fn a_client_has_a_few_commands_to_log_in() {
+    let (_server, addr) = start("noauth", ServerOptions::default()).await;
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    let wire: Vec<u8> = (0..40).flat_map(|_| command(&[b"PING"])).collect();
+    conn.write_all(&wire).await.unwrap();
+    let (said, closed) = answer(&mut conn, "\u{0}", Duration::from_secs(5)).await;
+    assert!(closed, "{said:?}");
+    assert_eq!(said.matches("-NOAUTH").count(), 10, "{said:?}");
+    assert!(said.ends_with("-ERR 10 commands without AUTH: the connection is closed\r\n"), "{said:?}");
+    // A few refused, then the right token: in.
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    for _ in 0..3 {
+        assert!(say(&mut conn, &[b"PING"]).await.starts_with("-NOAUTH"));
+    }
+    assert!(say(&mut conn, &[b"AUTH", b"wrong"]).await.starts_with("-WRONGPASS"));
+    assert_eq!(say(&mut conn, &[b"AUTH", b"t0ken"]).await, "+OK\r\n");
+    let wire: Vec<u8> = (0..40).flat_map(|_| command(&[b"PING"])).collect();
+    conn.write_all(&wire).await.unwrap();
+    let pongs = "+PONG\r\n".repeat(40);
+    assert_eq!(answer(&mut conn, &pongs, Duration::from_secs(5)).await, (pongs.clone(), false));
+}
+
+/// Read-only tokens (which may be in web pages, and so anyone's) have half
+/// of the connections at most: read-write clients always find a place.
+#[tokio::test]
+async fn read_only_tokens_have_half_of_the_places() {
+    let (server, addr) = start("read-only", ServerOptions { kv_max_connections: 4, ..ServerOptions::default() }).await;
+    let read_only = server.new_app_read_only_token("nuage").unwrap();
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(say(&mut conn, &[b"AUTH", read_only.as_bytes()]).await, "+OK\r\n");
+        readers.push(conn);
+    }
+    let mut third = TcpStream::connect(addr).await.unwrap();
+    let refused = say(&mut third, &[b"AUTH", read_only.as_bytes()]).await;
+    assert!(refused.starts_with("-ERR max number of read-only clients reached"), "{refused}");
+    assert_eq!(say(&mut third, &[b"AUTH", b"t0ken"]).await, "+OK\r\n", "a read-write token finds a place");
+    assert_eq!(say(&mut third, &[b"PING"]).await, "+PONG\r\n");
+    // A place given back is a place to take.
+    drop(readers.pop());
+    let mut again = false;
+    for _ in 0..50 {
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        if say(&mut conn, &[b"AUTH", read_only.as_bytes()]).await == "+OK\r\n" {
+            again = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(again, "the read-only place was given back");
+}
+
+/// A command must come whole within a minute (more for a long one): a
+/// client that sends a byte now and then is closed all the same; an idle
+/// one between commands is not.
+#[tokio::test]
+async fn a_command_comes_at_a_pace() {
+    let (_server, addr) = start("pace", ServerOptions::default()).await;
+    let mut slow = TcpStream::connect(addr).await.unwrap();
+    let mut idle = TcpStream::connect(addr).await.unwrap();
+    for conn in [&mut slow, &mut idle] {
+        assert_eq!(say(conn, &[b"AUTH", b"t0ken"]).await, "+OK\r\n");
+    }
+    slow.write_all(b"*2\r\n$3\r\nGET\r\n$40\r\nab").await.unwrap();
+    let started = Instant::now();
+    let closed = loop {
+        let (said, closed) = answer(&mut slow, "\u{0}", Duration::from_secs(20)).await;
+        assert!(said.is_empty(), "{said:?}");
+        if closed || slow.write_all(b"c").await.is_err() {
+            break started.elapsed();
+        }
+        assert!(started.elapsed() < Duration::from_secs(100), "a trickled command keeps its connection");
+    };
+    assert!(closed > Duration::from_secs(50) && closed < Duration::from_secs(85), "closed after {closed:?}");
+    assert_eq!(say(&mut idle, &[b"PING"]).await, "+PONG\r\n", "idle between commands, it stays");
+}

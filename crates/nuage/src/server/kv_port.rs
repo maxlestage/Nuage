@@ -14,10 +14,14 @@
 //! also answers TLS: the first byte of a connection tells which. Commands sent
 //! together (a pipeline) are answered together.
 //!
-//! A client has 15 seconds to log in, with small commands; the port serves
+//! A client has 15 seconds to log in, with a few small commands; the port
+//! serves
 //! [`ServerOptions::kv_max_connections`](super::ServerOptions::kv_max_connections)
-//! connections at once, and a transaction (`MULTI`) queues what a request
-//! body may hold.
+//! connections at once (read-only tokens, half of them at most), a command
+//! comes at a pace, a transaction (`MULTI`) queues what a request body may
+//! hold, and what the connections hold together past 64 KiB each (commands
+//! being read, transactions being queued) is bounded: an eighth of the
+//! server's memory, and room for four of the largest request bodies.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +33,7 @@ use tokio::net::TcpStream;
 
 use super::State;
 use super::apps::App;
+use super::net::{PortMemory, Share};
 use crate::kv::Reply;
 
 /// Settings of the key-value port.
@@ -56,11 +61,25 @@ const LOGIN_TIME: Duration = Duration::from_secs(15);
 const LOGIN_ARGS: usize = 16;
 const LOGIN_ARG_BYTES: usize = 4 << 10;
 const LOGIN_BUFFER: usize = 8 << 10;
+/// Commands a client may send before it logs in: logging in takes one to
+/// three, and each refused one has an answer to hold.
+const LOGIN_COMMANDS: usize = 10;
 /// Answers held before they are sent, in a long pipeline.
 const SEND_AT: usize = 1 << 20;
-/// A client that takes nothing of its answers this long, or sends nothing
-/// more of a command it started, is gone: its connection is closed.
+/// A client that has not taken its answers in this long (and a second more
+/// for each [`COMMAND_PACE`] bytes of them) is gone: its connection is
+/// closed. A command it started has as long to come whole, and its next
+/// bytes come within this long.
 const STALLED: Duration = Duration::from_secs(60);
+const COMMAND_PACE: usize = 64 << 10;
+/// What a connection holds of its port's memory for nothing: a command or a
+/// transaction past this takes its share of the port's.
+const FREE: usize = 64 << 10;
+/// Once a connection is closed for a reason it was told, what the client
+/// still sends is read (and let go) this long, this much at most, so that
+/// the reason reaches it instead of a reset.
+const LINGER: Duration = Duration::from_secs(1);
+const LINGER_BYTES: u64 = 1 << 20;
 /// Commands a transaction (`MULTI`) may queue. What they hold together is
 /// bounded too, by the largest request body.
 const QUEUE_COMMANDS: usize = 100_000;
@@ -70,20 +89,64 @@ const QUEUED_ARG_COST: usize = 32;
 /// The answer to a connection past [`ServerOptions::kv_max_connections`](super::ServerOptions).
 pub(super) const TOO_MANY_CLIENTS: &[u8] = b"-ERR max number of clients reached\r\n";
 
+/// What the connections of one key-value port share.
+pub(crate) struct Port {
+    memory: Arc<PortMemory>,
+    /// Connections served at once at most.
+    most: usize,
+    open: AtomicUsize,
+    /// Connections logged in with a read-only token.
+    read_only: AtomicUsize,
+}
+
+impl Port {
+    /// `memory`: see [`PortMemory::new`].
+    pub(crate) fn new(memory: Option<usize>, max_body: usize, most: usize) -> Arc<Port> {
+        Arc::new(Port {
+            memory: PortMemory::new(memory, max_body),
+            most: most.max(1),
+            open: AtomicUsize::new(0),
+            read_only: AtomicUsize::new(0),
+        })
+    }
+
+    /// One more of `count` (connections, or read-only ones) if fewer than `most`.
+    fn take(count: &AtomicUsize, most: usize) -> bool {
+        super::net::add_within(count, 1, most)
+    }
+}
+
 /// A connection's place among those the listener serves at once: given back
 /// when the connection ends, however it ends.
-pub(super) struct Place(Arc<AtomicUsize>);
+pub(super) struct Place(Arc<Port>);
 
 impl Place {
-    pub(super) fn take(open: &Arc<AtomicUsize>) -> Place {
-        open.fetch_add(1, Ordering::Relaxed);
-        Place(open.clone())
+    /// A place, if one is left.
+    pub(super) fn take(port: &Arc<Port>) -> Option<Place> {
+        Port::take(&port.open, port.most).then(|| Place(port.clone()))
     }
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A session's place among those read-only tokens may have: half of the
+/// port's, so that their holders (a token in a web page is anyone's) never
+/// keep the application's own clients out.
+struct ReadOnlyPlace(Arc<Port>);
+
+impl ReadOnlyPlace {
+    fn take(port: &Arc<Port>) -> Option<ReadOnlyPlace> {
+        Port::take(&port.read_only, port.most.div_ceil(2)).then(|| ReadOnlyPlace(port.clone()))
+    }
+}
+
+impl Drop for ReadOnlyPlace {
+    fn drop(&mut self) {
+        self.0.read_only.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -143,13 +206,20 @@ fn text(arg: &[u8]) -> String {
 
 struct Session {
     state: Arc<State>,
+    port: Arc<Port>,
     peer: String,
     app: Option<(Arc<App>, bool)>,
+    /// Its place among read-only sessions, when its token only reads.
+    read_only_place: Option<ReadOnlyPlace>,
     name: String,
     /// The client asked for RESP3 (`HELLO 3`).
     resp3: bool,
     /// The commands queued since `MULTI`.
     queued: Option<Queue>,
+    /// What the command being read and the queue hold past [`FREE`].
+    share: Share,
+    /// The part of it for the command being read.
+    buffer_held: usize,
 }
 
 /// The commands of a transaction, waiting for `EXEC`.
@@ -174,6 +244,21 @@ impl Session {
         let token = text(token);
         match self.state.apps.authenticate(&token, self.state.options.token.as_deref()) {
             Some((app, read_only)) => {
+                let place = match (read_only, self.read_only_place.take()) {
+                    (false, _) => None,
+                    (true, Some(place)) => Some(place),
+                    (true, None) => match ReadOnlyPlace::take(&self.port) {
+                        Some(place) => Some(place),
+                        None => {
+                            return Reply::Error(format!(
+                                "ERR max number of read-only clients reached: {} of the {} connections at most, so that read-write clients always find a place",
+                                self.port.most.div_ceil(2),
+                                self.port.most
+                            ));
+                        }
+                    },
+                };
+                self.read_only_place = place;
                 app.touch();
                 app.connected("Key-value port", &self.name, &self.peer, read_only);
                 self.app = Some((app, read_only));
@@ -244,6 +329,12 @@ impl Session {
                     Reply::Error(format!(
                         "ERR this transaction is too large: it may queue {QUEUE_COMMANDS} commands and {} MiB, EXEC will discard it",
                         most >> 20
+                    ))
+                } else if !self.share.hold(held(queue.bytes + bytes, self.buffer_held)) {
+                    queue.spoil();
+                    Reply::Error(format!(
+                        "ERR the server holds many large commands and transactions at once ({} MiB in all): EXEC will discard this one, try again in a moment",
+                        self.share.total() >> 20
                     ))
                 } else {
                     queue.bytes += bytes;
@@ -331,12 +422,31 @@ impl Session {
     }
 }
 
-/// Writes `out` and empties it; `false` when the client is gone, or took
-/// nothing of it for [`STALLED`].
-async fn send<S: AsyncWrite + Unpin>(stream: &mut S, out: &mut Vec<u8>) -> bool {
+/// What a connection holds past [`FREE`]: its queue's bytes past it, and
+/// `buffer` for the command being read.
+fn held(queue: usize, buffer: usize) -> usize {
+    queue.saturating_sub(FREE) + buffer
+}
+
+impl Session {
+    /// Holds what the queue and the command being read take now (less once
+    /// a transaction ended or a large command was answered).
+    fn settle(&mut self) {
+        let queue = self.queued.as_ref().map_or(0, |q| q.bytes);
+        self.share.hold(held(queue, self.buffer_held));
+    }
+}
+
+/// Writes `out` and empties it; `false` when the client is gone, or did not
+/// take it in [`STALLED`] and a second more for each [`COMMAND_PACE`] bytes
+/// of it (however little it takes at a time), or (before login) when its
+/// time to log in is over.
+async fn send<S: AsyncWrite + Unpin>(stream: &mut S, out: &mut Vec<u8>, by: Option<tokio::time::Instant>) -> bool {
+    let paced = tokio::time::Instant::now() + STALLED + Duration::from_secs((out.len() / COMMAND_PACE) as u64);
+    let deadline = by.map_or(paced, |by| by.min(paced));
     let mut at = 0;
     while at < out.len() {
-        match tokio::time::timeout(STALLED, stream.write(&out[at..])).await {
+        match tokio::time::timeout_at(deadline, stream.write(&out[at..])).await {
             Ok(Ok(n)) if n > 0 => at += n,
             _ => return false,
         }
@@ -346,7 +456,23 @@ async fn send<S: AsyncWrite + Unpin>(stream: &mut S, out: &mut Vec<u8>) -> bool 
     if out.capacity() > 2 * SEND_AT {
         *out = Vec::with_capacity(4096);
     }
-    matches!(tokio::time::timeout(STALLED, stream.flush()).await, Ok(Ok(())))
+    matches!(tokio::time::timeout_at(deadline, stream.flush()).await, Ok(Ok(())))
+}
+
+/// Closes a connection whose client was told why: what it still sends is
+/// read and let go for a moment, so that the reason reaches it (a socket
+/// closed with unread data is reset, and the answer may be lost with it).
+async fn close<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+    let _ = tokio::time::timeout(LINGER, stream.shutdown()).await;
+    let mut sink = [0u8; 4096];
+    let mut drained = 0;
+    let until = tokio::time::Instant::now() + LINGER;
+    while drained < LINGER_BYTES {
+        match tokio::time::timeout_at(until, stream.read(&mut sink)).await {
+            Ok(Ok(n)) if n > 0 => drained += n as u64,
+            _ => return,
+        }
+    }
 }
 
 async fn session<S: AsyncRead + AsyncWrite + Unpin>(
@@ -354,12 +480,28 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     peer: SocketAddr,
     login_by: tokio::time::Instant,
+    port: Arc<Port>,
 ) {
     let max = state.options.max_body_bytes;
-    let mut session =
-        Session { state, peer: peer.ip().to_string(), app: None, name: String::new(), resp3: false, queued: None };
+    let share = Share::new(&port.memory);
+    let mut session = Session {
+        state,
+        port,
+        peer: peer.ip().to_string(),
+        app: None,
+        read_only_place: None,
+        name: String::new(),
+        resp3: false,
+        queued: None,
+        share,
+        buffer_held: 0,
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut out: Vec<u8> = Vec::with_capacity(4096);
+    // Commands answered before login.
+    let mut before_login = 0;
+    // When the command still coming started to.
+    let mut started: Option<tokio::time::Instant> = None;
     loop {
         // Every command already there, then one write: a pipeline costs one
         // round trip. A long one is answered as it goes, so that its answers
@@ -367,15 +509,27 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         let mut at = 0;
         let mut open = true;
         while open {
-            let (max_args, max_bytes) =
-                if session.app.is_some() { (MAX_ARGS, max) } else { (LOGIN_ARGS, LOGIN_ARG_BYTES) };
+            let by = session.app.is_none().then_some(login_by);
+            let (max_args, max_bytes) = if by.is_none() { (MAX_ARGS, max) } else { (LOGIN_ARGS, LOGIN_ARG_BYTES) };
             match parse(&buf[at..], max_args, max_bytes) {
                 Ok(Some((args, used))) => {
                     at += used;
                     if !args.is_empty() {
                         open = session.answer(&args, &mut out);
+                        // Each refused command has an answer: a client that
+                        // does not log in gets a few, not a stream of them.
+                        if session.app.is_none() {
+                            before_login += 1;
+                            if open && before_login >= LOGIN_COMMANDS {
+                                Reply::Error(format!(
+                                    "ERR {LOGIN_COMMANDS} commands without AUTH: the connection is closed"
+                                ))
+                                .write_resp(&mut out, session.resp3);
+                                open = false;
+                            }
+                        }
                     }
-                    if out.len() >= SEND_AT && !send(&mut stream, &mut out).await {
+                    if out.len() >= SEND_AT && !send(&mut stream, &mut out, by).await {
                         return;
                     }
                 }
@@ -387,37 +541,69 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         buf.drain(..at);
-        if !out.is_empty() && !send(&mut stream, &mut out).await {
+        let by = session.app.is_none().then_some(login_by);
+        if !out.is_empty() && !send(&mut stream, &mut out, by).await {
             return;
         }
         // A command larger than a request body may be: refused. Before login,
         // a few KiB at most.
-        let most = if session.app.is_some() { max + (64 << 10) } else { LOGIN_BUFFER };
+        let most = if by.is_none() { max + (64 << 10) } else { LOGIN_BUFFER };
         if open && buf.len() > most {
             Reply::Error("ERR Protocol error: this command is longer than the server reads".into())
                 .write_resp(&mut out, session.resp3);
-            let _ = send(&mut stream, &mut out).await;
+            let _ = send(&mut stream, &mut out, by).await;
             open = false;
         }
         if !open {
-            let _ = stream.shutdown().await;
+            close(&mut stream).await;
             return;
         }
         // The room a large command took is not kept by an idle connection.
         if buf.capacity() > 64 << 10 && buf.capacity() > 4 * buf.len() {
             buf.shrink_to(buf.len().max(4096));
         }
-        let partial = !buf.is_empty();
+        // Room to read into, doubling as a command grows: past what is free,
+        // taken from the port's memory first.
+        if buf.capacity() - buf.len() < 4096 {
+            let room = (buf.capacity() * 2).min(most + 4096).max(buf.len() + 4096);
+            session.buffer_held = room.saturating_sub(FREE);
+            let queue = session.queued.as_ref().map_or(0, |q| q.bytes);
+            if !session.share.hold_soon(held(queue, session.buffer_held)).await {
+                Reply::Error(format!(
+                    "ERR the server holds many large commands and transactions at once ({} MiB in all): try again in a moment",
+                    session.share.total() >> 20
+                ))
+                .write_resp(&mut out, session.resp3);
+                let _ = send(&mut stream, &mut out, by).await;
+                close(&mut stream).await;
+                return;
+            }
+            buf.reserve_exact(room - buf.len());
+        } else {
+            session.buffer_held = buf.capacity().saturating_sub(FREE);
+        }
+        session.settle();
+        // A command that started must come whole at a pace; one that ended
+        // (or none started) has no clock.
+        if at > 0 || buf.is_empty() {
+            started = None;
+        }
+        if !buf.is_empty() && started.is_none() {
+            started = Some(tokio::time::Instant::now());
+        }
+        let pace = Duration::from_secs((buf.len() / COMMAND_PACE) as u64);
         let read = stream.read_buf(&mut buf);
-        let read = if session.app.is_none() {
+        let read = if let Some(by) = by {
             // Not logged in yet: the time to do it is counted from the connection.
-            match tokio::time::timeout_at(login_by, read).await {
+            match tokio::time::timeout_at(by, read).await {
                 Ok(read) => read,
                 Err(_) => return too_late(&mut stream).await,
             }
-        } else if partial {
-            // Half a command: the rest is expected to come.
-            match tokio::time::timeout(STALLED, read).await {
+        } else if let Some(since) = started {
+            // Part of a command: the rest is expected to come, a byte within
+            // a minute, all of it at a pace.
+            let by = (since + STALLED + pace).min(tokio::time::Instant::now() + STALLED);
+            match tokio::time::timeout_at(by, read).await {
                 Ok(read) => read,
                 Err(_) => return,
             }
@@ -451,6 +637,7 @@ impl Drop for Open<'_> {
 
 /// Serves one connection until the client leaves; `place` is given back then.
 pub(crate) async fn serve(state: Arc<State>, stream: TcpStream, peer: SocketAddr, options: KvOptions, place: Place) {
+    let port = place.0.clone();
     let _place = place;
     let login_by = tokio::time::Instant::now() + LOGIN_TIME;
     state.metrics.open_connections.fetch_add(1, Ordering::Relaxed);
@@ -469,11 +656,11 @@ pub(crate) async fn serve(state: Arc<State>, stream: TcpStream, peer: SocketAddr
         (true, Some(config)) => {
             let accept = tokio_rustls::TlsAcceptor::from(config.clone()).accept(stream);
             if let Ok(Ok(stream)) = tokio::time::timeout_at(login_by, accept).await {
-                session(state.clone(), stream, peer, login_by).await;
+                session(state.clone(), stream, peer, login_by, port).await;
             }
         }
         (true, None) => {}
-        (false, _) => session(state.clone(), stream, peer, login_by).await,
+        (false, _) => session(state.clone(), stream, peer, login_by, port).await,
     }
 }
 
