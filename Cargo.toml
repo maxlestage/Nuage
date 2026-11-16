@@ -6,7 +6,7 @@ members = ["crates/nuage", "crates/nuage-site", "crates/nuage-editor"]
 default-members = ["crates/nuage", "crates/nuage-site"]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"

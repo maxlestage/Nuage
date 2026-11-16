@@ -1355,7 +1355,12 @@ pub(crate) fn json_response(status: u16, body: &Json) -> Response<HttpBody> {
     // The same bytes as `body.to_string()`, written straight into the buffer instead of
     // through `fmt::Display`: half the time for a page of rows. A JSON value always
     // serializes (its keys are strings).
-    let mut res = Response::new(full(serde_json::to_vec(body).unwrap_or_default()));
+    json_text(status, serde_json::to_vec(body).unwrap_or_default())
+}
+
+/// [`json_response`] for an answer already written as its text.
+pub(crate) fn json_text(status: u16, body: Vec<u8>) -> Response<HttpBody> {
+    let mut res = Response::new(full(body));
     *res.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -2062,17 +2067,19 @@ fn answer_statement(
                 crate::sql::run_values(engine, branch, schemas, &[(&script, &params)], true)?.pop().unwrap_or_default()
             }
         };
+        // The rows written straight as their text: the same bytes as
+        // `{"rows": rows_to_json(..)}`, without building (and copying) that tree.
         let answer = if fetch {
             let rows = results.into_iter().rev().find(|r| !r.columns.is_empty()).map(|r| r.rows);
-            json!({ "rows": wire::rows_to_json(&rows.unwrap_or_default()) })
+            wire::rows_to_vec(&rows.unwrap_or_default())
         } else {
             let done = memoire_orm::ExecResult {
                 rows_affected: results.iter().map(|r| r.rows_affected).sum(),
                 last_insert_id: results.iter().rev().find_map(|r| r.last_insert_id.clone()),
             };
-            wire::exec_result_to_json(&done)
+            serde_json::to_vec(&wire::exec_result_to_json(&done)).unwrap_or_default()
         };
-        return Ok((serde_json::to_vec(&answer).unwrap_or_default(), false));
+        return Ok((answer, false));
     }
     let q = query.as_query();
     let done = |r: memoire_orm::ExecResult| {

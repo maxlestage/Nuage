@@ -50,7 +50,7 @@ each token opens only its own application.
 
 ```bash
 curl "$NUAGE_URL/v1/ping" -H "Authorization: Bearer $NUAGE_TOKEN"
-# {"ok": true, "message": "Connected to Nuage DB 0.4.6: application `blog`, read and write, ...", ...}
+# {"ok": true, "message": "Connected to Nuage DB 0.4.7: application `blog`, read and write, ...", ...}
 nuage check "$NUAGE_URL" "$NUAGE_TOKEN"     # the same, as one line, from any machine
 ```
 
