@@ -701,7 +701,12 @@ pub(crate) fn json_response(status: u16, body: &Json) -> Response<HttpBody> {
     // The same bytes as `body.to_string()`, written straight into the buffer instead of
     // through `fmt::Display`: half the time for a page of rows. A JSON value always
     // serializes (its keys are strings).
-    let mut res = Response::new(full(serde_json::to_vec(body).unwrap_or_default()));
+    json_text(status, serde_json::to_vec(body).unwrap_or_default())
+}
+
+/// [`json_response`] for an answer already written as its text.
+pub(crate) fn json_text(status: u16, body: Vec<u8>) -> Response<HttpBody> {
+    let mut res = Response::new(full(body));
     *res.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1098,7 +1103,7 @@ async fn app_protocol(
                     return Ok(forbidden(READ_ONLY));
                 }
                 let schemas = state.clone();
-                let answer = tokio::task::spawn_blocking(move || -> Result<Json> {
+                let answer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                     let results = match tx {
                         Some(tx) => crate::sql::run_in(&tx.tx, &schemas.schemas, &script, &params)?,
                         None => {
@@ -1108,20 +1113,22 @@ async fn app_protocol(
                                 .unwrap_or_default()
                         }
                     };
+                    // The rows written straight as their text: the same bytes as
+                    // `{"rows": rows_to_json(..)}`, without building (and copying) that tree.
                     Ok(if fetch {
                         let rows = results.into_iter().rev().find(|r| !r.columns.is_empty()).map(|r| r.rows);
-                        json!({ "rows": wire::rows_to_json(&rows.unwrap_or_default()) })
+                        wire::rows_to_vec(&rows.unwrap_or_default())
                     } else {
                         let done = memoire_orm::ExecResult {
                             rows_affected: results.iter().map(|r| r.rows_affected).sum(),
                             last_insert_id: results.iter().rev().find_map(|r| r.last_insert_id.clone()),
                         };
-                        wire::exec_result_to_json(&done)
+                        serde_json::to_vec(&wire::exec_result_to_json(&done)).unwrap_or_default()
                     })
                 })
                 .await
                 .map_err(|e| Error::Pool(e.to_string()))??;
-                return Ok(json_response(200, &answer));
+                return Ok(json_text(200, answer));
             }
             // A read outside a transaction: where it is while reads of its
             // shape are short (see `fast::ReadCosts`), its answer written
@@ -1189,14 +1196,7 @@ async fn app_protocol(
             })
             .await
             .map_err(|e| Error::Pool(e.to_string()))??;
-            let results: Vec<Json> = results
-                .into_iter()
-                .map(|r| match r {
-                    Ok(rows) => json!({ "rows": wire::rows_to_json(&rows) }),
-                    Err(done) => wire::exec_result_to_json(&done),
-                })
-                .collect();
-            Ok(json_response(200, &json!({ "results": results })))
+            Ok(json_text(200, batch_answer(&results)))
         }
         (Method::POST, ["transactions"]) => {
             let tx = state.db(engine, &branch)?.begin_now()?;
@@ -1319,6 +1319,28 @@ fn raw_script(query: &wire::OwnedQuery) -> Result<Option<(crate::sql::Script, Ve
     })
 }
 
+/// The answer to `/v1/batch`, `{"results": [...]}`, written straight as its text, each
+/// statement's rows too: the same bytes as serializing the JSON tree, without building it
+/// (`json!` copied each statement's rows, then the whole list, before it was serialized).
+fn batch_answer(results: &[std::result::Result<Vec<Vec<memoire_orm::Value>>, memoire_orm::ExecResult>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(b"{\"results\":[");
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        match r {
+            Ok(rows) => out.extend_from_slice(&wire::rows_to_vec(rows)),
+            // A JSON value always serializes (its keys are strings).
+            Err(done) => {
+                let _ = serde_json::to_writer(&mut out, &wire::exec_result_to_json(done));
+            }
+        }
+    }
+    out.extend_from_slice(b"]}");
+    out
+}
+
 /// A script of a `/v1/sql` request: `{"sql": "...", "params": [...]}`.
 fn script_of(j: &Json) -> Result<(crate::sql::Script, Vec<Json>)> {
     let sql = j.get("sql").and_then(Json::as_str).ok_or_else(|| Error::Conversion("missing `sql`".into()))?;
@@ -1375,5 +1397,47 @@ impl State {
         }
         *tx.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         Ok(tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use memoire_orm::{ExecResult, Value};
+
+    use super::*;
+
+    /// `/v1/batch` answers the bytes the JSON tree it replaces serialized to.
+    #[test]
+    fn batch_answer_is_the_json_tree() {
+        let rows = vec![
+            vec![
+                Value::I64(-7),
+                Value::I32(3),
+                Value::Text("é \"quoted\" \\ \n".into()),
+                Value::Null,
+                Value::Bool(true),
+                Value::F64(0.1),
+                Value::F64(f64::NAN),
+                Value::Bytes(vec![0, 255]),
+            ],
+            vec![
+                Value::Json(json!({ "b": [1, 2], "a": null })),
+                Value::Uuid(uuid::Uuid::nil()),
+                Value::Date(chrono::NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()),
+            ],
+        ];
+        let done = ExecResult { rows_affected: 2, last_insert_id: Some(Value::I64(9)) };
+        let none = ExecResult { rows_affected: 0, last_insert_id: None };
+        for results in [vec![], vec![Ok(rows.clone()), Err(done), Ok(vec![]), Err(none), Ok(rows)]] {
+            let tree: Vec<Json> = results
+                .iter()
+                .map(|r| match r {
+                    Ok(rows) => json!({ "rows": wire::rows_to_json(rows) }),
+                    Err(done) => wire::exec_result_to_json(done),
+                })
+                .collect();
+            let expected = serde_json::to_vec(&json!({ "results": tree })).unwrap();
+            assert_eq!(String::from_utf8(batch_answer(&results)).unwrap(), String::from_utf8(expected).unwrap());
+        }
     }
 }
