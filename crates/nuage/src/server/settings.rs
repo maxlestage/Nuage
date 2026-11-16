@@ -93,6 +93,8 @@ pub(crate) mod refused {
     pub(crate) const BY_HAND_TOO_MUCH: &str = "{}: {} MiB would be set by hand ({} MiB for the page caches, {} MiB for the key-value stores): more than three quarters of the {} MiB this server counts on ({} MiB at most)";
     pub(crate) const TOO_LITTLE_FOR_BY_HAND: &str = "`memory.total_mb`: {} MiB is too little for what is set by hand ({} MiB for the page caches, {} MiB for the key-value stores): {} MiB at least, or lower those amounts first";
     pub(crate) const PG_MORE_THAN_THREADS: &str = "`postgres.connections`: {} is more than this server can serve at once (each connection has a thread): {} at most";
+    pub(crate) const STATEMENT_MORE_THAN_HALF: &str =
+        "`statement.memory_mb`: {} MiB is more than half of the {} MiB this server counts on: {} MiB at most";
     pub(crate) const CACHE_TOO_SMALL: &str = "a page cache needs {} MiB at least";
     pub(crate) const CACHE_MORE_THAN_LEFT: &str = "{} MiB for `{}` is more than is left: the page caches of this server may take {} MiB in all, {} MiB of it are set apart for other databases and {} MiB stay for those that share: {} MiB at most";
     pub(crate) const KV_TOO_SMALL: &str = "a key-value store needs {} MiB at least";
@@ -102,7 +104,7 @@ pub(crate) mod refused {
 
     /// Every sentence above.
     #[cfg(test)]
-    pub(crate) const ALL: [&str; 20] = [
+    pub(crate) const ALL: [&str; 21] = [
         UNREADABLE,
         TOO_MUCH_FOR_ANY,
         TOO_LITTLE,
@@ -119,6 +121,7 @@ pub(crate) mod refused {
         BY_HAND_TOO_MUCH,
         TOO_LITTLE_FOR_BY_HAND,
         PG_MORE_THAN_THREADS,
+        STATEMENT_MORE_THAN_HALF,
         CACHE_TOO_SMALL,
         CACHE_MORE_THAN_LEFT,
         KV_TOO_SMALL,
@@ -406,7 +409,7 @@ impl Settings {
     /// What was said for `key`, for a budget to be computed from it:
     /// `Some(value)` (`None` inside: nothing said, the default), or `None`
     /// for a server built by hand and nothing saved, whose options stand.
-    fn said(&self, key: &str) -> Option<Option<String>> {
+    pub(crate) fn said(&self, key: &str) -> Option<Option<String>> {
         match (self.saved(key), &self.env) {
             (Some(v), _) => Some(Some(v)),
             (None, Some(_)) => Some(self.environment(key)),

@@ -34,5 +34,25 @@ fn a_saved_memory_never_goes_past_the_environment() {
     // Given back: the environment's figure again.
     server.save_setting("memory.total_mb", None).unwrap();
     assert_eq!(total(), Some(512 << 20));
+
+    // What one SQL request may hold, and how long a statement may run: in
+    // force for the next request (the figures of the process).
+    use std::time::Duration;
+    assert_eq!(nuage::sql::statement_memory(), 64 << 20, "auto: an eighth of 512 MiB");
+    assert_eq!(nuage::sql::statement_timeout(), Some(Duration::from_secs(60)), "the default");
+    server.save_setting("statement.memory_mb", Some("100")).unwrap();
+    assert_eq!(nuage::sql::statement_memory(), 100 << 20);
+    let refused = server.save_setting("statement.memory_mb", Some("300")).unwrap_err();
+    assert!(refused.to_string().contains("more than half of the 512 MiB"), "{refused}");
+    server.save_setting("statement.seconds", Some("5")).unwrap();
+    assert_eq!(nuage::sql::statement_timeout(), Some(Duration::from_secs(5)));
+    server.save_setting("statement.seconds", Some("0")).unwrap();
+    assert_eq!(nuage::sql::statement_timeout(), None, "0: no limit");
+    // A lower memory: the automatic budget follows it.
+    server.save_setting("statement.memory_mb", None).unwrap();
+    server.save_setting("memory.total_mb", Some("256")).unwrap();
+    assert_eq!(nuage::sql::statement_memory(), 32 << 20, "an eighth of 256 MiB");
+    server.save_setting("statement.seconds", None).unwrap();
+    assert_eq!(nuage::sql::statement_timeout(), Some(Duration::from_secs(60)));
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -20,7 +20,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -106,10 +105,29 @@ pub fn statement_timeout() -> Option<Duration> {
     }
 }
 
-/// The memory of the server, read once.
+/// The memory of the server: read once, and again after
+/// [`memory_changed`] (a server's owner said another memory).
 fn total_memory() -> Option<u64> {
-    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
-    *TOTAL.get_or_init(|| crate::memory::MemoryInfo::now().total_bytes)
+    match TOTAL.load(Ordering::Relaxed) {
+        TOTAL_UNREAD => {
+            let total = crate::memory::MemoryInfo::now().total_bytes;
+            TOTAL.store(total.unwrap_or(TOTAL_UNKNOWN), Ordering::Relaxed);
+            total
+        }
+        TOTAL_UNKNOWN => None,
+        total => Some(total),
+    }
+}
+
+/// The memory of the server as last read ([`TOTAL_UNREAD`]: not yet).
+static TOTAL: AtomicU64 = AtomicU64::new(TOTAL_UNREAD);
+const TOTAL_UNREAD: u64 = u64::MAX;
+const TOTAL_UNKNOWN: u64 = u64::MAX - 1;
+
+/// The memory of the server changed: the default budgets follow it.
+#[cfg(feature = "server")]
+pub(crate) fn memory_changed() {
+    TOTAL.store(TOTAL_UNREAD, Ordering::Relaxed);
 }
 
 /// An eighth of the memory of the server: a few statements at the same
