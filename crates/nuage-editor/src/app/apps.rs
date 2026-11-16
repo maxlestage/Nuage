@@ -180,8 +180,9 @@ fn unsure(ui: &mut egui::Ui, session: &mut Session, name: &str, l: Lang) {
     if open {
         session.open_app = Some(name.to_owned());
         session.unsure = None;
-        // Its first token never reached the editor: its page marks it.
-        session.token_asked = Some(TokenAsked { app: name.to_owned(), known: Vec::new(), lost: true });
+        // Its first token never reached the editor: its page marks it. The list read again
+        // shows the application, so it is known what was made.
+        session.token_asked = Some(TokenAsked { app: name.to_owned(), known: Vec::new(), lost: true, checked: true });
     }
 }
 
@@ -325,7 +326,15 @@ fn tokens_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
         }
         // A new token whose answer was lost: once the list is read again, the one made is marked.
         let lost = session.token_asked.as_ref().filter(|a| a.lost && a.app == app.name).map(|a| a.known.clone());
-        if let Some(known) = &lost
+        let checked = session.token_asked.as_ref().is_some_and(|a| a.checked);
+        if lost.is_some() && !checked && !session.loading() {
+            // The list could not be read again: nothing can be said yet.
+            theme::status(
+                ui,
+                Mark::Warn,
+                t(l, "Whether the token was made is not known yet: the list could not be read again. Refresh to know."),
+            );
+        } else if let Some(known) = &lost
             && !session.loading()
         {
             if app.tokens.iter().any(|t| !known.contains(&t.id)) {
@@ -367,7 +376,7 @@ fn tokens_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
                 if ui.add_enabled(!session.busy(), egui::Button::new(label)).clicked() {
                     let name = app.name.clone();
                     let known = app.tokens.iter().map(|t| t.id.clone()).collect();
-                    session.token_asked = Some(TokenAsked { app: name.clone(), known, lost: false });
+                    session.token_asked = Some(TokenAsked { app: name.clone(), known, lost: false, checked: false });
                     let bound = bound_here(session.settings.as_ref());
                     session.act(&ctx, Doing::Token, move |server| {
                         let connection = server.new_token(&name, read_only)?;

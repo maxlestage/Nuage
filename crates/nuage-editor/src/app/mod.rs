@@ -389,6 +389,9 @@ struct TokenAsked {
     app: String,
     known: Vec<String>,
     lost: bool,
+    /// The list of applications was read again after the answer was lost:
+    /// only then can the page say whether the token was made.
+    checked: bool,
 }
 
 /// A token about to be revoked: its owner confirms.
@@ -1127,6 +1130,9 @@ impl Editor {
             match answer {
                 Ok(apps) => {
                     session.apps = Some(apps);
+                    if let Some(asked) = session.token_asked.as_mut().filter(|a| a.lost) {
+                        asked.checked = true;
+                    }
                     session.stale = None;
                 }
                 Err(ApiError::TokenRefused) => refused = true,
@@ -1165,6 +1171,14 @@ impl Editor {
             self.connect.address = address;
             self.connect.use_kept = false;
             self.connect.failed = true;
+            if local {
+                // A token kept for it is the old one: Open reads the file again, not the store.
+                // (The store keeps tokens by address: the next one kept replaces it; refused, it
+                // opens nothing meanwhile.)
+                for s in self.prefs.servers.iter_mut().filter(|s| s.local) {
+                    s.token_kept = false;
+                }
+            }
             self.connect.notice = Some(Notice::bad(if local {
                 // Its token was read from the settings file, never typed: read it again.
                 t(
@@ -1182,13 +1196,15 @@ impl Editor {
         let mut answers = Vec::new();
         self.keeping.retain(|k| match k.job.poll() {
             Some(answer) => {
-                answers.push((k.address.clone(), answer));
+                answers.push((k.address.clone(), answer, k.forgotten.load(Ordering::SeqCst)));
                 false
             }
             None => true,
         });
-        for (address, answer) in answers {
+        for (address, answer, forgotten) in answers {
             let why = match answer {
+                // Forgotten while it was written: the job deleted it again, it is not kept.
+                Ok(Ok(())) if forgotten => continue,
                 Ok(Ok(())) => {
                     for s in self.prefs.servers.iter_mut().filter(|s| s.address == address) {
                         s.token_kept = true;
@@ -1413,6 +1429,8 @@ impl Editor {
             Given::Typed => match api::typed_token(&self.connect.token) {
                 Ok(token) => Some(token),
                 Err(e) => {
+                    // Refused before anything is sent: the steps of an earlier try are not this one's.
+                    self.connect.stepped = false;
                     self.connect.notice = Some(Notice::bad(e.explain(l)));
                     return;
                 }
@@ -1732,6 +1750,7 @@ fn unknown_change(ctx: &egui::Context, session: &mut Session, doing: Doing, e: &
         && let Some(asked) = session.token_asked.as_mut()
     {
         asked.lost = true;
+        asked.checked = false;
     }
     if doing == Doing::Settings {
         session.public_as_saved();
