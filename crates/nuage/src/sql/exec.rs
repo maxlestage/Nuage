@@ -235,11 +235,92 @@ struct Joined {
     failed: Vec<bool>,
 }
 
+/// What a join is asked for.
+#[derive(Clone, Copy)]
+struct Wanted {
+    /// Only how many rows it gives.
+    count: bool,
+    /// Only its first rows.
+    first: Option<usize>,
+}
+
 /// The rows of a group.
 type Group = Vec<Vec<Value>>;
 
+/// Rows an `UPDATE` or a `DELETE` reads at once (see [`Runner::each_target`]).
+const CHANGE_CHUNK: usize = 1024;
+
 /// What a key of a group, of `DISTINCT` or of a hash join takes beside its text.
 const KEY_BYTES: usize = 48;
+
+/// The values a column holds, as a hash join tells them apart.
+#[derive(Clone, Copy)]
+enum Family {
+    /// Integers and floats: SQL compares them by their value, whatever their type.
+    Number,
+    Text,
+    /// Values of one type only (dates, UUIDs...).
+    Exact(ColumnType),
+}
+
+impl Family {
+    /// `None`: no key tells the values apart as SQL does (JSON documents may
+    /// be equal and written differently).
+    fn of(kind: Option<ColumnType>) -> Option<Family> {
+        Some(match kind? {
+            ColumnType::SmallInt | ColumnType::Int | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
+                Family::Number
+            }
+            ColumnType::Text => Family::Text,
+            ColumnType::Json => return None,
+            other => Family::Exact(other),
+        })
+    }
+}
+
+/// The key of a value in a hash join: two values that SQL finds equal have
+/// the same key (two that do not may too; the join's condition is asked
+/// again of each pair).
+#[derive(Hash, PartialEq, Eq)]
+enum JoinKey {
+    Number(u64),
+    Text(String),
+    Other(String),
+}
+
+impl JoinKey {
+    /// `Ok(None)`: it equals nothing (NULL, NaN). `Err(())`: it is not of the
+    /// family, and is compared with each value instead.
+    fn of(v: &Value, family: Family) -> std::result::Result<Option<JoinKey>, ()> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(match (family, v) {
+            (Family::Number, Value::I32(_) | Value::I64(_) | Value::F64(_)) => {
+                let f = v.as_f64().ok_or(())?;
+                if f.is_nan() {
+                    return Ok(None);
+                }
+                // `0.0` and `-0.0` are equal.
+                JoinKey::Number(if f == 0.0 { 0 } else { f.to_bits() })
+            }
+            (Family::Text, Value::Text(t)) => JoinKey::Text(t.clone()),
+            (Family::Exact(kind), _) if v::kind_of(v) == Some(kind) => {
+                let mut k = String::new();
+                v::key(v, &mut k);
+                JoinKey::Other(k)
+            }
+            _ => return Err(()),
+        }))
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            JoinKey::Number(_) => 8,
+            JoinKey::Text(t) | JoinKey::Other(t) => t.len(),
+        }
+    }
+}
 
 /// The key of a row among others (`DISTINCT`, `UNION`).
 fn row_key(row: &[Value]) -> String {
@@ -400,7 +481,12 @@ impl<'a> Runner<'a> {
     }
 
     fn binary(&self, op: Op, a: &Expr, b: &Expr, env: &Env<'_>) -> Result<Value> {
-        let (l, r) = (self.eval(a, env)?, self.eval(b, env)?);
+        let l = self.eval(a, env)?;
+        // The left side is kept while the right one is computed.
+        let mut live = self.limits.live();
+        live.add(&l)?;
+        let r = self.eval(b, env)?;
+        drop(live);
         if !matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
             return arith(op, &l, &r);
         }
@@ -425,15 +511,21 @@ impl<'a> Runner<'a> {
 
     fn in_list(&self, x: &Expr, list: &[Expr], negated: bool, env: &Env<'_>) -> Result<Value> {
         let v = self.eval(x, env)?;
+        let mut live = self.limits.live();
+        live.add(&v)?;
         let mut values = Vec::with_capacity(list.len());
         for item in list {
-            values.push(self.eval(item, env)?);
+            let item = self.eval(item, env)?;
+            live.add(&item)?;
+            values.push(item);
         }
         Ok(in_values(&v, &values, negated))
     }
 
     fn in_select(&self, x: &Expr, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
         let v = self.eval(x, env)?;
+        let mut live = self.limits.live();
+        live.add(&v)?;
         let rows = self.subquery(sub, env)?;
         if rows.columns.len() != 1 {
             return Err(syntax("the subquery of IN must return one column"));
@@ -443,11 +535,13 @@ impl<'a> Runner<'a> {
     }
 
     fn exists(&self, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
-        Ok(Value::Bool(self.subquery(sub, env)?.rows.is_empty() == negated))
+        // One row tells.
+        Ok(Value::Bool(self.subquery_first(sub, env, Some(1))?.rows.is_empty() == negated))
     }
 
     fn scalar_subquery(&self, sub: &Select, env: &Env<'_>) -> Result<Value> {
-        let rows = self.subquery(sub, env)?;
+        // Its first row is its value.
+        let rows = self.subquery_first(sub, env, Some(1))?;
         if rows.columns.len() != 1 {
             return Err(syntax("a subquery used as a value must return one column"));
         }
@@ -455,7 +549,13 @@ impl<'a> Runner<'a> {
     }
 
     fn between(&self, x: &Expr, low: &Expr, high: &Expr, negated: bool, env: &Env<'_>) -> Result<Value> {
-        let (v, l, h) = (self.eval(x, env)?, self.eval(low, env)?, self.eval(high, env)?);
+        let mut live = self.limits.live();
+        let v = self.eval(x, env)?;
+        live.add(&v)?;
+        let l = self.eval(low, env)?;
+        live.add(&l)?;
+        let h = self.eval(high, env)?;
+        drop(live);
         if v.is_null() || l.is_null() || h.is_null() {
             return Ok(Value::Null);
         }
@@ -472,13 +572,19 @@ impl<'a> Runner<'a> {
         escape: Option<&Expr>,
         env: &Env<'_>,
     ) -> Result<Value> {
-        let (s, p) = (self.eval(expr, env)?, self.eval(pattern, env)?);
+        let mut live = self.limits.live();
+        let s = self.eval(expr, env)?;
+        live.add(&s)?;
+        let p = self.eval(pattern, env)?;
+        live.add(&p)?;
         let (Some(s), Some(p)) = (v::to_text(&s), v::to_text(&p)) else { return Ok(Value::Null) };
         let esc = match escape {
             Some(e) => v::to_text(&self.eval(e, env)?).and_then(|t| t.chars().next()),
             None => None,
         };
-        Ok(Value::Bool(v::like(&s, &p, ci, esc)? != negated))
+        let matched = v::like(&s, &p, ci, esc)?;
+        self.limits.work(s.len() + p.len())?;
+        Ok(Value::Bool(matched != negated))
     }
 
     fn case(
@@ -492,7 +598,12 @@ impl<'a> Runner<'a> {
             Some(o) => Some(self.eval(o, env)?),
             None => None,
         };
+        let mut live = self.limits.live();
+        if let Some(s) = &subject {
+            live.add(s)?;
+        }
         for (w, then) in whens {
+            self.limits.tick()?;
             let hit = match &subject {
                 Some(s) => compare(s, &self.eval(w, env)?).is_some_and(|o| o.is_eq()),
                 None => truthy(&self.eval(w, env)?),
@@ -508,15 +619,30 @@ impl<'a> Runner<'a> {
     }
 
     fn cast(&self, x: &Expr, kind: ColumnType, env: &Env<'_>) -> Result<Value> {
-        cast(&self.eval(x, env)?, kind)
+        let x = self.eval(x, env)?;
+        let out = cast(&x, kind)?;
+        if matches!(x, Value::Text(_) | Value::Bytes(_) | Value::Json(_)) {
+            self.limits.work(value_bytes(&x))?;
+        }
+        Ok(out)
     }
 
     fn call(&self, name: &str, args: &[Expr], env: &Env<'_>) -> Result<Value> {
+        self.limits.tick()?;
         let mut values = Vec::with_capacity(args.len());
+        // The arguments computed are kept while the next ones are: each may be large.
+        let mut live = self.limits.live();
         for a in args {
-            values.push(self.eval(a, env)?);
+            let x = self.eval(a, env)?;
+            live.add(&x)?;
+            values.push(x);
         }
-        v::scalar(name, values)
+        let read = live.bytes();
+        let out = v::scalar(name, values)?;
+        drop(live);
+        // What a function gets through counts toward the deadline, however few the rows.
+        self.limits.work(read.saturating_add(value_bytes(&out)))?;
+        Ok(out)
     }
 
     /// `first op x op y ...`, from the left, in a loop: a long list takes no
@@ -538,6 +664,7 @@ impl<'a> Runner<'a> {
             if all == Some(false) {
                 break;
             }
+            self.limits.tick()?;
             all = match (all, tri(&self.eval(x, env)?)) {
                 (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -554,6 +681,7 @@ impl<'a> Runner<'a> {
             if any == Some(true) {
                 break;
             }
+            self.limits.tick()?;
             any = match (any, tri(&self.eval(x, env)?)) {
                 (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -566,12 +694,24 @@ impl<'a> Runner<'a> {
     /// Arithmetic and `||`, from the left.
     fn fold(&self, mut acc: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
         for (op, x) in rest {
+            self.limits.tick()?;
             acc = match (op, x.interval()) {
                 // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`.
                 (Op::Add, Some(span)) => v::shift(&acc, span, 1)?,
                 (Op::Sub, Some(span)) => v::shift(&acc, span, -1)?,
-                (Op::Concat, _) => v::concat(acc, &self.eval(x, env)?)?,
-                _ => arith(*op, &acc, &self.eval(x, env)?)?,
+                _ => {
+                    // What was computed so far is kept while the next operand is.
+                    let mut live = self.limits.live();
+                    live.add(&acc)?;
+                    let next = self.eval(x, env)?;
+                    drop(live);
+                    if *op == Op::Concat {
+                        self.limits.work(value_bytes(&next))?;
+                        v::concat(acc, &next)?
+                    } else {
+                        arith(*op, &acc, &next)?
+                    }
+                }
             };
         }
         Ok(acc)
@@ -678,21 +818,38 @@ impl<'a> Runner<'a> {
                     Some(s) => v::to_text(&self.eval(s, env)?).unwrap_or_default(),
                     None => ",".into(),
                 };
-                let texts: Vec<String> = values.iter().filter_map(v::to_text).collect();
-                text_fits(&format!("{name}()"), v::joined_len(texts.iter().map(String::len), sep.len()))?;
-                Value::Text(texts.join(&sep))
+                // Written straight into the result, its size known first: the values are
+                // held already, and a copy of them as texts would hold them twice.
+                let size = v::joined_len(values.iter().filter_map(v::text_ref).map(|t| t.len()), sep.len());
+                text_fits(&format!("{name}()"), size)?;
+                let mut out = String::with_capacity(size);
+                for (i, t) in values.iter().filter_map(v::text_ref).enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    out.push_str(&t);
+                }
+                self.limits.work(size)?;
+                Value::Text(out)
             }
         })
     }
 
     fn subquery(&self, sub: &Select, env: &Env<'_>) -> Result<Rc<Rows>> {
+        self.subquery_first(sub, env, None)
+    }
+
+    /// The rows of a subquery, the first `want` of them when only those are
+    /// needed (`EXISTS`). A `SELECT` is in one place of a statement: its rows
+    /// are always asked for the same way.
+    fn subquery_first(&self, sub: &Select, env: &Env<'_>, want: Option<usize>) -> Result<Rc<Rows>> {
         if let Some(r) = self.cache.borrow().get(&sub.id) {
             return Ok(r.clone());
         }
         // A subquery that reads the enclosing row runs once per row: the clock is read at each run.
         self.limits.check_time()?;
         let used = Cell::new(false);
-        let rows = Rc::new(self.select(sub, Some(env), &used)?);
+        let rows = Rc::new(self.select_first(sub, Some(env), &used, want)?);
         if !used.get() {
             self.cache.borrow_mut().insert(sub.id, rows.clone());
         }
@@ -1090,7 +1247,23 @@ impl<'a> Runner<'a> {
     // -----------------------------------------------------------------------
 
     fn select(&self, sel: &Select, outer: Option<&Env<'_>>, used: &Cell<bool>) -> Result<Rows> {
-        if let Some((ast, columns)) = self.as_memoire(sel, outer, used) {
+        self.select_first(sel, outer, used, None)
+    }
+
+    /// [`Runner::select`], only its first `want` rows when given.
+    fn select_first(
+        &self,
+        sel: &Select,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+        want: Option<usize>,
+    ) -> Result<Rows> {
+        if let Some((mut ast, columns)) = self.as_memoire(sel, outer, used) {
+            if let Some(w) = want {
+                let w = w as u64;
+                ast.limit = Some(ast.limit.map_or(w, |l| l.min(w)));
+            }
+            self.limits.take_declined();
             match self.tx.fetch_rows(&Query::Select(&ast)) {
                 Ok(rows) => return Ok(Rows { columns, hold: self.limits.hold_rows(&rows)?, rows }),
                 // The engine would have joined more rows than the statement
@@ -1108,6 +1281,10 @@ impl<'a> Runner<'a> {
             },
             None => None,
         };
+        let limit = match (limit, want) {
+            (Some(l), Some(w)) => Some(l.min(w)),
+            (l, w) => l.or(w),
+        };
         let offset = match &sel.offset {
             Some(e) => usize::try_from(self.eval(e, &empty_env)?.as_i64().unwrap_or(0).max(0)).unwrap_or(usize::MAX),
             None => 0,
@@ -1117,53 +1294,94 @@ impl<'a> Runner<'a> {
             self.core(&sel.first, &sel.order, hint, outer, used)?
         } else {
             let mut acc = self.core(&sel.first, &[], None, outer, used)?;
+            // The keys of the rows of `acc` when they are all different (after a UNION, an
+            // INTERSECT or an EXCEPT): a UNION after it looks up only its own rows, instead
+            // of the rows of every step before, which made a long UNION take the square
+            // of its rows.
+            let mut distinct: Option<(std::collections::HashSet<String>, Hold)> = None;
             for (op, core) in &sel.rest {
                 let next = self.core(core, &[], None, outer, used)?;
                 if next.columns.len() != acc.columns.len() {
                     return Err(syntax("each SELECT of a UNION must have the same number of columns"));
                 }
-                if *op == SetOp::UnionAll {
-                    // The new rows after the others, where those are: gathering them all
-                    // again at each step made a long UNION ALL cost the square of its rows.
-                    acc.rows.extend(next.rows);
-                    acc.hold.absorb(next.hold);
-                    continue;
-                }
-                // The keys of the rows already seen are held while this step runs.
-                let mut keys = self.limits.hold();
-                let mut key_of = |r: &[Value]| -> Result<String> {
-                    self.limits.tick()?;
-                    let k = row_key(r);
-                    keys.add(k.len() + KEY_BYTES)?;
-                    Ok(k)
-                };
-                let mut seen = std::collections::HashSet::new();
-                let mut kept = Vec::new();
                 match op {
+                    SetOp::UnionAll => {
+                        // The new rows after the others, where those are.
+                        acc.rows.extend(next.rows);
+                        acc.hold.absorb(next.hold);
+                        distinct = None;
+                    }
                     SetOp::Union => {
-                        for r in acc.rows.into_iter().chain(next.rows) {
-                            if seen.insert(key_of(&r)?) {
-                                kept.push(r);
+                        let (mut seen, mut keys) = match distinct.take() {
+                            Some(d) => d,
+                            None => {
+                                let mut seen = std::collections::HashSet::new();
+                                let mut keys = self.limits.hold();
+                                let mut dropped = 0;
+                                let rows = std::mem::take(&mut acc.rows);
+                                for r in rows {
+                                    self.limits.tick()?;
+                                    let k = row_key(&r);
+                                    if seen.contains(&k) {
+                                        dropped += row_bytes(&r);
+                                        continue;
+                                    }
+                                    keys.add(k.len() + KEY_BYTES)?;
+                                    seen.insert(k);
+                                    acc.rows.push(r);
+                                }
+                                acc.hold.less(dropped);
+                                (seen, keys)
                             }
+                        };
+                        acc.hold.absorb(next.hold);
+                        let mut dropped = 0;
+                        for r in next.rows {
+                            self.limits.tick()?;
+                            let k = row_key(&r);
+                            if seen.contains(&k) {
+                                dropped += row_bytes(&r);
+                                continue;
+                            }
+                            keys.add(k.len() + KEY_BYTES)?;
+                            seen.insert(k);
+                            acc.rows.push(r);
                         }
+                        acc.hold.less(dropped);
+                        distinct = Some((seen, keys));
                     }
                     SetOp::Intersect | SetOp::Except => {
+                        // The keys of the step before are of no use here.
+                        drop(distinct.take());
+                        // The keys of the rows of both sides are held while this step runs.
+                        let mut keys = self.limits.hold();
                         let mut other = std::collections::HashSet::new();
                         for r in &next.rows {
-                            other.insert(key_of(r)?);
+                            self.limits.tick()?;
+                            let k = row_key(r);
+                            keys.add(k.len() + KEY_BYTES)?;
+                            other.insert(k);
                         }
-                        for r in acc.rows {
-                            let k = key_of(&r)?;
-                            if other.contains(&k) == (*op == SetOp::Intersect) && seen.insert(k) {
+                        drop(next);
+                        let mut seen = std::collections::HashSet::new();
+                        let mut kept_keys = self.limits.hold();
+                        let mut kept = Vec::new();
+                        for r in std::mem::take(&mut acc.rows) {
+                            self.limits.tick()?;
+                            let k = row_key(&r);
+                            if other.contains(&k) == (*op == SetOp::Intersect) && !seen.contains(&k) {
+                                kept_keys.add(k.len() + KEY_BYTES)?;
+                                seen.insert(k);
                                 kept.push(r);
                             }
                         }
+                        acc.rows = kept;
+                        acc.hold.set(rows_bytes(&acc.rows))?;
+                        distinct = Some((seen, kept_keys));
                     }
-                    SetOp::UnionAll => unreachable!("handled above"),
                 }
-                acc.rows = kept;
-                acc.hold.set(rows_bytes(&acc.rows))?;
             }
+            drop(distinct);
             // ORDER BY of a compound: output columns, by name or position.
             if !sel.order.is_empty() {
                 let mut keys = Vec::new();
@@ -1252,6 +1470,8 @@ impl<'a> Runner<'a> {
         let [arg] = args else { return Err(syntax(format!("{name}() takes one argument"))) };
         let env = Env { scope, row: &[], tail: &[], group: None, outer, used_outer: used, output: None };
         let elements = v::set_returning(name, &self.eval(arg, &env)?)?;
+        let mut held_elements = self.limits.hold();
+        held_elements.add(elements.iter().map(value_bytes).sum())?;
         let mut rows = Vec::with_capacity(elements.len());
         let mut hold = self.limits.hold();
         for x in &elements {
@@ -1343,12 +1563,20 @@ impl<'a> Runner<'a> {
             || core.items.iter().any(|i| matches!(i, SelItem::Expr(e, _) if e.has_aggregate()))
             || order.iter().any(|o| o.expr.has_aggregate());
         // `SELECT count(*) FROM a, b ...` and nothing else: the rows of the last join are
-        // counted, not kept.
+        // counted, not kept. `count(1)` counts the same.
         let count_only = order.is_empty()
             && !core.distinct
             && core.group_by.is_empty()
             && core.having.is_none()
-            && matches!(core.items.as_slice(), [SelItem::Expr(Expr::Func { name, star: true, .. }, _)] if name == "count");
+            && match core.items.as_slice() {
+                [SelItem::Expr(Expr::Func { name, star: true, .. }, _)] => name == "count",
+                [SelItem::Expr(Expr::Func { name, args, distinct: false, star: false }, _)] => {
+                    name == "count" && matches!(args.as_slice(), [Expr::Lit(v)] if !v.is_null())
+                }
+                _ => false,
+            };
+        // Only the first rows are needed, in the order they come: the last join stops there.
+        let first = hint.filter(|_| !grouped && !core.distinct && order.is_empty());
         // For each condition of WHERE, the last table it reads: a join applies it as
         // soon as that table is joined, instead of keeping rows it will refuse.
         let reads: Vec<Option<usize>> =
@@ -1459,8 +1687,8 @@ impl<'a> Runner<'a> {
             let now: Vec<usize> =
                 (0..where_parts.len()).filter(|&i| !pushed[i] && (whole || reads[i].is_some_and(|q| q <= p))).collect();
             let also: Vec<&Expr> = now.iter().map(|&i| where_parts[i]).collect();
-            let joined =
-                self.join(&scope, p, &rows, &part_rows, join, &also, whole, whole && count_only, outer, used)?;
+            let wanted = Wanted { count: whole && count_only, first: if whole { first } else { None } };
+            let joined = self.join(&scope, p, &rows, &part_rows, join, &also, whole, wanted, outer, used)?;
             for (&i, failed) in now.iter().zip(&joined.failed) {
                 pushed[i] = !failed;
             }
@@ -1554,8 +1782,12 @@ impl<'a> Runner<'a> {
                 {
                     let env =
                         Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
+                    // The key grows with each expression: it is kept while the next one is computed.
+                    let mut live = self.limits.live();
                     for g in &core.group_by {
+                        let before = k.len();
                         v::key(&self.eval(g, &env)?, &mut k);
+                        live.add_bytes(k.len() - before)?;
                     }
                 }
                 match index.get(&k) {
@@ -1578,14 +1810,22 @@ impl<'a> Runner<'a> {
         let units = groups.as_ref().map_or(rows.len(), Vec::len);
         let mut produced: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(units);
         let mut produced_hold = self.limits.hold();
+        // Each row read is let go once its columns are computed: the statement holds the
+        // rows read, then the result, not both whole at once.
+        let mut read = rows.into_iter();
         for unit in 0..units {
             self.limits.tick()?;
+            let owned;
             let (row, members): (&[Value], Option<&[Vec<Value>]>) = match &groups {
                 Some(groups) => {
                     (groups[unit].first().map_or(null_row.as_slice(), Vec::as_slice), Some(groups[unit].as_slice()))
                 }
-                None => (rows[unit].as_slice(), None),
+                None => {
+                    owned = read.next().unwrap_or_default();
+                    (owned.as_slice(), None)
+                }
             };
+            let read_bytes = if members.is_none() { row_bytes(row) } else { 0 };
             let env = Env { scope: &scope, row, tail: &[], group: members, outer, used_outer: used, output: None };
             if let Some(h) = &core.having
                 && tri(&self.eval(h, &env)?) != Some(true)
@@ -1593,15 +1833,19 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let mut out = Vec::with_capacity(items.len());
+            // The columns computed are kept while the next ones are, and the sort keys after them.
+            let mut live = self.limits.live();
             for item in &items {
-                out.push(match item {
+                let x = match item {
                     Item::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
                     Item::Expr(e) => self.eval(e, &env)?,
-                });
+                };
+                live.add(&x)?;
+                out.push(x);
             }
             let mut keys = Vec::with_capacity(order.len());
             for o in order {
-                keys.push(match &o.expr {
+                let key = match &o.expr {
                     Expr::Lit(Value::I64(n)) => {
                         let i = usize::try_from(*n)
                             .ok()
@@ -1626,13 +1870,18 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
-                });
+                };
+                live.add(&key)?;
+                keys.push(key);
             }
-            produced_hold.add(row_bytes(&out) + row_bytes(&keys))?;
+            let bytes = live.bytes() + 2 * size_of::<Vec<Value>>();
+            drop(live);
+            produced_hold.add(bytes)?;
             produced.push((out, keys));
+            held.less(read_bytes);
         }
         // What was read is no longer needed: only the result is held.
-        drop((rows, groups, held));
+        drop((read, groups, held));
         if core.distinct {
             let mut seen = std::collections::HashSet::new();
             let mut keys = self.limits.hold();
@@ -1674,7 +1923,7 @@ impl<'a> Runner<'a> {
     /// rest of `WHERE` might refuse: the row is kept, the condition marked in
     /// [`Joined::failed`], and it is asked again on the whole rows.
     ///
-    /// `count`: the rows are counted, not built.
+    /// `wanted`: what of the rows is needed.
     #[allow(clippy::too_many_arguments)]
     fn join(
         &self,
@@ -1685,10 +1934,13 @@ impl<'a> Runner<'a> {
         join: &Join,
         also: &[&Expr],
         whole: bool,
-        count: bool,
+        wanted: Wanted,
         outer: Option<&Env<'_>>,
         used: &Cell<bool>,
     ) -> Result<Joined> {
+        let Wanted { count, first } = wanted;
+        // Enough rows were given.
+        let full = |out: &Joined| first.is_some_and(|n| out.count >= n);
         let part = &scope.parts[p];
         let mut out = Joined { rows: Vec::new(), hold: self.limits.hold(), count: 0, failed: vec![false; also.len()] };
         let on = match (&join.kind, &join.on) {
@@ -1698,6 +1950,9 @@ impl<'a> Runner<'a> {
         let left_join = join.kind == JoinKind::Left && on.is_some();
         if on.is_none() && also.is_empty() && count {
             out.count = left.len().saturating_mul(right.len());
+            return Ok(out);
+        }
+        if full(&out) {
             return Ok(out);
         }
         // A hash join on `right.col = <expression of the left tables>`.
@@ -1775,31 +2030,61 @@ impl<'a> Runner<'a> {
             }
             Ok(())
         };
-        match equi {
-            Some((c, left_key)) => {
-                let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        // A hash join when the right column's values can be told apart by a key.
+        match equi.and_then(|(c, left_key)| Some((c, left_key, Family::of(part.kinds[c])?))) {
+            Some((c, left_key, family)) => {
+                let mut table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+                // Rows whose value is not of the column's type: tried with every row.
+                let mut loose: Vec<usize> = Vec::new();
                 let mut keys = self.limits.hold();
                 for (i, r) in right.iter().enumerate() {
-                    if r[c].is_null() {
-                        continue;
+                    match JoinKey::of(&r[c], family) {
+                        Ok(Some(k)) => {
+                            keys.add(k.bytes() + KEY_BYTES)?;
+                            table.entry(k).or_default().push(i);
+                        }
+                        Ok(None) => {}
+                        Err(()) => loose.push(i),
                     }
-                    let mut k = String::new();
-                    v::key(&r[c], &mut k);
-                    keys.add(k.len() + KEY_BYTES)?;
-                    table.entry(k).or_default().push(i);
                 }
                 for l in left {
+                    if full(&out) {
+                        break;
+                    }
                     self.limits.tick()?;
                     let env = Env { scope, row: l, tail: &[], group: None, outer, used_outer: used, output: None };
                     let lk = self.eval(left_key, &env)?;
                     let mut matched = false;
-                    if !lk.is_null() {
-                        // Keys compare as SQL does: an integer column and a text holding it.
-                        let lk = part.kinds[c].and_then(|k| cast(&lk, k).ok()).unwrap_or(lk);
-                        let mut k = String::new();
-                        v::key(&lk, &mut k);
-                        for &i in table.get(&k).map(Vec::as_slice).unwrap_or_default() {
-                            pair(&mut out, l, &right[i], &mut matched, false)?;
+                    match JoinKey::of(&lk, family) {
+                        Ok(Some(k)) => {
+                            let found = table.get(&k).map(Vec::as_slice).unwrap_or_default();
+                            // The rows of the key and the loose ones, in their order.
+                            let (mut a, mut b) = (found.iter().copied().peekable(), loose.iter().copied().peekable());
+                            loop {
+                                let i = match (a.peek(), b.peek()) {
+                                    (Some(&x), Some(&y)) if x < y => a.next(),
+                                    (Some(_), Some(_)) | (None, Some(_)) => b.next(),
+                                    (Some(_), None) => a.next(),
+                                    (None, None) => None,
+                                };
+                                let Some(i) = i else { break };
+                                pair(&mut out, l, &right[i], &mut matched, false)?;
+                                if full(&out) {
+                                    break;
+                                }
+                            }
+                        }
+                        // NULL equals nothing.
+                        Ok(None) => {}
+                        // A value of another type than the column's: SQL may still find it
+                        // equal to some of them (`1` and `'01'`), each one is asked.
+                        Err(()) => {
+                            for r in right {
+                                pair(&mut out, l, r, &mut matched, false)?;
+                                if full(&out) {
+                                    break;
+                                }
+                            }
                         }
                     }
                     if !matched && left_join {
@@ -1809,9 +2094,15 @@ impl<'a> Runner<'a> {
             }
             None => {
                 for l in left {
+                    if full(&out) {
+                        break;
+                    }
                     let mut matched = false;
                     for r in right {
                         pair(&mut out, l, r, &mut matched, false)?;
+                        if full(&out) {
+                            break;
+                        }
                     }
                     if !matched && left_join {
                         pair(&mut out, l, &nulls, &mut matched, true)?;
@@ -1989,25 +2280,36 @@ impl<'a> Runner<'a> {
             self.limits.tick()?;
             let env = Env { scope, row: r, tail: &[], group: None, outer: None, used_outer: &used, output: None };
             let mut row = Vec::with_capacity(columns_of.len());
+            let mut live = self.limits.live();
             for c in &columns_of {
-                row.push(match c {
+                let x = match c {
                     Err(i) => r[*i].clone(),
                     Ok(e) => self.eval(e, &env)?,
-                });
+                };
+                live.add(&x)?;
+                row.push(x);
             }
-            hold.add(row_bytes(&row))?;
+            let bytes = live.bytes() + size_of::<Vec<Value>>();
+            drop(live);
+            hold.add(bytes)?;
             out.push(row);
         }
         Ok(SqlResult { columns: unique_headers(names), rows: out, returns_rows: true, ..SqlResult::default() })
     }
 
-    /// The rows of `schema` matching `filter`, and the scope they live in.
-    fn target_rows(
+    /// The rows of `schema` matching `filter`, given to `each` a chunk at a
+    /// time; returns how many. Only the primary keys of the rows the indexable
+    /// part of the filter names are held, and one chunk of rows: an `UPDATE` or
+    /// a `DELETE` of a whole table holds no more. A rest of the filter with a
+    /// subquery (it may read the rows being changed) is asked of every row
+    /// before any is changed, as one chunk.
+    fn each_target(
         &self,
         schema: &'static TableSchema,
         alias: Option<&str>,
         filter: Option<&Expr>,
-    ) -> Result<(Scope, Vec<Vec<Value>>, Hold)> {
+        mut each: impl FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<usize> {
         let scope = Scope::of_schema(alias.unwrap_or(schema.name), schema);
         let used = Cell::new(false);
         let mut parts = Vec::new();
@@ -2022,9 +2324,11 @@ impl<'a> Runner<'a> {
                 None => residual.push(p),
             }
         }
-        let mut rows = self.read_table(schema, and_all(pushed), None)?;
-        let mut hold = self.limits.hold_rows(&rows)?;
-        if !residual.is_empty() {
+        // The rows that the rest of the filter accepts.
+        let keep = |rows: Vec<Vec<Value>>, hold: &mut Hold| -> Result<Vec<Vec<Value>>> {
+            if residual.is_empty() {
+                return Ok(rows);
+            }
             let mut kept = Vec::new();
             for r in rows {
                 self.limits.tick()?;
@@ -2048,10 +2352,40 @@ impl<'a> Runner<'a> {
                     kept.push(r);
                 }
             }
-            rows = kept;
-            hold.set(rows_bytes(&rows))?;
+            hold.set(rows_bytes(&kept))?;
+            Ok(kept)
+        };
+        let reads_rows = residual.iter().any(|w| {
+            let mut sub = false;
+            w.walk(&mut |x| sub |= matches!(x, Expr::Exists(..) | Expr::Scalar(_) | Expr::InSelect(..)));
+            sub
+        });
+        if reads_rows {
+            let rows = self.read_table(schema, and_all(pushed), None)?;
+            let mut hold = self.limits.hold_rows(&rows)?;
+            let rows = keep(rows, &mut hold)?;
+            let n = rows.len();
+            each(rows)?;
+            return Ok(n);
         }
-        Ok((scope, rows, hold))
+        let c = &schema.columns[schema.primary_key];
+        let key = M::Column(ColumnRef { table: schema.name, name: c.name, index: schema.primary_key, kind: c.kind });
+        let mut ast = SelectAst::new(schema);
+        ast.filter = and_all(pushed);
+        ast.projection = Projection::Exprs(vec![key.clone()]);
+        let keys = self.tx.fetch_rows(&Query::Select(&ast))?;
+        let _keys_held = self.limits.hold_rows(&keys)?;
+        let mut n = 0;
+        for chunk in keys.chunks(CHANGE_CHUNK) {
+            let list = chunk.iter().filter_map(|r| r.first().cloned()).collect();
+            let by_key = M::InList { expr: Box::new(key.clone()), list, negated: false };
+            let rows = self.read_table(schema, Some(by_key), None)?;
+            let mut hold = self.limits.hold_rows(&rows)?;
+            let rows = keep(rows, &mut hold)?;
+            n += rows.len();
+            each(rows)?;
+        }
+        Ok(n)
     }
 
     fn update(
@@ -2101,41 +2435,56 @@ impl<'a> Runner<'a> {
                 None => Some(None),
             };
             if let (Some(sets), Some(filter)) = (consts, m_filter) {
-                let r = self.tx.execute_now(&Query::Update(&UpdateAst { table: schema, sets, filter }))?;
-                return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() });
-            }
-        }
-        let (scope, rows, _held) = self.target_rows(schema, alias, filter)?;
-        let mut after = Vec::with_capacity(rows.len());
-        let mut after_hold = self.limits.hold();
-        for old in &rows {
-            self.limits.tick()?;
-            let env =
-                Env { scope: &scope, row: old, tail: &[], group: None, outer: None, used_outer: &used, output: None };
-            let mut new = old.clone();
-            for (i, e) in &targets {
-                let col = &schema.columns[*i];
-                let value = cast(&self.eval(e, &env)?, col.kind)
-                    .map_err(|err| syntax(format!("column `{}`: {err}", col.name)))?;
-                if value.is_null() && !col.nullable {
-                    return Err(syntax(format!("column `{}` cannot be NULL", col.name)));
+                self.limits.take_declined();
+                match self.tx.execute_now(&Query::Update(&UpdateAst { table: schema, sets, filter })) {
+                    Ok(r) => return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() }),
+                    // The engine would have held more rows than the statement may (it wrote
+                    // nothing): they are changed below, a chunk at a time.
+                    Err(_) if self.limits.take_declined() => {}
+                    Err(e) => return Err(e),
                 }
-                new[*i] = value;
-            }
-            if new != *old {
-                self.tx.execute_now(&Query::UpdateRow { table: schema, values: &new })?;
-            }
-            // The new rows are kept for RETURNING only.
-            if returning.is_some() {
-                after_hold.add(row_bytes(&new))?;
-                after.push(new);
             }
         }
+        let mut after = Vec::new();
+        let mut after_hold = self.limits.hold();
+        let changed = self.each_target(schema, alias, filter, |rows| {
+            for old in &rows {
+                self.limits.tick()?;
+                let env = Env {
+                    scope: &scope,
+                    row: old,
+                    tail: &[],
+                    group: None,
+                    outer: None,
+                    used_outer: &used,
+                    output: None,
+                };
+                let mut new = old.clone();
+                for (i, e) in &targets {
+                    let col = &schema.columns[*i];
+                    let value = cast(&self.eval(e, &env)?, col.kind)
+                        .map_err(|err| syntax(format!("column `{}`: {err}", col.name)))?;
+                    if value.is_null() && !col.nullable {
+                        return Err(syntax(format!("column `{}` cannot be NULL", col.name)));
+                    }
+                    new[*i] = value;
+                }
+                if new != *old {
+                    self.tx.execute_now(&Query::UpdateRow { table: schema, values: &new })?;
+                }
+                // The new rows are kept for RETURNING only.
+                if returning.is_some() {
+                    after_hold.add(row_bytes(&new))?;
+                    after.push(new);
+                }
+            }
+            Ok(())
+        })?;
         let mut result = match returning {
             Some(items) => self.returning(items, &scope, &after)?,
             None => SqlResult::default(),
         };
-        result.rows_affected = rows.len() as u64;
+        result.rows_affected = changed as u64;
         Ok(result)
     }
 
@@ -2155,20 +2504,37 @@ impl<'a> Runner<'a> {
                 None => Some(None),
             };
             if let Some(filter) = m_filter {
-                let r = self.tx.execute_now(&Query::Delete(&DeleteAst { table: schema, filter }))?;
-                return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() });
+                self.limits.take_declined();
+                match self.tx.execute_now(&Query::Delete(&DeleteAst { table: schema, filter })) {
+                    Ok(r) => return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() }),
+                    // As for UPDATE: a chunk at a time below.
+                    Err(_) if self.limits.take_declined() => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
-        let (scope, rows, _held) = self.target_rows(schema, alias, filter)?;
-        for r in &rows {
-            self.limits.tick()?;
-            self.tx.execute_now(&Query::DeleteByKey { table: schema, key: &r[schema.primary_key] })?;
-        }
+        let mut gone = Vec::new();
+        let mut gone_hold = self.limits.hold();
+        let deleted = self.each_target(schema, alias, filter, |rows| {
+            for r in rows {
+                self.limits.tick()?;
+                self.tx.execute_now(&Query::DeleteByKey { table: schema, key: &r[schema.primary_key] })?;
+                // The rows are kept for RETURNING only.
+                if returning.is_some() {
+                    gone_hold.add(row_bytes(&r))?;
+                    gone.push(r);
+                }
+            }
+            Ok(())
+        })?;
         let mut result = match returning {
-            Some(items) => self.returning(items, &scope, &rows)?,
+            Some(items) => {
+                let scope = Scope::of_schema(alias.unwrap_or(schema.name), schema);
+                self.returning(items, &scope, &gone)?
+            }
             None => SqlResult::default(),
         };
-        result.rows_affected = rows.len() as u64;
+        result.rows_affected = deleted as u64;
         Ok(result)
     }
 
@@ -2254,11 +2620,23 @@ impl<'a> Runner<'a> {
         // The new rows' values.
         let (source_rows, _source_hold): (Vec<Vec<Value>>, Hold) = match source {
             InsertSource::Values(rows) => {
-                let values: Vec<Vec<Value>> = rows
-                    .iter()
-                    .map(|r| r.iter().map(|e| self.eval_const(e)).collect::<Result<Vec<_>>>())
-                    .collect::<Result<_>>()?;
-                let hold = self.limits.hold_rows(&values)?;
+                // Each row counted as it is computed: a row of large values fails before the next one is.
+                let mut values = Vec::with_capacity(rows.len());
+                let mut hold = self.limits.hold();
+                for r in rows {
+                    self.limits.tick()?;
+                    let mut row = Vec::with_capacity(r.len());
+                    let mut live = self.limits.live();
+                    for e in r {
+                        let x = self.eval_const(e)?;
+                        live.add(&x)?;
+                        row.push(x);
+                    }
+                    let bytes = live.bytes() + size_of::<Vec<Value>>();
+                    drop(live);
+                    hold.add(bytes)?;
+                    values.push(row);
+                }
                 (values, hold)
             }
             InsertSource::Select(sel) => {

@@ -107,23 +107,24 @@ fn a_subquery_is_never_answered_with_another_one() {
 fn a_type_left_open_is_an_error() {
     let db = Db::open("open-type");
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            for sql in [
-                "SELECT 1::int(",
-                "SELECT 1::varchar(10",
-                "SELECT CAST(1 AS varchar(",
-                "SELECT CAST(1 AS varchar(10)",
-                "CREATE TABLE u (a varchar(",
-            ] {
-                tx.send((sql, db.err(sql))).unwrap();
-            }
-        });
-        for _ in 0..5 {
-            let (sql, e) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the parser loops");
-            assert!(e.contains("SQL: "), "{sql}: {e}");
+    // A thread of its own, not waited for: were the parser to loop, the test
+    // fails after its timeout instead of waiting with it.
+    let handle = db.0.clone();
+    std::thread::spawn(move || {
+        for sql in [
+            "SELECT 1::int(",
+            "SELECT 1::varchar(10",
+            "SELECT CAST(1 AS varchar(",
+            "SELECT CAST(1 AS varchar(10)",
+            "CREATE TABLE u (a varchar(",
+        ] {
+            let _ = tx.send((sql, handle.sql(sql, &[]).expect_err(sql).to_string()));
         }
     });
+    for _ in 0..5 {
+        let (sql, e) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the parser loops");
+        assert!(e.contains("SQL: "), "{sql}: {e}");
+    }
     assert_eq!(db.rows("SELECT 1::varchar(10), CAST(2 AS numeric(10, 2))"), json!([["1", 2.0]]));
 }
 
@@ -143,6 +144,8 @@ fn texts_have_a_maximum_size() {
         "SELECT length(concat_ws(',', repeat('a', 40000000), repeat('b', 40000000)))",
         // A character that becomes three: 30 MiB of text, 90 in capitals.
         "SELECT length(upper(repeat('ΐ', 15000000)))",
+        // A format of 6 MB whose `%c` each write 24 bytes.
+        "SELECT length(strftime(repeat('%c', 3000000), '2026-01-01'))",
     ] {
         let e = db.err(sql);
         assert!(e.contains("larger than 64 MiB"), "{sql}: {e}");
@@ -234,4 +237,76 @@ fn cross_joins_are_not_built_for_nothing() {
         db.err("SELECT count(*) FROM t a, t b WHERE a.id < 3 AND b.id < 8 AND a.id / b.g > 0")
             .contains("division by zero")
     );
+}
+
+/// A join on an equality of columns of different types finds the pairs SQL
+/// finds equal: an integer and the texts that hold it, as without the join.
+#[test]
+fn a_join_on_values_of_different_types_finds_every_pair() {
+    let db = Db::open("join-types");
+    db.run(
+        "CREATE TABLE ti (id INT PRIMARY KEY, x INT); INSERT INTO ti VALUES (1, 1), (2, 10);
+         CREATE TABLE tt (id INT PRIMARY KEY, y TEXT); INSERT INTO tt VALUES (1, '01'), (2, ' 1'), (3, '1'), (4, '1.0'), (5, '10'), (6, 'x');
+         CREATE TABLE tr (id INT PRIMARY KEY, z DOUBLE PRECISION); INSERT INTO tr VALUES (1, 1.0), (2, 1.5), (3, 10.0)",
+        &[],
+    );
+    let all = json!([[1, "01"], [1, " 1"], [1, "1"], [1, "1.0"], [10, "10"]]);
+    // The same rows whether the equality is a hash join or not.
+    assert_eq!(db.rows("SELECT ti.x, tt.y FROM ti, tt WHERE ti.x = tt.y ORDER BY ti.x, tt.id"), all);
+    assert_eq!(db.rows("SELECT ti.x, tt.y FROM ti, tt WHERE coalesce(ti.x, NULL) = tt.y ORDER BY ti.x, tt.id"), all);
+    assert_eq!(db.rows("SELECT ti.x, tt.y FROM ti JOIN tt ON tt.y = ti.x ORDER BY ti.x, tt.id"), all);
+    assert_eq!(db.rows("SELECT ti.x, tt.y FROM tt JOIN ti ON ti.x = tt.y ORDER BY ti.x, tt.id"), all);
+    // A float and an integer: equal by their value, 1.5 equal to none.
+    assert_eq!(
+        db.rows("SELECT tr.z, ti.x FROM tr, ti WHERE tr.z = ti.x ORDER BY tr.id"),
+        json!([[1.0, 1], [10.0, 10]])
+    );
+    assert_eq!(
+        db.rows("SELECT tr.z, tt.y FROM tr JOIN tt ON tt.y = tr.z ORDER BY tr.id, tt.id").as_array().unwrap().len(),
+        5
+    );
+    // A LEFT JOIN keeps the rows that meet none.
+    assert_eq!(
+        db.rows("SELECT tr.id, ti.id FROM tr LEFT JOIN ti ON ti.x = tr.z ORDER BY tr.id"),
+        json!([[1, 1], [2, null], [3, 2]])
+    );
+}
+
+/// A long chain of UNION reads each arm's rows once, and keeps what UNION,
+/// INTERSECT and EXCEPT gave.
+#[test]
+fn set_operations_give_what_they_gave() {
+    let db = Db::open("unions");
+    db.run("CREATE TABLE n (id INT PRIMARY KEY, v INT); INSERT INTO n VALUES (1, 1), (2, 2), (3, 2), (4, 3)", &[]);
+    assert_eq!(db.rows("SELECT v FROM n UNION SELECT v FROM n UNION SELECT 4 ORDER BY 1"), json!([[1], [2], [3], [4]]));
+    assert_eq!(
+        db.rows("SELECT v FROM n UNION ALL SELECT v FROM n UNION SELECT 5 ORDER BY 1"),
+        json!([[1], [2], [3], [5]])
+    );
+    assert_eq!(db.rows("SELECT v FROM n INTERSECT SELECT 2 UNION SELECT 9 ORDER BY 1"), json!([[2], [9]]));
+    assert_eq!(db.rows("SELECT v FROM n EXCEPT SELECT 2 UNION SELECT 1 ORDER BY 1"), json!([[1], [3]]));
+    assert_eq!(db.rows("SELECT v FROM n UNION SELECT 2 UNION ALL SELECT 2 ORDER BY 1"), json!([[1], [2], [2], [3]]));
+    // Thousands of arms, each adding a row or not.
+    let arms: Vec<String> = (0..3000).map(|i| format!("SELECT {}", i % 1000)).collect();
+    let started = std::time::Instant::now();
+    assert_eq!(db.rows(&format!("SELECT count(*) FROM ({}) AS u", arms.join(" UNION "))), json!([[1000]]));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+}
+
+/// `LIMIT`, `EXISTS` and `count(1)` over a join stop as soon as they know.
+#[test]
+fn small_answers_over_a_join_stop_early() {
+    let db = Db::open("early");
+    let values: Vec<String> = (1..=1000).map(|i| format!("({i}, {})", i % 7)).collect();
+    db.run(&format!("CREATE TABLE t (id INT PRIMARY KEY, g INT); INSERT INTO t VALUES {}", values.join(",")), &[]);
+    assert_eq!(db.rows("SELECT count(1) FROM t a CROSS JOIN t b"), json!([[1_000_000]]));
+    assert_eq!(db.rows("SELECT a.id, b.id FROM t a CROSS JOIN t b LIMIT 3"), json!([[1, 1], [1, 2], [1, 3]]));
+    assert_eq!(db.rows("SELECT a.id, b.id FROM t a CROSS JOIN t b LIMIT 2 OFFSET 999"), json!([[1, 1000], [2, 1]]));
+    assert_eq!(
+        db.rows("SELECT a.id, b.id FROM t a JOIN t b ON abs(a.g) = b.g WHERE a.id > 5 LIMIT 2"),
+        json!([[6, 6], [6, 13]])
+    );
+    assert_eq!(db.rows("SELECT EXISTS (SELECT 1 FROM t a CROSS JOIN t b WHERE a.id + b.id > 1500)"), json!([[true]]));
+    assert_eq!(db.rows("SELECT EXISTS (SELECT 1 FROM t a CROSS JOIN t b WHERE a.id + b.id > 5000)"), json!([[false]]));
+    assert_eq!(db.rows("SELECT (SELECT b.id FROM t a, t b WHERE a.id = 3 AND b.id > a.id)"), json!([[4]]));
 }
