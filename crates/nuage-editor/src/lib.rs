@@ -12,12 +12,12 @@ pub mod guard;
 pub mod i18n;
 pub mod jobs;
 pub mod local;
-mod screens;
 pub mod secret;
 pub mod selftest;
+pub mod theme;
 pub mod vault;
 
-pub use app::{Editor, Prefs, SavedServer, Setup};
+pub use app::{Editor, LocalServer, Prefs, SavedServer, Setup};
 
 /// The editor's name for the systems: the window's app id (Wayland and X11
 /// group the window under the `.desktop` entry of that name), the macOS

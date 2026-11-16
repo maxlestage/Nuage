@@ -8,12 +8,29 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 - **For those who would rather not use a terminal**: a program with a window, for macOS
   (Apple silicon and Intel), Windows and Linux desktops, in English, French and Spanish
-  (the system's language, or the one chosen). It shows the server (memory, caches,
-  applications), changes its memory and its limits, makes applications and their tokens
-  (shown once, with Copy buttons and the connection lines), revokes a token after asking, and
-  says in plain words what the server refuses, with its figures.
+  (the system's language, or the one chosen), light, dark or as the system, in the console's
+  colors, with marks drawn next to words (never a color alone). It changes nothing by itself:
+  every change is a button, and it says what it did.
+- **Does it work?** The overview says it in words, from `/api/status`: the version, how long
+  the server has run, the memory Nuage DB uses and the computer's, its applications and when
+  each last connected, and whether the backups work (the last copy, when and where, or the
+  error of the one that failed; no backup at all is said in red, with Heroku's emptied disk).
+  It is read again after a change, on Refresh and when the window comes back after a minute;
+  a refresh that fails keeps the page, greyed, and says why.
+- **An application for a website, in a few clicks**: say what it is for, its name follows
+  (accents folded, the server's own rule checked before sending). Its two connection lines are
+  shown once, masked until asked, copied with the clipboard history asked to skip them, and the
+  card does not close on Escape, nor without a copy unless confirmed. **Test the token** opens
+  the application with it from this computer; its row then says it was tested from the editor
+  and that the site has not connected yet. A read-only token for a web page comes with the
+  script to paste in the page, and the application's page allows its website
+  (`POST /api/apps/{name}/origins`), checked as the server does. Tokens are revoked after a
+  question whose Escape keeps them; deleting an application stays in the console.
+- **Tools**: test an application's token from anywhere (`/v1/ping`), and generate a token as
+  `nuage genkey` does, for a Heroku Config Var or Docker's `.env`.
 - **Connecting is one step.** A server installed on this computer by the installer is found
-  by itself, even where its settings file is for administrators only. The editor never runs
+  by itself (**Open**, nothing to type), even where its settings file is for administrators
+  only, and one answering on port 8080 (Docker) is offered too. The editor never runs
   as administrator: the system's own tools read four lines of that file (`PORT`,
   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; never the encryption key) after a window of
   the system's: polkit's password (pkexec and grep) on Linux, macOS's (osascript and grep;
@@ -21,15 +38,18 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   consent for Windows' own cmd.exe and findstr, which hand the lines over through a pipe of
   the editor's. A closed window, a refused password and a system that cannot ask are each
   said; a file without a management token is said too, with how to add one (the installer
-  writes one on a first installation only). A server online
-  takes its address and its management token; the address is remembered, the token only
-  when asked, in the system's password store (Keychain, Credential Manager, Secret Service),
-  never in a file. The token is never sent after a redirect, nor to an address that does not
+  writes one on a first installation only). A server online takes its address and its
+  management token, with where that token is on Heroku, on an installed server and in Docker;
+  the connection shows its steps, with an honest "Stop waiting". The address is remembered,
+  the token only when asked, in the system's password store (Keychain, Credential Manager,
+  Secret Service), never in a file. The token is never sent after a redirect, nor to an address that does not
   answer as Nuage DB, and plain `http://` to the Internet waits for a "Connect anyway". A
   wrong token, a website's address, a redirect, a name that does not exist, a refused port, a
   server that does not answer, a certificate not trusted: each is said, with what to do.
 - **Servers deployed today connect too** (0.4.2 to 0.4.6, before the settings): the editor
-  manages their applications and tokens, and says to update the server for the rest.
+  manages their applications and tokens, and says what updating the server would show (the
+  memory, the limits, the backups, the websites). A route a server lacks is told apart from a
+  refusal.
 - The connection lines given to an application use the server's public address when it has
   one (`SITE_URL` of a server on this computer), and say when `127.0.0.1` works on this
   computer only. Copied tokens are kept out of the clipboard history where the system allows.

@@ -34,6 +34,11 @@ arboard = { version = "3.6", default-features = false }
 # A management token is kept only in the system's password store: the macOS Keychain, the
 # Windows Credential Manager, the Secret Service of Linux desktops.
 keyring = "4.2"
+# The tokens' dates and the times of the status, in this computer's time zone (the server's
+# chrono, with the same features).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# "Generate a token": 32 random bytes, as `nuage genkey` (and the pipe's name on Windows).
+getrandom = "0.4"
 
 # keyring's Secret Service store needs an async runtime for zbus: async-io, the one
 # accesskit already brings, said here rather than left to feature unification.
@@ -62,7 +67,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-getrandom = "0.4"
 
 [build-dependencies]
 # Only its resource compiler call (rc.exe, or windres when cross-compiling): no TOML parser.

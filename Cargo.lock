@@ -2503,6 +2503,7 @@ name = "nuage-editor"
 version = "0.4.6"
 dependencies = [
  "arboard",
+ "chrono",
  "eframe",
  "egui_kittest",
  "getrandom 0.4.3",

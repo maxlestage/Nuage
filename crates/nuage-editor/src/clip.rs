@@ -22,6 +22,8 @@ pub enum Copied {
 /// Where secrets are copied to.
 pub trait CopySink {
     fn copy_secret(&mut self, ctx: &egui::Context, text: &str) -> Copied;
+    /// Empties the clipboard (after a secret was pasted where it goes).
+    fn clear(&mut self, ctx: &egui::Context);
 }
 
 /// The system's clipboard, through arboard. One clipboard lives as long as
@@ -39,6 +41,13 @@ impl CopySink for ArboardSink {
         };
         ctx.copy_text(text.to_owned());
         Copied::Plain(reason)
+    }
+
+    fn clear(&mut self, ctx: &egui::Context) {
+        let cleared = self.clipboard.as_mut().is_some_and(|c| c.clear().is_ok());
+        if !cleared {
+            ctx.copy_text(String::new());
+        }
     }
 }
 
@@ -85,5 +94,10 @@ impl CopySink for FakeSink {
     fn copy_secret(&mut self, _ctx: &egui::Context, text: &str) -> Copied {
         self.copies.lock().unwrap_or_else(PoisonError::into_inner).push(Secret::new(text.to_owned()));
         Copied::Private
+    }
+
+    /// Recorded as an empty copy.
+    fn clear(&mut self, _ctx: &egui::Context) {
+        self.copies.lock().unwrap_or_else(PoisonError::into_inner).push(Secret::new(String::new()));
     }
 }
