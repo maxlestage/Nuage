@@ -25,6 +25,7 @@ pub mod files;
 mod i18n;
 mod kv;
 mod kv_port;
+mod limits;
 mod manage;
 mod pg;
 mod second_copy;
@@ -38,26 +39,32 @@ pub use pg::{PgOptions, tls_config};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use memoire_orm::nuage::wire::{self, SchemaCache};
 use memoire_orm::nuage::{BRANCH_HEADER, TRANSACTION_HEADER};
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
+
+use self::limits::{
+    Asker, MAX_BATCH_ANSWER, MAX_PARAMS, MAX_SQL_TEXT, MAX_STATEMENTS, refused, too_large, too_many, unblocked,
+};
 
 pub use self::apps::{AppInfo, TokenInfo};
 use crate::embedded::{self, Embedded, EmbeddedTransaction};
@@ -125,8 +132,38 @@ pub struct ServerOptions {
     /// An interactive transaction left without a request this long is
     /// rolled back. Default: 30 seconds.
     pub transaction_timeout: Duration,
+    /// An interactive transaction is rolled back this long after it began,
+    /// however busy: an open one keeps the pages it sees, and the database's
+    /// file grows meanwhile. Default: 5 minutes.
+    pub transaction_lifetime: Duration,
+    /// Interactive transactions open at once, per application; the next
+    /// one is refused (429) until one ends. Default: 64.
+    pub max_transactions: usize,
     /// Largest request body. Default: 16 MiB.
     pub max_body_bytes: usize,
+    /// How long a client has to send a request's headers, and how long a
+    /// kept-alive connection waits for its next request. Default: 30 seconds.
+    pub header_timeout: Duration,
+    /// How long a client has to send a request's body (408 after it).
+    /// Default: 60 seconds.
+    pub body_timeout: Duration,
+    /// How long an answer waits for a client that takes none of it before
+    /// its connection is closed. Default: 60 seconds.
+    pub send_timeout: Duration,
+    /// HTTP connections served at once; the next ones are answered 503 and
+    /// closed at once. Default: half the files the system lets the process
+    /// open, between 32 and 4096.
+    pub max_connections: usize,
+    /// Memory the requests being read may hold together (their bodies, and
+    /// the JSON they are read into): a request that would pass it waits a
+    /// moment, then is answered 503 (413 when it alone would). `None`: a
+    /// quarter of the memory, and twice `max_body_bytes` at least.
+    pub request_memory: Option<usize>,
+    /// Statements run at once, each on a thread of its own (a quarter of
+    /// them, two at least, for writes: reads never keep a write waiting).
+    /// The next ones wait a moment, then are answered 503. Default: the
+    /// blocking pool of the `nuage` binary, less 4.
+    pub statement_threads: usize,
     /// The website served next to the database, if any.
     pub site: Option<Arc<dyn SiteHandler>>,
     /// Port of the PostgreSQL protocol ([`Server::listen_pg`]), for the
@@ -202,6 +239,11 @@ impl std::fmt::Debug for ServerOptions {
             .field("cache_budget", &self.cache_budget)
             .field("pg_max_connections", &self.pg_max_connections)
             .field("settings_read_only", &self.settings_read_only)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_connections", &self.max_connections)
+            .field("request_memory", &self.request_memory)
+            .field("statement_threads", &self.statement_threads)
+            .field("max_transactions", &self.max_transactions)
             .finish()
     }
 }
@@ -214,7 +256,15 @@ impl Default for ServerOptions {
             admin_token: None,
             public_status: false,
             transaction_timeout: Duration::from_secs(30),
+            transaction_lifetime: Duration::from_secs(300),
+            max_transactions: 64,
             max_body_bytes: 16 << 20,
+            header_timeout: Duration::from_secs(30),
+            body_timeout: Duration::from_secs(60),
+            send_timeout: Duration::from_secs(60),
+            max_connections: limits::default_max_connections(),
+            request_memory: None,
+            statement_threads: limits::statement_threads(),
             site: None,
             pg_port: None,
             pg_tls: false,
@@ -312,10 +362,45 @@ impl Metrics {
     }
 }
 
+/// One more in a counter for as long as it lives: a request dropped half-way
+/// (its client left) or a task that panicked is no longer counted.
+struct Counted<'a>(&'a AtomicU64);
+
+impl<'a> Counted<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Counted(counter)
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A future whose panic comes back as `Err`: a bug met by one request
+/// answers 500, and the connection and its counters stay right.
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(out)) => Poll::Ready(Ok(out)),
+            Err(panic) => Poll::Ready(Err(panic)),
+        }
+    }
+}
+
 struct OpenTx {
     tx: EmbeddedTransaction,
     app: String,
     branch: String,
+    opened: Instant,
     last_used: Mutex<Instant>,
 }
 
@@ -329,9 +414,28 @@ pub(crate) struct State {
     /// One change of the settings at a time.
     settings_changes: Mutex<()>,
     pub(crate) metrics: Metrics,
+    /// The schemas of the tables, for SQL (the stored ones).
     pub(crate) schemas: SchemaCache,
+    /// The schemas the clients of each application describe, by its name:
+    /// apart from the tables' own and from the other applications'.
+    client_schemas: Mutex<HashMap<String, Arc<limits::ClientSchemas>>>,
+    /// The memory those schemas take, all the applications together.
+    pub(crate) described_total: Arc<limits::DescribedTotal>,
     /// How long reads take, by shape: the short ones run where they are.
     pub(crate) read_costs: Arc<fast::ReadCosts>,
+    /// Reads that run where they are, and their watch (set by the first
+    /// listener; `None` on a runtime with one thread).
+    inline: std::sync::OnceLock<Option<Arc<fast::Inline>>>,
+    /// Threads for statements, reads and writes apart.
+    pub(crate) admission: limits::Admission,
+    /// Memory for the requests being read.
+    pub(crate) request_memory: limits::RequestMemory,
+    /// HTTP connections that may still open.
+    connections: Arc<Semaphore>,
+    /// The status of the views that have a stream open, made once a second.
+    pub(crate) status_hub: status::Hub,
+    /// `/api/status` computed at once.
+    pub(crate) status_slots: Arc<Semaphore>,
     transactions: Mutex<HashMap<String, Arc<OpenTx>>>,
     pub(crate) admin: admin::Sessions,
     /// PostgreSQL connections open now.
@@ -420,16 +524,30 @@ impl Server {
             settings::Settings::open(engine.clone(), options.settings_env.clone(), options.settings_read_only);
         settings.declare_memory();
         let plan = settings.memory_plan(&options);
+        let memory = crate::memory::MemoryInfo::now().total_bytes;
+        // A quarter of the memory for the requests being read, and room for two of the largest.
+        let request_memory = options
+            .request_memory
+            .unwrap_or_else(|| memory.map_or(256 << 20, |m| (m / 4) as usize))
+            .max(options.max_body_bytes.saturating_mul(2));
         Server {
             state: Arc::new(State {
                 apps: apps::Apps::open(engine.clone(), plan, options.settings_read_only),
                 engine,
-                options,
                 settings,
                 settings_changes: Mutex::new(()),
                 metrics: Metrics::new(),
                 schemas: SchemaCache::default(),
+                client_schemas: Mutex::new(HashMap::new()),
+                described_total: limits::DescribedTotal::for_memory(memory),
                 read_costs: Arc::new(fast::ReadCosts::new()),
+                inline: std::sync::OnceLock::new(),
+                admission: limits::Admission::new(options.statement_threads),
+                request_memory: limits::RequestMemory::new(request_memory),
+                connections: Arc::new(Semaphore::new(options.max_connections.max(1))),
+                status_hub: status::Hub::default(),
+                status_slots: Arc::new(Semaphore::new(2)),
+                options,
                 transactions: Mutex::new(HashMap::new()),
                 admin: admin::Sessions::default(),
                 pg_connections: std::sync::atomic::AtomicUsize::new(0),
@@ -536,31 +654,63 @@ impl Server {
         let listener = TcpListener::bind(addr).await.map_err(|e| Error::Pool(format!("cannot listen: {e}")))?;
         let addr = listener.local_addr().map_err(|e| Error::Pool(e.to_string()))?;
         let stop = Arc::new(Notify::new());
+        self.state.inline.get_or_init(|| fast::Inline::start(self.state.read_costs.clone()));
         let state = self.state.clone();
         let stopped = stop.clone();
+        // The upkeep of every second runs on a thread of its own, whatever the
+        // listener and the runtime's workers are doing; it stops with the
+        // listener (when `ticking` is dropped).
+        let (ticking, ticks) = std::sync::mpsc::channel::<()>();
+        let threaded = start_ticks(&self.state, ticks);
         let task = tokio::spawn(async move {
+            let _ticking = ticking;
             let mut tick = tokio::time::interval(Duration::from_secs(1));
+            // Headers within `header_timeout` (hyper needs a timer to keep
+            // time), and a kept-alive connection closes after as long idle.
+            let mut http = http1::Builder::new();
+            http.timer(TokioTimer::new()).header_read_timeout(state.options.header_timeout);
             loop {
                 tokio::select! {
                     _ = stopped.notified() => break,
-                    _ = tick.tick() => {
-                        state.expire_transactions();
-                        state.sweep_keys();
-                        state.watch_memory();
-                    }
+                    // Only when no thread could be started for it.
+                    _ = tick.tick(), if !threaded => state.tick(),
                     accepted = listener.accept() => {
-                        let Ok((stream, peer)) = accepted else { continue };
+                        let (stream, peer) = match accepted {
+                            Ok(accepted) => accepted,
+                            // Out of file descriptors (or memory): the connection
+                            // stays in the backlog and the next accept would fail at
+                            // once; a pause, not a loop that burns a core.
+                            Err(e) => {
+                                if !matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::Interrupted
+                                ) {
+                                    tokio::time::sleep(ACCEPT_PAUSE).await;
+                                }
+                                continue;
+                            }
+                        };
+                        // Past the connections it may hold, the server says so and
+                        // closes at once: the socket holds nothing.
+                        let Ok(slot) = state.connections.clone().try_acquire_owned() else {
+                            let _ = stream.try_write(&limits::full_answer());
+                            continue;
+                        };
                         let _ = stream.set_nodelay(true);
                         let state = state.clone();
+                        let http = http.clone();
                         tokio::spawn(async move {
-                            state.metrics.open_connections.fetch_add(1, Ordering::Relaxed);
+                            let _slot = slot;
+                            let _open = Counted::new(&state.metrics.open_connections);
                             let conn_state = state.clone();
                             let service = service_fn(move |req| {
                                 let state = conn_state.clone();
                                 async move { Ok::<_, Infallible>(handle(state, req, peer).await) }
                             });
-                            let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
-                            state.metrics.open_connections.fetch_sub(1, Ordering::Relaxed);
+                            let stream = limits::Patient::new(stream, state.options.send_timeout);
+                            let _ = http.serve_connection(TokioIo::new(stream), service).await;
                         });
                     }
                 }
@@ -568,6 +718,26 @@ impl Server {
         });
         Ok(RunningServer { addr, stop, task })
     }
+}
+
+/// A pause after an accept that failed for want of resources.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
+/// Starts the upkeep of every second on a thread of its own: it goes on when
+/// the runtime's workers are busy, which is when memory is highest. It stops
+/// when `ticks` is closed or the server is gone. `false` when no thread
+/// could be started (the listener then keeps the time itself).
+fn start_ticks(state: &Arc<State>, ticks: std::sync::mpsc::Receiver<()>) -> bool {
+    let state = Arc::downgrade(state);
+    std::thread::Builder::new()
+        .name("nuage-tick".into())
+        .spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ticks.recv_timeout(Duration::from_secs(1)) {
+                let Some(state) = state.upgrade() else { return };
+                state.tick();
+            }
+        })
+        .is_ok()
 }
 
 impl Server {
@@ -641,6 +811,21 @@ impl Server {
 }
 
 impl State {
+    /// The upkeep of every second: transactions that expired, keys whose
+    /// time came, the memory guard. A panic in one round is told, and the
+    /// next second runs again.
+    fn tick(&self) {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.expire_transactions();
+            self.sweep_keys();
+            self.watch_memory();
+            self.forget_deleted_apps();
+        }));
+        if let Err(panic) = round {
+            self.engine.event("error", format!("the server's upkeep failed: {}", limits::panic_text(&panic)));
+        }
+    }
+
     /// Keeps the memory in use where it should be, whatever the server: the
     /// page caches take the memory there is and no more. Every two seconds:
     /// past [`MEMORY_HIGH`](crate::memory::MEMORY_HIGH) the caches are emptied,
@@ -942,10 +1127,130 @@ impl State {
         self.memory_reliefs.load(Ordering::Relaxed)
     }
 
+    /// Rolls back the interactive transactions left idle too long, or open
+    /// too long however busy (each keeps the pages it sees).
     fn expire_transactions(&self) {
-        let timeout = self.options.transaction_timeout;
+        let (idle, lifetime) = (self.options.transaction_timeout, self.options.transaction_lifetime);
         let mut txs = self.transactions.lock().unwrap_or_else(|e| e.into_inner());
-        txs.retain(|_, tx| tx.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < timeout);
+        txs.retain(|_, tx| {
+            tx.opened.elapsed() < lifetime && tx.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < idle
+        });
+    }
+
+    /// The schemas the clients of application `app` describe.
+    pub(crate) fn client_schemas(&self, app: &str) -> Arc<limits::ClientSchemas> {
+        let mut all = self.client_schemas.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(described) = all.get(app) {
+            return described.clone();
+        }
+        let described = Arc::new(limits::ClientSchemas::new(self.described_total.clone()));
+        all.insert(app.to_owned(), described.clone());
+        described
+    }
+
+    /// Lets go of what was kept for the applications deleted since: their
+    /// shares of the threads, the maps of their clients' schemas (the
+    /// schemas themselves stay counted in the server's total, as they stay
+    /// in memory).
+    fn forget_deleted_apps(&self) {
+        let exists = |app: &str| self.apps.get(app).is_some();
+        self.admission.forget(exists);
+        self.client_schemas.lock().unwrap_or_else(|e| e.into_inner()).retain(|app, _| exists(app));
+    }
+
+    /// The schemas the clients of application `app` described: how many, and their bytes.
+    pub(crate) fn described_schemas(&self, app: &str) -> (usize, usize) {
+        let all = self.client_schemas.lock().unwrap_or_else(|e| e.into_inner());
+        all.get(app).map_or((0, 0), |c| c.usage())
+    }
+
+    /// A thread for a statement of `who` that reads or writes (see [`limits::Admission`]).
+    pub(crate) async fn enter(&self, write: bool, who: Asker<'_>) -> Result<limits::Thread> {
+        self.admission.enter(write, who, || self.apps.all().len() <= 1).await
+    }
+
+    /// Runs `f`, a statement of `who`, on a thread for reads or for writes
+    /// (see [`limits::Admission`]), off the runtime.
+    pub(crate) async fn statement<T: Send + 'static>(
+        &self,
+        write: bool,
+        who: Asker<'_>,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let _thread = self.enter(write, who).await?;
+        unblocked(f).await?
+    }
+
+    /// Runs `f`, a read of `shape`, for which the caller holds a thread for
+    /// reads: right here when reads of its shape have proved short and a seat
+    /// is free (see [`fast::Inline`]: a point read answers in microseconds,
+    /// less than handing the worker's duties over would cost), else off the
+    /// runtime. Either way its time is recorded for its shape.
+    async fn read<T: Send + 'static>(&self, shape: Option<u64>, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+        if let Some(shape) = shape.filter(|s| self.read_costs.short(*s))
+            && let Some(inline) = self.inline.get().and_then(Option::as_ref)
+            && let Some(seat) = inline.seat(shape)
+        {
+            let started = Instant::now();
+            let out = std::panic::catch_unwind(AssertUnwindSafe(f));
+            drop(seat);
+            self.read_costs.record(shape, started.elapsed());
+            return out.map_err(|panic| Error::Pool(format!("the request failed: {}", limits::panic_text(&panic))));
+        }
+        let costs = self.read_costs.clone();
+        unblocked(move || {
+            let started = Instant::now();
+            let out = f();
+            if let Some(shape) = shape {
+                costs.record(shape, started.elapsed());
+            }
+            out
+        })
+        .await
+    }
+
+    /// Reads a request of `who` (its JSON, its SQL; `read` says whether it
+    /// writes) on a thread of the kind it looks like (`looks_like_write`, a
+    /// guess on its first words), then runs it right there when the guess was
+    /// right. Else it waits for a thread of its kind. A thread for writes only
+    /// ever reads what looks like a write of a token that writes: slow reads,
+    /// or a text that takes long to read, never keep the writes from their
+    /// threads.
+    async fn read_then_run<P, T, F>(
+        &self,
+        who: Asker<'_>,
+        shape: Option<u64>,
+        looks_like_write: bool,
+        read: impl FnOnce() -> Result<(P, bool)> + Send + 'static,
+        run: F,
+    ) -> Result<T>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(P) -> Result<T> + Send + 'static,
+    {
+        enum Step<T, P, F> {
+            Done(T),
+            Later(P, F, bool),
+        }
+        let for_writes = looks_like_write && !who.read_only;
+        let thread = self.enter(for_writes, who).await?;
+        // A write waits for the disk: never where it is.
+        let step = self
+            .read(shape.filter(|_| !for_writes), move || -> Result<Step<T, P, F>> {
+                let (read, writes) = read()?;
+                if writes != for_writes { Ok(Step::Later(read, run, writes)) } else { run(read).map(Step::Done) }
+            })
+            .await??;
+        drop(thread);
+        match step {
+            Step::Done(out) => Ok(out),
+            Step::Later(read, run, true) => self.statement(true, who, move || run(read)).await,
+            Step::Later(read, run, false) => {
+                let _thread = self.enter(false, who).await?;
+                self.read(shape, move || run(read)).await?
+            }
+        }
     }
 
     /// Drops the keys of the key-value stores whose time has come.
@@ -984,8 +1289,21 @@ pub(crate) fn json_response(status: u16, body: &Json) -> Response<HttpBody> {
 }
 
 pub(crate) fn error_response(e: &Error) -> Response<HttpBody> {
+    if let Some(refusal) = limits::refusal(e) {
+        return limits::refusal_response(refusal);
+    }
     let (status, body) = wire::error_to_json(e);
     json_response(status, &body)
+}
+
+/// The HTTP status of the answer to `e`.
+fn error_status(e: &Error) -> u16 {
+    limits::refusal(e).map_or_else(|| wire::error_to_json(e).0, |r| r.status)
+}
+
+/// A read-only token's attempt at writing, as an error.
+fn read_only_error() -> Error {
+    refused(403, "forbidden", READ_ONLY)
 }
 
 pub(crate) fn unauthorized(message: &str) -> Response<HttpBody> {
@@ -1014,20 +1332,30 @@ impl State {
     }
 }
 
+/// The body of `req`, `limit` bytes at most, with its share of the memory of
+/// the requests being read (see [`limits::read_body`]).
+async fn body_of(state: &State, req: Request<Incoming>, limit: usize) -> Result<limits::Body> {
+    limits::read_body(&state.request_memory, req, limit, state.options.body_timeout).await
+}
+
+/// The body of `req`, as JSON, with the memory of its tree: for a large
+/// one, read off the runtime.
+async fn json_body(state: &State, req: Request<Incoming>) -> Result<(Json, limits::Held)> {
+    let mut body = body_of(state, req, state.options.max_body_bytes).await?;
+    body.for_json(&state.request_memory).await?;
+    if body.bytes.len() < limits::LARGE_BODY {
+        let json = body.json()?;
+        return Ok((json, body.into_held()));
+    }
+    unblocked(move || body.json().map(|json| (json, body.into_held()))).await?
+}
+
 async fn read_body(state: &State, req: Request<Incoming>) -> Result<Bytes> {
-    Ok(Limited::new(req.into_body(), state.options.max_body_bytes)
-        .collect()
-        .await
-        .map_err(|e| Error::Validation(format!("cannot read the request: {e}")))?
-        .to_bytes())
+    Ok(body_of(state, req, state.options.max_body_bytes).await?.bytes)
 }
 
 async fn read_json(state: &State, req: Request<Incoming>) -> Result<Json> {
-    let body = read_body(state, req).await?;
-    if body.is_empty() {
-        return Ok(Json::Null);
-    }
-    serde_json::from_slice(&body).map_err(|e| Error::Conversion(format!("invalid JSON: {e}")))
+    Ok(json_body(state, req).await?.0)
 }
 
 /// A body fed by a channel: Server-Sent Events.
@@ -1051,14 +1379,17 @@ impl Body for ChannelBody {
 
 async fn handle(state: Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> Response<HttpBody> {
     let started = Instant::now();
-    state.metrics.active_requests.fetch_add(1, Ordering::Relaxed);
+    let active = Counted::new(&state.metrics.active_requests);
     let path = req.uri().path().to_owned();
     let gzip = accepts_gzip(req.headers());
-    let mut res = route(&state, req, peer).await;
+    let mut res = match CatchUnwind(Box::pin(route(&state, req, peer))).await {
+        Ok(res) => res,
+        Err(panic) => error_response(&Error::Pool(format!("the request failed: {}", limits::panic_text(&panic)))),
+    };
     if gzip {
         res = compress(res).await;
     }
-    state.metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
+    drop(active);
     // The status stream would count as one never-ending request.
     if path != "/api/status/stream" {
         state.metrics.record(started.elapsed(), res.status().is_server_error());
@@ -1204,7 +1535,14 @@ async fn compress(res: Response<HttpBody>) -> Response<HttpBody> {
     if bytes.len() < 1024 {
         return Response::from_parts(parts, full(bytes));
     }
-    match fast::gzip(&bytes) {
+    // A large answer takes milliseconds to compress: off the runtime.
+    let packed = if bytes.len() < 256 << 10 {
+        fast::gzip(&bytes)
+    } else {
+        let text = bytes.clone();
+        unblocked(move || fast::gzip(&text)).await.ok().flatten()
+    };
+    match packed {
         Some(packed) => {
             parts.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -1272,7 +1610,7 @@ async fn protocol(
     let result = app_protocol(state, &app, read_only, req).await;
     let failed = match &result {
         Ok(res) => res.status().is_server_error(),
-        Err(e) => wire::error_to_json(e).0 >= 500,
+        Err(e) => error_status(e) >= 500,
     };
     app.metrics.record(started.elapsed(), failed);
     let res = result.unwrap_or_else(|e| error_response(&e));
@@ -1310,6 +1648,7 @@ async fn app_protocol(
     let branch = header(BRANCH_HEADER).unwrap_or_else(|| MAIN.to_owned());
     let tx_id = header(TRANSACTION_HEADER);
     let engine = &app.engine;
+    let who = Asker { app: &app.name, read_only };
 
     if segments.first() == Some(&"kv") {
         return kv::route(state, app, read_only, req).await;
@@ -1319,10 +1658,16 @@ async fn app_protocol(
         return files::route(state, &app.name, read_only, req, &name).await;
     }
     match (method, segments.as_slice()) {
-        // "Does my connection work?": which application the token opens.
+        // "Does my connection work?": which application the token opens. It
+        // waits for no thread (it answers when statements fill them all), and
+        // reads the catalog off the runtime.
         (Method::GET, ["ping"]) => {
-            check_branch(engine, &branch)?;
-            let tables = Embedded::from_engine(engine.clone()).tables().map(|t| t.len()).unwrap_or(0);
+            let (engine, at) = (engine.clone(), branch.clone());
+            let tables = unblocked(move || -> Result<usize> {
+                check_branch(&engine, &at)?;
+                Ok(Embedded::from_engine(engine).tables().map(|t| t.len()).unwrap_or(0))
+            })
+            .await??;
             let access = if read_only { "read-only" } else { "read-write" };
             Ok(json_response(
                 200,
@@ -1362,126 +1707,154 @@ async fn app_protocol(
         )),
         (Method::POST, [op @ ("fetch" | "execute")]) => {
             let fetch = *op == "fetch";
-            let body = read_json(state, req).await?;
-            let query = wire::query_from_json(body.get("query").unwrap_or(&Json::Null), &state.schemas)?;
-            let engine = engine.clone();
+            let (body, held) = json_body(state, req).await?;
+            let large = held.large();
             let tx = match &tx_id {
                 Some(id) => Some(state.transaction(id, &app.name, &branch)?),
                 None => None,
             };
-            // `db.raw(...)` and `db.raw_execute(...)` of Memoire's client: the
-            // SQL layer runs them, as for `/v1/sql`, inside the open transaction
-            // when there is one.
-            if let Some((script, params)) = raw_script(&query)? {
-                if read_only && script.writes() {
-                    return Ok(forbidden(READ_ONLY));
-                }
-                let schemas = state.clone();
-                let answer = tokio::task::spawn_blocking(move || -> Result<Json> {
-                    let results = match tx {
-                        Some(tx) => crate::sql::run_in(&tx.tx, &schemas.schemas, &script, &params)?,
-                        None => {
-                            check_branch(&engine, &branch)?;
-                            crate::sql::run_values(&engine, &branch, &schemas.schemas, &[(&script, &params)], true)?
-                                .pop()
-                                .unwrap_or_default()
-                        }
-                    };
-                    Ok(if fetch {
-                        let rows = results.into_iter().rev().find(|r| !r.columns.is_empty()).map(|r| r.rows);
-                        json!({ "rows": wire::rows_to_json(&rows.unwrap_or_default()) })
-                    } else {
-                        let done = memoire_orm::ExecResult {
-                            rows_affected: results.iter().map(|r| r.rows_affected).sum(),
-                            last_insert_id: results.iter().rev().find_map(|r| r.last_insert_id.clone()),
-                        };
-                        wire::exec_result_to_json(&done)
-                    })
-                })
-                .await
-                .map_err(|e| Error::Pool(e.to_string()))??;
-                return Ok(json_response(200, &answer));
-            }
-            // A read outside a transaction: where it is while reads of its
-            // shape are short (see `fast::ReadCosts`), its answer written
-            // straight as text.
-            if let (true, None, Some(shape)) = (fetch, &tx, fast::shape(&query)) {
-                let body = state
-                    .read_costs
-                    .read(shape, move || -> Result<Vec<u8>> {
-                        check_branch(&engine, &branch)?;
-                        Ok(wire::rows_to_vec(&embedded::fetch_rows(&engine, &branch, &query.as_query())?))
-                    })
-                    .await??;
-                return Ok(json_bytes(200, body));
-            }
-            // The engine blocks on disk: off the async workers.
-            let answer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-                let q = query.as_query();
-                let done = |r: memoire_orm::ExecResult| {
-                    serde_json::to_vec(&wire::exec_result_to_json(&r)).map_err(|e| Error::Conversion(e.to_string()))
+            let write = !fetch || tx.is_some();
+            let (described, name) = (state.client_schemas(&app.name), app.name.clone());
+            // The statement, its schemas checked before the cache keeps them.
+            let decode = move || -> Result<(wire::OwnedQuery, limits::Held)> {
+                let q = body.get("query").unwrap_or(&Json::Null);
+                described.admit(q, &name)?;
+                Ok((wire::query_from_json(q, &described.cache)?, held))
+            };
+            let (engine, s) = (engine.clone(), state.clone());
+            let run = move |(query, _held): (wire::OwnedQuery, limits::Held)| {
+                answer_statement(&engine, &branch, &s.schemas, query, tx, fetch, read_only)
+            };
+            let (answer, cached) = if write {
+                // Writes, and a transaction's statements: on a thread for writes.
+                state.statement(true, who, move || run(decode()?)).await?
+            } else {
+                // A read: decoded first (here, unless its body is large), for
+                // its shape, which tells where it runs.
+                let decoded = if large { unblocked(decode).await?? } else { decode()? };
+                let shape = match &decoded.0 {
+                    wire::OwnedQuery::Raw(sql, _) | wire::OwnedQuery::Script(sql) => {
+                        Some(fast::sql_shape(std::iter::once(sql.as_str())))
+                    }
+                    query => fast::shape(query),
                 };
-                match (tx, fetch) {
-                    (Some(tx), true) => Ok(wire::rows_to_vec(&tx.tx.fetch_rows(&q)?)),
-                    (Some(tx), false) => done(tx.tx.execute_now(&q)?),
-                    (None, true) => {
-                        check_branch(&engine, &branch)?;
-                        Ok(wire::rows_to_vec(&embedded::fetch_rows(&engine, &branch, &q)?))
-                    }
-                    (None, false) => {
-                        check_branch(&engine, &branch)?;
-                        done(embedded::execute_now(&engine, &branch, &q)?)
-                    }
-                }
-            })
-            .await
-            .map_err(|e| Error::Pool(e.to_string()))??;
-            Ok(json_bytes(200, answer))
+                let _thread = state.enter(false, who).await?;
+                state.read(shape, move || run(decoded)).await??
+            };
+            let mut res = json_bytes(200, answer);
+            if !cached {
+                res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            }
+            Ok(res)
         }
         (Method::POST, ["batch"]) => {
-            let body = read_json(state, req).await?;
-            let mut statements = Vec::new();
-            for s in body
+            let (body, held) = json_body(state, req).await?;
+            let db = state.db(engine, &branch)?;
+            let (described, name) = (state.client_schemas(&app.name), app.name.clone());
+            let looks_like_write = body
                 .get("statements")
                 .and_then(Json::as_array)
-                .ok_or_else(|| Error::Conversion("missing `statements`".into()))?
-            {
-                let (fetch, q) = match (s.get("fetch"), s.get("execute")) {
-                    (Some(q), _) => (true, q),
-                    (_, Some(q)) => (false, q),
-                    _ => {
-                        return Err(Error::Conversion(
-                            "a statement is `{\"fetch\": ...}` or `{\"execute\": ...}`".into(),
-                        ));
-                    }
-                };
-                if read_only && !fetch {
-                    return Ok(forbidden(READ_ONLY));
+                .is_some_and(|list| list.iter().take(MAX_STATEMENTS + 1).any(|s| s.get("execute").is_some()));
+            let read = move || -> Result<(_, bool)> {
+                let list = body
+                    .get("statements")
+                    .and_then(Json::as_array)
+                    .ok_or_else(|| Error::Conversion("missing `statements`".into()))?;
+                if list.len() > MAX_STATEMENTS {
+                    return Err(too_many_statements(list.len()));
                 }
-                statements.push((fetch, wire::query_from_json(q, &state.schemas)?));
-            }
-            let db = state.db(engine, &branch)?;
-            let results = tokio::task::spawn_blocking(move || {
-                let list: Vec<(bool, memoire_orm::Query<'_>)> =
-                    statements.iter().map(|(f, q)| (*f, q.as_query())).collect();
-                db.batch(&list)
-            })
-            .await
-            .map_err(|e| Error::Pool(e.to_string()))??;
-            let results: Vec<Json> = results
-                .into_iter()
-                .map(|r| match r {
-                    Ok(rows) => json!({ "rows": wire::rows_to_json(&rows) }),
-                    Err(done) => wire::exec_result_to_json(&done),
-                })
-                .collect();
-            Ok(json_response(200, &json!({ "results": results })))
+                let mut statements = Vec::with_capacity(list.len());
+                for s in list {
+                    let (fetch, q) = match (s.get("fetch"), s.get("execute")) {
+                        (Some(q), _) => (true, q),
+                        (_, Some(q)) => (false, q),
+                        _ => {
+                            return Err(Error::Conversion(
+                                "a statement is `{\"fetch\": ...}` or `{\"execute\": ...}`".into(),
+                            ));
+                        }
+                    };
+                    if read_only && !fetch {
+                        return Err(read_only_error());
+                    }
+                    described.admit(q, &name)?;
+                    statements.push((fetch, wire::query_from_json(q, &described.cache)?));
+                }
+                let writes = statements.iter().any(|(fetch, _)| !fetch);
+                Ok(((statements, held), writes))
+            };
+            let run = move |(statements, _held): (Vec<(bool, wire::OwnedQuery)>, limits::Held)| {
+                // `{"results": [...]}`, each answer written as it comes.
+                let mut out = b"{\"results\":[".to_vec();
+                if statements.iter().all(|(fetch, _)| *fetch) {
+                    // Reads alone, as `Embedded::batch` runs them (one
+                    // transaction that only reads), stopped once their answers
+                    // pass what one answer may be.
+                    let tx = db.begin_read()?;
+                    for (i, (_, q)) in statements.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        out.extend_from_slice(&wire::rows_to_vec(&tx.fetch_rows(&q.as_query())?));
+                        if out.len() > MAX_BATCH_ANSWER {
+                            return Err(too_large(format!(
+                                "the answers to this batch pass {} MiB after {} of its {} statements: ask for fewer rows at once",
+                                MAX_BATCH_ANSWER >> 20,
+                                i + 1,
+                                statements.len()
+                            )));
+                        }
+                    }
+                } else {
+                    let list: Vec<(bool, memoire_orm::Query<'_>)> =
+                        statements.iter().map(|(f, q)| (*f, q.as_query())).collect();
+                    for (i, r) in db.batch(&list)?.into_iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        match r {
+                            Ok(rows) => out.extend_from_slice(&wire::rows_to_vec(&rows)),
+                            Err(done) => serde_json::to_writer(&mut out, &wire::exec_result_to_json(&done))
+                                .map_err(|e| Error::Conversion(e.to_string()))?,
+                        }
+                    }
+                }
+                out.extend_from_slice(b"]}");
+                Ok(out)
+            };
+            let answer = state.read_then_run(who, None, looks_like_write, read, run).await?;
+            let mut res = json_bytes(200, answer);
+            res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(res)
         }
         (Method::POST, ["transactions"]) => {
-            let tx = state.db(engine, &branch)?.begin_now()?;
+            let open = || {
+                let txs = state.transactions.lock().unwrap_or_else(|e| e.into_inner());
+                txs.values().filter(|t| t.app == app.name).count()
+            };
+            let max = state.options.max_transactions.max(1);
+            let full = || {
+                too_many(format!(
+                    "application `{}` has {max} transactions open, the most it may: commit or roll one back first",
+                    app.name
+                ))
+            };
+            if open() >= max {
+                return Err(full());
+            }
+            let db = state.db(engine, &branch)?;
+            let tx = state.statement(true, who, move || db.begin_now()).await?;
             let id = random_token();
-            let open = OpenTx { tx, app: app.name.clone(), branch, last_used: Mutex::new(Instant::now()) };
-            state.transactions.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), Arc::new(open));
+            let now = Instant::now();
+            let open_tx = OpenTx { tx, app: app.name.clone(), branch, opened: now, last_used: Mutex::new(now) };
+            {
+                let mut txs = state.transactions.lock().unwrap_or_else(|e| e.into_inner());
+                if txs.values().filter(|t| t.app == app.name).count() >= max {
+                    drop(txs);
+                    return Err(full());
+                }
+                txs.insert(id.clone(), Arc::new(open_tx));
+            }
             Ok(json_response(200, &json!({ "id": id })))
         }
         (Method::POST, ["transactions", id, action @ ("commit" | "rollback")]) => {
@@ -1494,119 +1867,294 @@ async fn app_protocol(
                 txs.remove(*id).ok_or(Error::TransactionFinished)?
             };
             let commit = *action == "commit";
-            tokio::task::spawn_blocking(move || if commit { open.tx.commit_now() } else { open.tx.rollback_now() })
-                .await
-                .map_err(|e| Error::Pool(e.to_string()))??;
+            state
+                .statement(true, who, move || if commit { open.tx.commit_now() } else { open.tx.rollback_now() })
+                .await?;
             Ok(json_response(200, &json!({ "ok": true })))
         }
         (Method::GET, ["branches"]) => {
-            let list: Vec<Json> = engine.branches().iter().map(memoire_orm::nuage::Branch::to_json).collect();
+            let engine = engine.clone();
+            let list: Vec<Json> = state
+                .statement(false, who, move || {
+                    Ok(engine.branches().iter().map(memoire_orm::nuage::Branch::to_json).collect())
+                })
+                .await?;
             Ok(json_response(200, &json!({ "branches": list })))
         }
+        // Branches change under the writer's lock, with a sync to disk: on a
+        // thread for writes.
         (Method::POST, ["branches"]) => {
             let body = read_json(state, req).await?;
-            let name = body.get("name").and_then(Json::as_str).unwrap_or_default();
-            let from = body.get("from").and_then(Json::as_str);
-            Ok(json_response(201, &engine.create_branch(name, from)?.to_json()))
+            let engine = engine.clone();
+            let branch = state
+                .statement(true, who, move || {
+                    let name = body.get("name").and_then(Json::as_str).unwrap_or_default();
+                    Ok(engine.create_branch(name, body.get("from").and_then(Json::as_str))?.to_json())
+                })
+                .await?;
+            Ok(json_response(201, &branch))
         }
         (Method::DELETE, ["branches", name]) => {
-            if engine.delete_branch(name)? {
+            let (engine, at) = (engine.clone(), (*name).to_owned());
+            if state.statement(true, who, move || engine.delete_branch(&at)).await? {
                 Ok(json_response(200, &json!({ "deleted": name })))
             } else {
                 Err(Error::NotFound)
             }
         }
         (Method::POST, ["branches", name, "reset"]) => {
-            if engine.reset_branch(name)? {
+            let (engine, at) = (engine.clone(), (*name).to_owned());
+            if state.statement(true, who, move || engine.reset_branch(&at)).await? {
                 Ok(json_response(200, &json!({ "reset": name })))
             } else {
                 Err(Error::NotFound)
             }
         }
         (Method::POST, ["sql"]) => {
-            let body = read_json(state, req).await?;
-            // `{"sql", "params"}`, or `{"statements": [{"sql", "params"}, ...]}`:
-            // one transaction either way.
-            let mut batch = Vec::new();
-            let several = match body.get("statements").and_then(Json::as_array) {
-                Some(list) => {
-                    for s in list {
-                        batch.push(script_of(s)?);
-                    }
-                    true
-                }
-                None => {
-                    let (script, params) = script_of(&body)?;
-                    let several = script.len() > 1;
-                    batch.push((script, params));
-                    several
-                }
-            };
-            if read_only && batch.iter().any(|(s, _)| s.writes()) {
-                return Ok(forbidden(READ_ONLY));
-            }
-            let reads = (!batch.iter().any(|(s, _)| s.writes())).then(|| {
+            let (body, held) = json_body(state, req).await?;
+            let texts = || {
                 let one = body.get("sql").and_then(Json::as_str);
-                let several = body.get("statements").and_then(Json::as_array);
-                let texts = several.into_iter().flatten().filter_map(|s| s.get("sql").and_then(Json::as_str));
-                fast::sql_shape(one.into_iter().chain(texts))
-            });
-            let arrays = body.get("arrays").and_then(Json::as_bool).unwrap_or(false);
-            let engine = engine.clone();
-            let schemas = state.clone();
-            let run = move || crate::sql::run(&engine, &branch, &schemas.schemas, &batch, true);
-            // Statements that only read run where they are while they are
-            // short; the others wait for the disk, off the async workers.
-            let results = match reads {
-                Some(shape) => state.read_costs.read(shape, run).await??,
-                None => tokio::task::spawn_blocking(run).await.map_err(|e| Error::Pool(e.to_string()))??,
+                let several = body.get("statements").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default();
+                let texts = several.iter().take(MAX_STATEMENTS + 1).filter_map(|s| s.get("sql").and_then(Json::as_str));
+                one.into_iter().chain(texts)
             };
-            let all: Vec<crate::sql::SqlResult> = results.into_iter().flatten().collect();
-            // The answer written straight as its text, when it can be.
-            let mut out = Vec::with_capacity(256);
-            let single = !several && all.len() == 1;
-            if !single {
-                out.extend_from_slice(b"{\"results\":[");
+            // Its shape: its SQL texts (a large request runs off the runtime).
+            let shape = (!held.large()).then(|| fast::sql_shape(texts()));
+            let looks_like_write = !read_only && texts().any(|sql| !reads_by_its_first_word(sql));
+            let (engine, s) = (engine.clone(), state.clone());
+            // Reading the SQL is part of the read (off the runtime unless its
+            // shape has proved short), on a thread of the kind its first words
+            // tell: a statement that turns out to be of the other kind then
+            // waits for a thread of its own.
+            let (answer, cached) = state
+                .read_then_run(
+                    who,
+                    shape,
+                    looks_like_write,
+                    move || {
+                        let request = sql_request(body, held, read_only)?;
+                        let writes = request.writes;
+                        Ok((request, writes))
+                    },
+                    move |request| run_sql(&engine, &branch, &s.schemas, request),
+                )
+                .await?;
+            let mut res = json_bytes(200, answer);
+            if !cached {
+                res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             }
-            let mut written = true;
-            for (i, r) in all.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                written = written && fast::write_sql_result(&mut out, r, arrays);
-            }
-            if !single {
-                out.extend_from_slice(b"]}");
-            }
-            if written {
-                return Ok(json_bytes(200, out));
-            }
-            let mut all: Vec<Json> = all.iter().map(|r| sql_json(r, arrays)).collect();
-            Ok(json_response(200, &if single { all.remove(0) } else { json!({ "results": all }) }))
+            Ok(res)
         }
         _ => Err(Error::NotFound),
     }
 }
 
+/// Runs a statement of Memoire's protocol (`/v1/fetch`, `/v1/execute`), in
+/// the open transaction when there is one, and writes its answer: rows, or
+/// what was done. `false` with an answer that is not to be kept by a cache.
+fn answer_statement(
+    engine: &Arc<Engine>,
+    branch: &str,
+    schemas: &SchemaCache,
+    query: wire::OwnedQuery,
+    tx: Option<Arc<OpenTx>>,
+    fetch: bool,
+    read_only: bool,
+) -> Result<(Vec<u8>, bool)> {
+    // `db.raw(...)` and `db.raw_execute(...)` of Memoire's client: the SQL
+    // layer runs them, as for `/v1/sql`, inside the open transaction when
+    // there is one.
+    if let Some((script, params)) = raw_script(&query)? {
+        if read_only && script.writes() {
+            return Err(read_only_error());
+        }
+        let results = match tx {
+            Some(tx) => crate::sql::run_in(&tx.tx, schemas, &script, &params)?,
+            None => {
+                check_branch(engine, branch)?;
+                crate::sql::run_values(engine, branch, schemas, &[(&script, &params)], true)?.pop().unwrap_or_default()
+            }
+        };
+        let answer = if fetch {
+            let rows = results.into_iter().rev().find(|r| !r.columns.is_empty()).map(|r| r.rows);
+            json!({ "rows": wire::rows_to_json(&rows.unwrap_or_default()) })
+        } else {
+            let done = memoire_orm::ExecResult {
+                rows_affected: results.iter().map(|r| r.rows_affected).sum(),
+                last_insert_id: results.iter().rev().find_map(|r| r.last_insert_id.clone()),
+            };
+            wire::exec_result_to_json(&done)
+        };
+        return Ok((serde_json::to_vec(&answer).unwrap_or_default(), false));
+    }
+    let q = query.as_query();
+    let done = |r: memoire_orm::ExecResult| {
+        serde_json::to_vec(&wire::exec_result_to_json(&r)).map_err(|e| Error::Conversion(e.to_string()))
+    };
+    let answer = match (tx, fetch) {
+        (Some(tx), true) => wire::rows_to_vec(&tx.tx.fetch_rows(&q)?),
+        (Some(tx), false) => done(tx.tx.execute_now(&q)?)?,
+        (None, true) => {
+            check_branch(engine, branch)?;
+            wire::rows_to_vec(&embedded::fetch_rows(engine, branch, &q)?)
+        }
+        (None, false) => {
+            check_branch(engine, branch)?;
+            done(embedded::execute_now(engine, branch, &q)?)?
+        }
+    };
+    Ok((answer, true))
+}
+
+fn too_many_statements(n: usize) -> Error {
+    too_large(format!("{n} statements in one request: a request takes {MAX_STATEMENTS} at most; send them in several"))
+}
+
 /// The SQL of a raw statement of Memoire's protocol (`Query::Raw`,
 /// `Query::Script`), parsed, with its parameters; `None` for the others.
 fn raw_script(query: &wire::OwnedQuery) -> Result<Option<(crate::sql::Script, Vec<memoire_orm::Value>)>> {
-    Ok(match query {
-        wire::OwnedQuery::Raw(sql, params) => Some((crate::sql::Script::parse(sql)?, params.clone())),
-        wire::OwnedQuery::Script(sql) => Some((crate::sql::Script::parse(sql)?, Vec::new())),
-        _ => None,
-    })
+    let (sql, params) = match query {
+        wire::OwnedQuery::Raw(sql, params) => (sql, params.clone()),
+        wire::OwnedQuery::Script(sql) => (sql, Vec::new()),
+        _ => return Ok(None),
+    };
+    check_sql(sql, params.len())?;
+    Ok(Some((crate::sql::Script::parse(sql)?, params)))
 }
 
-/// A script of a `/v1/sql` request: `{"sql": "...", "params": [...]}`.
-fn script_of(j: &Json) -> Result<(crate::sql::Script, Vec<Json>)> {
-    let sql = j.get("sql").and_then(Json::as_str).ok_or_else(|| Error::Conversion("missing `sql`".into()))?;
-    let params = match j.get("params") {
+/// Refuses an SQL text or a list of parameters that no statement may have.
+fn check_sql(sql: &str, params: usize) -> Result<()> {
+    if sql.len() > MAX_SQL_TEXT {
+        return Err(too_large(format!(
+            "the SQL text is {} bytes: a statement is {} MiB at most; send a long script in several requests",
+            sql.len(),
+            MAX_SQL_TEXT >> 20
+        )));
+    }
+    if params > MAX_PARAMS {
+        return Err(Error::Validation(format!(
+            "SQL: {params} parameters given: a statement takes {MAX_PARAMS} at most"
+        )));
+    }
+    Ok(())
+}
+
+/// The text `sql` reads, by its first word, before it is parsed (a guess
+/// that only says on which thread it is parsed: the parse decides). Only the
+/// start of the text is looked at, on the runtime.
+fn reads_by_its_first_word(sql: &str) -> bool {
+    let mut rest = &sql.as_bytes()[..sql.len().min(256)];
+    loop {
+        rest = rest.trim_ascii_start();
+        if let Some(after) = rest.strip_prefix(b"--") {
+            rest = after.iter().position(|b| *b == b'\n').map_or(&[], |n| &after[n..]);
+        } else if let Some(after) = rest.strip_prefix(b"/*") {
+            rest = after.windows(2).position(|w| w == b"*/").map_or(&[], |n| &after[n + 2..]);
+        } else if let Some(after) = rest.strip_prefix(b"(") {
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    let word = &rest[..rest.iter().position(|b| !b.is_ascii_alphabetic()).unwrap_or(rest.len())];
+    // The statements that change nothing (`Stmt::writes`), and a text with no word.
+    ["", "select", "with", "values", "explain", "begin", "start", "commit", "end", "rollback"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w.as_bytes()))
+}
+
+/// A `/v1/sql` request, read and checked.
+struct SqlRequest {
+    batch: Vec<(crate::sql::Script, Vec<Json>)>,
+    /// The answer lists the results (`{"results": [...]}`).
+    several: bool,
+    /// Rows as arrays, not objects.
+    arrays: bool,
+    writes: bool,
+    /// The memory of the JSON the request was read into.
+    _held: limits::Held,
+}
+
+/// Reads `{"sql", "params"}`, or `{"statements": [{"sql", "params"}, ...]}`:
+/// every statement and its parameters are counted before anything is copied
+/// or converted.
+fn sql_request(mut body: Json, held: limits::Held, read_only: bool) -> Result<SqlRequest> {
+    let arrays = body.get("arrays").and_then(Json::as_bool).unwrap_or(false);
+    let mut batch = Vec::new();
+    let several = match body.get_mut("statements") {
+        Some(Json::Array(list)) => {
+            if list.len() > MAX_STATEMENTS {
+                return Err(too_many_statements(list.len()));
+            }
+            for s in list.iter_mut() {
+                batch.push(script_of(s)?);
+            }
+            true
+        }
+        _ => {
+            let (script, params) = script_of(&mut body)?;
+            let several = script.len() > 1;
+            batch.push((script, params));
+            several
+        }
+    };
+    let writes = batch.iter().any(|(s, _)| s.writes());
+    if read_only && writes {
+        return Err(read_only_error());
+    }
+    Ok(SqlRequest { batch, several, arrays, writes, _held: held })
+}
+
+/// Runs a `/v1/sql` request, one transaction, and writes its answer:
+/// straight as its text when it can be (`true`), else through JSON values.
+fn run_sql(engine: &Arc<Engine>, branch: &str, schemas: &SchemaCache, request: SqlRequest) -> Result<(Vec<u8>, bool)> {
+    let results = crate::sql::run(engine, branch, schemas, &request.batch, true)?;
+    let all: Vec<crate::sql::SqlResult> = results.into_iter().flatten().collect();
+    let mut out = Vec::with_capacity(256);
+    let single = !request.several && all.len() == 1;
+    if !single {
+        out.extend_from_slice(b"{\"results\":[");
+    }
+    let mut written = true;
+    for (i, r) in all.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        written = written && fast::write_sql_result(&mut out, r, request.arrays);
+    }
+    if !single {
+        out.extend_from_slice(b"]}");
+    }
+    if written {
+        return Ok((out, true));
+    }
+    let mut all: Vec<Json> = all.iter().map(|r| sql_json(r, request.arrays)).collect();
+    let answer = if single { all.remove(0) } else { json!({ "results": all }) };
+    Ok((serde_json::to_vec(&answer).unwrap_or_default(), false))
+}
+
+/// A script of a `/v1/sql` request: `{"sql": "...", "params": [...]}`. Its
+/// parameters are taken out of the request, not copied, once counted.
+fn script_of(j: &mut Json) -> Result<(crate::sql::Script, Vec<Json>)> {
+    if j.get("sql").and_then(Json::as_str).is_none() {
+        return Err(Error::Conversion("missing `sql`".into()));
+    }
+    let params = match j.get_mut("params") {
         None | Some(Json::Null) => Vec::new(),
-        Some(Json::Array(list)) => list.clone(),
+        Some(Json::Array(list)) => std::mem::take(list),
         Some(_) => return Err(Error::Conversion("`params` is a list of values".into())),
     };
-    Ok((crate::sql::Script::parse(sql)?, params))
+    let sql = j.get("sql").and_then(Json::as_str).unwrap_or_default();
+    check_sql(sql, params.len())?;
+    let script = crate::sql::Script::parse(sql)?;
+    if params.len() != script.params() {
+        return Err(Error::Validation(format!(
+            "SQL: {} parameter(s) given, the statement uses {}",
+            params.len(),
+            script.params()
+        )));
+    }
+    Ok((script, params))
 }
 
 /// A statement's result as `/v1/sql` answers it: rows as objects (or arrays).
@@ -1661,4 +2209,124 @@ impl State {
 /// a thread, and half of what the system lets this user start is kept for them.
 pub(crate) fn pg_connections_most() -> usize {
     crate::memory::thread_limit().map_or(usize::MAX, |limit| (limit / 2).max(8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request that panics answers 500, and is no longer counted as active.
+    #[tokio::test]
+    async fn a_panic_in_a_request_is_an_answer() {
+        let active = AtomicU64::new(0);
+        let request = async {
+            let _counted = Counted::new(&active);
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+            tokio::task::yield_now().await;
+            panic!("a bug");
+        };
+        let caught = CatchUnwind(Box::pin(request)).await;
+        let panic = caught.expect_err("the panic comes back");
+        assert_eq!(limits::panic_text(&panic), "a bug");
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        // And a request dropped half-way (its client left).
+        let pending = async {
+            let _counted = Counted::new(&active);
+            std::future::pending::<()>().await;
+        };
+        let mut pending = Box::pin(pending);
+        assert!(futures_poll_once(pending.as_mut()).await.is_none());
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        drop(pending);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    /// Polls `f` once.
+    async fn futures_poll_once<F: Future>(mut f: Pin<&mut F>) -> Option<F::Output> {
+        std::future::poll_fn(|cx| {
+            Poll::Ready(match f.as_mut().poll(cx) {
+                Poll::Ready(out) => Some(out),
+                Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    /// The SQL of a request is counted before it is read: parameters taken
+    /// out, not copied, and refused past the limits.
+    #[test]
+    fn sql_requests_are_counted_before_they_are_read() {
+        let held = || limits::Body::empty().into_held();
+        let r = sql_request(json!({ "sql": "SELECT ? + ?", "params": [1, 2] }), held(), true).unwrap();
+        assert_eq!((r.batch.len(), r.batch[0].1.len(), r.several, r.writes), (1, 2, false, false));
+        let refused = |body: Json, read_only: bool| sql_request(body, held(), read_only).err().unwrap();
+        let status = |e: &Error| error_status(e);
+        assert_eq!(status(&refused(json!({ "sql": "SELECT 1", "params": vec![0; MAX_PARAMS + 1] }), false)), 400);
+        assert_eq!(status(&refused(json!({ "sql": "SELECT 1", "params": [1] }), false)), 400);
+        let many: Vec<Json> = (0..=MAX_STATEMENTS).map(|_| json!({ "sql": "SELECT 1" })).collect();
+        assert_eq!(status(&refused(json!({ "statements": many }), false)), 413);
+        assert_eq!(status(&refused(json!({ "sql": " ".repeat(MAX_SQL_TEXT + 1) }), false)), 413);
+        assert_eq!(status(&refused(json!({ "sql": "DELETE FROM t" }), true)), 403);
+        assert_eq!(status(&refused(json!({ "params": "x" }), false)), 400);
+        let several = sql_request(json!({ "sql": "SELECT 1; SELECT 2" }), held(), false).unwrap();
+        assert!(several.several);
+    }
+
+    /// The upkeep of every second runs on a thread of its own: it needs no
+    /// worker of a runtime (here there is no runtime at all), so it goes on
+    /// when every worker is busy.
+    #[test]
+    fn the_upkeep_needs_no_runtime() {
+        let dir = std::env::temp_dir().join(format!("nuage-upkeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::open(&dir, crate::EngineOptions { sync: false, ..Default::default() }).unwrap();
+        let options = ServerOptions { transaction_lifetime: Duration::from_millis(100), ..ServerOptions::default() };
+        let state = Server::new(engine.clone(), options).state;
+        let tx = state.db(&engine, MAIN).unwrap().begin_now().unwrap();
+        let now = Instant::now();
+        let open = OpenTx { tx, app: "a".into(), branch: MAIN.into(), opened: now, last_used: Mutex::new(now) };
+        state.transactions.lock().unwrap().insert("t".into(), Arc::new(open));
+        let (ticking, ticks) = std::sync::mpsc::channel();
+        assert!(start_ticks(&state, ticks));
+        let started = Instant::now();
+        while state.open_transactions() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "the upkeep did not run");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(ticking);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first word of an SQL text says on which thread it is parsed; the
+    /// parse decides what it is.
+    #[test]
+    fn sql_texts_are_told_apart_by_their_first_word() {
+        for reads in [
+            "SELECT 1",
+            "  select * from t",
+            "-- a comment\nWITH x AS (SELECT 1) SELECT * FROM x",
+            "/* a comment */ (SELECT 1) UNION (SELECT 2)",
+            "VALUES (1)",
+            "EXPLAIN SELECT 1",
+            "BEGIN",
+            "",
+            "-- nothing but a comment",
+        ] {
+            assert!(reads_by_its_first_word(reads), "{reads}");
+        }
+        for writes in [
+            "INSERT INTO t VALUES (1)",
+            "\n\tupdate t set v = 1",
+            "/* SELECT */ DELETE FROM t",
+            "CREATE TABLE t (id INTEGER)",
+            "DROP TABLE t",
+            "selection",
+            "SELECTION",
+        ] {
+            assert!(!reads_by_its_first_word(writes), "{writes}");
+        }
+        // Only the start of a text is looked at: a long comment says nothing.
+        assert!(reads_by_its_first_word(&format!("/*{}*/ DELETE FROM t", " ".repeat(1000))));
+    }
 }

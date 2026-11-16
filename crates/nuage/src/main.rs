@@ -85,9 +85,12 @@ fn main() -> ExitCode {
     nuage::memory::tune_allocator();
     // Blocking work (statements, backups) on a bounded number of threads: more
     // requests wait their turn instead of starting threads without end (a
-    // Heroku dyno allows 256 in all).
+    // Heroku dyno allows 256 in all). Statements run on these threads, and a
+    // deep one recurses: 8 MiB of stack each, a margin over the default 2
+    // (address space, not memory, until it is used).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(8 << 20)
         .max_blocking_threads(nuage::memory::blocking_threads())
         .build()
     {

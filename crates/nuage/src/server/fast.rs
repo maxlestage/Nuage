@@ -1,31 +1,33 @@
-//! What keeps a request short: reads that run where they are, answers
-//! written straight as their text, and a compressor that is made once.
+//! What keeps a request short: reads that run where they are while they are
+//! short, answers written straight as their text, and a compressor that is
+//! made once.
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use memoire_orm::nuage::wire::OwnedQuery;
-use memoire_orm::{Error, Expr, Result, Value};
+use memoire_orm::{Expr, Value};
 
 use crate::sql::SqlResult;
 
-/// A read that takes longer than this, on average, goes to the blocking pool.
+/// A read that takes longer than this, on average, runs off the runtime.
 const SLOW_MICROS: u32 = 500;
 
 /// How long the reads of each shape take.
 ///
-/// A read served from the page cache takes a few microseconds: handing it to
-/// another thread and waiting for the answer costs more than the read. So a
-/// read runs where it is, on the connection's own task, as long as reads of
-/// its shape (the same table, the same clauses) are short; a shape that turns
-/// out slow (a scan, a cold disk) goes to the blocking pool, where it holds up
-/// nobody, and comes back when it is short again. Writes always go to the
-/// pool: they wait for the disk.
+/// A read served from the page cache takes a few microseconds: handing the
+/// worker's duties to another thread for it costs more than the read. So a
+/// read whose shape (the same table, the same clauses, the same SQL text) has
+/// proved short runs where it is, on the connection's own worker, watched
+/// (see [`Inline`]); a shape never measured, or slow (a scan, a cold disk),
+/// runs off the runtime, and comes back when it is short again.
 pub(crate) struct ReadCosts {
-    /// The average of each shape, in microseconds; shapes that share a slot
-    /// share their average, which only makes the choice more careful.
+    /// The average of each shape, in microseconds (0: never measured); shapes
+    /// that share a slot share their average, which only makes the choice
+    /// more careful.
     slots: [AtomicU32; 256],
 }
 
@@ -38,8 +40,14 @@ impl ReadCosts {
         &self.slots[((shape ^ (shape >> 32)) & 255) as usize]
     }
 
+    #[cfg(test)]
     pub(crate) fn slow(&self, shape: u64) -> bool {
         self.slot(shape).load(Ordering::Relaxed) > SLOW_MICROS
+    }
+
+    /// Reads of this shape were measured, and are short.
+    pub(crate) fn short(&self, shape: u64) -> bool {
+        (1..=SLOW_MICROS).contains(&self.slot(shape).load(Ordering::Relaxed))
     }
 
     pub(crate) fn record(&self, shape: u64, took: Duration) {
@@ -50,29 +58,157 @@ impl ReadCosts {
         let new = if old == 0 { micros.max(1) } else { ((u64::from(old) * 3 + u64::from(micros)) / 4).max(1) as u32 };
         slot.store(new, Ordering::Relaxed);
     }
+}
 
-    /// Runs the read `f`, of this `shape`: where it is when the shape is
-    /// short, on the blocking pool when it is slow.
-    pub(crate) async fn read<T: Send + 'static>(
-        self: &std::sync::Arc<Self>,
-        shape: u64,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T> {
-        if self.slow(shape) {
-            let costs = self.clone();
-            return tokio::task::spawn_blocking(move || {
-                let started = Instant::now();
-                let out = f();
-                costs.record(shape, started.elapsed());
-                out
-            })
-            .await
-            .map_err(|e| Error::Pool(e.to_string()));
+/// A read that runs where it is longer than this has its worker's duties
+/// taken over by another worker, and its shape is marked slow.
+const LONG_MICROS: u64 = 1_000;
+/// The watch looks this often while reads run where they are...
+const WATCH_EVERY: Duration = Duration::from_millis(1);
+/// ...and sleeps once none has for this long.
+const WATCH_IDLE: Duration = Duration::from_millis(50);
+
+/// Reads that run where they are, on a worker of the multi-threaded
+/// runtime: one fewer at once than there are workers, so that one is always
+/// free; and watched by a thread of their own. While a worker is busy with a
+/// read, nobody polls the sockets and the timers unless another worker is
+/// awake: a read that lasts more than a millisecond gets one woken (a task
+/// spawned from outside does it; once done, that worker waits on the
+/// sockets), and its shape is marked slow, so that the next ones run off the
+/// runtime. A read turned slow (other parameters, a cold disk) holds its
+/// worker, never the server.
+pub(crate) struct Inline {
+    /// Each read running: when it began (microseconds since `epoch`, plus
+    /// one; 0: a free seat), and its shape.
+    seats: Box<[(AtomicU64, AtomicU64)]>,
+    epoch: Instant,
+    /// Seats taken so far: the watch sleeps when this stays still.
+    taken: AtomicU64,
+    /// The watch sleeps.
+    asleep: AtomicBool,
+    watch: OnceLock<std::thread::Thread>,
+    runtime: tokio::runtime::Handle,
+    costs: Arc<ReadCosts>,
+}
+
+/// A seat of [`Inline`], given back when dropped.
+pub(crate) struct Seat<'a>(&'a AtomicU64);
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+impl Inline {
+    /// The reads that may run on the workers of the current runtime, and
+    /// their watch; `None` on a runtime with one thread, where nothing may.
+    pub(crate) fn start(costs: Arc<ReadCosts>) -> Option<Arc<Inline>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        if !matches!(runtime.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) {
+            return None;
         }
-        let started = Instant::now();
-        let out = f();
-        self.record(shape, started.elapsed());
-        Ok(out)
+        let seats = runtime.metrics().num_workers().saturating_sub(1);
+        if seats == 0 {
+            return None;
+        }
+        let inline = Arc::new(Inline {
+            seats: (0..seats).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect(),
+            epoch: Instant::now(),
+            taken: AtomicU64::new(0),
+            asleep: AtomicBool::new(false),
+            watch: OnceLock::new(),
+            runtime,
+            costs,
+        });
+        let weak = Arc::downgrade(&inline);
+        let thread = std::thread::Builder::new().name("nuage-watch".into()).spawn(move || watch(weak)).ok()?;
+        let _ = inline.watch.set(thread.thread().clone());
+        Some(inline)
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64 + 1
+    }
+
+    /// A seat for a read of `shape` running here, when one is free and this
+    /// thread is a worker of the runtime.
+    pub(crate) fn seat(&self, shape: u64) -> Option<Seat<'_>> {
+        let here = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread));
+        if !here {
+            return None;
+        }
+        let now = self.now();
+        let (started, of) = self
+            .seats
+            .iter()
+            .find(|(started, _)| started.compare_exchange(0, now, Ordering::SeqCst, Ordering::Relaxed).is_ok())?;
+        of.store(shape, Ordering::Relaxed);
+        self.taken.fetch_add(1, Ordering::Relaxed);
+        if self.asleep.load(Ordering::SeqCst)
+            && self.asleep.swap(false, Ordering::SeqCst)
+            && let Some(watch) = self.watch.get()
+        {
+            watch.unpark();
+        }
+        Some(Seat(started))
+    }
+}
+
+impl Drop for Inline {
+    fn drop(&mut self) {
+        // The watch ends.
+        if let Some(watch) = self.watch.get() {
+            watch.unpark();
+        }
+    }
+}
+
+/// The watch of the reads that run where they are (see [`Inline`]).
+fn watch(inline: Weak<Inline>) {
+    let mut nudged: Vec<u64> = Vec::new();
+    let mut taken = u64::MAX;
+    let mut still = Instant::now();
+    loop {
+        std::thread::sleep(WATCH_EVERY);
+        let Some(w) = inline.upgrade() else { return };
+        nudged.resize(w.seats.len(), 0);
+        let now = w.now();
+        let mut running = false;
+        for ((started, shape), nudged) in w.seats.iter().zip(nudged.iter_mut()) {
+            let at = started.load(Ordering::Acquire);
+            if at == 0 {
+                continue;
+            }
+            running = true;
+            if now.saturating_sub(at) >= LONG_MICROS && *nudged != at {
+                *nudged = at;
+                // Another worker wakes, and waits on the sockets once it is done...
+                drop(w.runtime.spawn(async {}));
+                // ...and the next reads of this shape run off the runtime.
+                w.costs.record(shape.load(Ordering::Relaxed), Duration::from_micros(now - at));
+            }
+        }
+        let seen = w.taken.load(Ordering::Relaxed);
+        if running || seen != taken {
+            taken = seen;
+            still = Instant::now();
+            continue;
+        }
+        if still.elapsed() < WATCH_IDLE {
+            continue;
+        }
+        // Asleep until a read takes a seat (it wakes the watch): said first,
+        // then the seats looked at again, so that no read is missed.
+        w.asleep.store(true, Ordering::SeqCst);
+        if w.seats.iter().any(|(started, _)| started.load(Ordering::SeqCst) != 0) {
+            w.asleep.store(false, Ordering::SeqCst);
+            continue;
+        }
+        drop(w);
+        std::thread::park();
+        still = Instant::now();
     }
 }
 
@@ -276,26 +412,64 @@ mod tests {
     #[test]
     fn slow_shapes_leave_and_come_back() {
         let costs = ReadCosts::new();
-        assert!(!costs.slow(7));
+        assert!(!costs.slow(7) && !costs.short(7), "never measured: neither");
         for _ in 0..10 {
             costs.record(7, Duration::from_micros(20));
         }
-        assert!(!costs.slow(7));
-        // One slow read (a cold page): a few on the pool, then back.
+        assert!(!costs.slow(7) && costs.short(7));
+        // One slow read (a cold page): a few off the runtime, then back.
         costs.record(7, Duration::from_millis(5));
-        assert!(costs.slow(7));
+        assert!(costs.slow(7) && !costs.short(7));
         assert!(!costs.slow(8), "another shape is not touched");
-        let mut on_the_pool = 0;
+        let mut off = 0;
         while costs.slow(7) {
             costs.record(7, Duration::from_micros(20));
-            on_the_pool += 1;
+            off += 1;
         }
-        assert!((2..10).contains(&on_the_pool), "{on_the_pool}");
-        // A shape that stays slow stays on the pool.
+        assert!((2..10).contains(&off), "{off}");
+        // A shape that stays slow stays off the runtime.
         for _ in 0..10 {
             costs.record(9, Duration::from_millis(3));
         }
         assert!(costs.slow(9));
+    }
+
+    /// A read that lasts, run where it is, gets another worker woken: the
+    /// runtime goes on (a timer fires) while it runs, and its shape is
+    /// marked slow before it ends.
+    #[test]
+    fn a_long_read_where_it_is_holds_its_worker_only() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        runtime.block_on(async {
+            let costs = Arc::new(ReadCosts::new());
+            let inline = Inline::start(costs.clone()).expect("two workers: one seat");
+            assert_eq!(inline.seats.len(), 1);
+            let ticked = Arc::new(AtomicBool::new(false));
+            let (i, c, t) = (inline.clone(), costs.clone(), ticked.clone());
+            // Woken by a timer, on the worker that waits on the timers and the
+            // sockets: while it does not let go of it, only the watch gets
+            // another worker to take over.
+            let read = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let seat = i.seat(42).expect("a free seat");
+                assert!(i.seat(43).is_none(), "one seat only");
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(400) && !t.load(Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+                drop(seat);
+                (c.slow(42), t.load(Ordering::SeqCst))
+            });
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                ticked.store(true, Ordering::SeqCst);
+            });
+            let (slow, ticked_meanwhile) = read.await.unwrap();
+            timer.await.unwrap();
+            assert!(slow, "marked slow while it ran");
+            assert!(ticked_meanwhile, "the runtime went on while the read held its worker");
+            assert!(inline.seat(42).is_some(), "the seat was given back");
+        });
     }
 
     #[test]

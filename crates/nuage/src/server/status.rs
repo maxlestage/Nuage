@@ -1,8 +1,8 @@
 //! `/api/status` and `/api/status/stream`: the live state of the server.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes_helper::sse;
@@ -10,11 +10,13 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response};
 use serde_json::{Value as Json, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::apps::App;
-use super::{ChannelBody, HttpBody, State, json_response, unauthorized};
+use super::limits::{ADMISSION_WAIT, busy, unblocked};
+use super::{ChannelBody, HttpBody, State, error_response, json_response, unauthorized};
 use crate::embedded::Embedded;
+use crate::engine::{BackupStatus, StorageStats};
 use http_body_util::BodyExt;
 
 mod bytes_helper {
@@ -45,6 +47,7 @@ fn ago(t: SystemTime) -> String {
 }
 
 /// Who may see what.
+#[derive(Clone)]
 pub(crate) enum View {
     /// A console session, or the management token: every application.
     All,
@@ -76,6 +79,30 @@ impl View {
             View::Public => Vec::new(),
         }
     }
+
+    /// The two show the same thing.
+    fn same(&self, other: &View) -> bool {
+        match (self, other) {
+            (View::All, View::All) | (View::Public, View::Public) => true,
+            (View::App(a), View::App(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// What the status reads of every application: once for all the views
+/// made at the same time.
+struct Every {
+    all: Vec<Arc<App>>,
+    stats: Vec<(StorageStats, BackupStatus)>,
+}
+
+impl Every {
+    fn of(state: &State) -> Every {
+        let all = state.apps.all();
+        let stats = all.iter().map(|a| (a.engine.stats(), a.engine.backup_status())).collect();
+        Every { all, stats }
+    }
 }
 
 fn requests_json(metrics: &super::Metrics) -> Json {
@@ -85,10 +112,10 @@ fn requests_json(metrics: &super::Metrics) -> Json {
 }
 
 /// One application, as `databases[]` lists it.
-fn app_json(state: &State, app: &App, env_token: bool) -> Json {
+fn app_json(state: &State, app: &App, env_token: bool, every: &Every) -> Json {
     let engine = &app.engine;
-    let stats = engine.stats();
-    let backup = engine.backup_status();
+    let read = every.all.iter().position(|a| std::ptr::eq(a.as_ref(), app)).map(|i| every.stats[i].clone());
+    let (stats, backup) = read.unwrap_or_else(|| (engine.stats(), engine.backup_status()));
     let db = Embedded::from_engine(engine.clone());
     let tables = db.tables().unwrap_or_default();
     let branches: Vec<Json> = engine
@@ -106,6 +133,7 @@ fn app_json(state: &State, app: &App, env_token: bool) -> Json {
     let last = app.last_request.load(Ordering::Relaxed);
     let info = app.info(env_token);
     let kv = app.kv.stats();
+    let described = state.described_schemas(&app.name);
     let kv = json!({
         "keys": kv.keys, "bytes": kv.bytes, "max_bytes": kv.max_bytes,
         "hits": kv.hits, "misses": kv.misses, "evictions": kv.evictions, "expired": kv.expired,
@@ -133,6 +161,8 @@ fn app_json(state: &State, app: &App, env_token: bool) -> Json {
         })),
         "requests": requests_json(&app.metrics),
         "kv": kv,
+        // The table schemas its clients described, kept while the server runs.
+        "described_schemas": { "count": described.0, "bytes": described.1 },
         // What it keeps in the bucket (`/v1/files`), as last counted: null
         // without a bucket, or until the first count is back.
         "files": state
@@ -147,9 +177,12 @@ fn app_json(state: &State, app: &App, env_token: bool) -> Json {
 
 /// The status JSON (the shape the site and the console read).
 pub(crate) fn status(state: &State, view: &View) -> Json {
+    status_of(state, view, &Every::of(state))
+}
+
+fn status_of(state: &State, view: &View, read: &Every) -> Json {
     let engine = &state.engine;
-    let all = state.apps.all();
-    let every: Vec<_> = all.iter().map(|a| (a.engine.stats(), a.engine.backup_status())).collect();
+    let (all, every) = (&read.all, &read.stats);
     let (per_s, _) = state.metrics.rates();
     let uptime = engine.uptime().as_secs();
     let open = state.metrics.open_connections.load(Ordering::Relaxed);
@@ -158,7 +191,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
     let backup = engine.backup_status();
     let failing: Vec<String> = all
         .iter()
-        .zip(&every)
+        .zip(every)
         .filter(|(_, (_, b))| !b.last_ok)
         .map(|(a, (_, b))| format!("{}: {}", a.name, b.last_error.clone().unwrap_or_else(|| "failed".into())))
         .collect();
@@ -203,7 +236,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
     }
 
     let env_token = state.options.token.is_some();
-    let databases: Vec<Json> = view.apps(state).iter().map(|a| app_json(state, a, env_token)).collect();
+    let databases: Vec<Json> = view.apps(state).iter().map(|a| app_json(state, a, env_token, read)).collect();
     let sum = |f: fn(&crate::engine::StorageStats) -> u64| every.iter().map(|(s, _)| f(s)).sum::<u64>();
     let first = &every[0].0;
     let m = crate::memory::MemoryInfo::now();
@@ -215,6 +248,13 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
         "cache_budget_bytes": state.apps.cache_budget(),
         "cache_ceiling_bytes": state.apps.cache_ceiling(),
         "reliefs": state.memory_reliefs(),
+        // What the requests being read may hold together.
+        "request_bytes": state.request_memory.total(),
+        // What the schemas described by clients take (they stay), and the most they may.
+        "described_schemas": {
+            "bytes": state.described_total.usage().0,
+            "limit_bytes": state.described_total.usage().1,
+        },
         "process_bytes": m.process_bytes,
         "swap_total_bytes": m.swap_total_bytes,
         "swap_free_bytes": m.swap_free_bytes,
@@ -262,17 +302,98 @@ pub(crate) async fn route(state: &Arc<State>, req: Request<Incoming>, path: &str
         return unauthorized("the status needs an application's token, the management token or a console session");
     };
     if path == "/api/status" {
+        // A few at once, off the runtime: the status waits for each
+        // application's writer, which a long write holds.
+        let Ok(Ok(_slot)) = tokio::time::timeout(ADMISSION_WAIT, state.status_slots.clone().acquire_owned()).await
+        else {
+            return error_response(&busy("the status is being made for many clients: try again in a moment"));
+        };
         let state = state.clone();
-        let body = tokio::task::spawn_blocking(move || status(&state, &view)).await.unwrap_or(Json::Null);
+        let body = unblocked(move || status(&state, &view)).await.unwrap_or(Json::Null);
         return json_response(200, &body);
     }
-    stream(state.clone(), Arc::new(view))
+    stream(state.clone(), view)
+}
+
+/// The status of each view that has a stream open, made once a second for
+/// all of them on one thread: however many dashboards are open, each
+/// engine is looked at once a second, and a long write in one application
+/// holds one thread, not one per stream.
+#[derive(Default)]
+pub(crate) struct Hub {
+    inner: Mutex<Views>,
+}
+
+#[derive(Default)]
+struct Views {
+    /// Each view watched, and its last status as text.
+    list: Vec<(View, watch::Sender<Option<Arc<str>>>)>,
+    /// A task makes them.
+    running: bool,
+}
+
+impl Hub {
+    /// The status of `view`, as it is made.
+    fn watch(state: &Arc<State>, view: View) -> watch::Receiver<Option<Arc<str>>> {
+        let mut views = state.status_hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let known = views.list.iter().find(|(v, _)| v.same(&view)).map(|(_, tx)| tx.subscribe());
+        let rx = known.unwrap_or_else(|| {
+            let (tx, rx) = watch::channel(None);
+            views.list.push((view, tx));
+            rx
+        });
+        if !views.running {
+            views.running = true;
+            tokio::spawn(make_statuses(state.clone()));
+        }
+        rx
+    }
+}
+
+/// Makes the status of every view watched, once a second, until none is.
+async fn make_statuses(state: Arc<State>) {
+    /// The task is marked as gone however it ends (a panic included).
+    struct Gone<'a>(&'a Hub, bool);
+    impl Drop for Gone<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                self.0.inner.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+            }
+        }
+    }
+    let mut gone = Gone(&state.status_hub, true);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let watched: Vec<(View, watch::Sender<Option<Arc<str>>>)> = {
+            let mut views = state.status_hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+            views.list.retain(|(_, tx)| tx.receiver_count() > 0);
+            if views.list.is_empty() {
+                views.running = false;
+                gone.1 = false;
+                return;
+            }
+            views.list.clone()
+        };
+        let (s, list) = (state.clone(), watched.clone());
+        let made = unblocked(move || {
+            let every = Every::of(&s);
+            list.iter().map(|(view, _)| Arc::<str>::from(status_of(&s, view, &every).to_string())).collect::<Vec<_>>()
+        })
+        .await;
+        if let Ok(made) = made {
+            for ((_, tx), text) in watched.iter().zip(made) {
+                tx.send_replace(Some(text));
+            }
+        }
+    }
 }
 
 /// Server-Sent Events: `status` every second, `log` for each engine event
 /// (of the applications in view, each line naming its application), a
 /// comment every 15 seconds so proxies keep the connection.
-fn stream(state: Arc<State>, view: Arc<View>) -> Response<HttpBody> {
+fn stream(state: Arc<State>, view: View) -> Response<HttpBody> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
         if tx.send(hyper::body::Bytes::from_static(b"retry: 2000\n\n")).await.is_err() {
@@ -281,13 +402,15 @@ fn stream(state: Arc<State>, view: Arc<View>) -> Response<HttpBody> {
         // Events already there are history: only new ones are sent.
         let mut seen: HashMap<String, u64> =
             view.apps(&state).iter().map(|a| (a.name.clone(), a.engine.events().1)).collect();
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut status = Hub::watch(&state, view.clone());
+        // A status made already goes at once.
+        if status.borrow().is_some() {
+            status.mark_changed();
+        }
         let mut n: u64 = 0;
-        loop {
-            tick.tick().await;
-            let (s, v) = (state.clone(), view.clone());
-            let body = tokio::task::spawn_blocking(move || status(&s, &v)).await.unwrap_or(Json::Null);
-            if tx.send(sse("status", &body.to_string())).await.is_err() {
+        while status.changed().await.is_ok() {
+            let Some(body) = status.borrow_and_update().clone() else { continue };
+            if tx.send(sse("status", &body)).await.is_err() {
                 return;
             }
             for app in view.apps(&state) {
@@ -316,4 +439,37 @@ fn stream(state: Arc<State>, view: Arc<View>) -> Response<HttpBody> {
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     h.insert("x-accel-buffering", HeaderValue::from_static("no"));
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// However many streams show a view, its status is made once a second,
+    /// for all of them; once nobody watches, nothing is made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_streams_of_a_view_share_one_status() {
+        let dir = std::env::temp_dir().join(format!("nuage-status-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = crate::EngineOptions { sync: false, ..crate::EngineOptions::default() };
+        let server = super::super::Server::new(crate::Engine::open(&dir, options).unwrap(), Default::default());
+        let state = &server.state;
+        let mut a = Hub::watch(state, View::All);
+        let mut b = Hub::watch(state, View::All);
+        let public = Hub::watch(state, View::Public);
+        assert_eq!(state.status_hub.inner.lock().unwrap().list.len(), 2, "two views, not three streams");
+        for rx in [&mut a, &mut b] {
+            tokio::time::timeout(Duration::from_secs(5), rx.changed()).await.expect("a status").unwrap();
+        }
+        assert!(Arc::ptr_eq(a.borrow().as_ref().unwrap(), b.borrow().as_ref().unwrap()), "made once");
+        assert!(a.borrow().as_ref().unwrap().contains("\"databases\""));
+        drop((a, b, public));
+        let started = std::time::Instant::now();
+        while state.status_hub.inner.lock().unwrap().running {
+            assert!(started.elapsed() < Duration::from_secs(5), "still made for nobody");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(state.status_hub.inner.lock().unwrap().list.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

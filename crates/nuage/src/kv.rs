@@ -31,6 +31,13 @@ use std::time::{Duration, Instant};
 /// Longest key, in bytes.
 pub const MAX_KEY: usize = 1024;
 
+/// Most bytes the answer of one command may hold (`MGET` of many keys), and
+/// the answers of one transaction together: values are copied into the
+/// answer under the store's lock, and a request of a few bytes could
+/// otherwise name the same large value a million times. One value alone may
+/// be larger.
+pub const MAX_ANSWER: usize = 16 << 20;
+
 /// What an entry weighs besides its key and its value: the maps' own nodes.
 const ENTRY_OVERHEAD: usize = 128;
 
@@ -383,9 +390,26 @@ impl Kv {
 
     /// Runs several commands as one (`MULTI` ... `EXEC`): nothing else reads
     /// or writes between them. Each one has its answer; one that is refused
-    /// does not undo the others.
+    /// does not undo the others. Once the answers pass [`MAX_ANSWER`], the
+    /// commands left are not run, and answer an error.
     pub fn transaction(&self, commands: &[Vec<Vec<u8>>], read_only: bool) -> Vec<Reply> {
-        self.locked(|l| commands.iter().map(|c| l.command(c, read_only)).collect())
+        self.locked(|l| {
+            let mut size = 0usize;
+            commands
+                .iter()
+                .map(|c| {
+                    if size > MAX_ANSWER {
+                        return Reply::err(format!(
+                            "the answers of this transaction passed {} MiB: the commands after were not run",
+                            MAX_ANSWER >> 20
+                        ));
+                    }
+                    let reply = l.command(c, read_only);
+                    size = size.saturating_add(reply.weight());
+                    reply
+                })
+                .collect()
+        })
     }
 }
 
@@ -418,6 +442,17 @@ pub enum Reply {
 impl Reply {
     fn err(message: impl std::fmt::Display) -> Reply {
         Reply::Error(format!("ERR {message}"))
+    }
+
+    /// About what the answer weighs, on the wire or as JSON.
+    pub(crate) fn weight(&self) -> usize {
+        16 + match self {
+            Reply::Ok | Reply::Nil | Reply::Int(_) => 0,
+            Reply::Status(s) | Reply::Error(s) => s.len(),
+            Reply::Bulk(b) => b.len(),
+            Reply::Array(items) => items.iter().map(Reply::weight).sum(),
+            Reply::Map(pairs) => pairs.iter().map(|(k, v)| k.weight() + v.weight()).sum(),
+        }
     }
 
     /// The answer on the wire: RESP2, or RESP3 (`HELLO 3`), where
@@ -783,11 +818,24 @@ impl Locked<'_> {
                 })
             }
             ("MGET", [_, ..]) => self.with(|inner, now| {
-                Reply::Array(
-                    args.iter()
-                        .map(|k| inner.read(k, now).map_or(Reply::Nil, |e| Reply::Bulk(e.value.clone())))
-                        .collect(),
-                )
+                // Each value is counted before it is copied.
+                let mut size = 0usize;
+                let mut values = Vec::with_capacity(args.len().min(4096));
+                for key in args {
+                    let len = inner.read(key, now).map(|e| e.value.len());
+                    size = size.saturating_add(16 + len.unwrap_or(0));
+                    if size > MAX_ANSWER && !values.is_empty() {
+                        return Reply::err(format!(
+                            "the answer would pass {} MiB: ask for fewer keys at once",
+                            MAX_ANSWER >> 20
+                        ));
+                    }
+                    values.push(match len {
+                        Some(_) => inner.map.get(key.as_slice()).map_or(Reply::Nil, |e| Reply::Bulk(e.value.clone())),
+                        None => Reply::Nil,
+                    });
+                }
+                Reply::Array(values)
             }),
             ("MSET" | "MSETNX", [_, _, ..]) if args.len().is_multiple_of(2) => {
                 for pair in args.chunks(2) {
@@ -1116,6 +1164,33 @@ mod tests {
             );
         }
         assert_eq!(kv.get(b"k").as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn answers_are_bounded() {
+        let kv = Kv::new(64 << 20);
+        kv.set(b"big", vec![b'x'; 1 << 20], &SetOptions::default()).unwrap();
+        // One large value is answered; the same one named again and again is not.
+        assert!(matches!(run(&kv, &["MGET", "big"]), Reply::Array(v) if v.len() == 1));
+        let mut many = vec!["MGET"];
+        many.extend(std::iter::repeat_n("big", 400));
+        assert!(matches!(run(&kv, &many), Reply::Error(e) if e.contains("fewer keys")));
+        let few: Vec<&str> = std::iter::once("MGET").chain(std::iter::repeat_n("big", 10)).collect();
+        assert!(matches!(run(&kv, &few), Reply::Array(v) if v.len() == 10));
+        // Missing keys count too: a million of them is a large answer.
+        let nothing: Vec<Vec<u8>> =
+            std::iter::once(b"MGET".to_vec()).chain(std::iter::repeat_n(b"nope".to_vec(), 1_100_000)).collect();
+        assert!(matches!(kv.command(&nothing, true), Reply::Error(e) if e.contains("fewer keys")));
+        // A transaction stops running commands once its answers are that large.
+        let get = vec![b"GET".to_vec(), b"big".to_vec()];
+        let set = vec![b"SET".to_vec(), b"after".to_vec(), b"1".to_vec()];
+        let mut commands = vec![get; 20];
+        commands.push(set);
+        let replies = kv.transaction(&commands, false);
+        assert_eq!(replies.len(), 21);
+        assert!(matches!(&replies[0], Reply::Bulk(b) if b.len() == 1 << 20));
+        assert!(matches!(&replies[20], Reply::Error(e) if e.contains("not run")));
+        assert_eq!(kv.get(b"after"), None);
     }
 
     #[test]
