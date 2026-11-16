@@ -421,6 +421,8 @@ pub(crate) struct State {
     pub(crate) settings: settings::Settings,
     /// One change of the settings at a time.
     settings_changes: Mutex<()>,
+    /// The second copy of the backups, chosen by the owner (see [`second_copy`]).
+    pub(crate) second: second_copy::Second,
     pub(crate) metrics: Metrics,
     /// The schemas of the tables, for SQL (the stored ones).
     pub(crate) schemas: SchemaCache,
@@ -541,6 +543,7 @@ impl Server {
         Server {
             state: Arc::new(State {
                 apps: apps::Apps::open(engine.clone(), plan, options.settings_read_only),
+                second: second_copy::Second::open(&engine, crate::engine::store::now_millis()),
                 engine,
                 settings,
                 settings_changes: Mutex::new(()),
@@ -743,9 +746,47 @@ fn start_ticks(state: &Arc<State>, ticks: std::sync::mpsc::Receiver<()>) -> bool
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ticks.recv_timeout(Duration::from_secs(1)) {
                 let Some(state) = state.upgrade() else { return };
                 state.tick();
+                start_second_copy(&state);
             }
         })
         .is_ok()
+}
+
+/// Starts a copy of every database to the second copy of the backups when
+/// one is due, on a thread of its own: a slow or unreachable place never
+/// holds the server's upkeep, its requests or its backups.
+fn start_second_copy(state: &Arc<State>) {
+    let now = crate::engine::store::now_millis();
+    let Some(place) = state.second.take_turn(now) else { return };
+    let databases: Vec<(String, Arc<Engine>)> = state
+        .apps
+        .all()
+        .iter()
+        .map(|app| (if app.first { String::new() } else { app.name.clone() }, app.engine.clone()))
+        .collect();
+    let weak = Arc::downgrade(state);
+    let spawned = std::thread::Builder::new().name("nuage-second-copy".into()).spawn(move || {
+        let state = weak;
+        let Some(life) = state.upgrade().map(|s| s.second.life.clone()) else { return };
+        let result = second_copy::copy_all(&place, &life, &databases);
+        drop(databases);
+        let Some(state) = state.upgrade() else { return };
+        let now = crate::engine::store::now_millis();
+        if state.second.done(now, &result) {
+            match &result {
+                Ok(()) => state
+                    .engine
+                    .event("info", format!("second copy of the backups: works again, to {}", place.describe())),
+                Err(e) => state.engine.event(
+                    "warn",
+                    format!("second copy of the backups: failed, to {}: {e} (tried again later)", place.describe()),
+                ),
+            }
+        }
+    });
+    if spawned.is_err() {
+        state.second.done(now, &Err(Error::Pool("no thread for the second copy".into())));
+    }
 }
 
 impl Server {
@@ -1136,6 +1177,87 @@ impl State {
         Ok(self.ship_settings())
     }
 
+    /// Saves the second copy of the backups (`None`: removes it), one change
+    /// of the settings at a time. A place is checked first: written to, read
+    /// back, never inside the data directory nor where the environment's
+    /// backups already go. Returns what kept the change from reaching the
+    /// backup yet, if anything did.
+    pub(crate) fn save_second_copy(
+        &self,
+        body: Option<&Json>,
+    ) -> std::result::Result<Option<String>, settings::Refusal> {
+        use second_copy::refused;
+        use settings::Refusal;
+        let _guard = self.settings_changes.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(body) = body else {
+            if self.second.place().is_none() {
+                return Ok(None);
+            }
+            self.second.save(&self.engine, None).map_err(|e| Refusal::failed(&e))?;
+            self.engine.event("info", "second copy of the backups: removed (the copies already there stay)");
+            return Ok(self.ship_settings());
+        };
+        if self.settings.read_only() {
+            return Err(Refusal { forbidden: true, ..Refusal::new(settings::refused::READ_ONLY, &[]) });
+        }
+        let place = second_copy::Place::from_json(body, self.second.place().as_ref())?;
+        let environment = self.engine.options().backup.as_ref();
+        // A host whose disk is erased at each restart loses what is saved
+        // here with it, unless the environment names where backups go.
+        if environment.is_none() && std::env::var_os("DYNO").is_some() {
+            return Err(Refusal::new(refused::NOT_FOUND_AGAIN, &[]));
+        }
+        place.check_folder(self.engine.dir())?;
+        let store = place.store()?;
+        if let Some(b) = environment {
+            let (a, b) = (store.describe(), b.store.describe());
+            let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+            if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")) {
+                return Err(Refusal::new(refused::SAME, &[&place.describe()]));
+            }
+        }
+        second_copy::probe(store.as_ref())?;
+        self.second.save(&self.engine, Some(place.clone())).map_err(|e| Refusal::failed(&e))?;
+        self.engine.event("info", format!("second copy of the backups: {} (a copy starts now)", place.describe()));
+        Ok(self.ship_settings())
+    }
+
+    /// The backups as the API, the page and the command line show them: the
+    /// environment's destination and the second copy (never its secret).
+    pub(crate) fn backups_json(&self) -> Json {
+        let status = self.engine.backup_status();
+        let environment = status.target.as_ref().map(|target| {
+            json!({
+                "target": target,
+                "last_at": status.last_at,
+                "ok": status.last_ok,
+                "last_error": status.last_error,
+                "last_snapshot_at": status.last_snapshot_at,
+            })
+        });
+        let second = self.second.place().map(|place| {
+            let state = self.second.state();
+            json!({
+                "place": place.shown(),
+                "target": place.describe(),
+                "run": self.second.life,
+                "last_at": state.last_at,
+                "last_error": state.last_error,
+                "failing_since": state.failing_since,
+                "running": state.running,
+                "next_at": state.next_at,
+                "every_minutes": second_copy::EVERY_MS / 60_000,
+                "restore": second_copy::restore_lines(&place, &self.second.life),
+            })
+        });
+        json!({
+            "environment": environment,
+            "second": second,
+            "second_unreadable": self.second.unreadable,
+            "read_only": self.settings.read_only(),
+        })
+    }
+
     /// Sets the memory of one application (see [`apps::Apps::set_memory`]),
     /// one change of the settings at a time. Returns whether anything
     /// changed, and what kept it from reaching the backup yet, if anything did.
@@ -1508,6 +1630,8 @@ async fn route(state: &Arc<State>, req: Request<Incoming>, peer: SocketAddr) -> 
         || path.starts_with("/api/apps/")
         || path == "/api/settings"
         || path.starts_with("/api/settings/")
+        || path == "/api/backup"
+        || path.starts_with("/api/backup/")
     {
         return manage::route(state, req, &path).await;
     }

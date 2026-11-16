@@ -572,6 +572,30 @@ before it serves. The installer asks where they go; or say it in the command:
   prefix (each would overwrite the other's). A computer next to a Heroku server uses a
   folder, bucket or `NUAGE_BACKUP_S3_PREFIX` of its own.
 
+#### A second copy, chosen later (la copie de secours)
+
+Besides the destination the environment names, the console's Settings page (section
+*Backups*), `nuage backup second dir /Volumes/OtherDisk/nuage` (or `nuage backup second s3
+<bucket> [endpoint] [region] [prefix]`, the keys in `NUAGE_SECOND_S3_ACCESS_KEY_ID` and
+`NUAGE_SECOND_S3_SECRET_ACCESS_KEY`) and `POST /api/backup/second` choose a **second copy**: a
+folder on another disk, or S3-compatible storage. It is the only one when the environment names
+none (on a computer whose disk stays).
+
+- It is a **complete copy of every database**, written when it is saved, when the server
+  starts, then **every hour**: up to an hour of writes can be missing from it, where the first
+  destination also receives the log every 30 seconds.
+- Each start of the server writes into a **folder of its own** there (`lives/<start>-<id>/`):
+  nothing is ever overwritten, whoever else writes the same place; the three newest complete
+  ones are kept.
+- The place is checked before it is saved (written to, read back; never inside the data
+  directory, nor where the backups already go); its S3 secret is kept with the settings,
+  encrypted with the data, and never shown again.
+- The server **never restores from it by itself**. `nuage backup`, the page and `GET
+  /api/backup` give the lines that start a server from the copy of a run: put them in its
+  environment, with an empty data folder and the same `NUAGE_ENCRYPTION_KEY`.
+- On a host whose disk is erased at each restart (Heroku), a second copy needs a destination in
+  the environment: saved alone, it would be lost with the disk.
+
 ## Quick start
 
 ```bash

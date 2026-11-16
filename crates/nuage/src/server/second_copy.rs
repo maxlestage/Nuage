@@ -17,18 +17,15 @@
 //! is named in the environment (the Settings page gives the lines), and the
 //! server restores from it as from any backup.
 
-// Wired to the engine in the next step.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
 
 use super::settings::Refusal;
-use crate::engine::{BackupStore, DirectoryStore, PrefixedStore, storage_err};
+use crate::engine::{BackupStore, DirectoryStore, Engine, PrefixedStore, storage_err};
 
 /// How many complete runs a place keeps, the one being written aside.
 pub(crate) const KEPT: usize = 3;
@@ -49,6 +46,7 @@ pub(crate) mod refused {
     pub(crate) const SAME: &str = "`{}` is where the backups already go: a second copy is somewhere else";
     pub(crate) const PROBE: &str = "nothing could be written to {}: {}";
     pub(crate) const NOT_FOUND_AGAIN: &str = "on this host the disk is erased at each restart, and the server could not find this place again by itself: name the destination of the backups in the environment (NUAGE_BACKUP_S3_*); a second copy can be added here once there is one";
+    #[cfg_attr(feature = "s3", allow(dead_code))]
     pub(crate) const NO_S3: &str = "this build of Nuage DB has no `s3` feature: the second copy is a folder";
 
     #[cfg(test)]
@@ -260,6 +258,12 @@ impl BackupStore for PresentDir {
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.inner.get(name)
     }
+    fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
+        self.inner.get_file(name, dest)
+    }
+    fn size(&self, name: &str) -> Result<Option<u64>> {
+        self.inner.size(name)
+    }
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list(prefix)
     }
@@ -337,6 +341,159 @@ pub(crate) fn prune(place: &Place, root: &dyn BackupStore, mine: &str) -> Result
         removed.push(life.clone());
     }
     Ok(removed)
+}
+
+/// Where the second copy is kept: with the settings, in the first
+/// database's metadata (encrypted with the data), its secret included.
+pub(crate) const SAVED: &[u8] = b"setting:backup.second";
+
+/// A complete copy of every database goes to the second copy this often,
+/// besides one when the server starts and one when the place is saved.
+pub(crate) const EVERY_MS: i64 = 60 * 60 * 1000;
+/// After a failure, the next try waits this long, then twice as long each
+/// time, up to [`RETRY_MOST_MS`].
+const RETRY_FIRST_MS: i64 = 60 * 1000;
+const RETRY_MOST_MS: i64 = 15 * 60 * 1000;
+
+/// How the second copy goes, for the page, the API and the command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyState {
+    /// When the last complete copy ended (Unix ms), in this run.
+    pub last_at: Option<i64>,
+    /// Why the last try failed, if it did.
+    pub last_error: Option<String>,
+    /// Since when the tries fail.
+    pub failing_since: Option<i64>,
+    /// When the next copy starts (Unix ms; 0: as soon as it can).
+    pub next_at: i64,
+    /// A copy is being written.
+    pub running: bool,
+    tries: u32,
+}
+
+/// The second copy of a server: where it goes, the folder of this run, how
+/// it goes.
+pub(crate) struct Second {
+    place: RwLock<Option<Place>>,
+    /// The folder of this run in the place (`lives/<life>/`).
+    pub(crate) life: String,
+    state: Mutex<CopyState>,
+    /// What was saved could not be read (another version wrote it).
+    pub(crate) unreadable: Option<String>,
+}
+
+impl Second {
+    /// The second copy saved in `engine`'s metadata, if any; this run's folder.
+    pub(crate) fn open(engine: &Engine, started_ms: i64) -> Second {
+        let life = life_name(started_ms, &super::random_token());
+        let saved = engine.meta_entries(SAVED).map(|entries| entries.into_iter().find(|(key, _)| key == SAVED));
+        let (place, unreadable) = match saved {
+            Ok(None) => (None, None),
+            Ok(Some((_, bytes))) => {
+                match serde_json::from_slice::<Json>(&bytes).ok().map(|j| Place::from_json(&j, None)) {
+                    Some(Ok(place)) => (Some(place), None),
+                    _ => (None, Some("the second copy saved here cannot be read by this version".to_owned())),
+                }
+            }
+            Err(e) => (None, Some(e.to_string())),
+        };
+        Second { place: RwLock::new(place), life, state: Mutex::new(CopyState::default()), unreadable }
+    }
+
+    /// Where the copies go, if anywhere.
+    pub(crate) fn place(&self) -> Option<Place> {
+        self.place.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn state(&self) -> CopyState {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Saves `place` (`None`: no second copy) in `engine`'s metadata, then
+    /// puts it in force: the next copy starts at once.
+    pub(crate) fn save(&self, engine: &Engine, place: Option<Place>) -> Result<()> {
+        let bytes = place.as_ref().map(|p| p.to_json().to_string().into_bytes());
+        engine.set_meta(SAVED, bytes.as_deref())?;
+        *self.place.write().unwrap_or_else(|e| e.into_inner()) = place;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = CopyState::default();
+        Ok(())
+    }
+
+    /// A copy is due now (and none is being written): it is marked as running.
+    pub(crate) fn take_turn(&self, now: i64) -> Option<Place> {
+        let place = self.place()?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.running || now < state.next_at {
+            return None;
+        }
+        state.running = true;
+        Some(place)
+    }
+
+    /// The copy that was running ended with `result`. Returns whether this
+    /// changes how it goes (it starts failing, or works again), to be said
+    /// once in the log.
+    pub(crate) fn done(&self, now: i64, result: &Result<()>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.running = false;
+        match result {
+            Ok(()) => {
+                let changed = state.failing_since.is_some();
+                state.last_at = Some(now);
+                state.last_error = None;
+                state.failing_since = None;
+                state.tries = 0;
+                state.next_at = now + EVERY_MS;
+                changed
+            }
+            Err(e) => {
+                let changed = state.failing_since.is_none();
+                state.last_error = Some(e.to_string());
+                state.failing_since.get_or_insert(now);
+                let wait = RETRY_FIRST_MS.saturating_mul(1 << state.tries.min(10)).min(RETRY_MOST_MS);
+                state.tries += 1;
+                state.next_at = now + wait;
+                changed
+            }
+        }
+    }
+}
+
+/// Writes a complete copy of each database (`(name, engine)`, the first
+/// database named "") to this run's folder of `place`, the first database
+/// last (its manifest says the run is complete), then removes the runs older
+/// than the [`KEPT`] newest complete ones.
+pub(crate) fn copy_all(place: &Place, life: &str, databases: &[(String, Arc<Engine>)]) -> Result<()> {
+    let root = place.store().map_err(|r| Error::Validation(r.said(super::i18n::Lang::En)))?;
+    let run = life_store(root.clone(), life);
+    let mut ordered: Vec<&(String, Arc<Engine>)> = databases.iter().collect();
+    ordered.sort_by_key(|(name, _)| name.is_empty());
+    for (name, engine) in ordered {
+        let store: Arc<dyn BackupStore> = if name.is_empty() {
+            run.clone()
+        } else {
+            Arc::new(PrefixedStore::new(run.clone(), format!("apps/{name}/")))
+        };
+        engine.copy_to(store.as_ref())?;
+    }
+    prune(place, root.as_ref(), life)?;
+    Ok(())
+}
+
+/// The lines that start a server from the run `life` of `place`: the
+/// environment's destination named there (the secret, never written out).
+pub(crate) fn restore_lines(place: &Place, life: &str) -> Vec<String> {
+    match place {
+        Place::Dir(path) => vec![format!("NUAGE_BACKUP_DIR={}", path.join(LIVES).join(life).display())],
+        Place::S3 { endpoint, bucket, region, prefix, access_key_id, .. } => vec![
+            format!("NUAGE_BACKUP_S3_ENDPOINT={endpoint}"),
+            format!("NUAGE_BACKUP_S3_BUCKET={bucket}"),
+            format!("NUAGE_BACKUP_S3_REGION={region}"),
+            format!("NUAGE_BACKUP_S3_PREFIX={prefix}{LIVES}{life}/"),
+            format!("NUAGE_BACKUP_S3_ACCESS_KEY_ID={access_key_id}"),
+            "NUAGE_BACKUP_S3_SECRET_ACCESS_KEY=…".to_owned(),
+        ],
+    }
 }
 
 #[cfg(test)]

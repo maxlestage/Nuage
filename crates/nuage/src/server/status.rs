@@ -284,6 +284,16 @@ fn status_of(state: &State, view: &View, read: &Every) -> Json {
             "last_at": oldest_backup.and_then(rfc3339_ms),
             "last_ok": failing.is_empty(),
             "last_error": failing.first(),
+            // The second copy, for whoever sees the whole server (never its secret).
+            "second": state.second.place().filter(|_| matches!(view, View::All)).map(|place| {
+                let copy = state.second.state();
+                json!({
+                    "target": place.describe(),
+                    "last_at": copy.last_at.and_then(rfc3339_ms),
+                    "last_error": copy.last_error,
+                    "running": copy.running,
+                })
+            }),
         },
         "encryption": {
             "enabled": encrypted,

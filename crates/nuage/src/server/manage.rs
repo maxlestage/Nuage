@@ -270,6 +270,46 @@ async fn settings_answer(state: &Arc<State>, req: Request<Incoming>, path: &str)
     }
 }
 
+/// `/api/backup`: the backups (`GET`); `/api/backup/second`: the second
+/// copy, set (`POST` a place, checked and probed first) or removed
+/// (`DELETE`).
+async fn backup_answer(state: &Arc<State>, req: Request<Incoming>, path: &str) -> Result<Response<HttpBody>, Refus> {
+    let method = req.method().clone();
+    let l = super::i18n::Lang::of(req.headers());
+    let rest = path.trim_end_matches('/').trim_start_matches("/api/backup");
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    let save = |body: Option<Json>| {
+        let s = state.clone();
+        async move {
+            let saved = tokio::task::spawn_blocking(move || s.save_second_copy(body.as_ref()))
+                .await
+                .map_err(|e| error(500, "internal", &e.to_string()))?;
+            saved.map_err(|e| settings_refusal(&e, l))
+        }
+    };
+    match (&method, segments.as_slice()) {
+        (&Method::GET, []) => Ok(json_response(200, &state.backups_json())),
+        (&Method::POST, ["second"]) => {
+            let body = read_json(state, req).await.map_err(|e| bad_request(&e))?;
+            if !body.is_object() {
+                return Err(error(
+                    400,
+                    "validation",
+                    "send a JSON object: {\"kind\": \"dir\", \"path\": \"/mnt/backup/nuage\"} or {\"kind\": \"s3\", \"bucket\": ..., \"access_key_id\": ..., \"secret_access_key\": ...}",
+                ));
+            }
+            let unshipped = save(Some(body)).await?;
+            Ok(json_response(200, &with_warning(state.backups_json(), unshipped)))
+        }
+        (&Method::DELETE, ["second"]) => {
+            let unshipped = save(None).await?;
+            Ok(json_response(200, &with_warning(state.backups_json(), unshipped)))
+        }
+        (_, [] | ["second"]) => Err(error(405, "method_not_allowed", "method not allowed")),
+        _ => Err(error(404, "not_found", "no such route: see /v1/openapi.json")),
+    }
+}
+
 fn info(state: &State, app: &App) -> AppInfo {
     app.info(app.first && state.options.token.is_some())
 }
@@ -324,6 +364,9 @@ pub(super) async fn route(state: &Arc<State>, req: Request<Incoming>, path: &str
     }
     if path == "/api/settings" || path.starts_with("/api/settings/") {
         return settings_answer(state, req, path).await.unwrap_or_else(|refused| refused.response());
+    }
+    if path == "/api/backup" || path.starts_with("/api/backup/") {
+        return backup_answer(state, req, path).await.unwrap_or_else(|refused| refused.response());
     }
     answer(state, req, path).await.unwrap_or_else(|refused| refused.response())
 }

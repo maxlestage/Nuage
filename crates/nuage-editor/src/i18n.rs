@@ -578,6 +578,22 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("{} ago", "il y a {}", "hace {}"),
     ("just now", "à l'instant", "ahora mismo"),
     (
+        "The second copy failed (tried again in a few minutes): {}.",
+        "La copie de secours a échoué (nouvel essai dans quelques minutes) : {}.",
+        "La segunda copia falló (se vuelve a intentar en unos minutos): {}.",
+    ),
+    ("Second copy {}, to {}", "Copie de secours {}, vers {}", "Segunda copia {}, hacia {}"),
+    (
+        "The second copy is being written, to {}",
+        "La copie de secours est en cours d'écriture, vers {}",
+        "La segunda copia se está escribiendo, hacia {}",
+    ),
+    (
+        "The second copy starts in a moment, to {}",
+        "La copie de secours commence dans un instant, vers {}",
+        "La segunda copia empieza en un momento, hacia {}",
+    ),
+    (
         "An application is a database for one website or program: its own data, encrypted, and its own tokens. Applications never see each other's data.",
         "Une application, c'est une base de données pour un site ou un programme : ses propres données, chiffrées, et ses propres jetons. Les applications ne voient jamais les données des autres.",
         "Una aplicación es una base de datos para un sitio web o un programa: sus propios datos, cifrados, y sus propios tokens. Las aplicaciones nunca ven los datos de las demás.",
