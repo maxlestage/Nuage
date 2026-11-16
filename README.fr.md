@@ -715,10 +715,33 @@ comme réglé, jamais sa valeur) et dit comment les changer sur cet hébergement
 ### Dans une fenêtre : Nuage DB Éditeur
 
 Pour celles et ceux qui préfèrent éviter le terminal, **Nuage DB Éditeur** est un programme
-avec une fenêtre, en français, en anglais et en espagnol : il montre le serveur, change sa
-mémoire et ses limites, crée des applications et leurs jetons (montrés une fois, avec un
-bouton Copier), et dit en clair ce qu'il refuse et pourquoi. Il fait ce que fait la page
-Réglages de la console, depuis votre bureau.
+avec une fenêtre, en français, en anglais et en espagnol (la langue du système, ou celle que
+vous choisissez), clair, sombre ou comme le système, aux couleurs de la console. Il s'occupe
+d'un serveur par son API de gestion, et ne change rien de lui-même : chaque changement est un
+bouton que vous pressez, et il dit ce qu'il a fait.
+
+- **Voir qu'il fonctionne** : sa version, depuis quand il tourne, la mémoire qu'il occupe et
+  celle de l'ordinateur, ses applications et leur dernière connexion, et si les sauvegardes
+  fonctionnent (la dernière copie, quand, vers où, et en clair l'erreur quand l'une a échoué).
+- **Créer une application** pour un site ou un programme : dites à quoi elle sert, son nom
+  suit. Ses deux lignes (`NUAGE_URL`, `NUAGE_TOKEN`) sont montrées une fois, masquées tant que
+  vous ne les affichez pas, et copiées en priant l'historique du presse-papiers de les ignorer.
+  **Tester le jeton** appelle le serveur avec lui depuis cet ordinateur ; la page de
+  l'application dit ensuite qu'il a été testé depuis l'éditeur, et que votre site ne s'est pas
+  encore connecté.
+- **Brancher une page web** : un jeton en lecture seule, le site à autoriser
+  (`https://monsite.fr`), et le script à coller dans la page. Un jeton se révoque après une
+  question.
+- **Mémoire et limites** : en vigueur tout de suite, sans redémarrage ; un refus arrive dans
+  votre langue, avec ses chiffres. Ce que le serveur lit au démarrage (ports, clés, destination
+  des sauvegardes) est affiché, jamais changé, avec l'endroit où cela se change sur cet
+  hébergement.
+- **Outils** : tester le jeton d'une application depuis n'importe où, et générer un jeton
+  (comme `nuage genkey`).
+
+Supprimer une application reste dans la console, derrière sa confirmation tapée. Un serveur de
+0.4.2 à 0.4.6 s'ouvre aussi, pour ses applications et ses jetons ; pour ce qui lui manque (les
+réglages, l'état, les sites web), l'éditeur dit qu'une mise à jour du serveur le montrerait.
 
 1. **Téléchargez-le** depuis la [dernière version](https://github.com/maxlestage/Nuage/releases/latest) :
    `Nuage-DB-Editor-macOS.dmg` (tout Mac sous macOS 11 ou plus récent, puce Apple ou Intel),
@@ -734,15 +757,19 @@ Réglages de la console, depuis votre bureau.
    clic droit sur `nuage-editor`, **Exécuter comme un programme** (GNOME Fichiers ne lance pas
    un programme d'un double-clic) ; `README.txt` le met dans le menu.
 3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installeur est trouvé
-   tout seul, avec une fenêtre du système au plus : l'éditeur ne tourne jamais en
+   tout seul : **Ouvrir**, avec une fenêtre du système au plus. L'éditeur ne tourne jamais en
    administrateur ; les outils du système lisent pour lui quatre lignes du fichier de
    réglages (`PORT`, `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND` ; jamais la clé de
    chiffrement) : pkexec et grep après votre mot de passe sous Linux, osascript et grep sous
    macOS (sans mot de passe pour le compte qui a installé), cmd.exe et findstr de Windows
-   après la fenêtre UAC, qui nomme *Processeur de commandes Windows*, de Microsoft. Pour un
-   serveur en ligne, tapez son adresse et son jeton de gestion, `NUAGE_ADMIN_TOKEN` (sur
-   Heroku : Settings de l'application, **Reveal Config Vars**). L'éditeur retient l'adresse ;
-   le jeton seulement si vous cochez *Retenir sur cet ordinateur*, et alors dans le
+   après la fenêtre UAC, qui nomme *Processeur de commandes Windows*, de Microsoft ; l'éditeur
+   le dit avant que la fenêtre s'ouvre. Pour un serveur ailleurs, tapez son adresse et son
+   jeton de gestion, `NUAGE_ADMIN_TOKEN` : *Où le trouver ?* montre où il est sur Heroku
+   (Settings de l'application, **Reveal Config Vars**), sur un serveur posé par l'installeur,
+   et dans le `.env` de Docker, et en génère un quand il n'y en a pas. La connexion se fait pas
+   à pas (le serveur, le jeton, ses réglages), avec **Ne plus attendre** après 3 secondes ;
+   quand une étape échoue, l'éditeur dit laquelle, pourquoi, et quoi essayer. Il retient
+   l'adresse ; le jeton seulement si vous cochez *Retenir sur cet ordinateur*, et alors dans le
    gestionnaire de mots de passe de votre système (le trousseau de macOS, le Gestionnaire
    d'identification de Windows, le trousseau d'un bureau Linux), jamais dans un fichier à
    lui. Il n'envoie jamais le jeton après une redirection, et demande avant de l'envoyer en

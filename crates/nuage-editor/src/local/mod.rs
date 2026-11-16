@@ -382,12 +382,16 @@ fn read_limited(file: &Path) -> std::io::Result<Zeroizing<Vec<u8>>> {
 /// Reads the settings file of the server this computer's installer set up,
 /// as the person running the editor.
 pub fn read() -> Result<Found, ReadError> {
-    let paths = Paths::installed().ok_or(ReadError::NotInstalled)?;
+    read_at(&Paths::installed().ok_or(ReadError::NotInstalled)?)
+}
+
+/// [`read`] for the server the installer set up at `paths`.
+pub fn read_at(paths: &Paths) -> Result<Found, ReadError> {
     match access(&paths.settings) {
         Access::Readable => read_file(&paths.settings),
-        Access::Protected => Err(ReadError::NeedsAdministrator(paths.settings)),
+        Access::Protected => Err(ReadError::NeedsAdministrator(paths.settings.clone())),
         Access::Absent if paths.kind == Kind::Windows && present(&paths.service) => {
-            Err(ReadError::NeedsAdministrator(paths.settings))
+            Err(ReadError::NeedsAdministrator(paths.settings.clone()))
         }
         Access::Absent => Err(ReadError::NotInstalled),
     }

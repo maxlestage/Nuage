@@ -706,10 +706,30 @@ cambiarlos en este alojamiento.
 ### En una ventana: Nuage DB Editor
 
 Para quien prefiera no usar una terminal, **Nuage DB Editor** es un programa con ventana, en
-español, inglés y francés: muestra el servidor, cambia su memoria y sus límites, crea
-aplicaciones y sus tokens (mostrados una sola vez, con un botón Copiar) y dice con palabras
-claras lo que rechaza y por qué. Hace lo mismo que la página de Ajustes de la consola, desde
-tu escritorio.
+español, inglés y francés (el idioma del sistema, o el que elijas), claro, oscuro o como el
+sistema, con los colores de la consola. Se ocupa de un servidor a través de su API de gestión,
+y no cambia nada por su cuenta: cada cambio es un botón que pulsas, y dice lo que ha hecho.
+
+- **Ver que funciona**: su versión, desde cuándo está en marcha, la memoria que ocupa y la del
+  equipo, sus aplicaciones y su última conexión, y si las copias de seguridad funcionan (la
+  última copia, cuándo, adónde, y con palabras el error cuando una falló).
+- **Crear una aplicación** para un sitio web o un programa: di para qué sirve, su nombre sigue.
+  Sus dos líneas (`NUAGE_URL`, `NUAGE_TOKEN`) se muestran una sola vez, ocultas hasta que las
+  muestres, y se copian pidiendo al historial del portapapeles que las ignore. **Probar el
+  token** llama al servidor con él desde este equipo; la página de la aplicación dice luego que
+  se probó desde el editor, y que tu sitio aún no se ha conectado.
+- **Conectar una página web**: un token de solo lectura, el sitio que autorizar
+  (`https://misitio.es`), y el script que pegar en la página. Un token se revoca tras una
+  pregunta.
+- **Memoria y límites**: en vigor al momento, sin reiniciar; un rechazo llega en tu idioma, con
+  sus cifras. Lo que el servidor lee al arrancar (puertos, claves, destino de las copias) se
+  muestra, nunca se cambia, con dónde se cambia en ese alojamiento.
+- **Herramientas**: probar el token de una aplicación desde cualquier sitio, y generar un token
+  (como `nuage genkey`).
+
+Eliminar una aplicación sigue en la consola, tras su confirmación escrita. Un servidor de 0.4.2
+a 0.4.6 también se abre, para sus aplicaciones y sus tokens; para lo que le falta (los ajustes,
+el estado, los sitios web), el editor dice que actualizar el servidor lo mostraría.
 
 1. **Descárgalo** de la [última versión](https://github.com/maxlestage/Nuage/releases/latest):
    `Nuage-DB-Editor-macOS.dmg` (cualquier Mac con macOS 11 o posterior, chip de Apple o
@@ -724,19 +744,23 @@ tu escritorio.
    información** y **Ejecutar de todas formas**. Linux: descomprime y haz clic derecho en
    `nuage-editor`, **Ejecutar como un programa** (Archivos de GNOME no abre un programa con
    doble clic); `README.txt` lo pone en el menú.
-3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo,
-   con una ventana del sistema como mucho: el editor nunca se ejecuta como administrador;
-   las herramientas del sistema leen por él cuatro líneas del archivo de ajustes (`PORT`,
-   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; nunca la clave de cifrado): pkexec y grep
-   tras tu contraseña en Linux, osascript y grep en macOS (sin contraseña para la cuenta que
-   instaló), cmd.exe y findstr de Windows tras la ventana UAC, que nombra *Procesador de
-   comandos de Windows*, de Microsoft. Para un servidor en línea, escribe su dirección y su
-   token de gestión, `NUAGE_ADMIN_TOKEN` (en Heroku: Settings de la aplicación, **Reveal
-   Config Vars**). El editor recuerda la dirección; el token solo si marcas *Recordar en este
-   equipo*, y entonces en el almacén de contraseñas de tu sistema (el llavero de macOS, el
-   Administrador de credenciales de Windows, el llavero de un escritorio Linux), nunca en un
-   archivo propio. Nunca envía el token tras una redirección, y pregunta antes de enviarlo en
-   claro (`http://`) a una dirección de Internet.
+3. **Conéctate.** Un servidor instalado en este equipo por el instalador se encuentra solo:
+   **Abrir**, con una ventana del sistema como mucho. El editor nunca se ejecuta como
+   administrador; las herramientas del sistema leen por él cuatro líneas del archivo de ajustes
+   (`PORT`, `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; nunca la clave de cifrado): pkexec y
+   grep tras tu contraseña en Linux, osascript y grep en macOS (sin contraseña para la cuenta
+   que instaló), cmd.exe y findstr de Windows tras la ventana UAC, que nombra *Procesador de
+   comandos de Windows*, de Microsoft; el editor lo dice antes de que se abra la ventana. Para
+   un servidor en otro sitio, escribe su dirección y su token de gestión, `NUAGE_ADMIN_TOKEN`:
+   *¿Dónde lo encuentro?* muestra dónde está en Heroku (Settings de la aplicación, **Reveal
+   Config Vars**), en un servidor que puso el instalador, y en el `.env` de Docker, y genera uno
+   cuando no lo hay. La conexión va paso a paso (el servidor, el token, sus ajustes), con
+   **Dejar de esperar** a los 3 segundos; cuando un paso falla, el editor dice cuál, por qué, y
+   qué probar. Recuerda la dirección; el token solo si marcas *Recordar en este equipo*, y
+   entonces en el almacén de contraseñas de tu sistema (el llavero de macOS, el Administrador de
+   credenciales de Windows, el llavero de un escritorio Linux), nunca en un archivo propio.
+   Nunca envía el token tras una redirección, y pregunta antes de enviarlo en claro (`http://`)
+   a una dirección de Internet.
 
 Lo que cambia lo guarda el servidor, como desde la consola: vigente al instante, guardado
 con los datos. Los ajustes que el servidor lee al arrancar (la clave de cifrado, los

@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -72,8 +73,33 @@ pub enum Route {
     Settings,
     /// `/api/status`.
     Status,
-    /// An application, its tokens, its memory.
+    /// An application, its tokens, its memory, its websites.
     App,
+    /// `/v1/ping`, with an application's token.
+    Ping,
+}
+
+/// The steps of a connection, as the window shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Step {
+    /// `/api/health`, without the token.
+    Looking = 0,
+    /// `/api/apps`, with it.
+    Token = 1,
+    /// The settings and the status.
+    Reading = 2,
+}
+
+impl Step {
+    /// The step a counter says (see [`Server::connect_reporting`]).
+    pub fn of(n: u8) -> Step {
+        match n {
+            0 => Step::Looking,
+            1 => Step::Token,
+            _ => Step::Reading,
+        }
+    }
 }
 
 /// Why a call failed, as the window says it.
@@ -397,6 +423,114 @@ pub struct Application {
     pub memory: AppAmounts,
 }
 
+/// The memory of the server, as its status says it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusMemory {
+    /// What the server counts on (the system's, or what was set).
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    /// What Nuage DB itself uses.
+    pub process_bytes: Option<u64>,
+}
+
+/// Where the backups go, and how the last copy went.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Backup {
+    pub enabled: bool,
+    /// A folder or a bucket.
+    pub target: Option<String>,
+    /// The last copy of the application furthest behind (RFC 3339).
+    pub last_at: Option<String>,
+    pub last_ok: bool,
+    /// The first failure, `application: what failed`.
+    pub last_error: Option<String>,
+}
+
+/// What encrypts the data.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Encryption {
+    pub enabled: bool,
+    pub scheme: Option<String>,
+}
+
+/// The last client of an application.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LastConnection {
+    /// RFC 3339.
+    pub at: String,
+    /// `HTTP API`, `SQL over HTTP`, `PostgreSQL`.
+    pub via: String,
+    /// Its User-Agent, a website's origin, or a PostgreSQL driver's name.
+    pub client: String,
+    pub read_only: bool,
+}
+
+impl LastConnection {
+    /// It was the editor testing a token (its User-Agent), not a website or a program.
+    pub fn by_the_editor(&self) -> bool {
+        self.client.starts_with("nuage-editor/")
+    }
+}
+
+/// An application, as the status lists it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DbStatus {
+    pub name: String,
+    /// `ok`, or `degraded` when its backup fails.
+    pub status: String,
+    pub tables: u64,
+    pub rows: u64,
+    pub bytes: u64,
+    pub websites: Vec<String>,
+    pub last_connection: Option<LastConnection>,
+}
+
+/// What `/api/status` says, opened by the management token (S1): the
+/// version, the memory, the backups, every application.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Status {
+    pub version: String,
+    pub uptime_s: u64,
+    pub memory: StatusMemory,
+    pub backup: Backup,
+    pub encryption: Encryption,
+    pub databases: Vec<DbStatus>,
+}
+
+impl Status {
+    /// The application named `name`.
+    pub fn database(&self, name: &str) -> Option<&DbStatus> {
+        self.databases.iter().find(|d| d.name == name)
+    }
+}
+
+/// What `/v1/ping` says of an application's token.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Ping {
+    pub version: String,
+    pub application: String,
+    /// `read-write` or `read-only`.
+    pub access: String,
+    pub branch: String,
+    pub tables: u64,
+    /// How long the call took.
+    #[serde(skip)]
+    pub millis: u128,
+}
+
+impl Ping {
+    pub fn read_only(&self) -> bool {
+        self.access == "read-only"
+    }
+}
+
 /// What an application needs to connect.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Connection {
@@ -427,6 +561,8 @@ pub struct Connected {
     /// `None`: an older server without settings, or they failed (`settings_error`).
     pub settings: Option<Settings>,
     pub settings_error: Option<ApiError>,
+    /// `None`: the management token does not open the status (an older server).
+    pub status: Option<Status>,
 }
 
 /// A Nuage DB server and its management token.
@@ -540,9 +676,17 @@ impl Server {
     /// Checks the server step by step, and what it has: `/api/health` without
     /// the token (a wrong address, a website, a captive portal never gets it),
     /// `/api/apps` with it, then the settings and the status together.
-    pub fn connect(mut self) -> Result<Connected, ApiError> {
+    pub fn connect(self) -> Result<Connected, ApiError> {
+        self.connect_reporting(&AtomicU8::new(0))
+    }
+
+    /// [`Server::connect`], saying in `step` which [`Step`] it is at.
+    pub fn connect_reporting(mut self, step: &AtomicU8) -> Result<Connected, ApiError> {
+        step.store(Step::Looking as u8, Ordering::SeqCst);
         self.health()?;
+        step.store(Step::Token as u8, Ordering::SeqCst);
         let apps = self.applications()?;
+        step.store(Step::Reading as u8, Ordering::SeqCst);
         let (settings, status) = std::thread::scope(|scope| {
             let this = &self;
             let status =
@@ -556,21 +700,21 @@ impl Server {
             (settings, status)
         });
         // An older server answers a token it does not know with its public
-        // status, which has no version: that is no status.
-        let version = status.ok().and_then(|s| s.get("version")?.as_str().map(str::to_owned));
-        self.caps.status = version.is_some();
+        // status, which has no version: that is no status (S1 and S2 came together).
+        let status = status.ok();
+        self.caps.status = status.is_some();
         self.caps.origins = self.caps.status;
-        self.caps.version = version;
+        self.caps.version = status.as_ref().map(|s| s.version.clone());
         let (settings, settings_error) = match settings {
             Ok(s) => (Some(s), None),
             Err(ApiError::Unsupported) => (None, None),
             Err(e) => (None, Some(e)),
         };
         self.caps.settings = settings.is_some() || settings_error.is_some();
-        Ok(Connected { server: self, apps, settings, settings_error })
+        Ok(Connected { server: self, apps, settings, settings_error, status })
     }
 
-    /// One call: the answer's JSON, or why it failed. `bearer`: with the token.
+    /// One call with the management token (`bearer`), or without any.
     fn call(
         &self,
         route: Route,
@@ -579,13 +723,26 @@ impl Server {
         body: Option<Json>,
         bearer: bool,
     ) -> Result<Json, ApiError> {
+        self.call_as(route, method, path, body, bearer.then_some(&*self.token))
+    }
+
+    /// One call: the answer's JSON, or why it failed. `token`: the one it
+    /// carries (the management token, an application's), or none.
+    fn call_as(
+        &self,
+        route: Route,
+        method: Method,
+        path: &str,
+        body: Option<Json>,
+        token: Option<&Secret>,
+    ) -> Result<Json, ApiError> {
         let url = format!("{}{path}", self.base);
         let lang = self.lang.code();
-        let auth = Zeroizing::new(format!("Bearer {}", self.token.expose()));
+        let auth = Zeroizing::new(token.map(|t| format!("Bearer {}", t.expose())).unwrap_or_default());
         let answer = match method {
             Method::Get => {
                 let request = self.agent.get(&url).header("accept-language", lang);
-                if bearer { request.header("authorization", auth.as_str()).call() } else { request.call() }
+                if token.is_some() { request.header("authorization", auth.as_str()).call() } else { request.call() }
             }
             Method::Delete => {
                 self.agent.delete(&url).header("accept-language", lang).header("authorization", auth.as_str()).call()
@@ -671,9 +828,36 @@ impl Server {
         }
     }
 
-    /// The live status (its `version` says the management token opens it).
-    pub fn status(&self) -> Result<Json, ApiError> {
-        self.call(Route::Status, Method::Get, "/api/status", None, true)
+    /// The live status. Only a whole one counts: the public subset an older
+    /// server gives a token it does not know has no `version`.
+    pub fn status(&self) -> Result<Status, ApiError> {
+        let json = self.call(Route::Status, Method::Get, "/api/status", None, true)?;
+        let status: Status = self.parse(json)?;
+        if status.version.is_empty() { Err(ApiError::Unsupported) } else { Ok(status) }
+    }
+
+    /// Asks `/v1/ping` with `token`, an application's: which application it
+    /// opens, and how. The server notes the editor as its last client.
+    pub fn ping_with(&self, token: &Secret) -> Result<Ping, ApiError> {
+        let started = std::time::Instant::now();
+        let json = self.call_as(Route::Ping, Method::Get, "/v1/ping", None, Some(token))?;
+        let mut ping: Ping = self.parse(json)?;
+        if ping.application.is_empty() {
+            return Err(ApiError::NotNuage(self.base.clone()));
+        }
+        ping.millis = started.elapsed().as_millis();
+        Ok(ping)
+    }
+
+    /// [`Server::ping_with`] its own token (an application's, in Tools).
+    pub fn ping(&self) -> Result<Ping, ApiError> {
+        self.ping_with(&self.token)
+    }
+
+    /// The websites whose pages may call `name`, all of them at once (`[]`: none).
+    pub fn set_origins(&self, name: &str, origins: &[String]) -> Result<Application, ApiError> {
+        let path = format!("/api/apps/{}/origins", segment(name));
+        self.parse(self.call(Route::App, Method::Post, &path, Some(json!({ "origins": origins })), true)?)
     }
 
     /// The settings, the memory and the applications' amounts (0.4.7).
@@ -832,6 +1016,62 @@ pub fn typed_token(typed: &str) -> Result<Secret, TokenError> {
     } else {
         Ok(Secret::new(text.to_owned()))
     }
+}
+
+/// Whether `name` can be an application's name, as the server's engine
+/// checks it: 1 to 63 lowercase letters, digits, `-` and `_`, not `main`.
+pub fn app_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && name != "main"
+}
+
+/// A name for an application, from what it is for (`Ma Boutique Été` gives
+/// `ma-boutique-ete`): lowercase, accents folded, any other character a `-`.
+pub fn suggest_name(what: &str) -> String {
+    let mut name = String::new();
+    for c in what.chars().flat_map(char::to_lowercase) {
+        let folded = match c {
+            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => "a",
+            'ç' => "c",
+            'é' | 'è' | 'ê' | 'ë' => "e",
+            'í' | 'ì' | 'î' | 'ï' => "i",
+            'ñ' => "n",
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' => "o",
+            'ú' | 'ù' | 'û' | 'ü' => "u",
+            'ý' | 'ÿ' => "y",
+            'œ' => "oe",
+            'æ' => "ae",
+            'ß' => "ss",
+            c if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' => {
+                name.push(c);
+                continue;
+            }
+            _ => "-",
+        };
+        if folded == "-" && (name.is_empty() || name.ends_with('-')) {
+            continue;
+        }
+        name.push_str(folded);
+    }
+    let mut name: String = name.trim_end_matches('-').chars().take(63).collect();
+    while name.ends_with('-') {
+        name.pop();
+    }
+    name
+}
+
+/// A website's origin as the server keeps it (`https://monsite.fr`), or
+/// `None` when it is not one: a scheme and a host, without a path; `*` for any.
+pub fn origin(typed: &str) -> Option<String> {
+    let o = typed.trim().trim_end_matches('/').to_ascii_lowercase();
+    if o == "*" {
+        return Some(o);
+    }
+    let host = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://"))?;
+    let fits = !host.is_empty() && !host.chars().any(|c| c.is_whitespace() || matches!(c, '/' | ',' | '?' | '#' | '@'));
+    fits.then_some(o)
 }
 
 /// Why a typed text is not a management token.
@@ -1024,6 +1264,39 @@ mod tests {
         assert_eq!(typed_token("nuage_0123456789abcdef0123456789abcdef").map(|_| ()), Err(TokenError::Application));
         assert_eq!(typed_token("0123456789abcdef 0123456789abcdef").map(|_| ()), Err(TokenError::Characters));
         assert_eq!(segment("ma boutique/é"), "ma%20boutique%2F%C3%A9");
+    }
+
+    #[test]
+    fn names_and_websites() {
+        assert_eq!(suggest_name("Ma Boutique Été"), "ma-boutique-ete");
+        assert_eq!(suggest_name("  L'atelier — Ñandú & Cie  "), "l-atelier-nandu-cie");
+        assert_eq!(suggest_name("blog_2"), "blog_2");
+        assert_eq!(suggest_name("!!!"), "");
+        let long = suggest_name(&"a".repeat(70));
+        assert_eq!(long.len(), 63);
+        assert!(app_name_ok(&long) && app_name_ok("ma-boutique") && app_name_ok("a_1"));
+        for bad in ["", "main", "Shop", "ma boutique", "é", &"a".repeat(64)] {
+            assert!(!app_name_ok(bad), "{bad}");
+        }
+        assert_eq!(origin(" HTTPS://MonSite.fr/ ").as_deref(), Some("https://monsite.fr"));
+        assert_eq!(origin("http://localhost:3000").as_deref(), Some("http://localhost:3000"));
+        assert_eq!(origin("*").as_deref(), Some("*"));
+        for bad in ["monsite.fr", "https://", "https://monsite.fr/page", "ftp://x", "https://a b", "https://a,b"] {
+            assert_eq!(origin(bad), None, "{bad}");
+        }
+        let status: Status = serde_json::from_value(json!({
+            "version": "0.4.7", "uptime_s": 90, "memory": { "process_bytes": 5, "total_bytes": 9 },
+            "backup": { "enabled": true, "target": "/var/backups", "last_at": "2026-11-15T21:04:00Z", "last_ok": true, "last_error": null },
+            "databases": [{ "name": "shop", "status": "ok", "tables": 2, "rows": 3, "websites": ["https://x.fr"],
+                            "last_connection": { "at": "2026-11-15T21:04:00Z", "via": "HTTP API", "client": "nuage-editor/0.4.7" } }],
+        }))
+        .unwrap();
+        assert!(
+            status.backup.last_ok && status.database("shop").unwrap().last_connection.as_ref().unwrap().by_the_editor()
+        );
+        let public: Status =
+            serde_json::from_value(json!({ "name": "Nuage DB", "status": "ok", "uptime_s": 3 })).unwrap();
+        assert!(public.version.is_empty(), "the public subset has no version");
     }
 
     #[test]

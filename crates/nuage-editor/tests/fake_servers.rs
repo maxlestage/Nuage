@@ -174,10 +174,18 @@ fn a_server_deployed_before_the_settings_connects() {
     harness.get_by_label("Se connecter").click();
     wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
     assert!(has(&harness, "ne laisse l'éditeur gérer que les applications et les jetons"));
+    // No status for the management token: what updating would show, said instead.
+    assert!(has(&harness, "Les versions plus récentes de Nuage DB disent à l'éditeur leur version"));
+    assert!(has(&harness, "si la dernière copie a fonctionné"));
     click(&mut harness, "Mémoire");
     assert!(has(&harness, "Mettez le serveur à jour pour voir ceci ici"));
     click(&mut harness, "Applications");
     wait_for(&mut harness, "its applications", |h| has(h, "La boutique"));
+    // Its websites change in the console only, which it opens on the application.
+    click(&mut harness, "shop");
+    assert!(has(&harness, "Cette version de Nuage DB ne change les sites web que dans la console web"));
+    assert!(harness.query_by_label("L'ouvrir sur cette application").is_some());
+    assert!(harness.query_by_label("Site à autoriser").is_none(), "no field the server would refuse");
     // No settings were asked for again: an older server has none.
     let settings_calls = fake.requests().iter().filter(|r| r.path == "/api/settings").count();
     assert_eq!(settings_calls, 2, "once by the API test, once by the window, never on reload");
@@ -200,6 +208,51 @@ fn a_newer_server_with_fields_this_editor_does_not_know() {
     assert!(caps.settings && caps.status && caps.origins, "{caps:?}");
     assert_eq!(caps.version.as_deref(), Some("0.9.0"));
     assert_eq!(connected.apps[0].name, "shop");
+}
+
+/// A server whose management token opens the status, but that has no route for
+/// the websites (a version between the two).
+fn without_websites(request: &Request, _base: &str) -> Option<Vec<u8>> {
+    let no_route = |path: &str| serde_json::json!({ "error": { "kind": "not_found", "message": format!("no such route: {path}") } });
+    match request.path.as_str() {
+        "/api/status" if request.bearer() => json(
+            "200 OK",
+            serde_json::json!({ "version": "0.4.6", "uptime_s": 7200, "backup": { "enabled": false, "last_ok": true },
+                                 "databases": [{ "name": "shop", "status": "ok" }] }),
+        ),
+        "/api/apps/shop/origins" => json("404 Not Found", no_route(&request.path)),
+        _ => older(request, _base),
+    }
+}
+
+#[test]
+fn a_server_without_a_route_says_what_to_update() {
+    let fake = fake(without_websites);
+    let connected = connect(&fake.address).unwrap();
+    let caps = connected.server.caps();
+    assert!(caps.status && !caps.settings, "{caps:?}");
+    assert_eq!(
+        connected.server.set_origins("shop", &["https://monsite.fr".into()]).unwrap_err(),
+        ApiError::Unsupported,
+        "a missing route is told apart from a refusal"
+    );
+    let prefs = Prefs { lang: Some(Lang::Es), ..Prefs::default() };
+    let mut harness = window(prefs, Arc::new(MemoryVault::default()), FakeSink::default());
+    type_into(&mut harness, "Dirección del servidor", &fake.address);
+    type_into(&mut harness, "Token de gestión", ADMIN);
+    harness.get_by_label("Conectar").click();
+    wait_for(&mut harness, "the connection", |h| h.state().connected_to().is_some());
+    // Its status: the version, and no backup said in words.
+    assert!(has(&harness, "versión 0.4.6") && has(&harness, "Ninguna copia de seguridad"));
+    click(&mut harness, "Aplicaciones");
+    click(&mut harness, "shop");
+    type_into(&mut harness, "Sitio que autorizar", "https://misitio.es");
+    harness.get_by_role_and_label(eframe::egui::accesskit::Role::Button, "Añadir").click();
+    wait_for(&mut harness, "the answer", |h| {
+        has(h, "Esta versión de Nuage DB solo cambia los sitios web en la consola web")
+    });
+    assert!(harness.query_by_label("Abrirla en esta aplicación").is_some());
+    assert!(fake.requests().iter().any(|r| r.path == "/api/apps/shop/origins" && r.bearer()));
 }
 
 #[test]
@@ -321,11 +374,8 @@ fn https_to_a_plain_port() {
 
 #[test]
 fn plain_http_to_the_internet_waits_for_consent() {
-    let prefs = Prefs {
-        lang: Some(Lang::Fr),
-        servers: vec![SavedServer { address: "http://nuage.example.com".into(), token_kept: false }],
-        ..Prefs::default()
-    };
+    let prefs =
+        Prefs { lang: Some(Lang::Fr), servers: vec![SavedServer::at("http://nuage.example.com")], ..Prefs::default() };
     let mut harness = window(prefs, Arc::new(MemoryVault::default()), FakeSink::default());
     assert!(has(&harness, "Non chiffré : le jeton traverserait Internet en clair"));
     assert!(harness.get_by_label("Se connecter").accesskit_node().is_disabled(), "not until consented");

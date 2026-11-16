@@ -41,9 +41,23 @@ impl Lang {
         }
     }
 
+    /// The first of French, Spanish or English in the order the person put
+    /// their languages (macOS and Windows list several), else English.
+    pub fn of_locales<S: AsRef<str>>(locales: impl IntoIterator<Item = S>) -> Lang {
+        locales
+            .into_iter()
+            .find_map(|l| {
+                let l = l.as_ref().trim().to_ascii_lowercase();
+                [("fr", Lang::Fr), ("es", Lang::Es), ("en", Lang::En)]
+                    .into_iter()
+                    .find_map(|(code, lang)| l.starts_with(code).then_some(lang))
+            })
+            .unwrap_or(Lang::En)
+    }
+
     /// The language of this computer.
     pub fn of_system() -> Lang {
-        sys_locale::get_locale().map_or(Lang::En, |l| Lang::of_locale(&l))
+        Lang::of_locales(sys_locale::get_locales())
     }
 }
 
@@ -92,14 +106,12 @@ fn table() -> &'static HashMap<&'static str, (&'static str, &'static str)> {
 const TEXTS: &[(&str, &str, &str)] = &[
     ("This message is also in {}.", "Ce message est aussi dans {}.", "Este mensaje también está en {}."),
     ("Theme", "Thème", "Tema"),
-    ("Connection lines", "Lignes de connexion", "Líneas de conexión"),
     ("Language", "Langue", "Idioma"),
     (
         "Saved: in force now, with no restart.",
         "Enregistré : en vigueur tout de suite, sans redémarrage.",
         "Guardado: en vigor al momento, sin reiniciar.",
     ),
-    ("Saved and in force, but:", "Enregistré et en vigueur, mais :", "Guardado y en vigor, pero:"),
     (
         "Application {} created, with its own encrypted database.",
         "Application {} créée, avec sa propre base chiffrée.",
@@ -122,40 +134,14 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Tapez d'abord l'adresse du serveur.",
         "Escribe primero la dirección del servidor.",
     ),
-    ("Editor", "Éditeur", "Editor"),
     ("Connected to {}", "Connecté à {}", "Conectado a {}"),
     ("Not connected", "Non connecté", "Sin conexión"),
     ("Disconnect", "Se déconnecter", "Desconectar"),
     ("Open the console in my browser", "Ouvrir la console dans mon navigateur", "Abrir la consola en mi navegador"),
     ("Refresh", "Actualiser", "Actualizar"),
-    ("Connect to your Nuage DB server", "Se connecter à votre serveur Nuage DB", "Conectarse a tu servidor Nuage DB"),
-    (
-        "The editor changes your server's settings and applications, as the console does, without a terminal. It needs the address of the server and its management token.",
-        "L'éditeur change les réglages et les applications de votre serveur, comme la console, sans terminal. Il lui faut l'adresse du serveur et son jeton de gestion.",
-        "El editor cambia los ajustes y las aplicaciones de tu servidor, como la consola, sin terminal. Necesita la dirección del servidor y su token de gestión.",
-    ),
     ("On this computer", "Sur cet ordinateur", "En este equipo"),
-    (
-        "A Nuage DB server is installed here (its settings are in {}).",
-        "Un serveur Nuage DB est installé ici (ses réglages sont dans {}).",
-        "Hay un servidor Nuage DB instalado aquí (sus ajustes están en {}).",
-    ),
-    ("Enter my password", "Saisir mon mot de passe", "Introducir mi contraseña"),
-    ("Use this server", "Utiliser ce serveur", "Usar este servidor"),
-    (
-        "No server was installed on this computer by the installer. If yours is elsewhere (online, another computer), type its address below.",
-        "Aucun serveur n'a été installé sur cet ordinateur par l'installateur. Si le vôtre est ailleurs (en ligne, sur un autre ordinateur), tapez son adresse ci-dessous.",
-        "El instalador no ha instalado ningún servidor en este equipo. Si el tuyo está en otro sitio (en línea, en otro equipo), escribe su dirección abajo.",
-    ),
-    ("Address and management token", "Adresse et jeton de gestion", "Dirección y token de gestión"),
-    ("Address of the server", "Adresse du serveur", "Dirección del servidor"),
     ("Management token", "Jeton de gestion", "Token de gestión"),
     ("Show", "Afficher", "Mostrar"),
-    (
-        "The management token is NUAGE_ADMIN_TOKEN: in the settings file the installer wrote, or in your host's variables (Heroku: Settings, Config Vars). It is not an application's token.",
-        "Le jeton de gestion, c'est NUAGE_ADMIN_TOKEN : dans le fichier de réglages écrit par l'installateur, ou dans les variables de votre hébergeur (Heroku : Settings, Config Vars). Ce n'est pas le jeton d'une application.",
-        "El token de gestión es NUAGE_ADMIN_TOKEN: en el archivo de ajustes que escribió el instalador, o en las variables de tu alojamiento (Heroku: Settings, Config Vars). No es el token de una aplicación.",
-    ),
     ("Remember on this computer", "Retenir sur cet ordinateur", "Recordar en este equipo"),
     ("Connect", "Se connecter", "Conectar"),
     ("Servers you used", "Serveurs déjà utilisés", "Servidores que has usado"),
@@ -163,7 +149,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Theme: as the system", "Thème : comme le système", "Tema: como el sistema"),
     ("Theme: light", "Thème : clair", "Tema: claro"),
     ("Theme: dark", "Thème : sombre", "Tema: oscuro"),
-    ("Language: as the system", "Langue : comme le système", "Idioma: como el sistema"),
     (
         "No server was installed on this computer by the installer.",
         "Aucun serveur n'a été installé sur cet ordinateur par l'installateur.",
@@ -205,11 +190,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "This system does not tell Nuage DB its memory: say how much it may count on.",
         "Ce système ne dit pas sa mémoire à Nuage DB : indiquez sur combien il peut compter.",
         "Este sistema no le dice su memoria a Nuage DB: indica con cuánta puede contar.",
-    ),
-    (
-        "Amounts are written auto, 512 MiB or 2 GiB (a number alone is in MiB).",
-        "Les quantités s'écrivent auto, 512 Mio ou 2 Go (un nombre seul est en Mio).",
-        "Las cantidades se escriben auto, 512 MiB o 2 GiB (un número solo va en MiB).",
     ),
     ("unknown", "inconnu", "desconocido"),
     (
@@ -263,45 +243,12 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Más allá, la sentencia se detiene con un error y sus cambios se deshacen. 0: sin límite.",
     ),
     ("PostgreSQL connections at once", "Connexions PostgreSQL simultanées", "Conexiones PostgreSQL simultáneas"),
-    (
-        "Each has a thread; the next ones are refused as PostgreSQL does.",
-        "Chacune a un thread ; les suivantes sont refusées, comme le fait PostgreSQL.",
-        "Cada una tiene un hilo; las siguientes se rechazan, como hace PostgreSQL.",
-    ),
     ("Save the limits", "Enregistrer les limites", "Guardar los límites"),
     ("Visibility", "Visibilité", "Visibilidad"),
-    (
-        "Public status: the dashboard shows a public subset without signing in",
-        "État public : le tableau de bord montre une partie publique sans connexion",
-        "Estado público: el panel muestra una parte pública sin iniciar sesión",
-    ),
     ("New application", "Nouvelle application", "Nueva aplicación"),
-    (
-        "Each application has its own encrypted database and its own tokens: one per website or program.",
-        "Chaque application a sa propre base chiffrée et ses propres jetons : une par site web ou par programme.",
-        "Cada aplicación tiene su propia base cifrada y sus propios tokens: una por sitio web o programa.",
-    ),
     ("Name", "Nom", "Nombre"),
-    ("Description", "Description", "Descripción"),
-    ("what this application is", "ce qu'est cette application", "qué es esta aplicación"),
-    (
-        "A name: lowercase letters, digits, - and _ (1 to 63).",
-        "Un nom : lettres minuscules, chiffres, - et _ (1 à 63).",
-        "Un nombre: letras minúsculas, cifras, - y _ (de 1 a 63).",
-    ),
     ("Create the application", "Créer l'application", "Crear la aplicación"),
-    ("the server's own", "celle du serveur", "la del servidor"),
-    (
-        "Memory: page cache {}, key-value store {}.",
-        "Mémoire : cache de pages {}, stockage clé-valeur {}.",
-        "Memoria: caché de páginas {}, almacén clave-valor {}.",
-    ),
     ("Tokens", "Jetons", "Tokens"),
-    (
-        "NUAGE_TOKEN (set on the server): read and write.",
-        "NUAGE_TOKEN (réglé sur le serveur) : lecture et écriture.",
-        "NUAGE_TOKEN (definido en el servidor): lectura y escritura.",
-    ),
     (
         "No token: no program can connect yet.",
         "Aucun jeton : aucun programme ne peut encore se connecter.",
@@ -311,47 +258,13 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("read and write", "lecture et écriture", "lectura y escritura"),
     ("Revoke", "Révoquer", "Revocar"),
     ("New token (read and write)", "Nouveau jeton (lecture et écriture)", "Nuevo token (lectura y escritura)"),
-    ("New read-only token", "Nouveau jeton en lecture seule", "Nuevo token de solo lectura"),
-    (
-        "A token in a web page is public: give pages a read-only token, and keep read-and-write tokens on servers.",
-        "Un jeton dans une page web est public : donnez aux pages un jeton en lecture seule, et gardez les jetons de lecture et écriture sur des serveurs.",
-        "Un token en una página web es público: da a las páginas un token de solo lectura, y guarda los de lectura y escritura en servidores.",
-    ),
-    (
-        "Deleting an application (its data and its backups) is done in the console, behind a typed confirmation.",
-        "Supprimer une application (ses données et ses sauvegardes) se fait dans la console, après une confirmation tapée.",
-        "Eliminar una aplicación (sus datos y sus copias) se hace en la consola, tras una confirmación escrita.",
-    ),
-    ("The token of {}", "Le jeton de {}", "El token de {}"),
-    (
-        "Read only: for the pages of a website.",
-        "Lecture seule : pour les pages d'un site web.",
-        "Solo lectura: para las páginas de un sitio web.",
-    ),
     (
         "Read and write: for a server or a program, never in a web page.",
         "Lecture et écriture : pour un serveur ou un programme, jamais dans une page web.",
         "Lectura y escritura: para un servidor o un programa, nunca en una página web.",
     ),
-    (
-        "Copy it now: it is not shown again (the server keeps only a fingerprint of it).",
-        "Copiez-le maintenant : il ne sera plus affiché (le serveur n'en garde qu'une empreinte).",
-        "Cópialo ahora: no se vuelve a mostrar (el servidor solo guarda una huella).",
-    ),
-    ("Copy the two lines", "Copier les deux lignes", "Copiar las dos líneas"),
     ("Copy the token", "Copier le jeton", "Copiar el token"),
-    (
-        "Give these two lines to the program, as its settings (environment variables).",
-        "Donnez ces deux lignes au programme, comme réglages (variables d'environnement).",
-        "Da estas dos líneas al programa, como sus ajustes (variables de entorno).",
-    ),
-    ("I have copied it: close", "Je l'ai copié : fermer", "Lo he copiado: cerrar"),
     ("Revoke this token?", "Révoquer ce jeton ?", "¿Revocar este token?"),
-    (
-        "nuage_{}… of {} will open nothing any more: the programs that use it lose access at once. It cannot be undone (make a new token instead).",
-        "nuage_{}… de {} n'ouvrira plus rien : les programmes qui l'utilisent perdent l'accès aussitôt. C'est définitif (faites plutôt un nouveau jeton).",
-        "nuage_{}… de {} ya no abrirá nada: los programas que lo usan pierden el acceso al momento. No se puede deshacer (crea un token nuevo en su lugar).",
-    ),
     ("Cancel", "Annuler", "Cancelar"),
     (
         "The server at {} answers, and its management token is right.",
@@ -360,19 +273,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Memory", "Mémoire", "Memoria"),
     ("{} used, {} free of {}", "{} utilisés, {} libres sur {}", "{} usados, {} libres de {}"),
-    ("Page caches", "Caches de pages", "Cachés de páginas"),
-    (
-        "{} for all the applications (up to {} while memory has room)",
-        "{} pour toutes les applications (jusqu'à {} tant que la mémoire le permet)",
-        "{} para todas las aplicaciones (hasta {} mientras haya memoria)",
-    ),
     ("Applications", "Applications", "Aplicaciones"),
     ("Backups", "Sauvegardes", "Copias de seguridad"),
-    (
-        "none: if the disk of this server is lost, its data is lost",
-        "aucune : si le disque de ce serveur est perdu, ses données le sont aussi",
-        "ninguna: si se pierde el disco de este servidor, se pierden sus datos",
-    ),
     (
         "The settings of this server are those of its environment (NUAGE_SETTINGS=environment): the editor shows them, and changes nothing.",
         "Les réglages de ce serveur sont ceux de son environnement (NUAGE_SETTINGS=environment) : l'éditeur les montre, et ne change rien.",
@@ -383,12 +285,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "{} réglage(s) enregistré(s) plus tôt sont ignorés tant que l'environnement fait foi.",
         "{} ajuste(s) guardado(s) antes se ignoran mientras manda el entorno.",
     ),
-    (
-        "The server reads these before it opens its data, or they are what it listens on and what opens it: a wrong value could lock you out, so they are not changed from here. They change in the settings file (or the host's variables), then the server restarts.",
-        "Le serveur les lit avant d'ouvrir ses données, ou bien ce sont ses ports et ce qui lui donne accès : une mauvaise valeur pourrait vous en fermer la porte, alors ils ne se changent pas d'ici. Ils se changent dans le fichier de réglages (ou les variables de l'hébergeur), puis le serveur redémarre.",
-        "El servidor los lee antes de abrir sus datos, o son sus puertos y lo que da acceso a él: un valor erróneo podría dejarte fuera, así que no se cambian desde aquí. Se cambian en el archivo de ajustes (o las variables del alojamiento), y luego el servidor se reinicia.",
-    ),
-    ("Its settings file: {}", "Son fichier de réglages : {}", "Su archivo de ajustes: {}"),
     ("Variable", "Variable", "Variable"),
     ("Value", "Valeur", "Valor"),
     ("set (a secret: not shown)", "réglé (un secret : non affiché)", "definido (un secreto: no se muestra)"),
@@ -426,7 +322,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Une première version de l'éditeur gardait des jetons dans un fichier, en clair : ce fichier est maintenant supprimé. Tapez à nouveau votre jeton ; cochez « Retenir sur cet ordinateur » pour le garder dans le gestionnaire de mots de passe de votre système.",
         "Una primera versión del editor guardaba tokens en un archivo, en claro: ese archivo se ha borrado. Escribe tu token de nuevo; marca «Recordar en este equipo» para guardarlo en el almacén de contraseñas de tu sistema.",
     ),
-    ("Checking… ({} s)", "Vérification… ({} s)", "Comprobando… ({} s)"),
     ("Connect anyway", "Se connecter quand même", "Conectar de todos modos"),
     (
         "Connected, but the token could not be kept in {} ({}): it is used until you close the editor.",
@@ -437,11 +332,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Copied, but the clipboard history could not be asked to skip it ({}): it may keep it.",
         "Copié, mais l'historique du presse-papiers n'a pas pu être prié de l'ignorer ({}) : il peut le garder.",
         "Copiado, pero no se pudo pedir al historial del portapapeles que lo ignore ({}): puede guardarlo.",
-    ),
-    (
-        "Copied. It stays in the clipboard until you copy something else. Clipboard managers are asked to skip it (KDE's does; some on GNOME do not). On Linux, what you copy may disappear when the editor closes: paste it first.",
-        "Copié. Il reste dans le presse-papiers jusqu'à la prochaine copie. Les gestionnaires de presse-papiers sont priés de l'ignorer (celui de KDE le fait ; certains sous GNOME, non). Sous Linux, ce que vous copiez peut disparaître à la fermeture de l'éditeur : collez-le avant.",
-        "Copiado. Se queda en el portapapeles hasta que copies otra cosa. Se pide a los gestores del portapapeles que lo ignoren (el de KDE lo hace; algunos de GNOME, no). En Linux, lo que copias puede desaparecer al cerrar el editor: pégalo antes.",
     ),
     (
         "Copied. It stays in the clipboard until you copy something else; the clipboard history is asked to skip it.",
@@ -483,12 +373,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Nuage DB does not answer on this computer (port {}): it is stopped, or still starting.",
         "Nuage DB ne répond pas sur cet ordinateur (port {}) : il est arrêté, ou encore en train de démarrer.",
         "Nuage DB no responde en este equipo (puerto {}): está detenido, o todavía arrancando.",
-    ),
-    ("Nuage DB {}", "Nuage DB {}", "Nuage DB {}"),
-    (
-        "Saving… ({} s; the editor waits up to {} s)",
-        "Enregistrement… ({} s ; l'éditeur attend jusqu'à {} s)",
-        "Guardando… ({} s; el editor espera hasta {} s)",
     ),
     ("Stop waiting", "Ne plus attendre", "Dejar de esperar"),
     (
@@ -553,16 +437,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "El servidor ha rechazado este token. El editor necesita el token de gestión (NUAGE_ADMIN_TOKEN), no el token de una aplicación ni la contraseña de la consola.",
     ),
     ("The token goes in {}.", "Le jeton va dans {}.", "El token se guarda en {}."),
-    (
-        "This address works for a program on this computer only. A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
-        "Cette adresse ne fonctionne que pour un programme de cet ordinateur. Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
-        "Esta dirección solo sirve para un programa de este equipo. Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
-    ),
-    (
-        "This address works for a program on this computer only. On another device of your network, use http://{}:{} instead (if this computer's firewall lets it in). A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
-        "Cette adresse ne fonctionne que pour un programme de cet ordinateur. Sur un autre appareil de votre réseau, utilisez plutôt http://{}:{} (si le pare-feu de cet ordinateur le laisse entrer). Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
-        "Esta dirección solo sirve para un programa de este equipo. En otro dispositivo de tu red, usa en su lugar http://{}:{} (si el cortafuegos de este equipo lo deja entrar). Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
-    ),
     (
         "This is an application's token (NUAGE_TOKEN), not the management token.",
         "Ceci est le jeton d'une application (NUAGE_TOKEN), pas le jeton de gestion.",
@@ -633,7 +507,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "« {} » n'est pas une adresse. Exemple : https://mon-nuage.herokuapp.com",
         "«{}» no es una dirección. Ejemplo: https://mi-nuage.herokuapp.com",
     ),
-    ("not encrypted", "non chiffré", "sin cifrar"),
     (
         "the editor's memory, until it closes",
         "la mémoire de l'éditeur, jusqu'à sa fermeture",
@@ -686,12 +559,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Nuage DB Éditeur démarre le serveur Nuage DB de cet ordinateur.",
         "Nuage DB Editor inicia el servidor Nuage DB de este equipo.",
     ),
-    ("The editor hit a bug", "L'éditeur a rencontré un bug", "El editor encontró un error de programa"),
-    (
-        "Something in the editor went wrong, and its page stopped. Nothing more was sent to your server. What was saved before is saved; a change on its way may or may not have been made: look again once connected.",
-        "Quelque chose s'est mal passé dans l'éditeur, et sa page s'est arrêtée. Rien de plus n'a été envoyé à votre serveur. Ce qui était enregistré avant l'est toujours ; un changement en cours a pu être fait ou non : regardez à nouveau une fois connecté.",
-        "Algo falló en el editor y su página se detuvo. No se envió nada más a tu servidor. Lo que estaba guardado antes sigue guardado; un cambio en curso puede haberse hecho o no: vuelve a mirar una vez conectado.",
-    ),
     ("What failed: {}", "Ce qui a échoué : {}", "Lo que falló: {}"),
     ("Where: {}", "Où : {}", "Dónde: {}"),
     ("Back to the start", "Revenir au début", "Volver al inicio"),
@@ -707,81 +574,819 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Rien ne répond sur le port {} de cet ordinateur pour l'instant : le serveur est peut-être arrêté.",
         "Nada responde en el puerto {} de este equipo ahora mismo: puede que el servidor esté detenido.",
     ),
-    ("Ask Windows", "Demander à Windows", "Pedírselo a Windows"),
+    ("{} s", "{} s", "{} s"),
+    ("{} min", "{} min", "{} min"),
+    ("{} h", "{} h", "{} h"),
+    ("{} day", "{} jour", "{} día"),
+    ("{} days", "{} jours", "{} días"),
+    ("{} ago", "il y a {}", "hace {}"),
     (
-        "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of {}.",
-        "Ce système ne peut pas afficher ici de fenêtre demandant un administrateur ({}). Tapez l'adresse et le jeton de gestion ci-dessous : le jeton est la ligne NUAGE_ADMIN_TOKEN de {}.",
-        "Este sistema no puede mostrar aquí una ventana que pida un administrador ({}). Escribe abajo la dirección y el token de gestión: el token es la línea NUAGE_ADMIN_TOKEN de {}.",
+        "An application is a database for one website or program: its own data, encrypted, and its own tokens. Applications never see each other's data.",
+        "Une application, c'est une base de données pour un site ou un programme : ses propres données, chiffrées, et ses propres jetons. Les applications ne voient jamais les données des autres.",
+        "Una aplicación es una base de datos para un sitio web o un programa: sus propios datos, cifrados, y sus propios tokens. Las aplicaciones nunca ven los datos de las demás.",
+    ),
+    ("Open its page", "Ouvrir sa page", "Abrir su página"),
+    ("main", "principale", "principal"),
+    (
+        "created at installation; it cannot be deleted",
+        "créée à l'installation ; elle ne peut pas être supprimée",
+        "creada en la instalación; no se puede eliminar",
+    ),
+    ("tables {} · rows {} · {}", "tables {} · lignes {} · {}", "tablas {} · filas {} · {}"),
+    ("Backup failing", "Sauvegarde en échec", "Copia de seguridad fallida"),
+    (
+        "For now there is only the main application, {}, created at installation. Make one per website, with New application above.",
+        "Pour l'instant il n'y a que l'application principale, {}, créée à l'installation. Créez-en une par site, avec Nouvelle application ci-dessus.",
+        "Por ahora solo existe la aplicación principal, {}, creada en la instalación. Crea una por sitio web, con Nueva aplicación arriba.",
     ),
     (
-        "Waiting for the system's window… ({} s)",
-        "En attente de la fenêtre du système… ({} s)",
-        "Esperando la ventana del sistema… ({} s)",
+        "An application missing here? The web console lists those the server could not open.",
+        "Une application manque ? La console web liste celles que le serveur n'a pas pu ouvrir.",
+        "¿Falta una aplicación? La consola web lista las que el servidor no pudo abrir.",
+    ),
+    ("What is it for?", "À quoi sert-elle ?", "¿Para qué sirve?"),
+    ("My shop", "Ma boutique", "Mi tienda"),
+    ("Its name will be: {}", "Son nom sera : {}", "Su nombre será: {}"),
+    (
+        "1 to 63 lowercase letters, digits, - and _ (not main). It is also its database name for PostgreSQL.",
+        "1 à 63 lettres minuscules, chiffres, - et _ (pas main). C'est aussi son nom de base pour PostgreSQL.",
+        "De 1 a 63 letras minúsculas, cifras, - y _ (no main). También es su nombre de base de datos para PostgreSQL.",
+    ),
+    ("Creating…", "Création…", "Creando…"),
+    (
+        "It was created, but its token never reached the editor: make it a new token, then revoke the lost one (made at {}).",
+        "Elle a été créée, mais son jeton n'est jamais arrivé jusqu'à l'éditeur : créez-lui un nouveau jeton, puis révoquez celui qui est perdu (créé à {}).",
+        "Se creó, pero su token nunca llegó al editor: crea un token nuevo y revoca después el perdido (creado a las {}).",
+    ),
+    ("Open {}", "Ouvrir {}", "Abrir {}"),
+    (
+        "The server did not answer in time. The application may have been created anyway.",
+        "Le serveur n'a pas répondu à temps. L'application a peut-être été créée quand même.",
+        "El servidor no respondió a tiempo. Puede que la aplicación se haya creado de todos modos.",
+    ),
+    ("Check", "Vérifier", "Comprobar"),
+    ("{} token", "{} jeton", "{} token"),
+    ("{} tokens", "{} jetons", "{} tokens"),
+    ("{}, {} read-only", "{}, dont {} en lecture seule", "{}, {} de solo lectura"),
+    ("Waiting for a first connection", "En attente d'une première connexion", "Esperando una primera conexión"),
+    (
+        "Tested from the editor {} — your site has not connected yet",
+        "Testée depuis l'éditeur {} — votre site ne s'est pas encore connecté",
+        "Probada desde el editor {}: tu sitio aún no se ha conectado",
+    ),
+    ("Connected {} ({})", "Connectée {} ({})", "Conectada {} ({})"),
+    (
+        "There is no application {} any more (deleted from the console?).",
+        "Il n'y a plus d'application {} (supprimée depuis la console ?).",
+        "Ya no hay ninguna aplicación {} (¿eliminada desde la consola?).",
+    ),
+    ("Connection", "Connexion", "Conexión"),
+    ("a token of this application", "un jeton de cette application", "un token de esta aplicación"),
+    (
+        "A token is shown only when it is made: make a new one to connect another site.",
+        "Un jeton n'est affiché qu'à sa création : créez-en un nouveau pour brancher un autre site.",
+        "Un token solo se muestra al crearlo: crea uno nuevo para conectar otro sitio.",
     ),
     (
-        "The window asking for an administrator was closed: nothing was read. Click the button again to be asked once more, or type the address and the token below.",
-        "La fenêtre demandant un administrateur a été fermée : rien n'a été lu. Cliquez à nouveau sur le bouton pour qu'elle revienne, ou tapez l'adresse et le jeton ci-dessous.",
-        "Se cerró la ventana que pedía un administrador: no se leyó nada. Pulsa otra vez el botón para que vuelva, o escribe abajo la dirección y el token.",
+        "The token also works as the PostgreSQL password of this application (its database name is its name).",
+        "Le jeton sert aussi de mot de passe PostgreSQL pour cette application (son nom de base est son nom).",
+        "El token también sirve como contraseña de PostgreSQL de esta aplicación (su nombre de base de datos es su nombre).",
+    ),
+    ("Delete", "Supprimer", "Eliminar"),
+    (
+        "The main application cannot be deleted.",
+        "L'application principale ne peut pas être supprimée.",
+        "La aplicación principal no se puede eliminar.",
     ),
     (
-        "The system did not accept the answer ({}): nothing was read. It takes the password of an administrator of this computer.",
-        "Le système n'a pas accepté la réponse ({}) : rien n'a été lu. Il faut le mot de passe d'un administrateur de cet ordinateur.",
-        "El sistema no aceptó la respuesta ({}): no se leyó nada. Hace falta la contraseña de un administrador de este equipo.",
+        "Deleting an application erases its database and its backups. It is done in the web console, where you type its name again to confirm. The console asks for its password (NUAGE_ADMIN_PASSWORD, set with the server).",
+        "Supprimer une application efface sa base et ses sauvegardes. Cela se fait dans la console web, où l'on retape son nom pour confirmer. La console demande son mot de passe (NUAGE_ADMIN_PASSWORD, réglé avec le serveur).",
+        "Eliminar una aplicación borra su base de datos y sus copias de seguridad. Se hace en la consola web, donde vuelves a escribir su nombre para confirmar. La consola pide su contraseña (NUAGE_ADMIN_PASSWORD, definida con el servidor).",
     ),
     (
-        "This system cannot show a window asking for an administrator here ({}). Type the address and the management token below: the token is the NUAGE_ADMIN_TOKEN line of the settings file.",
-        "Ce système ne peut pas afficher ici de fenêtre demandant un administrateur ({}). Tapez l'adresse et le jeton de gestion ci-dessous : le jeton est la ligne NUAGE_ADMIN_TOKEN du fichier de réglages.",
-        "Este sistema no puede mostrar aquí una ventana que pida un administrador ({}). Escribe abajo la dirección y el token de gestión: el token es la línea NUAGE_ADMIN_TOKEN del archivo de ajustes.",
+        "Open the console on this application",
+        "Ouvrir la console sur cette application",
+        "Abrir la consola en esta aplicación",
     ),
     (
-        "The settings file could not be read, even as administrator: {}",
-        "Le fichier de réglages n'a pas pu être lu, même en administrateur : {}",
-        "No se pudo leer el archivo de ajustes, ni siquiera como administrador: {}",
+        "NUAGE_TOKEN (set on the server): read and write; it changes in the server's settings, not here.",
+        "NUAGE_TOKEN (réglé sur le serveur) : lecture et écriture ; il se change dans les réglages du serveur, pas ici.",
+        "NUAGE_TOKEN (definido en el servidor): lectura y escritura; se cambia en los ajustes del servidor, no aquí.",
+    ),
+    ("{} · made {}", "{} · créé le {}", "{} · creado el {}"),
+    (
+        "New read-only token, for a web page",
+        "Nouveau jeton en lecture seule, pour une page web",
+        "Nuevo token de solo lectura, para una página web",
     ),
     (
-        "Windows did not hand the settings file over (code {}): nothing was read.",
-        "Windows n'a pas transmis le fichier de réglages (code {}) : rien n'a été lu.",
-        "Windows no entregó el archivo de ajustes (código {}): no se leyó nada.",
+        "A read-and-write token stays on a server. A web page shows its code to every visitor: give it a read-only token, which can only read.",
+        "Un jeton lecture-écriture reste sur un serveur. Une page web montre son code à tous ses visiteurs : donnez-lui un jeton en lecture seule, qui ne peut que lire.",
+        "Un token de lectura y escritura se queda en un servidor. Una página web muestra su código a todos sus visitantes: dale un token de solo lectura, que solo puede leer.",
+    ),
+    ("Websites allowed", "Sites web autorisés", "Sitios web autorizados"),
+    (
+        "Pages of these websites may call this database from their visitors' browsers. Write the start of the address, without a path: https://monsite.fr; to try on this computer, http://localhost:3000.",
+        "Les pages de ces sites peuvent appeler cette base depuis le navigateur de leurs visiteurs. Écrivez le début de l'adresse, sans chemin : https://monsite.fr ; pour essayer sur cet ordinateur, http://localhost:3000.",
+        "Las páginas de estos sitios pueden llamar a esta base de datos desde el navegador de sus visitantes. Escribe el principio de la dirección, sin ruta: https://misitio.es; para probar en este equipo, http://localhost:3000.",
     ),
     (
-        "Windows did not hand the settings file over within two minutes: nothing was read.",
-        "Windows n'a pas transmis le fichier de réglages en deux minutes : rien n'a été lu.",
-        "Windows no entregó el archivo de ajustes en dos minutos: no se leyó nada.",
+        "None yet: browsers refuse the calls of every page.",
+        "Aucun pour l'instant : les navigateurs refusent les appels de toutes les pages.",
+        "Ninguno por ahora: los navegadores rechazan las llamadas de todas las páginas.",
+    ),
+    ("any website", "n'importe quel site", "cualquier sitio"),
+    ("Remove", "Retirer", "Quitar"),
+    (
+        "Your site is in https and Nuage DB in http: browsers will block the calls. Nuage DB needs an https address.",
+        "Votre site est en https et Nuage DB en http : les navigateurs bloqueront les appels. Il faut une adresse https pour Nuage DB.",
+        "Tu sitio está en https y Nuage DB en http: los navegadores bloquearán las llamadas. Nuage DB necesita una dirección https.",
+    ),
+    ("Website to allow", "Site à autoriser", "Sitio que autorizar"),
+    ("Add", "Ajouter", "Añadir"),
+    (
+        "That is not the start of a website's address: write its scheme and its name, without a path, such as https://monsite.fr.",
+        "Ce n'est pas le début de l'adresse d'un site : écrivez son schéma et son nom, sans chemin, comme https://monsite.fr.",
+        "Eso no es el principio de la dirección de un sitio: escribe su esquema y su nombre, sin ruta, como https://misitio.es.",
+    ),
+    ("{} is already allowed.", "{} est déjà autorisé.", "{} ya está autorizado."),
+    ("Open it on this application", "L'ouvrir sur cette application", "Abrirla en esta aplicación"),
+    ("Memory of this application", "Mémoire de cette application", "Memoria de esta aplicación"),
+    (
+        "auto: shared with the others, by use. An amount: set apart for it (512 MiB, 2 GiB; a number alone is in MiB).",
+        "auto : partagée avec les autres, selon l'usage. Une quantité : une part réservée (512 Mio, 2 Gio ; un nombre seul est en Mio).",
+        "auto: compartida con las demás, según el uso. Una cantidad: una parte reservada (512 MiB, 2 GiB; un número solo va en MiB).",
     ),
     (
-        "restart this computer (the server starts with it)",
-        "redémarrez cet ordinateur (le serveur démarre avec lui)",
-        "reinicia este equipo (el servidor se inicia con él)",
+        "Its cache holds {} of {} now.",
+        "Son cache contient {} sur {} en ce moment.",
+        "Su caché contiene {} de {} ahora.",
+    ),
+    ("Save its memory", "Enregistrer sa mémoire", "Guardar su memoria"),
+    ("Copy this token now", "Copiez ce jeton maintenant", "Copia este token ahora"),
+    ("Application {} created", "Application {} créée", "Aplicación {} creada"),
+    ("New token for {}", "Nouveau jeton pour {}", "Nuevo token para {}"),
+    ("New read-only token for {}", "Nouveau jeton en lecture seule pour {}", "Nuevo token de solo lectura para {}"),
+    (
+        "Read only: it may sit in a web page; nobody can change or erase your data with it.",
+        "Lecture seule : il peut figurer dans une page web ; personne ne pourra modifier ni effacer vos données avec lui.",
+        "Solo lectura: puede estar en una página web; nadie podrá cambiar ni borrar tus datos con él.",
     ),
     (
-        "restart the server: sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
-        "redémarrez le serveur : sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
-        "reinicia el servidor: sudo launchctl kickstart -k system/io.github.maxlestage.nuage",
+        "It will never be shown again, here or in the console: the server keeps only a fingerprint of it. If you lose it, make another one.",
+        "Il ne sera plus jamais affiché, ni ici ni dans la console : le serveur n'en garde qu'une empreinte. Si vous le perdez, créez-en un autre.",
+        "No se volverá a mostrar nunca, ni aquí ni en la consola: el servidor solo guarda una huella. Si lo pierdes, crea otro.",
     ),
     (
-        "restart the server: sudo systemctl restart nuage",
-        "redémarrez le serveur : sudo systemctl restart nuage",
-        "reinicia el servidor: sudo systemctl restart nuage",
+        "For your website or program (its .env file, or its host's variables):",
+        "Pour votre site ou programme (son fichier .env, ou les variables de son hébergeur) :",
+        "Para tu sitio web o programa (su archivo .env, o las variables de su alojamiento):",
+    ),
+    ("Hide the token", "Masquer le jeton", "Ocultar el token"),
+    ("Show the token", "Afficher le jeton", "Mostrar el token"),
+    ("Copy both lines", "Copier les deux lignes", "Copiar las dos líneas"),
+    ("Copy the token only", "Copier le jeton seul", "Copiar solo el token"),
+    ("Test the token", "Tester le jeton", "Probar el token"),
+    (
+        "This address works for a program on this computer. On another device of your network, use http://{}:{} instead (if this computer's firewall lets it in). A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
+        "Cette adresse fonctionne pour un programme de cet ordinateur. Sur un autre appareil de votre réseau, utilisez plutôt http://{}:{} (si le pare-feu de cet ordinateur le laisse entrer). Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
+        "Esta dirección sirve para un programa de este equipo. En otro dispositivo de tu red, usa en su lugar http://{}:{} (si el cortafuegos de este equipo lo deja entrar). Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
     ),
     (
-        "{} has no management token (NUAGE_ADMIN_TOKEN), so the server's management API is off. The installer writes one only when it installs Nuage DB for the first time, not when it updates it: running it again adds none. To add one, as an administrator: add a line NUAGE_ADMIN_TOKEN= followed by 32 characters or more to that file (nuage genkey makes 64), then {}. Then come back here.",
-        "{} n'a pas de jeton de gestion (NUAGE_ADMIN_TOKEN) : l'API de gestion du serveur est donc fermée. L'installateur n'en écrit un que lorsqu'il installe Nuage DB pour la première fois, pas lors d'une mise à jour : le relancer n'en ajoute aucun. Pour en ajouter un, en administrateur : ajoutez à ce fichier une ligne NUAGE_ADMIN_TOKEN= suivie d'au moins 32 caractères (nuage genkey en donne 64), puis {}. Revenez ensuite ici.",
-        "{} no tiene token de gestión (NUAGE_ADMIN_TOKEN), así que la API de gestión del servidor está desactivada. El instalador solo escribe uno cuando instala Nuage DB por primera vez, no cuando lo actualiza: volver a ejecutarlo no añade ninguno. Para añadir uno, como administrador: añade a ese archivo una línea NUAGE_ADMIN_TOKEN= seguida de 32 caracteres o más (nuage genkey da 64) y después {}. Luego vuelve aquí.",
+        "This address works for a program on this computer. A website hosted on the Internet cannot reach a Nuage DB on this computer: it needs a public https address, or a Nuage DB online such as on Heroku.",
+        "Cette adresse fonctionne pour un programme de cet ordinateur. Un site hébergé sur Internet ne peut pas joindre un Nuage DB de cet ordinateur : il lui faut une adresse https publique, ou un Nuage DB en ligne, par exemple sur Heroku.",
+        "Esta dirección sirve para un programa de este equipo. Un sitio alojado en Internet no puede llegar a un Nuage DB de este equipo: necesita una dirección https pública, o un Nuage DB en línea, por ejemplo en Heroku.",
+    ),
+    ("In a web page", "Dans une page web", "En una página web"),
+    (
+        "No website may call this application yet: browsers will refuse calls from a page until you add its address under Websites allowed.",
+        "Aucun site ne peut encore appeler cette application : les navigateurs refuseront les appels d'une page tant que vous n'aurez pas ajouté son adresse dans Sites web autorisés.",
+        "Ningún sitio puede llamar todavía a esta aplicación: los navegadores rechazarán las llamadas de una página hasta que añadas su dirección en Sitios web autorizados.",
+    ),
+    ("Go to Websites allowed", "Aller aux sites web autorisés", "Ir a Sitios web autorizados"),
+    ("Websites allowed: {}.", "Sites autorisés : {}.", "Sitios permitidos: {}."),
+    (
+        "Paste this in the page's script:",
+        "Collez ceci dans le script de la page :",
+        "Pega esto en el script de la página:",
+    ),
+    ("Copy for the web page", "Copier pour la page web", "Copiar para la página web"),
+    (
+        "Then restart your website or program so it reads these lines. Its application page shows its first connection.",
+        "Ensuite, redémarrez votre site ou programme pour qu'il lise ces lignes. La page de l'application montre sa première connexion.",
+        "Después, reinicia tu sitio web o programa para que lea estas líneas. La página de la aplicación muestra su primera conexión.",
     ),
     (
-        "Its settings file is for administrators only (it holds the encryption key). Windows asks for an administrator's consent: its window names Windows Command Processor, verified publisher Microsoft Windows, and its details show the command. That command runs findstr, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
-        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). Windows demande l'accord d'un administrateur : sa fenêtre nomme Processeur de commandes Windows, éditeur vérifié Microsoft Windows, et ses détails montrent la commande. Cette commande lance findstr, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
-        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). Windows pide el consentimiento de un administrador: su ventana nombra Procesador de comandos de Windows, editor comprobado Microsoft Windows, y sus detalles muestran el comando. Ese comando ejecuta findstr, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
+        "Close without copying the token? It cannot be shown again.",
+        "Fermer sans avoir copié le jeton ? Il ne pourra plus être affiché.",
+        "¿Cerrar sin haber copiado el token? No se podrá volver a mostrar.",
+    ),
+    ("Back", "Revenir", "Volver"),
+    ("Close anyway", "Fermer quand même", "Cerrar de todos modos"),
+    ("I have copied it", "Je l'ai copié", "Lo he copiado"),
+    (
+        "The clipboard is empty again.",
+        "Le presse-papiers est de nouveau vide.",
+        "El portapapeles vuelve a estar vacío.",
+    ),
+    ("Clear the clipboard", "Vider le presse-papiers", "Vaciar el portapapeles"),
+    (
+        "It works: it opens {}, {} ({} ms), tested from this computer through {}.",
+        "Il fonctionne : il ouvre {}, en {} ({} ms), testé depuis cet ordinateur via {}.",
+        "Funciona: abre {}, con acceso de {} ({} ms), probado desde este equipo a través de {}.",
     ),
     (
-        "Its settings file is for administrators only (it holds the encryption key). macOS asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
-        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). macOS demande le mot de passe d'un administrateur, puis lance grep en administrateur, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
-        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). macOS pide la contraseña de un administrador y luego ejecuta grep como administrador, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
+        "The server does not recognise this token: make another one.",
+        "Le serveur ne reconnaît pas ce jeton : créez-en un autre.",
+        "El servidor no reconoce este token: crea otro.",
     ),
     (
-        "Its settings file is for administrators only (it holds the encryption key). Your system asks for an administrator's password, then runs grep as administrator, which reads four lines of the file: PORT, NUAGE_ADMIN_TOKEN, SITE_URL and NUAGE_BIND. The encryption key is not read.",
-        "Son fichier de réglages est réservé aux administrateurs (il contient la clé de chiffrement). Votre système demande le mot de passe d'un administrateur, puis lance grep en administrateur, qui lit quatre lignes du fichier : PORT, NUAGE_ADMIN_TOKEN, SITE_URL et NUAGE_BIND. La clé de chiffrement n'est pas lue.",
-        "Su archivo de ajustes es solo para administradores (contiene la clave de cifrado). Tu sistema pide la contraseña de un administrador y luego ejecuta grep como administrador, que lee cuatro líneas del archivo: PORT, NUAGE_ADMIN_TOKEN, SITE_URL y NUAGE_BIND. La clave de cifrado no se lee.",
+        "The test could not reach the server; the token itself is fine. Test again in a moment.",
+        "Le test n'a pas pu joindre le serveur ; le jeton lui-même n'est pas en cause. Testez à nouveau dans un instant.",
+        "La prueba no pudo llegar al servidor; el token en sí está bien. Vuelve a probar en un momento.",
+    ),
+    (
+        "nuage_{}… of {} will open nothing any more: what uses it (a site, a script) loses access at once. It cannot be undone; make a new token instead.",
+        "nuage_{}… de {} n'ouvrira plus rien : ce qui l'utilise (un site, un script) perd l'accès tout de suite. Cela ne s'annule pas ; créez plutôt un nouveau jeton.",
+        "nuage_{}… de {} ya no abrirá nada: lo que lo usa (un sitio, un script) pierde el acceso al momento. No se puede deshacer; crea un token nuevo en su lugar.",
+    ),
+    ("Keep it", "Le garder", "Conservarlo"),
+    ("This computer", "Cet ordinateur", "Este equipo"),
+    ("Tools", "Outils", "Herramientas"),
+    ("About", "À propos", "Acerca de"),
+    ("The editor ran into a bug", "L'éditeur a rencontré un bug", "El editor encontró un error de programa"),
+    (
+        "It stopped what it was showing. A change already sent to the server may or may not have been carried out: check after reconnecting.",
+        "Il a arrêté ce qu'il montrait. Un changement déjà envoyé au serveur a pu être fait ou non : vérifiez après vous être reconnecté.",
+        "Detuvo lo que mostraba. Puede que un cambio ya enviado al servidor se haya hecho o no: compruébalo al volver a conectarte.",
+    ),
+    ("Details", "Détails", "Detalles"),
+    ("Nuage DB Editor", "Nuage DB Éditeur", "Nuage DB Editor"),
+    (
+        "The server no longer accepts this token: it was changed on the server. Type the new one.",
+        "Le serveur n'accepte plus ce jeton : il a été changé sur le serveur. Tapez le nouveau.",
+        "El servidor ya no acepta este token: se cambió en el servidor. Escribe el nuevo.",
+    ),
+    (
+        "Everything the editor kept on this computer is forgotten.",
+        "Tout ce que l'éditeur gardait sur cet ordinateur est oublié.",
+        "Todo lo que el editor guardaba en este equipo está olvidado.",
+    ),
+    (
+        "The token of {} could not be removed from {}. Remove the entry io.github.maxlestage.nuage-editor yourself in Keychain Access, Credential Manager or your keyring.",
+        "Le jeton de {} n'a pas pu être retiré de {}. Retirez vous-même l'entrée io.github.maxlestage.nuage-editor dans Trousseaux d'accès, le Gestionnaire d'identification ou votre trousseau.",
+        "No se pudo quitar el token de {} de {}. Quita tú la entrada io.github.maxlestage.nuage-editor en Acceso a Llaveros, el Administrador de credenciales o tu llavero.",
+    ),
+    (
+        "This one looks like an application's token.",
+        "Celui-ci ressemble au jeton d'une application.",
+        "Este parece el token de una aplicación.",
+    ),
+    (
+        "Read: port {}, management token found, public address {}.",
+        "Lu : port {}, jeton de gestion trouvé, adresse publique {}.",
+        "Leído: puerto {}, token de gestión encontrado, dirección pública {}.",
+    ),
+    (
+        "Read: port {}, management token found.",
+        "Lu : port {}, jeton de gestion trouvé.",
+        "Leído: puerto {}, token de gestión encontrado.",
+    ),
+    (
+        "A change is on its way: wait for its answer.",
+        "Un changement est en route : attendez sa réponse.",
+        "Hay un cambio en camino: espera su respuesta.",
+    ),
+    ("Open the live dashboard", "Ouvrir le tableau de bord en direct", "Abrir el panel en directo"),
+    ("Encrypted (HTTPS)", "Chiffré (HTTPS)", "Cifrado (HTTPS)"),
+    ("Not encrypted: this computer only", "Non chiffré : cet ordinateur seulement", "Sin cifrar: solo este equipo"),
+    ("Not encrypted: local network", "Non chiffré : réseau local", "Sin cifrar: red local"),
+    ("Not encrypted: Internet", "Non chiffré : Internet", "Sin cifrar: Internet"),
+    ("Language: as the system ({})", "Langue : comme le système ({})", "Idioma: como el sistema ({})"),
+    (
+        "No website may call {} from a page any more.",
+        "Plus aucun site ne peut appeler {} depuis une page.",
+        "Ya ningún sitio puede llamar a {} desde una página.",
+    ),
+    (
+        "Saved: pages of {} may call {} now.",
+        "Enregistré : les pages de {} peuvent appeler {} dès maintenant.",
+        "Guardado: las páginas de {} ya pueden llamar a {}.",
+    ),
+    (
+        "There is already an application named {}: choose another name.",
+        "Il y a déjà une application « {} » : choisissez un autre nom.",
+        "Ya hay una aplicación llamada {}: elige otro nombre.",
+    ),
+    ("Not created:", "Non créée :", "No creada:"),
+    ("This token was already revoked.", "Ce jeton était déjà révoqué.", "Este token ya estaba revocado."),
+    (
+        "Detail from the server (in English): {}",
+        "Détail donné par le serveur (en anglais) : {}",
+        "Detalle del servidor (en inglés): {}",
+    ),
+    ("Saving…", "Enregistrement…", "Guardando…"),
+    (
+        "{} ({} s; the editor waits up to {} s)",
+        "{} ({} s ; l'éditeur attend jusqu'à {} s)",
+        "{} ({} s; el editor espera hasta {} s)",
+    ),
+    ("Could not refresh: {}", "Actualisation impossible : {}", "No se pudo actualizar: {}"),
+    ("What is shown is as of {}.", "Ce qui est affiché date de {}.", "Lo que se muestra es de las {}."),
+    ("Try again", "Réessayer", "Reintentar"),
+    (
+        "You cancelled: nothing was read. Try again, or paste the token yourself.",
+        "Vous avez annulé : rien n'a été lu. Réessayez, ou collez le jeton vous-même.",
+        "Has cancelado: no se ha leído nada. Vuelve a intentarlo, o pega el token tú mismo.",
+    ),
+    (
+        "The password was not accepted, or this account cannot act as administrator ({}). If someone else installed Nuage DB, ask them to press Continue once in your session.",
+        "Le mot de passe n'a pas été accepté, ou ce compte ne peut pas agir en administrateur ({}). Si quelqu'un d'autre a installé Nuage DB, demandez-lui d'appuyer une fois sur Continuer dans votre session.",
+        "No se aceptó la contraseña, o esta cuenta no puede actuar como administrador ({}). Si otra persona instaló Nuage DB, pídele que pulse una vez Continuar en tu sesión.",
+    ),
+    (
+        "This desktop cannot show a password window ({}): paste the token instead; it is the line NUAGE_ADMIN_TOKEN= of the settings file.",
+        "Ce bureau ne peut pas afficher de fenêtre de mot de passe ({}) : collez plutôt le jeton ; c'est la ligne NUAGE_ADMIN_TOKEN= du fichier de réglages.",
+        "Este escritorio no puede mostrar una ventana de contraseña ({}): pega el token en su lugar; es la línea NUAGE_ADMIN_TOKEN= del archivo de ajustes.",
+    ),
+    (
+        "The settings file could not be read: {}.",
+        "Le fichier de réglages n'a pas pu être lu : {}.",
+        "No se pudo leer el archivo de ajustes: {}.",
+    ),
+    (
+        "Windows did not hand the file over (code {}). Try again; if it fails again, paste the token.",
+        "Windows n'a pas transmis le fichier (code {}). Réessayez ; si cela échoue encore, collez le jeton.",
+        "Windows no entregó el archivo (código {}). Vuelve a intentarlo; si falla otra vez, pega el token.",
+    ),
+    (
+        "Windows did not hand the file over. Try again; if it fails again, paste the token.",
+        "Windows n'a pas transmis le fichier. Réessayez ; si cela échoue encore, collez le jeton.",
+        "Windows no entregó el archivo. Vuelve a intentarlo; si falla otra vez, pega el token.",
+    ),
+    (
+        "This server has no management token: its settings file ({}) has no line NUAGE_ADMIN_TOKEN= (Linux servers installed before version 0.4.2). An administrator adds one, with a token from Tools, Generate a token, then restarts the service.",
+        "Ce serveur n'a pas de jeton de gestion : son fichier de réglages ({}) n'a pas de ligne NUAGE_ADMIN_TOKEN= (serveurs Linux installés avant la version 0.4.2). Un administrateur en ajoute une, avec un jeton donné par Outils, Générer un jeton, puis redémarre le service.",
+        "Este servidor no tiene token de gestión: su archivo de ajustes ({}) no tiene línea NUAGE_ADMIN_TOKEN= (servidores Linux instalados antes de la versión 0.4.2). Un administrador añade una, con un token de Herramientas, Generar un token, y reinicia el servicio.",
+    ),
+    (
+        "Saved and in force, but not yet in the backup: a restart of the server now would bring the earlier value back.",
+        "Enregistré et en vigueur, mais pas encore dans la sauvegarde : un redémarrage du serveur maintenant ferait revenir l'ancienne valeur.",
+        "Guardado y en vigor, pero aún no en la copia de seguridad: un reinicio del servidor ahora traería de vuelta el valor anterior.",
+    ),
+    (
+        "This version of Nuage DB changes the websites in the web console only. The console asks for its password (NUAGE_ADMIN_PASSWORD).",
+        "Cette version de Nuage DB ne change les sites web que dans la console web. La console demande son mot de passe (NUAGE_ADMIN_PASSWORD).",
+        "Esta versión de Nuage DB solo cambia los sitios web en la consola web. La consola pide su contraseña (NUAGE_ADMIN_PASSWORD).",
+    ),
+    (
+        "Nuage DB keeps its settings in a file only administrators can read (/etc/nuage/nuage.env): it holds the encryption key. Your computer will now ask for your password.",
+        "Nuage DB garde ses réglages dans un fichier que seuls les administrateurs peuvent lire (/etc/nuage/nuage.env) : il contient la clé de chiffrement. Votre ordinateur va vous demander votre mot de passe.",
+        "Nuage DB guarda sus ajustes en un archivo que solo los administradores pueden leer (/etc/nuage/nuage.env): contiene la clave de cifrado. Tu equipo te va a pedir tu contraseña.",
+    ),
+    (
+        "Nuage DB keeps its settings in a file only administrators can read (/usr/local/etc/nuage/nuage.env): it holds the encryption key. This Mac will now ask for an administrator's name and password.",
+        "Nuage DB garde ses réglages dans un fichier que seuls les administrateurs peuvent lire (/usr/local/etc/nuage/nuage.env) : il contient la clé de chiffrement. Ce Mac va demander le nom et le mot de passe d'un administrateur.",
+        "Nuage DB guarda sus ajustes en un archivo que solo los administradores pueden leer (/usr/local/etc/nuage/nuage.env): contiene la clave de cifrado. Este Mac va a pedir el nombre y la contraseña de un administrador.",
+    ),
+    (
+        "Nuage DB keeps its settings in a file only administrators can read (C:\\ProgramData\\Nuage\\nuage.env). Windows will now ask for permission. Its window names the Windows Command Processor, published by Microsoft: that is expected, the editor uses it to read four lines of this file, and changes nothing.",
+        "Nuage DB garde ses réglages dans un fichier que seuls les administrateurs peuvent lire (C:\\ProgramData\\Nuage\\nuage.env). Windows va vous demander une autorisation : sa fenêtre parle du « Processeur de commandes Windows », publié par Microsoft. C'est normal : l'éditeur s'en sert pour lire quatre lignes de ce fichier, et ne modifie rien.",
+        "Nuage DB guarda sus ajustes en un archivo que solo los administradores pueden leer (C:\\ProgramData\\Nuage\\nuage.env). Windows te va a pedir permiso: su ventana nombra el «Procesador de comandos de Windows», publicado por Microsoft. Es normal: el editor lo usa para leer cuatro líneas de este archivo, y no cambia nada.",
+    ),
+    (
+        "Copied. It stays in the clipboard until you copy something else; the clipboard history is asked to skip it. On Linux, what you copy may disappear when the editor closes: paste it first.",
+        "Copié. Il reste dans le presse-papiers jusqu'à la prochaine copie ; l'historique du presse-papiers est prié de l'ignorer. Sous Linux, ce que vous copiez peut disparaître à la fermeture de l'éditeur : collez-le avant.",
+        "Copiado. Se queda en el portapapeles hasta que copies otra cosa; se pide al historial del portapapeles que lo ignore. En Linux, lo que copias puede desaparecer al cerrar el editor: pégalo antes.",
+    ),
+    ("Nuage DB answers", "Nuage DB répond", "Nuage DB responde"),
+    (
+        "Newer versions of Nuage DB tell the editor their version, their memory and whether the last backup worked: update the server to see it here.",
+        "Les versions plus récentes de Nuage DB disent à l'éditeur leur version, leur mémoire et si la dernière sauvegarde a fonctionné : mettez le serveur à jour pour le voir ici.",
+        "Las versiones más recientes de Nuage DB le dicen al editor su versión, su memoria y si la última copia de seguridad funcionó: actualiza el servidor para verlo aquí.",
+    ),
+    ("See them", "Les voir", "Verlas"),
+    (
+        "This server does not say its memory to the editor.",
+        "Ce serveur ne dit pas sa mémoire à l'éditeur.",
+        "Este servidor no le dice su memoria al editor.",
+    ),
+    ("Change", "Régler", "Ajustar"),
+    ("How to change where they go", "Changer de destination", "Cambiar el destino"),
+    (
+        "The destination is chosen when Nuage DB is installed: run the installer again with another destination (the guide shows the line). On Heroku: Settings, then Config Vars, the NUAGE_BACKUP_S3_* variables. The server restarts and keeps its data.",
+        "La destination se choisit à l'installation de Nuage DB : relancez l'installateur avec une autre destination (le guide montre la ligne). Sur Heroku : Settings, puis Config Vars, les variables NUAGE_BACKUP_S3_*. Le serveur redémarre et garde ses données.",
+        "El destino se elige al instalar Nuage DB: vuelve a ejecutar el instalador con otro destino (la guía muestra la línea). En Heroku: Settings, luego Config Vars, las variables NUAGE_BACKUP_S3_*. El servidor se reinicia y conserva sus datos.",
+    ),
+    ("Open the guide", "Ouvrir le guide", "Abrir la guía"),
+    ("Updated {}", "Mis à jour {}", "Actualizado {}"),
+    ("running for {}", "en marche depuis {}", "en marcha desde hace {}"),
+    ("version {}", "version {}", "versión {}"),
+    (
+        "everything it stores is encrypted ({})",
+        "tout ce qu'il stocke est chiffré ({})",
+        "todo lo que guarda está cifrado ({})",
+    ),
+    (
+        "its data is not encrypted on its disk",
+        "ses données ne sont pas chiffrées sur son disque",
+        "sus datos no están cifrados en su disco",
+    ),
+    ("{} application", "{} application", "{} aplicación"),
+    ("{} applications", "{} applications", "{} aplicaciones"),
+    ("{} · last connection {} ({})", "{} · dernière connexion {} ({})", "{} · última conexión {} ({})"),
+    (
+        "Nuage DB uses {} · this server has {}, {} free",
+        "Nuage DB occupe {} · ce serveur a {}, dont {} libres",
+        "Nuage DB ocupa {} · este servidor tiene {}, de los que {} están libres",
+    ),
+    (
+        "No backup: if this server's disk fails, its data is lost.",
+        "Aucune sauvegarde : si le disque de ce serveur lâche, ses données sont perdues.",
+        "Ninguna copia de seguridad: si el disco de este servidor falla, sus datos se pierden.",
+    ),
+    (
+        "On Heroku the disk is emptied at every restart, at least once a day.",
+        "Sur Heroku, le disque est vidé à chaque redémarrage, au moins une fois par jour.",
+        "En Heroku, el disco se vacía en cada reinicio, al menos una vez al día.",
+    ),
+    ("Backups go to {}.", "Les sauvegardes vont vers {}.", "Las copias de seguridad van a {}."),
+    (
+        "Newer versions of Nuage DB tell the editor whether the last copy worked: update the server to see it here.",
+        "Les versions plus récentes de Nuage DB disent à l'éditeur si la dernière copie a fonctionné : mettez le serveur à jour pour le voir ici.",
+        "Las versiones más recientes de Nuage DB le dicen al editor si la última copia funcionó: actualiza el servidor para verlo aquí.",
+    ),
+    (
+        "The last copy failed: {}. The data is safe on the server's disk, but not copied elsewhere.",
+        "La dernière copie a échoué : {}. Les données sont sur le disque du serveur, mais pas copiées ailleurs.",
+        "La última copia falló: {}. Los datos están a salvo en el disco del servidor, pero no copiados en otro sitio.",
+    ),
+    ("Last copy {}, to {}", "Dernière copie {}, vers {}", "Última copia {}, a {}"),
+    (
+        "Waiting for the first copy, to {}",
+        "En attente de la première copie, vers {}",
+        "Esperando la primera copia, a {}",
+    ),
+    (
+        "The settings of this server are those of its environment (NUAGE_SETTINGS=environment): the editor shows them and cannot change them.",
+        "Les réglages de ce serveur sont ceux de son environnement (NUAGE_SETTINGS=environment) : l'éditeur les montre et ne peut pas les changer.",
+        "Los ajustes de este servidor son los de su entorno (NUAGE_SETTINGS=environment): el editor los muestra y no puede cambiarlos.",
+    ),
+    ("Reading the settings…", "Lecture des réglages…", "Leyendo los ajustes…"),
+    (
+        "Nuage DB uses {} now. This server has {}, {} of it free.",
+        "Nuage DB occupe {} en ce moment. Ce serveur a {}, dont {} libres.",
+        "Nuage DB ocupa {} ahora. Este servidor tiene {}, de los que {} están libres.",
+    ),
+    (
+        "Amounts are written auto, 512 MiB or 2 GiB (a number alone is in MiB). In force at once, with no restart.",
+        "Les quantités s'écrivent auto, 512 Mio ou 2 Gio (un nombre seul est en Mio). En vigueur tout de suite, sans redémarrage.",
+        "Las cantidades se escriben auto, 512 MiB o 2 GiB (un número solo va en MiB). En vigor al momento, sin reiniciar.",
+    ),
+    (
+        "In force at once, with no restart.",
+        "En vigueur tout de suite, sans redémarrage.",
+        "En vigor al momento, sin reiniciar.",
+    ),
+    (
+        "Each has a thread; the next ones are refused as PostgreSQL does. Between 1 and 10 000.",
+        "Chacune a un thread ; les suivantes sont refusées, comme le fait PostgreSQL. Entre 1 et 10 000.",
+        "Cada una tiene un hilo; las siguientes se rechazan, como hace PostgreSQL. Entre 1 y 10 000.",
+    ),
+    (
+        "PostgreSQL connections at once: {} is not between 1 and 10 000.",
+        "Connexions PostgreSQL simultanées : {} n'est pas entre 1 et 10 000.",
+        "Conexiones PostgreSQL simultáneas: {} no está entre 1 y 10 000.",
+    ),
+    (
+        "Public status: /api/status and the dashboard show a public subset without signing in",
+        "État public : /api/status et le tableau de bord montrent l'essentiel sans connexion",
+        "Estado público: /api/status y el panel muestran una parte pública sin iniciar sesión",
+    ),
+    (
+        "This version does not list them: the console's Server page does.",
+        "Cette version ne les liste pas : la page Serveur de la console, si.",
+        "Esta versión no los lista: la página Servidor de la consola, sí.",
+    ),
+    (
+        "The server reads these before it opens its data, or they are what it listens on and what opens it: a wrong value could lock you out, so they are not changed from here.",
+        "Le serveur les lit avant d'ouvrir ses données, ou bien ce sont ses ports et ce qui lui donne accès : une mauvaise valeur pourrait vous en fermer la porte, alors ils ne se changent pas d'ici.",
+        "El servidor los lee antes de abrir sus datos, o son sus puertos y lo que da acceso a él: un valor erróneo podría dejarte fuera, así que no se cambian desde aquí.",
+    ),
+    (
+        "On the server's computer: its settings file {}, then a restart of its service.",
+        "Sur l'ordinateur du serveur : son fichier de réglages {}, puis un redémarrage de son service.",
+        "En el equipo del servidor: su archivo de ajustes {}, y luego un reinicio de su servicio.",
+    ),
+    (
+        "On Heroku: Settings, then Config Vars; Heroku restarts the server by itself.",
+        "Sur Heroku : Settings, puis Config Vars ; Heroku redémarre le serveur tout seul.",
+        "En Heroku: Settings, luego Config Vars; Heroku reinicia el servidor por su cuenta.",
+    ),
+    (
+        "In the server's environment (a host's variables, Docker's .env), then a restart.",
+        "Dans l'environnement du serveur (les variables d'un hébergeur, le .env de Docker), puis un redémarrage.",
+        "En el entorno del servidor (las variables de un alojamiento, el .env de Docker), y luego un reinicio.",
+    ),
+    ("not set", "non réglé", "no definido"),
+    ("Show the ones not set", "Montrer ceux qui ne sont pas réglés", "Mostrar los que no están definidos"),
+    ("Welcome", "Bienvenue", "Bienvenido"),
+    (
+        "This editor looks after your Nuage DB server without a terminal: see that it works, create an application for your website, choose how much memory it uses.",
+        "Cet éditeur s'occupe de votre serveur Nuage DB sans terminal : voir qu'il fonctionne, créer une application pour votre site, choisir la mémoire qu'il utilise.",
+        "Este editor se ocupa de tu servidor Nuage DB sin terminal: ver que funciona, crear una aplicación para tu sitio web, elegir cuánta memoria usa.",
+    ),
+    (
+        "The editor changes nothing by itself: every change is a button you press, and it says what it did.",
+        "L'éditeur ne change rien de lui-même : chaque changement est un bouton que vous pressez, et il dit ce qu'il a fait.",
+        "El editor no cambia nada por su cuenta: cada cambio es un botón que pulsas, y dice lo que ha hecho.",
+    ),
+    ("Connecting", "Connexion", "Conexión en curso"),
+    ("Looking for the server…", "Recherche du serveur…", "Buscando el servidor…"),
+    ("Checking the token…", "Vérification du jeton…", "Comprobando el token…"),
+    ("Change the address or the token", "Changer l'adresse ou le jeton", "Cambiar la dirección o el token"),
+    (
+        "Stopped waiting. The server may still answer later; nothing was changed.",
+        "Attente arrêtée. Le serveur répondra peut-être plus tard ; rien n'a été changé.",
+        "Se dejó de esperar. Puede que el servidor responda más tarde; no se ha cambiado nada.",
+    ),
+    (
+        "Read the management token of Nuage DB",
+        "Lire le jeton de gestion de Nuage DB",
+        "Leer el token de gestión de Nuage DB",
+    ),
+    (
+        "Only four lines are read: NUAGE_ADMIN_TOKEN, PORT, NUAGE_BIND and SITE_URL. The encryption key and the passwords are not read.",
+        "Seules quatre lignes sont lues : NUAGE_ADMIN_TOKEN, PORT, NUAGE_BIND et SITE_URL. La clé de chiffrement et les mots de passe ne sont pas lus.",
+        "Solo se leen cuatro líneas: NUAGE_ADMIN_TOKEN, PORT, NUAGE_BIND y SITE_URL. La clave de cifrado y las contraseñas no se leen.",
+    ),
+    (
+        "This desktop cannot show a password window ({}): paste the token instead; it is the line NUAGE_ADMIN_TOKEN= of {}.",
+        "Ce bureau ne peut pas afficher de fenêtre de mot de passe ({}) : collez plutôt le jeton ; c'est la ligne NUAGE_ADMIN_TOKEN= de {}.",
+        "Este escritorio no puede mostrar una ventana de contraseña ({}): pega el token en su lugar; es la línea NUAGE_ADMIN_TOKEN= de {}.",
+    ),
+    (
+        "Waiting for your answer in the system's window…",
+        "En attente de votre réponse dans la fenêtre du système…",
+        "Esperando tu respuesta en la ventana del sistema…",
+    ),
+    (
+        "Windows' window cannot be withdrawn from here: answer it, or close it.",
+        "La fenêtre de Windows ne peut pas être retirée d'ici : répondez-y, ou fermez-la.",
+        "La ventana de Windows no se puede retirar desde aquí: respóndela o ciérrala.",
+    ),
+    ("Continue", "Continuer", "Continuar"),
+    ("I have the token, I'll paste it", "J'ai le jeton, je le colle", "Tengo el token, lo pego"),
+    (
+        "Nuage DB on this computer — token kept in {}",
+        "Nuage DB sur cet ordinateur — jeton gardé dans {}",
+        "Nuage DB en este equipo: token guardado en {}",
+    ),
+    ("Open", "Ouvrir", "Abrir"),
+    (
+        "Nuage DB is installed on this computer.",
+        "Nuage DB est installé sur cet ordinateur.",
+        "Nuage DB está instalado en este equipo.",
+    ),
+    ("Nothing to type.", "Rien à taper.", "Nada que escribir."),
+    ("Open…", "Ouvrir…", "Abrir…"),
+    (
+        "Nuage DB seems installed, but its service is missing: installing it again repairs it; data and settings stay.",
+        "Nuage DB semble installé, mais son service manque : le réinstaller le répare ; données et réglages restent.",
+        "Nuage DB parece instalado, pero falta su servicio: volver a instalarlo lo repara; los datos y los ajustes se quedan.",
+    ),
+    ("Answers on port {}", "Répond sur le port {}", "Responde en el puerto {}"),
+    ("This computer…", "Cet ordinateur…", "Este equipo…"),
+    (
+        "Nuage DB answers on this computer (port 8080): Docker, or a server started by hand.",
+        "Nuage DB répond sur cet ordinateur (port 8080) : Docker, ou un serveur lancé à la main.",
+        "Nuage DB responde en este equipo (puerto 8080): Docker, o un servidor arrancado a mano.",
+    ),
+    ("Use this address", "Utiliser cette adresse", "Usar esta dirección"),
+    (
+        "My server is elsewhere: Heroku, a host, another computer",
+        "Mon serveur est ailleurs : Heroku, un hébergeur, un autre ordinateur",
+        "Mi servidor está en otro sitio: Heroku, un alojamiento, otro equipo",
+    ),
+    ("Server address", "Adresse du serveur", "Dirección del servidor"),
+    (
+        "The address you type to open the console, without /admin.",
+        "L'adresse que vous tapez pour ouvrir la console, sans /admin.",
+        "La dirección que escribes para abrir la consola, sin /admin.",
+    ),
+    (
+        "The value of NUAGE_ADMIN_TOKEN on the server (64 characters when the installer or Heroku made it). Not the console password, not an application's token (nuage_…).",
+        "La valeur de NUAGE_ADMIN_TOKEN sur le serveur (64 caractères quand l'installateur ou Heroku l'a créé). Ni le mot de passe de la console, ni le jeton d'une application (nuage_…).",
+        "El valor de NUAGE_ADMIN_TOKEN en el servidor (64 caracteres si lo creó el instalador o Heroku). Ni la contraseña de la consola, ni el token de una aplicación (nuage_…).",
+    ),
+    ("Where do I find it?", "Où le trouver ?", "¿Dónde lo encuentro?"),
+    ("Installed with the installer", "Installé avec l'installateur", "Instalado con el instalador"),
+    (
+        "1. Open your app in the Heroku dashboard. 2. Settings, then Reveal Config Vars. 3. Copy the value of NUAGE_ADMIN_TOKEN.",
+        "1. Ouvrez votre app dans le tableau de bord Heroku. 2. Settings, puis Reveal Config Vars. 3. Copiez la valeur de NUAGE_ADMIN_TOKEN.",
+        "1. Abre tu app en el panel de Heroku. 2. Settings, luego Reveal Config Vars. 3. Copia el valor de NUAGE_ADMIN_TOKEN.",
+    ),
+    ("Open the Heroku dashboard", "Ouvrir le tableau de bord Heroku", "Abrir el panel de Heroku"),
+    (
+        "No NUAGE_ADMIN_TOKEN there (a deploy from before 0.4.2)? Add one: name NUAGE_ADMIN_TOKEN, value from Generate a token. Heroku restarts the server by itself (about a minute).",
+        "Pas de NUAGE_ADMIN_TOKEN (un déploiement d'avant 0.4.2) ? Ajoutez-en un : nom NUAGE_ADMIN_TOKEN, valeur donnée par Générer un jeton. Heroku redémarre le serveur tout seul (environ une minute).",
+        "¿No hay NUAGE_ADMIN_TOKEN (un despliegue anterior a 0.4.2)? Añade uno: nombre NUAGE_ADMIN_TOKEN, valor dado por Generar un token. Heroku reinicia el servidor por su cuenta (alrededor de un minuto).",
+    ),
+    (
+        "On the server's computer, in its settings file, the line NUAGE_ADMIN_TOKEN= (Linux /etc/nuage/nuage.env, Mac /usr/local/etc/nuage/nuage.env, Windows C:\\ProgramData\\Nuage\\nuage.env); only an administrator of that computer can open it. Simplest: open the editor on that computer once.",
+        "Sur l'ordinateur du serveur, dans son fichier de réglages, la ligne NUAGE_ADMIN_TOKEN= (Linux /etc/nuage/nuage.env, Mac /usr/local/etc/nuage/nuage.env, Windows C:\\ProgramData\\Nuage\\nuage.env) ; seul un administrateur de cet ordinateur peut l'ouvrir. Le plus simple : ouvrir une fois l'éditeur sur cet ordinateur.",
+        "En el equipo del servidor, en su archivo de ajustes, la línea NUAGE_ADMIN_TOKEN= (Linux /etc/nuage/nuage.env, Mac /usr/local/etc/nuage/nuage.env, Windows C:\\ProgramData\\Nuage\\nuage.env); solo un administrador de ese equipo puede abrirlo. Lo más sencillo: abrir una vez el editor en ese equipo.",
+    ),
+    (
+        "In the .env file next to docker-compose.yml, the line NUAGE_ADMIN_TOKEN=. Without one: Generate a token, add the line, then restart the container.",
+        "Dans le fichier .env à côté de docker-compose.yml, la ligne NUAGE_ADMIN_TOKEN=. S'il n'y en a pas : Générer un jeton, ajoutez la ligne, puis redémarrez le conteneur.",
+        "En el archivo .env junto a docker-compose.yml, la línea NUAGE_ADMIN_TOKEN=. Si no la hay: Generar un token, añade la línea y reinicia el contenedor.",
+    ),
+    ("read from this computer", "lu sur cet ordinateur", "leído en este equipo"),
+    ("Forget this server?", "Oublier ce serveur ?", "¿Olvidar este servidor?"),
+    (
+        "Forget {}? Its kept token is deleted from {}.",
+        "Oublier {} ? Son jeton gardé est supprimé de {}.",
+        "¿Olvidar {}? Su token guardado se borra de {}.",
+    ),
+    ("Forget {}?", "Oublier {} ?", "¿Olvidar {}?"),
+    ("Forget everything on this computer?", "Tout oublier sur cet ordinateur ?", "¿Olvidarlo todo en este equipo?"),
+    (
+        "The servers you used and the language and theme chosen are forgotten, and every token the editor kept is deleted from {}. Your servers are not changed.",
+        "Les serveurs utilisés, la langue et le thème choisis sont oubliés, et chaque jeton gardé par l'éditeur est supprimé de {}. Vos serveurs ne sont pas modifiés.",
+        "Se olvidan los servidores usados, el idioma y el tema elegidos, y cada token guardado por el editor se borra de {}. Tus servidores no se modifican.",
+    ),
+    ("Forget everything", "Tout oublier", "Olvidarlo todo"),
+    (
+        "A change is being sent to {}. If you quit now it may or may not be carried out.",
+        "Un changement est en cours d'envoi à {}. Si vous quittez maintenant, il sera peut-être fait, peut-être pas.",
+        "Se está enviando un cambio a {}. Si sales ahora, puede que se haga o puede que no.",
+    ),
+    (
+        "A new token is shown and has not been copied: it cannot be shown again.",
+        "Un nouveau jeton est affiché et n'a pas été copié : il ne pourra plus être affiché.",
+        "Se muestra un token nuevo y no se ha copiado: no se podrá volver a mostrar.",
+    ),
+    ("Wait", "Attendre", "Esperar"),
+    ("Back to it", "Y revenir", "Volver a él"),
+    ("Quit anyway", "Quitter quand même", "Salir de todos modos"),
+    ("I don't have a server yet", "Je n'ai pas encore de serveur", "Aún no tengo servidor"),
+    (
+        "Installing Nuage DB on a computer takes one command, pasted once into Terminal (Mac, Linux) or into PowerShell opened as administrator (Windows). Online, the Deploy to Heroku button needs no command.",
+        "Installer Nuage DB sur un ordinateur demande une commande, collée une fois dans le Terminal (Mac, Linux) ou dans PowerShell ouvert en administrateur (Windows). En ligne, le bouton Deploy to Heroku n'en demande aucune.",
+        "Instalar Nuage DB en un equipo requiere una orden, pegada una vez en el Terminal (Mac, Linux) o en PowerShell abierto como administrador (Windows). En línea, el botón Deploy to Heroku no requiere ninguna.",
+    ),
+    (
+        "Copy the command for this computer",
+        "Copier la commande pour cet ordinateur",
+        "Copiar la orden para este equipo",
+    ),
+    ("Open the installation guide", "Ouvrir le guide d'installation", "Abrir la guía de instalación"),
+    ("Open Deploy to Heroku", "Ouvrir Deploy to Heroku", "Abrir Deploy to Heroku"),
+    ("Then come back here.", "Puis revenez ici.", "Luego vuelve aquí."),
+    (
+        "Your password will be asked once, to read its management token.",
+        "Votre mot de passe vous sera demandé une fois, pour lire son jeton de gestion.",
+        "Se te pedirá tu contraseña una vez, para leer su token de gestión.",
+    ),
+    (
+        "This Mac will ask for an administrator's name and password.",
+        "Ce Mac demandera le nom et le mot de passe d'un administrateur.",
+        "Este Mac pedirá el nombre y la contraseña de un administrador.",
+    ),
+    (
+        "Windows will ask an administrator's permission once, to read its management token.",
+        "Windows demandera une fois l'autorisation d'un administrateur, pour lire son jeton de gestion.",
+        "Windows pedirá una vez el permiso de un administrador, para leer su token de gestión.",
+    ),
+    ("Generate a token", "Générer un jeton", "Generar un token"),
+    ("Generate another", "En générer un autre", "Generar otro"),
+    (
+        "This system gave no random numbers: {}",
+        "Ce système n'a pas donné de nombres aléatoires : {}",
+        "Este sistema no ha dado números aleatorios: {}",
+    ),
+    ("Nuage DB answers.", "Nuage DB répond.", "Nuage DB responde."),
+    (
+        "It did not start within 60 s. Its log says why: {}. Restarting the computer starts it too.",
+        "Il n'a pas démarré en 60 s. Son journal dit pourquoi : {}. Redémarrer l'ordinateur le démarre aussi.",
+        "No arrancó en 60 s. Su registro dice por qué: {}. Reiniciar el equipo también lo arranca.",
+    ),
+    ("Its log: {}.", "Son journal : {}.", "Su registro: {}."),
+    (
+        "Test an application's connection",
+        "Tester la connexion d'une application",
+        "Probar la conexión de una aplicación",
+    ),
+    (
+        "What a website or a program does: it opens Nuage DB with an application's token.",
+        "Ce que fait un site ou un programme : il ouvre Nuage DB avec le jeton d'une application.",
+        "Lo que hace un sitio web o un programa: abre Nuage DB con el token de una aplicación.",
+    ),
+    ("Application token", "Jeton de l'application", "Token de la aplicación"),
+    ("Test", "Tester", "Probar"),
+    (
+        "Connected to Nuage DB {}: application {}, {}, branch {}, {} table(s) ({} ms).",
+        "Connecté à Nuage DB {} : application {}, {}, branche {}, {} table(s) ({} ms).",
+        "Conectado a Nuage DB {}: aplicación {}, {}, rama {}, {} tabla(s) ({} ms).",
+    ),
+    (
+        "The server answered, but refused this token.",
+        "Le serveur a répondu, mais a refusé ce jeton.",
+        "El servidor respondió, pero rechazó este token.",
+    ),
+    (
+        "Not a Nuage DB server of version 0.4 or later, or not this address.",
+        "Ce n'est pas un serveur Nuage DB de version 0.4 ou plus récente, ou pas à cette adresse.",
+        "No es un servidor Nuage DB de la versión 0.4 o posterior, o no en esta dirección.",
+    ),
+    (
+        "For NUAGE_ADMIN_TOKEN (Heroku Config Vars, Docker .env), or the NUAGE_ENCRYPTION_KEY of a new server. Never replace the NUAGE_ENCRYPTION_KEY of a server that already has data: its data and backups could no longer be read.",
+        "Pour NUAGE_ADMIN_TOKEN (Config Vars de Heroku, .env de Docker), ou la NUAGE_ENCRYPTION_KEY d'un nouveau serveur. Ne remplacez jamais la NUAGE_ENCRYPTION_KEY d'un serveur qui a déjà des données : ses données et ses sauvegardes ne pourraient plus être lues.",
+        "Para NUAGE_ADMIN_TOKEN (Config Vars de Heroku, .env de Docker), o la NUAGE_ENCRYPTION_KEY de un servidor nuevo. Nunca sustituyas la NUAGE_ENCRYPTION_KEY de un servidor que ya tiene datos: sus datos y sus copias de seguridad ya no se podrían leer.",
+    ),
+    ("Preferences", "Préférences", "Preferencias"),
+    ("Text size", "Taille du texte", "Tamaño del texto"),
+    (
+        "Ctrl + and Ctrl − change it too, until the editor closes.",
+        "Ctrl + et Ctrl − la changent aussi, jusqu'à la fermeture de l'éditeur.",
+        "Ctrl + y Ctrl − también lo cambian, hasta que se cierre el editor.",
+    ),
+    ("What the editor keeps", "Ce que l'éditeur garde", "Lo que guarda el editor"),
+    (
+        "Nuage DB Editor {}. It keeps no data of its own besides your preferences, and sends nothing to anyone but your servers.",
+        "Nuage DB Éditeur {}. Il ne garde aucune donnée à lui en dehors de vos préférences, et n'envoie rien à personne d'autre que vos serveurs.",
+        "Nuage DB Editor {}. No guarda ningún dato propio aparte de tus preferencias, y no envía nada a nadie más que a tus servidores.",
+    ),
+    (
+        "Your preferences are kept in {} (never a token).",
+        "Vos préférences sont gardées dans {} (jamais un jeton).",
+        "Tus preferencias se guardan en {} (nunca un token).",
+    ),
+    (
+        "Your preferences are kept until the editor closes (never a token).",
+        "Vos préférences sont gardées jusqu'à la fermeture de l'éditeur (jamais un jeton).",
+        "Tus preferencias se guardan hasta que se cierre el editor (nunca un token).",
+    ),
+    ("Kept tokens: {}, in {}.", "Jetons gardés : {}, dans {}.", "Tokens guardados: {}, en {}."),
+    ("Forget everything on this computer", "Tout oublier sur cet ordinateur", "Olvidarlo todo en este equipo"),
+    (
+        "Add the editor to the applications menu",
+        "Ajouter l'éditeur au menu des applications",
+        "Añadir el editor al menú de aplicaciones",
+    ),
+    (
+        "Added: {}. If you move the editor, press it again.",
+        "Ajouté : {}. Si vous déplacez l'éditeur, appuyez à nouveau.",
+        "Añadido: {}. Si mueves el editor, vuelve a pulsarlo.",
+    ),
+    ("Open the license", "Ouvrir la licence", "Abrir la licencia"),
+    ("Nuage DB on this computer", "Nuage DB sur cet ordinateur", "Nuage DB en este equipo"),
+    (
+        "This computer has no systemd: the installer left Nuage DB to be started by hand.",
+        "Cet ordinateur n'a pas systemd : l'installateur a laissé Nuage DB à démarrer à la main.",
+        "Este equipo no tiene systemd: el instalador dejó Nuage DB para arrancarlo a mano.",
+    ),
+    (
+        "Starts with the computer: systemd service nuage.",
+        "Démarre avec l'ordinateur : service systemd nuage.",
+        "Arranca con el equipo: servicio systemd nuage.",
+    ),
+    (
+        "Starts with the computer: launchd daemon io.github.maxlestage.nuage.",
+        "Démarre avec l'ordinateur : démon launchd io.github.maxlestage.nuage.",
+        "Arranca con el equipo: demonio launchd io.github.maxlestage.nuage.",
+    ),
+    (
+        "Starts with the computer: scheduled task Nuage DB.",
+        "Démarre avec l'ordinateur : tâche planifiée Nuage DB.",
+        "Arranca con el equipo: tarea programada Nuage DB.",
+    ),
+    ("Does not answer on port {}", "Ne répond pas sur le port {}", "No responde en el puerto {}"),
+    ("Check again", "Vérifier à nouveau", "Volver a comprobar"),
+    ("Settings file", "Fichier de réglages", "Archivo de ajustes"),
+    ("Log", "Journal", "Registro"),
+    ("Copy · {}", "Copier · {}", "Copiar · {}"),
+    (
+        "The editor starts the service; it never stops or restarts a running server. Your administrator password will be asked.",
+        "L'éditeur démarre le service ; il n'arrête ni ne redémarre jamais un serveur qui tourne. Votre mot de passe administrateur sera demandé.",
+        "El editor arranca el servicio; nunca detiene ni reinicia un servidor en marcha. Se te pedirá tu contraseña de administrador.",
+    ),
+    (
+        "Starting… waiting for Nuage DB to answer ({} s; 60 s at most; it restores from its backup if its data folder is empty).",
+        "Démarrage… en attente de la réponse de Nuage DB ({} s ; 60 s au plus ; il se restaure depuis sa sauvegarde si son dossier de données est vide).",
+        "Arrancando… esperando a que Nuage DB responda ({} s; 60 s como máximo; se restaura desde su copia si su carpeta de datos está vacía).",
+    ),
+    ("Start Nuage DB", "Démarrer Nuage DB", "Arrancar Nuage DB"),
+    (
+        "Its log: C:\\ProgramData\\Nuage\\nuage.log, readable by administrators.",
+        "Son journal : C:\\ProgramData\\Nuage\\nuage.log, lisible par les administrateurs.",
+        "Su registro: C:\\ProgramData\\Nuage\\nuage.log, legible por los administradores.",
+    ),
+    (
+        "Its log is in the system journal, unit nuage (GNOME Logs shows it).",
+        "Son journal est dans le journal du système, unité nuage (Journaux de GNOME le montre).",
+        "Su registro está en el diario del sistema, unidad nuage (Registros de GNOME lo muestra).",
     ),
 ];
 
@@ -794,13 +1399,138 @@ mod tests {
         assert_eq!(Lang::of_locale("fr-FR"), Lang::Fr);
         assert_eq!(Lang::of_locale("es_ES.UTF-8"), Lang::Es);
         assert_eq!(Lang::of_locale("de-DE"), Lang::En);
-        assert_eq!(tf(Lang::En, "{} of {}", &[&1, &2]), "1 of 2");
-        // Every text has the same `{}` in the three languages, and no text is twice.
+        // The person's order: the first language the editor speaks.
+        assert_eq!(Lang::of_locales(["de-DE", "fr-FR"]), Lang::Fr);
+        assert_eq!(Lang::of_locales(["en-FR", "fr-FR"]), Lang::En);
+        assert_eq!(Lang::of_locales(["es_MX"]), Lang::Es);
+        assert_eq!(Lang::of_locales(["de-DE", "it-IT"]), Lang::En);
+        assert_eq!(Lang::of_locales(Vec::<String>::new()), Lang::En);
+        assert_eq!(tf(Lang::En, "Connected to {}", &[&"n.example.com"]), "Connected to n.example.com");
+        // Every text has the same `{}` in the three languages, none is empty, and no text is twice.
         let mut seen = std::collections::HashSet::new();
         for (en, fr, es) in TEXTS {
             assert!(seen.insert(*en), "twice: {en}");
+            assert!(!en.trim().is_empty() && !fr.trim().is_empty() && !es.trim().is_empty(), "empty: {en}");
             let n = en.matches("{}").count();
             assert_eq!((fr.matches("{}").count(), es.matches("{}").count()), (n, n), "{en}");
         }
+    }
+
+    /// The string literals passed as the text of `t(…)` and `tf(…)` in `source`.
+    fn texts_in(source: &str) -> Vec<String> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i + 2 < chars.len() {
+            let call = match (chars.get(i), chars.get(i + 1), chars.get(i + 2)) {
+                (Some('t'), Some('('), _) => Some(i + 2),
+                (Some('t'), Some('f'), Some('(')) => Some(i + 3),
+                _ => None,
+            };
+            let starts = i == 0 || chars.get(i - 1).is_some_and(|c| !(c.is_alphanumeric() || *c == '_'));
+            let (Some(mut j), true) = (call, starts) else {
+                i += 1;
+                continue;
+            };
+            // The first argument, to the comma at its depth.
+            let mut depth = 0usize;
+            while let Some(&c) = chars.get(j) {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' if depth == 0 => break,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if chars.get(j) == Some(&',') {
+                j += 1;
+                while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'"') {
+                    let mut text = String::new();
+                    j += 1;
+                    while let Some(&c) = chars.get(j) {
+                        match c {
+                            '"' => break,
+                            '\\' => {
+                                j += 1;
+                                text.push(match chars.get(j) {
+                                    Some('n') => '\n',
+                                    Some(&other) => other,
+                                    None => break,
+                                });
+                            }
+                            c => text.push(c),
+                        }
+                        j += 1;
+                    }
+                    found.push(text);
+                }
+            }
+            i = j.max(i + 1);
+        }
+        found
+    }
+
+    fn sources(dir: &std::path::Path, into: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, into);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let mut source = std::fs::read_to_string(&path).unwrap();
+                // These tests' own examples are not texts of the window.
+                if path.ends_with("i18n.rs")
+                    && let Some(at) = source.find("#[cfg(test)]\nmod tests")
+                {
+                    source.truncate(at);
+                }
+                into.push((path.display().to_string(), source));
+            }
+        }
+    }
+
+    #[test]
+    fn every_text_of_the_sources_is_translated() {
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut used: Vec<(String, String)> = Vec::new();
+        for (file, source) in &files {
+            used.extend(texts_in(source).into_iter().map(|text| (file.clone(), text)));
+        }
+        used.extend(crate::app::CONSTANT_TEXTS.iter().map(|text| ("a constant".to_owned(), (*text).to_owned())));
+        assert!(used.len() > 300, "the scan found {} texts", used.len());
+        for (file, text) in &used {
+            assert!(table().contains_key(text.as_str()), "{file}: no translation for {text:?}");
+        }
+        // The scan reads what it should.
+        assert_eq!(texts_in(r#"x(t(l, "A"), tf(cx.l, "B {}", &[&f(1, 2)]), it(l, "C"), t(l, NAME))"#), ["A", "B {}"]);
+        assert_eq!(texts_in("t(\n    l,\n    \"Say \\\"it\\\"\",\n)"), ["Say \"it\""]);
+    }
+
+    #[test]
+    fn every_character_has_a_glyph() {
+        // The fonts the window has (eframe's default fonts, as the tests' and the program's).
+        let ctx = eframe::egui::Context::default();
+        let mut output = ctx.run_ui(eframe::egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        let mut missing = std::collections::BTreeSet::new();
+        // The marks typed in the window's own texts (the masked token, the path of a page).
+        let extra = format!("{}›·—−", crate::app::MASK);
+        ctx.fonts_mut(|fonts| {
+            for text in TEXTS.iter().flat_map(|(en, fr, es)| [*en, *fr, *es]).chain([extra.as_str()]) {
+                for c in text.chars().filter(|c| *c != '\n') {
+                    for family in [eframe::egui::FontFamily::Proportional, eframe::egui::FontFamily::Monospace] {
+                        if !fonts.has_glyph(&eframe::egui::FontId::new(15.0, family.clone()), c) {
+                            missing.insert((c, format!("{family:?}")));
+                        }
+                    }
+                }
+            }
+        });
+        assert!(missing.is_empty(), "no glyph for {missing:?}");
     }
 }

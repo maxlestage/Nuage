@@ -682,9 +682,28 @@ secret shows as set, never its value) and says how to change them on this host.
 ### In a window: Nuage DB Editor
 
 For those who would rather not use a terminal, **Nuage DB Editor** is a program with a window,
-in English, French and Spanish: it shows the server, changes its memory and its limits, makes
-applications and their tokens (shown once, with a Copy button), and says in plain words what
-it refuses and why. It does what the console's Settings page does, from your desktop.
+in English, French and Spanish (the system's language, or the one you pick), light, dark or as
+the system, in the console's colors. It looks after a server through its management API, and
+changes nothing by itself: every change is a button you press, and it says what it did.
+
+- **See that it works**: its version, how long it has run, the memory it uses and the
+  computer's, its applications and when each last connected, and whether the backups work (the
+  last copy, when, where, and in words the error when one failed).
+- **Make an application** for a website or a program: say what it is for, its name follows. Its
+  two lines (`NUAGE_URL`, `NUAGE_TOKEN`) are shown once, masked until you show them, and copied
+  with the clipboard history asked to skip them. **Test the token** calls the server with it from
+  this computer; the application's page then says it was tested from the editor, and that your
+  site has not connected yet.
+- **Connect a web page**: a read-only token, the website to allow (`https://monsite.fr`), and the
+  script to paste in the page. A token is revoked after a question.
+- **Memory and limits**: in force at once, with no restart; a refusal comes in your language, with
+  its figures. What the server read at startup (ports, keys, where backups go) is shown, never
+  changed, with where it changes on that host.
+- **Tools**: test an application's token from anywhere, and generate a token (as `nuage genkey`).
+
+Deleting an application stays in the console, behind its typed confirmation. A server of 0.4.2
+to 0.4.6 opens too, for its applications and tokens; for what it lacks (the settings, the status,
+the websites), the editor says that updating the server would show it.
 
 1. **Download it** from the [latest release](https://github.com/maxlestage/Nuage/releases/latest):
    `Nuage-DB-Editor-macOS.dmg` (any Mac with macOS 11 or later, Apple silicon or Intel),
@@ -697,19 +716,22 @@ it refuses and why. It does what the console's Settings page does, from your des
    commonly downloaded: **Keep**; SmartScreen says it protected your PC: **More info**, then
    **Run anyway**. Linux: unpack, then right-click `nuage-editor`, **Run as a Program** (GNOME
    Files does not start a program on a double-click); `README.txt` puts it in the menu.
-3. **Connect.** A server installed on this computer by the installer is found by itself,
-   with one window of the system's at most: the editor never runs as administrator; the
-   system's own tools read four lines of the settings file for it (`PORT`,
-   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; never the encryption key): pkexec and
-   grep after your password on Linux, osascript and grep on macOS (no password for the
-   account that installed), Windows' own cmd.exe and findstr after the UAC window, which
-   names *Windows Command Processor*, by Microsoft. For a server online, type its address and
-   its management token, `NUAGE_ADMIN_TOKEN` (on Heroku: the app's Settings, **Reveal Config
-   Vars**). The editor remembers the address; the token only if you tick *Remember on this
-   computer*, and then in your system's password store (the macOS Keychain, the Windows
-   Credential Manager, the keyring of a Linux desktop), never in a file of its own. It never
-   sends the token after a redirect, and asks before sending it in clear (`http://`) to an
-   address on the Internet.
+3. **Connect.** A server installed on this computer by the installer is found by itself:
+   **Open**, with one window of the system's at most. The editor never runs as administrator;
+   the system's own tools read four lines of the settings file for it (`PORT`,
+   `NUAGE_ADMIN_TOKEN`, `SITE_URL`, `NUAGE_BIND`; never the encryption key): pkexec and grep
+   after your password on Linux, osascript and grep on macOS (no password for the account that
+   installed), Windows' own cmd.exe and findstr after the UAC window, which names *Windows
+   Command Processor*, by Microsoft; the editor says so before the window opens. For a server
+   elsewhere, type its address and its management token, `NUAGE_ADMIN_TOKEN`: *Where do I find
+   it?* shows where it is on Heroku (the app's Settings, **Reveal Config Vars**), on a server the
+   installer set up, and in Docker's `.env`, and makes one when there is none. The connection
+   goes step by step (the server, the token, its settings), with **Stop waiting** after 3
+   seconds; when a step fails, the editor says which one, why, and what to try. It remembers the
+   address; the token only if you tick *Remember on this computer*, and then in your system's
+   password store (the macOS Keychain, the Windows Credential Manager, the keyring of a Linux
+   desktop), never in a file of its own. It never sends the token after a redirect, and asks
+   before sending it in clear (`http://`) to an address on the Internet.
 
 What it changes is saved by the server, as from the console: in force at once, kept with
 the data. Settings read when the server starts (the encryption key, ports, passwords,
