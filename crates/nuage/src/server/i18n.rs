@@ -210,6 +210,14 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Application {} supprimée, avec ses données et ses sauvegardes.",
         "Aplicación {} borrada, con sus datos y sus copias.",
     ),
+    (
+        "Application {} deleted, with its data, but its backup is still in {}: delete it there. Until then, no \
+         application named {} can be created.",
+        "Application {} supprimée, avec ses données, mais sa sauvegarde est encore dans {} : supprimez-la là-bas. \
+         D'ici là, aucune application nommée {} ne peut être créée.",
+        "Aplicación {} borrada, con sus datos, pero su copia sigue en {}: bórrela allí. Hasta entonces, no se puede \
+         crear ninguna aplicación llamada {}.",
+    ),
     ("There is no application {}.", "Il n'y a pas d'application {}.", "No hay ninguna aplicación {}."),
     ("Other applications:", "Autres applications :", "Otras aplicaciones:"),
     // Tabs
@@ -381,6 +389,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Last commit", "Dernier commit", "Último commit"),
     ("Backup target", "Destination des sauvegardes", "Destino de las copias"),
     ("Last backup", "Dernière sauvegarde", "Última copia"),
+    ("Last backup to {}", "Dernière sauvegarde vers {}", "Última copia en {}"),
     ("failed: {}", "échec : {}", "error: {}"),
     ("Maintenance", "Entretien", "Mantenimiento"),
     ("Checkpoint now", "Checkpoint maintenant", "Checkpoint ahora"),

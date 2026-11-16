@@ -16,10 +16,29 @@
 //! | `snapshots/<lsn>.db` | page store files (`.redb`: written by a version up to 0.4, see [`super::legacy`]) |
 //! | `wal/<first lsn>.log` | log segments |
 //! | `before-import/...` | the last backup of a version up to 0.4, as it was when this version took over (see [`keep_aside`]) |
+//!
+//! A location holds the backup of one database. Before each snapshot, the
+//! location's `encryption.json` is compared with the data directory's: when
+//! the location holds another database's, the snapshot is refused and nothing
+//! is written there or removed from it (see [`of_this_database`]). Only the
+//! header is compared, never how far each copy has gone: a location ahead of
+//! the data (another server of the same database still running beside this
+//! one, as when a host starts the new one before stopping the old) is this
+//! database's.
+//!
+//! A backup can go to two places at once ([`MirrorStore`]). The engine ships
+//! to each one with its own progress and its own lock, each on a thread of
+//! its own: one that does not answer never holds the other back,
+//! and one that missed log segments the data directory no longer has gets a
+//! whole snapshot before anything else ([`can_continue`]). An empty data
+//! directory is restored from ONE of them, whole, never a mix: the one that
+//! reaches furthest; when either cannot be read, nothing is restored
+//! ([`restore_best`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use memoire_orm::{Error, Result};
@@ -29,7 +48,7 @@ use super::legacy::LEGACY_FILE;
 use super::storage_err;
 use super::store::{FILE, Store, now_millis};
 use super::wal::{self, segment_lsn, segment_name};
-use crate::crypto::HEADER_FILE;
+use crate::crypto::{HEADER_FILE, same_database};
 
 /// Where backups go: a directory, object storage...
 ///
@@ -48,26 +67,6 @@ pub trait BackupStore: Send + Sync {
     }
     /// Reads an object, `None` when it does not exist.
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>>;
-    /// Writes an object to the file `dest`, created or replaced. `false`, and
-    /// no file, when the object does not exist. The default reads it whole
-    /// first; a store that can writes it as it comes, so that restoring a
-    /// large snapshot takes no more memory than a small one.
-    fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-        match self.get(name)? {
-            Some(data) => {
-                fs::write(dest, data).map_err(|e| storage_err(format!("cannot write {}: {e}", dest.display())))?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-    /// Bytes of a stored object, when the store can tell (the default cannot:
-    /// `None`). An object that is not there is an error. A snapshot is named by
-    /// the manifest only once this, where it tells, gives the size of the
-    /// file that was sent.
-    fn size(&self, _name: &str) -> Result<Option<u64>> {
-        Ok(None)
-    }
     /// Names of the objects starting with `prefix`.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
     /// Removes an object (no error when it does not exist).
@@ -102,6 +101,108 @@ pub trait BackupStore: Send + Sync {
     fn describe_aside(&self, dir: &str) -> String {
         format!("{}/{}", self.describe().trim_end_matches('/'), dir.trim_end_matches('/'))
     }
+
+    /// The two places of a store that backs up to two ([`MirrorStore`]), each
+    /// as a store of its own: the engine ships to each one with its own
+    /// progress, and restores from one of them. `None` (the default): one
+    /// place.
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        None
+    }
+}
+
+/// Backups to two places, kept in step: what an engine is given to back up
+/// to both. It is only the pair: the engine ships to each place
+/// ([`parts`](BackupStore::parts)) with its own progress, so a place that does
+/// not answer never holds the other back, and an empty data directory is
+/// restored from one place, whole (the one that reaches furthest; a place
+/// that cannot be read stops the opening, see [`restore_best`]).
+///
+/// Used as a store by itself, it writes and deletes in both places (trying
+/// both, and returning the first error), lists what either holds, and reads
+/// from the first place, then from the second.
+pub struct MirrorStore {
+    first: Arc<dyn BackupStore>,
+    second: Arc<dyn BackupStore>,
+}
+
+impl MirrorStore {
+    /// Backups to `first` and to `second`. An empty data directory whose two
+    /// places hold the same backup is restored from `first`.
+    pub fn new(first: Arc<dyn BackupStore>, second: Arc<dyn BackupStore>) -> Self {
+        MirrorStore { first, second }
+    }
+
+    /// `f` on both places: both are tried, and the first error is returned.
+    fn both(&self, f: impl Fn(&dyn BackupStore) -> Result<()>) -> Result<()> {
+        let first = f(self.first.as_ref());
+        let second = f(self.second.as_ref());
+        first.and(second)
+    }
+}
+
+/// The names of both lists, sorted, each once.
+fn union(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    a.extend(b);
+    a.sort();
+    a.dedup();
+    a
+}
+
+impl BackupStore for MirrorStore {
+    fn describe(&self) -> String {
+        format!("{} and {}", self.first.describe(), self.second.describe())
+    }
+
+    fn put(&self, name: &str, data: &[u8]) -> Result<()> {
+        self.both(|s| s.put(name, data))
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.both(|s| s.put_file(name, path))
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.first.get(name)? {
+            Some(data) => Ok(Some(data)),
+            None => self.second.get(name),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(union(self.first.list(prefix)?, self.second.list(prefix)?))
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.both(|s| s.delete(name))
+    }
+
+    fn put_aside(&self, dir: &str, name: &str, data: &[u8]) -> Result<()> {
+        self.both(|s| s.put_aside(dir, name, data))
+    }
+
+    fn get_aside(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.first.get_aside(dir, name)? {
+            Some(data) => Ok(Some(data)),
+            None => self.second.get_aside(dir, name),
+        }
+    }
+
+    fn list_aside(&self, dir: &str, prefix: &str) -> Result<Vec<String>> {
+        Ok(union(self.first.list_aside(dir, prefix)?, self.second.list_aside(dir, prefix)?))
+    }
+
+    fn delete_aside(&self, dir: &str, name: &str) -> Result<()> {
+        self.both(|s| s.delete_aside(dir, name))
+    }
+
+    fn describe_aside(&self, dir: &str) -> String {
+        format!("{} and {}", self.first.describe_aside(dir), self.second.describe_aside(dir))
+    }
+
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        Some((self.first.clone(), self.second.clone()))
+    }
 }
 
 /// Backups in a directory (another disk, a mounted network volume...).
@@ -128,64 +229,32 @@ fn io(e: std::io::Error) -> Error {
     storage_err(format!("backup directory: {e}"))
 }
 
-/// What marks a file being written, before it takes the name of its object.
-const PARTIAL: &str = ".partial";
-
-/// A file being written that nobody has written to for this long was left by
-/// a writer that never finished (a crash, a kill): it is removed.
-const PARTIAL_LEFT: Duration = Duration::from_secs(15 * 60);
-
-/// `name` followed by sixteen random hexadecimal digits and [`PARTIAL`]: a
-/// file of its own for each writer, whatever else writes the same object at
-/// the same time (another backup, another server on the same directory).
-fn partial_name(name: &str) -> String {
-    let unique: String = crate::crypto::random::<8>().iter().map(|b| format!("{b:02x}")).collect();
-    format!("{name}.{unique}{PARTIAL}")
-}
-
-impl DirectoryStore {
-    /// Stores the object `name`: `write` fills a file aside, which is synced
-    /// and then renamed, so that a reader never sees half an object. The file
-    /// aside is this writer's alone, and does not outlive a failure.
-    fn store(&self, name: &str, write: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<()> {
-        let path = self.path(name)?;
-        let dir = path.parent().unwrap_or(&self.root).to_owned();
-        fs::create_dir_all(&dir).map_err(io)?;
-        let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        let tmp = dir.join(partial_name(&file));
-        let stored =
-            write(&tmp).and_then(|()| super::wal::sync_file(&tmp)).and_then(|()| fs::rename(&tmp, &path)).map_err(io);
-        if stored.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        stored?;
-        super::wal::sync_dir(&dir);
-        // What a writer that was killed left there: nothing else removes it.
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let left = entry.file_name().to_string_lossy().ends_with(PARTIAL)
-                && entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|at| at.elapsed().is_ok_and(|d| d >= PARTIAL_LEFT));
-            if left {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        Ok(())
-    }
-}
-
 impl BackupStore for DirectoryStore {
     fn describe(&self) -> String {
         self.root.display().to_string()
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<()> {
-        self.store(name, |tmp| fs::write(tmp, data))
+        let path = self.path(name)?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(io)?;
+        }
+        // Written aside, then renamed: a reader never sees half an object.
+        let tmp = path.with_extension("partial");
+        fs::write(&tmp, data).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
+        fs::rename(&tmp, &path).map_err(io)
     }
 
     fn put_file(&self, name: &str, source: &Path) -> Result<()> {
-        self.store(name, |tmp| fs::copy(source, tmp).map(|_| ()))
+        let path = self.path(name)?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(io)?;
+        }
+        let tmp = path.with_extension("partial");
+        fs::copy(source, &tmp).map_err(io)?;
+        super::wal::sync_file(&tmp).map_err(io)?;
+        fs::rename(&tmp, &path).map_err(io)
     }
 
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -194,18 +263,6 @@ impl BackupStore for DirectoryStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io(e)),
         }
-    }
-
-    fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-        match fs::copy(self.path(name)?, dest) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(io(e)),
-        }
-    }
-
-    fn size(&self, name: &str) -> Result<Option<u64>> {
-        fs::metadata(self.path(name)?).map(|m| Some(m.len())).map_err(io)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -217,7 +274,7 @@ impl BackupStore for DirectoryStore {
         let Ok(entries) = fs::read_dir(&dir) else { return Ok(out) };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(file_prefix) && !name.ends_with(PARTIAL) {
+            if name.starts_with(file_prefix) && !name.ends_with(".partial") {
                 let base = prefix.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
                 out.push(format!("{base}{name}"));
             }
@@ -251,7 +308,10 @@ impl PrefixedStore {
 
 impl BackupStore for PrefixedStore {
     fn describe(&self) -> String {
-        format!("{}/{}", self.inner.describe().trim_end_matches('/'), self.prefix.trim_end_matches('/'))
+        match self.parts() {
+            Some((first, second)) => format!("{} and {}", first.describe(), second.describe()),
+            None => format!("{}/{}", self.inner.describe().trim_end_matches('/'), self.prefix.trim_end_matches('/')),
+        }
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<()> {
@@ -264,14 +324,6 @@ impl BackupStore for PrefixedStore {
 
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.inner.get(&format!("{}{name}", self.prefix))
-    }
-
-    fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-        self.inner.get_file(&format!("{}{name}", self.prefix), dest)
-    }
-
-    fn size(&self, name: &str) -> Result<Option<u64>> {
-        self.inner.size(&format!("{}{name}", self.prefix))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -310,13 +362,30 @@ impl BackupStore for PrefixedStore {
     }
 
     fn describe_aside(&self, dir: &str) -> String {
-        format!("{}/{}", self.inner.describe_aside(dir), self.prefix.trim_end_matches('/'))
+        match self.parts() {
+            Some((first, second)) => format!("{} and {}", first.describe_aside(dir), second.describe_aside(dir)),
+            None => format!("{}/{}", self.inner.describe_aside(dir), self.prefix.trim_end_matches('/')),
+        }
+    }
+
+    // The same prefix in each place: an application backs up under
+    // `apps/<name>/` of both.
+    fn parts(&self) -> Option<(Arc<dyn BackupStore>, Arc<dyn BackupStore>)> {
+        let (first, second) = self.inner.parts()?;
+        let part = |inner| -> Arc<dyn BackupStore> { Arc::new(PrefixedStore::new(inner, self.prefix.clone())) };
+        Some((part(first), part(second)))
     }
 }
 
-/// Removes every object of a backup (a deleted application's).
+/// Removes every object of a backup (a deleted application's). A backup to two
+/// places is emptied in each, one after the other: a place that does not
+/// answer does not keep the other's objects.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
+    if let Some((first, second)) = backup.parts() {
+        let first = delete_all(first.as_ref());
+        return first.and(delete_all(second.as_ref()));
+    }
     for prefix in ["snapshots/", "wal/"] {
         for name in backup.list(prefix)? {
             backup.delete(&name)?;
@@ -332,7 +401,16 @@ pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
     Ok(())
 }
 
-const MANIFEST: &str = "manifest.json";
+pub(crate) const MANIFEST: &str = "manifest.json";
+
+/// The places of `store`, in order: the two of a [`MirrorStore`] (and of a
+/// [`PrefixedStore`] of one), or the store itself.
+pub(crate) fn places(store: &Arc<dyn BackupStore>) -> Vec<Arc<dyn BackupStore>> {
+    match store.parts() {
+        Some((first, second)) => vec![first, second],
+        None => vec![store.clone()],
+    }
+}
 
 /// Where the last backup of a version up to 0.4 is kept once this version
 /// writes its own (see [`keep_aside`]).
@@ -386,80 +464,152 @@ pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bo
     Ok(true)
 }
 
-/// Ships the sealed log segments not shipped yet. Returns the last LSN they
-/// cover (everything up to it is in the backup).
+/// Ships the sealed log segments not shipped yet, oldest first. Returns the
+/// last LSN they cover (everything up to it is in the backup). A segment is
+/// sent only when the backup holds the log up to the commit before it: when
+/// the segment that follows `shipped` is no longer on this disk (a second
+/// destination that was away while the first's were removed), nothing is
+/// sent, and the destination needs a snapshot ([`can_continue`]).
 pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u64) -> Result<u64> {
     let segments = wal::segments(&store.dir.join("wal"))?;
-    // Not under the writer lock: a long write, or the last checkpoint of a
-    // server that stops, would hold the shipment for as long as it runs.
-    let current = store.current_segment();
+    let current = store.writer().wal.first_lsn;
     let mut last = shipped;
     for (i, (first, path)) in segments.iter().enumerate() {
         let Some((next_first, _)) = segments.get(i + 1) else { break };
         if *first == current || next_first - 1 <= shipped {
             continue;
         }
-        backup.put_file(&format!("wal/{}", segment_name(*first)), path)?;
+        let gone = || {
+            storage_err(format!(
+                "{}: the log after commit {last} is no longer on this disk, nothing after it was sent (a whole \
+                 snapshot goes there next)",
+                backup.describe()
+            ))
+        };
+        if *first > last + 1 {
+            return Err(gone());
+        }
+        // Removed while it was being sent (a destination that took too long to answer).
+        if let Err(e) = backup.put_file(&format!("wal/{}", segment_name(*first)), path) {
+            return Err(if path.exists() { e } else { gone() });
+        }
         last = last.max(next_first - 1);
     }
     Ok(last)
 }
 
-/// Takes a snapshot: checkpoint, copy of the page store, upload, manifest.
-/// Older snapshots and the segments before them are pruned, keeping `keep`.
-/// The backup of a version up to 0.4 is first set aside ([`keep_aside`]).
-/// Returns the snapshot's LSN, and whether an earlier version's backup was
-/// set aside now. `encrypted`: the store is, and its snapshot is sent with its
-/// header.
-pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize, encrypted: bool) -> Result<(u64, bool)> {
-    // An encrypted snapshot is unreadable without its header (salt, check
-    // value): without the header, no snapshot, rather than one a manifest
-    // would call in clear.
-    let header = if encrypted {
-        let read = fs::read(store.dir.join(HEADER_FILE));
-        Some(read.map_err(|e| {
-            storage_err(format!("cannot read {HEADER_FILE}, without which an encrypted snapshot cannot be read: {e}"))
-        })?)
-    } else {
-        None
+/// `true` when a destination that holds the log up to `shipped` can go on
+/// with log segments: this disk still has the segment that follows (its
+/// oldest one starts at or before `shipped + 1`). `false`: the commits after
+/// `shipped` are only in the page store now (the segments are kept until the
+/// first destination has them, never for the second), and the destination
+/// needs a whole snapshot before any further segment.
+pub(crate) fn can_continue(store: &Store, shipped: u64) -> Result<bool> {
+    let segments = wal::segments(&store.dir.join("wal"))?;
+    Ok(segments.first().is_none_or(|(first, _)| *first <= shipped + 1))
+}
+
+/// Refuses a location that holds another database's backup: its
+/// `encryption.json` is not the data directory's. A location without one is
+/// empty, holds the start of an encrypted database's first snapshot (the
+/// header is uploaded after the snapshot), or a backup in clear, which has
+/// nothing that tells one database from another (the server's binary always
+/// encrypts): nothing to refuse. A data directory in clear facing a location
+/// that has a header is refused too: nothing goes from an encrypted backup
+/// back to one in clear.
+///
+/// The header is made once, when a data directory is created; a restore
+/// writes the one it downloads and a snapshot uploads the directory's own,
+/// so a database is never refused its own backup.
+fn of_this_database(store: &Store, backup: &dyn BackupStore) -> Result<()> {
+    let Some(theirs) = backup.get(HEADER_FILE)? else { return Ok(()) };
+    let ours = match fs::read(store.dir.join(HEADER_FILE)) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(storage_err(format!("cannot read {HEADER_FILE}: {e}"))),
     };
-    let kept = keep_aside(backup, encrypted)?;
-    // A file of its own: nothing else, whatever it does at the same time,
-    // writes to it or removes it.
-    let local = store.dir.join(partial_name(LOCAL_SNAPSHOT));
-    let copied = (|| -> Result<(u64, u64)> {
-        // The snapshot is the page file as a checkpoint leaves it.
-        let mut w = store.writer();
-        let lsn = store.checkpoint_locked(&mut w, Some(0))?;
-        // From here the file must not change, for as long as it is copied:
-        // the checkpoints wait. The commits do not: they go to the log and to
-        // nodes in memory, and reach the backup in the log segments after `lsn`.
-        let held = store.pages.hold_file();
-        drop(w);
-        // Through the store's own handle: Windows lets no other handle read the locked file.
-        let bytes = store.pages.copy_file_to(&local)?;
-        drop(held);
-        Ok((lsn, bytes))
-    })();
-    let sent = copied.and_then(|(lsn, bytes)| {
-        let name = format!("snapshots/{lsn:020}.db");
-        backup.put_file(&name, &local)?;
-        // The manifest names the snapshot only once all of it is stored.
-        match backup.size(&name)? {
-            Some(stored) if stored != bytes => {
-                let _ = backup.delete(&name);
-                Err(storage_err(format!("backup snapshot `{name}` is incomplete: {stored} bytes stored of {bytes}")))
-            }
-            _ => Ok((lsn, bytes, name)),
+    if ours.is_some_and(|ours| same_database(&ours, &theirs)) {
+        return Ok(());
+    }
+    Err(storage_err(format!(
+        "{} holds the backup of another database (its {HEADER_FILE} is not this one's): nothing was written \
+         there. Give this database a place of its own, or empty that one",
+        backup.describe()
+    )))
+}
+
+/// A snapshot is taken in three steps, so that a round in which both places
+/// of a [`MirrorStore`] are due copies the page store once: [`prepare`] each
+/// place, [`take`] the copy, [`send`] it to each place.
+///
+/// The first step, before anything is written to `backup`: a location that
+/// holds another database's backup is refused, with nothing written
+/// ([`of_this_database`]); the backup of a version up to 0.4 is then set
+/// aside ([`keep_aside`]). Returns whether it was set aside now.
+pub(crate) fn prepare(store: &Store, backup: &dyn BackupStore) -> Result<bool> {
+    of_this_database(store, backup)?;
+    keep_aside(backup, store.dir.join(HEADER_FILE).exists())
+}
+
+/// A copy of the page store for a snapshot ([`take`]), removed from the disk
+/// when it is dropped. Each copy has a name of its own: the two destinations
+/// may each be sending one.
+pub(crate) struct Taken {
+    /// The LSN the copy holds everything up to.
+    pub(crate) lsn: u64,
+    path: PathBuf,
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The second step of a snapshot: a checkpoint, then a copy of the page
+/// store beside it, with no commit in between.
+pub(crate) fn take(store: &Store) -> Result<Taken> {
+    static COPIES: AtomicU64 = AtomicU64::new(0);
+    let path = store.dir.join(format!("{COPY}{}.partial", COPIES.fetch_add(1, Ordering::Relaxed)));
+    // No commit may land while the file is copied.
+    let mut w = store.writer();
+    let lsn = store.checkpoint_locked(&mut w, Some(0))?;
+    // Made before the copy: what a copy that fails part way leaves is removed.
+    let taken = Taken { lsn, path };
+    // Through the store's own handle: Windows lets no other handle read the locked file.
+    store.pages.copy_file_to(&taken.path)?;
+    Ok(taken)
+}
+
+/// The start of the names of the copies [`take`] makes in the data directory.
+const COPY: &str = "snapshot-";
+
+/// Removes the copies of the page store left in `dir` by a process that
+/// stopped while it sent one (they were never named by a manifest).
+pub(crate) fn remove_copies(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `snapshot.partial`: the name a copy had up to 0.4.6.
+        if (name.starts_with(COPY) && name.ends_with(".partial")) || name == "snapshot.partial" {
+            let _ = fs::remove_file(entry.path());
         }
-    });
-    let _ = fs::remove_file(&local);
-    let (lsn, bytes, name) = sent?;
+    }
+}
+
+/// The last step of a snapshot: the copy is uploaded, then the header and the
+/// manifest. Older snapshots and the segments before them are pruned,
+/// keeping `keep`.
+pub(crate) fn send(store: &Store, backup: &dyn BackupStore, taken: &Taken, keep: usize) -> Result<()> {
+    let lsn = taken.lsn;
+    let name = format!("snapshots/{lsn:020}.db");
+    backup.put_file(&name, &taken.path)?;
+    // An encrypted snapshot needs its header (salt, check value) to be read.
+    let header = fs::read(store.dir.join(HEADER_FILE)).ok();
     if let Some(h) = &header {
         backup.put(HEADER_FILE, h)?;
     }
-    let manifest =
-        json!({ "snapshot": name, "lsn": lsn, "bytes": bytes, "at": now_millis(), "encrypted": header.is_some() });
+    let manifest = json!({ "snapshot": name, "lsn": lsn, "at": now_millis(), "encrypted": header.is_some() });
     backup.put(MANIFEST, manifest.to_string().as_bytes())?;
     let mut snapshots = backup.list("snapshots/")?;
     // Oldest first; at the same place in the log, the one of an earlier
@@ -486,23 +636,7 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize, enc
             }
         }
     }
-    Ok((lsn, kept))
-}
-
-/// The start of the name of the copy of the page store a snapshot sends, in
-/// the data directory.
-const LOCAL_SNAPSHOT: &str = "snapshot";
-
-/// Removes the copies of the page store that snapshots cut short (a crash, a
-/// kill) left in the data directory. For when the database is opened: no
-/// snapshot is being taken.
-pub(crate) fn remove_left_copies(dir: &Path) {
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(LOCAL_SNAPSHOT) && name.ends_with(PARTIAL) {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
+    Ok(())
 }
 
 /// The LSN in the name of a snapshot (`snapshots/<lsn>.db`, or `.redb` for one
@@ -545,690 +679,152 @@ pub(crate) fn restore(dir: &Path, backup: &dyn BackupStore) -> Result<bool> {
     let manifest: Json = serde_json::from_slice(&manifest).map_err(|e| storage_err(format!("backup manifest: {e}")))?;
     let name = manifest.get("snapshot").and_then(Json::as_str).ok_or_else(|| storage_err("backup manifest"))?;
     let lsn = manifest.get("lsn").and_then(Json::as_u64).unwrap_or(0);
+    let data = backup.get(name)?.ok_or_else(|| storage_err(format!("backup snapshot `{name}` is missing")))?;
     fs::create_dir_all(dir.join("wal")).map_err(io)?;
-    // The snapshot goes straight to a file aside: it is never held in memory.
-    let tmp = dir.join("nuage.db.partial");
-    let fetched = (|| -> Result<()> {
-        if !backup.get_file(name, &tmp)? {
-            return Err(storage_err(format!("backup snapshot `{name}` is missing")));
-        }
-        // The manifest tells the size of the snapshot it names: a file cut
-        // short is refused here, not found out later page by page.
-        let got = fs::metadata(&tmp).map_err(io)?.len();
-        match manifest.get("bytes").and_then(Json::as_u64) {
-            Some(bytes) if bytes != got => {
-                Err(storage_err(format!("backup snapshot `{name}` is incomplete: {got} bytes of {bytes}")))
-            }
-            _ => Ok(()),
-        }
-    })();
-    if let Err(e) = fetched {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    // The header before the snapshot is put in place: it is unreadable without it.
+    // The header first: the snapshot is unreadable without it.
     if manifest.get("encrypted").and_then(Json::as_bool) == Some(true) {
         let header = backup.get(HEADER_FILE)?.ok_or_else(|| storage_err(format!("the backup has no {HEADER_FILE}")))?;
         fs::write(dir.join(HEADER_FILE), header).map_err(io)?;
     }
     // A snapshot of a version up to 0.4 is its page store: opening imports it.
     let file = if name.ends_with(".redb") { LEGACY_FILE } else { FILE };
+    let tmp = dir.join("nuage.db.partial");
+    fs::write(&tmp, data).map_err(io)?;
     for seg in backup.list("wal/")? {
         let Some(first) = segment_lsn(seg.trim_start_matches("wal/")) else { continue };
         // Segments that start before the snapshot only hold what it has.
         if first <= lsn {
             continue;
         }
-        // One at a time, each to its file.
-        let path = dir.join("wal").join(segment_name(first));
-        if backup.get_file(&seg, &path)? {
-            wal::sync_file(&path).map_err(io)?;
+        if let Some(bytes) = backup.get(&seg)? {
+            fs::write(dir.join("wal").join(segment_name(first)), bytes).map_err(io)?;
         }
     }
-    // All of it on disk before the page store has its name: a database that
-    // is there is whole, log included.
-    wal::sync_dir(&dir.join("wal"));
-    wal::sync_file(&tmp).map_err(io)?;
     fs::rename(&tmp, dir.join(file)).map_err(io)?;
     wal::sync_dir(dir);
     Ok(true)
 }
 
+/// What a backup location holds, read without restoring it ([`inspect`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// The latest snapshot (`snapshots/<lsn>.db`).
+    pub snapshot: String,
+    /// The LSN that snapshot holds everything up to.
+    pub lsn: u64,
+    /// When it was written (Unix ms; 0 when the manifest does not say).
+    pub at: i64,
+    /// The snapshot is encrypted.
+    pub encrypted: bool,
+    /// The `encryption.json` of the location, if it has one: what tells one
+    /// database from another.
+    pub header: Option<Vec<u8>>,
+    /// How far the backup reaches in the log: the larger of the snapshot's
+    /// LSN and the first LSN of the latest log segment after it. Two copies
+    /// of one database get their segments from the same data directory, and
+    /// a snapshot is taken where a segment ends, so the larger reach is the
+    /// copy that holds more.
+    pub reach: u64,
+}
+
+/// What `backup` holds: its manifest, its header and how far its log
+/// segments go. `None` when it holds no backup (no manifest).
+pub fn inspect(backup: &dyn BackupStore) -> Result<Option<BackupInfo>> {
+    let Some(manifest) = backup.get(MANIFEST)? else { return Ok(None) };
+    let j: Json = serde_json::from_slice(&manifest).map_err(|e| storage_err(format!("backup manifest: {e}")))?;
+    let snapshot = j.get("snapshot").and_then(Json::as_str).ok_or_else(|| storage_err("backup manifest"))?.to_owned();
+    let lsn = j.get("lsn").and_then(Json::as_u64).unwrap_or(0);
+    let header = backup.get(HEADER_FILE)?;
+    let last_segment =
+        backup.list("wal/")?.iter().filter_map(|name| segment_lsn(name.trim_start_matches("wal/"))).max();
+    Ok(Some(BackupInfo {
+        snapshot,
+        lsn,
+        at: j.get("at").and_then(Json::as_i64).unwrap_or(0),
+        encrypted: j.get("encrypted").and_then(Json::as_bool) == Some(true),
+        header,
+        reach: last_segment.unwrap_or(0).max(lsn),
+    }))
+}
+
+/// How long, after the first destination has been read, a restore waits for
+/// the second one ([`restore_best`]): a second that hangs stops the start
+/// within seconds, not after its own time limit for each database.
+const SECOND_WAIT: Duration = Duration::from_secs(5);
+
+/// Restores an empty `dir` from one of the two places of a backup, whole,
+/// never a mix of both: the one that reaches furthest ([`BackupInfo::reach`]),
+/// the first on a tie; the other one when only one holds a backup. Returns
+/// the place restored from, `None` when neither holds a backup.
+///
+/// Both places are read at the same time. A place that cannot be read is an
+/// error, and so is a second that has not answered [`SECOND_WAIT`] after the
+/// first: either may be the one that reaches furthest, and an older copy is
+/// never restored in silence while a newer one may exist (to start from one
+/// alone, the other is taken out of the settings). Two places that hold
+/// different databases are an error too. On an error, nothing is restored.
+pub(crate) fn restore_best(
+    dir: &Path,
+    first: &Arc<dyn BackupStore>,
+    second: &Arc<dyn BackupStore>,
+) -> Result<Option<String>> {
+    let (one, two) = (first.describe(), second.describe());
+    let (sent, looked) = std::sync::mpsc::channel();
+    let looking = second.clone();
+    // Left to end on its own when it does not answer in time.
+    std::thread::Builder::new()
+        .name("nuage-restore-2".into())
+        .spawn(move || {
+            let _ = sent.send(inspect(looking.as_ref()));
+        })
+        .map_err(|e| storage_err(format!("cannot read the second backup destination: {e}")))?;
+    let a = inspect(first.as_ref()).map_err(|e| {
+        storage_err(format!(
+            "the first backup destination does not answer ({one}: {}): nothing was restored. To start from the \
+             second alone ({two}), take the first out of the settings",
+            super::reason(&e)
+        ))
+    })?;
+    let unread = |why: String| {
+        storage_err(format!(
+            "the second backup destination does not answer ({two}: {why}): nothing was restored, since it may hold \
+             more than the first. To start from the first alone ({one}), take the second out of the settings"
+        ))
+    };
+    let b = match looked.recv_timeout(SECOND_WAIT) {
+        Ok(read) => read.map_err(|e| unread(super::reason(&e)))?,
+        Err(_) => return Err(unread(format!("no answer {} seconds after the first's", SECOND_WAIT.as_secs()))),
+    };
+    let chosen = match (&a, &b) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => first,
+        (None, Some(_)) => second,
+        (Some(a), Some(b)) => {
+            let same = match (&a.header, &b.header) {
+                (Some(x), Some(y)) => same_database(x, y),
+                // Backups in clear have nothing that tells them apart.
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                return Err(storage_err(format!(
+                    "the two backup destinations hold different databases ({one} and {two}): nothing was restored. \
+                     Keep the one of this database in the settings, and give the other a place of its own"
+                )));
+            }
+            if b.reach > a.reach { second } else { first }
+        }
+    };
+    let from = chosen.describe();
+    if !restore(dir, chosen.as_ref())? {
+        return Err(storage_err(format!("{from} held a backup a moment ago and holds none now: nothing was restored")));
+    }
+    Ok(Some(from))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
-    use crate::{BackupOptions, Embedded, EngineOptions};
-
-    fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nuage-backup-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
-
-    /// A database in `dir` backed up to `store`, with the table `t`. The
-    /// upkeep thread backs up once, when it opens, and then leaves the test alone.
-    fn open(dir: &Path, store: Arc<dyn BackupStore>) -> Embedded {
-        let options = EngineOptions {
-            backup: Some(BackupOptions::new(store)),
-            checkpoint_every: Duration::from_secs(3600),
-            sync: false,
-            ..EngineOptions::default()
-        };
-        let db = Embedded::open_with(dir, options).unwrap();
-        db.sql("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
-        db
-    }
-
-    fn insert(db: &Embedded, ids: std::ops::Range<i64>) {
-        for id in ids {
-            db.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), format!("row {id}").into()]).unwrap();
-        }
-    }
-
-    fn count(db: &Embedded) -> String {
-        db.sql("SELECT count(*) FROM t", &[]).unwrap()[0].rows[0][0].to_string()
-    }
-
-    /// Tells the threads of a test that it is over, however it ends: a
-    /// failed assertion must not leave them writing.
-    struct Over<'a>(&'a AtomicBool);
-
-    impl Drop for Over<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// A store written against the methods every store must have, and none of
-    /// the others: objects in memory.
-    #[derive(Default)]
-    struct Plain(Mutex<BTreeMap<String, Vec<u8>>>);
-
-    impl BackupStore for Plain {
-        fn describe(&self) -> String {
-            "memory".into()
-        }
-        fn put(&self, name: &str, data: &[u8]) -> Result<()> {
-            self.0.lock().unwrap().insert(name.to_owned(), data.to_vec());
-            Ok(())
-        }
-        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.0.lock().unwrap().get(name).cloned())
-        }
-        fn list(&self, prefix: &str) -> Result<Vec<String>> {
-            Ok(self.0.lock().unwrap().keys().filter(|k| k.starts_with(prefix)).cloned().collect())
-        }
-        fn delete(&self, name: &str) -> Result<()> {
-            self.0.lock().unwrap().remove(name);
-            Ok(())
-        }
-    }
-
-    /// A store that has the required methods alone backs up and restores, as
-    /// one part of it does: files go through `put` and `get`, and a size it
-    /// cannot tell is not asked of it.
-    #[test]
-    fn a_store_with_the_required_methods_alone_backs_up_and_restores() {
-        let (src, dst) = (temp("plain-src"), temp("plain-dst"));
-        let whole: Arc<dyn BackupStore> = Arc::new(Plain::default());
-        let part = || -> Arc<dyn BackupStore> { Arc::new(PrefixedStore::new(whole.clone(), "apps/shop/")) };
-        {
-            let db = open(&src, part());
-            insert(&db, 0..30);
-            db.engine().backup_now(true).unwrap();
-            insert(&db, 30..40);
-            db.engine().checkpoint().unwrap();
-            db.engine().backup_now(false).unwrap();
-        }
-        assert_eq!(whole.size("apps/shop/manifest.json").unwrap(), None);
-        let db = open(&dst, part());
-        assert!(db.engine().backup_status().restored);
-        assert_eq!(count(&db), "40");
-        drop(db);
-        for dir in [src, dst] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// A directory that, when told to, stores only the first half of a file.
-    struct Half {
-        inner: DirectoryStore,
-        on: AtomicBool,
-    }
-
-    impl BackupStore for Half {
-        fn describe(&self) -> String {
-            self.inner.describe()
-        }
-        fn put(&self, name: &str, data: &[u8]) -> Result<()> {
-            self.inner.put(name, data)
-        }
-        fn put_file(&self, name: &str, path: &Path) -> Result<()> {
-            if !self.on.load(Ordering::SeqCst) {
-                return self.inner.put_file(name, path);
-            }
-            let data = fs::read(path).unwrap();
-            self.inner.put(name, &data[..data.len() / 2])
-        }
-        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-            self.inner.get(name)
-        }
-        fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-            self.inner.get_file(name, dest)
-        }
-        fn size(&self, name: &str) -> Result<Option<u64>> {
-            self.inner.size(name)
-        }
-        fn list(&self, prefix: &str) -> Result<Vec<String>> {
-            self.inner.list(prefix)
-        }
-        fn delete(&self, name: &str) -> Result<()> {
-            self.inner.delete(name)
-        }
-    }
-
-    /// A snapshot of which only a part was stored is an error: the manifest
-    /// goes on naming the one before, the part is removed, and the backup
-    /// restores, with what the log shipped since.
-    #[test]
-    fn a_snapshot_stored_in_part_is_never_named_by_the_manifest() {
-        let (src, target, dst) = (temp("half-src"), temp("half-store"), temp("half-dst"));
-        let store = Arc::new(Half { inner: DirectoryStore::new(&target), on: AtomicBool::new(false) });
-        {
-            let db = open(&src, store.clone());
-            insert(&db, 0..30);
-            db.engine().backup_now(true).unwrap();
-            let manifest = store.get(MANIFEST).unwrap();
-            insert(&db, 30..60);
-            store.on.store(true, Ordering::SeqCst);
-            let e = db.engine().backup_now(true).unwrap_err().to_string();
-            assert!(e.contains("is incomplete"), "{e}");
-            assert!(!db.engine().backup_status().last_ok);
-            assert_eq!(store.get(MANIFEST).unwrap(), manifest, "the manifest still names the whole snapshot");
-            assert_eq!(store.list("snapshots/").unwrap().len(), 1, "the part is not kept");
-            store.on.store(false, Ordering::SeqCst);
-            db.engine().backup_now(false).unwrap();
-        }
-        let db = open_quiet(&dst, store);
-        assert!(db.engine().backup_status().restored);
-        assert_eq!(count(&db), "60");
-        assert!(db.engine().check_integrity().unwrap());
-        drop(db);
-        for dir in [src, target, dst] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// A snapshot cut short in the backup is refused when it is restored: no
-    /// database is put in place from a part of one.
-    #[test]
-    fn a_snapshot_cut_short_is_not_restored() {
-        let (src, target, dst) = (temp("short-src"), temp("short-store"), temp("short-dst"));
-        let store = Arc::new(DirectoryStore::new(&target));
-        {
-            let db = open(&src, store.clone());
-            insert(&db, 0..2000);
-            db.engine().backup_now(true).unwrap();
-        }
-        let manifest: Json = serde_json::from_slice(&store.get(MANIFEST).unwrap().unwrap()).unwrap();
-        let snapshot = target.join(manifest["snapshot"].as_str().unwrap());
-        let whole = fs::read(&snapshot).unwrap();
-        assert_eq!(manifest["bytes"].as_u64(), Some(whole.len() as u64));
-        fs::write(&snapshot, &whole[..whole.len() / 2]).unwrap();
-        let e = restore(&dst, store.as_ref()).unwrap_err().to_string();
-        assert!(e.contains("is incomplete"), "{e}");
-        assert!(is_empty(&dst), "nothing was put in place");
-        assert!(!dst.join("nuage.db.partial").exists());
-        // Whole again, it comes back.
-        fs::write(&snapshot, &whole).unwrap();
-        let db = open_quiet(&dst, store);
-        assert!(db.engine().backup_status().restored);
-        assert_eq!(count(&db), "2000");
-        drop(db);
-        for dir in [src, target, dst] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Commits go on while a snapshot copies the page store, and the file
-    /// does not change under the copy (the checkpoints wait for it): each
-    /// snapshot restores whole, every page in order, with every row that was
-    /// acknowledged before it began.
-    #[test]
-    fn a_snapshot_taken_while_commits_land_restores_whole() {
-        use std::sync::atomic::AtomicI64;
-        let (src, target) = (temp("live-src"), temp("live-store"));
-        let store = Arc::new(DirectoryStore::new(&target));
-        // A small cache: the commits have changed pages to write to the file every few of them.
-        let options = EngineOptions {
-            backup: Some(BackupOptions::new(store.clone())),
-            checkpoint_every: Duration::from_secs(3600),
-            checkpoint_wal_bytes: u64::MAX,
-            cache_bytes: 1 << 20,
-            sync: false,
-            ..EngineOptions::default()
-        };
-        let db = Embedded::open_with(&src, options).unwrap();
-        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
-        let body = "x".repeat(16 << 10);
-        let write = |id: i64| {
-            let row = format!("{id}{body}");
-            db.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), row.into()]).unwrap();
-            // Rows come and go: the pages they leave are written again.
-            db.sql("DELETE FROM t WHERE id = ?", &[(id - 100).into()]).unwrap();
-        };
-        (0..200).for_each(write);
-        // A copy long enough for several of those writes to the file to come up.
-        db.engine().store.pages.slow_copies.store(true, Ordering::SeqCst);
-        let (next, written, over) = (AtomicI64::new(200), AtomicI64::new(200), AtomicBool::new(false));
-        std::thread::scope(|s| {
-            let _over = Over(&over);
-            for _ in 0..2 {
-                s.spawn(|| {
-                    // No more than the log of a short test should hold.
-                    while !over.load(Ordering::SeqCst) && next.load(Ordering::SeqCst) < 1500 {
-                        write(next.fetch_add(1, Ordering::SeqCst));
-                        written.fetch_add(1, Ordering::SeqCst);
-                    }
-                });
-            }
-            for round in 0..4 {
-                let before = written.load(Ordering::SeqCst);
-                db.engine().backup_now(true).unwrap();
-                let dst = temp(&format!("live-dst-{round}"));
-                assert!(restore(&dst, store.as_ref()).unwrap());
-                let copy =
-                    Embedded::open_with(&dst, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
-                assert!(copy.engine().check_integrity().unwrap(), "round {round}: {:?}", copy.engine().events());
-                let newest = copy.sql("SELECT max(id) FROM t", &[]).unwrap()[0].rows[0][0].to_string();
-                let newest: i64 = newest.parse().unwrap();
-                assert!(newest >= before - 2, "round {round}: rows up to {newest} restored, {before} written before");
-                let whole = copy.sql("SELECT count(*) FROM t WHERE length(v) < 16384", &[]).unwrap();
-                assert_eq!(whole[0].rows[0][0].to_string(), "0");
-                drop(copy);
-                let _ = fs::remove_dir_all(&dst);
-            }
-        });
-        assert!(written.load(Ordering::SeqCst) > 200, "commits landed while the snapshots were taken");
-        assert!(db.engine().check_integrity().unwrap());
-        drop(db);
-        for dir in [src, target] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// A commit does not wait for a snapshot to be copied: it returns while
-    /// the copy is still being written.
-    #[test]
-    fn a_commit_does_not_wait_for_the_copy_of_a_snapshot() {
-        let (src, target) = (temp("nowait-src"), temp("nowait-store"));
-        let db = open(&src, Arc::new(DirectoryStore::new(&target)));
-        let body = "x".repeat(64 << 10);
-        for id in 0..128 {
-            db.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), body.clone().into()]).unwrap();
-        }
-        // The backup the upkeep thread sends when the database opens is over.
-        assert!((0..2000).any(|_| {
-            std::thread::sleep(Duration::from_millis(5));
-            db.engine().backup_status().last_snapshot_at.is_some()
-        }));
-        // Several mebibytes, copied slowly: a snapshot that lasts.
-        db.engine().store.pages.slow_copies.store(true, Ordering::SeqCst);
-        let copy_of = |dir: &Path| {
-            fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).find(|p| {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                name.starts_with(LOCAL_SNAPSHOT) && name.ends_with(PARTIAL)
-            })
-        };
-        std::thread::scope(|s| {
-            s.spawn(|| db.engine().backup_now(true).unwrap());
-            let copy = (0..5000).find_map(|_| {
-                std::thread::sleep(Duration::from_millis(1));
-                copy_of(&src)
-            });
-            let copy = copy.expect("the copy began");
-            insert(&db, 1000..1001);
-            let copied = fs::metadata(&copy).map_or(u64::MAX, |m| m.len());
-            let whole = db.engine().stats().file_bytes;
-            assert!(copied < whole, "the commit returned once {copied} bytes of {whole} were copied");
-        });
-        assert_eq!(count(&db), "129");
-        drop(db);
-        for dir in [src, target] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// A directory where a snapshot being sent waits, when told to, until it
-    /// is let through: a snapshot to a slow bucket.
-    struct Gate {
-        inner: DirectoryStore,
-        closed: Mutex<bool>,
-        opened: std::sync::Condvar,
-        /// Snapshots stored, and snapshots waiting to be.
-        sent: std::sync::atomic::AtomicUsize,
-        waiting: std::sync::atomic::AtomicUsize,
-    }
-
-    impl Gate {
-        fn new(root: &Path) -> Arc<Gate> {
-            Arc::new(Gate {
-                inner: DirectoryStore::new(root),
-                closed: Mutex::new(false),
-                opened: std::sync::Condvar::new(),
-                sent: Default::default(),
-                waiting: Default::default(),
-            })
-        }
-
-        /// Snapshots wait from now on, until the guard is dropped (whatever
-        /// happens to the test: nothing is left waiting).
-        fn close(&self) -> Opens<'_> {
-            *self.closed.lock().unwrap() = true;
-            Opens(self)
-        }
-
-        /// Waits until `n` snapshots wait at the gate.
-        fn until_waiting(&self, n: usize) {
-            assert!(
-                (0..2000).any(|_| {
-                    std::thread::sleep(Duration::from_millis(5));
-                    self.waiting.load(Ordering::SeqCst) == n
-                }),
-                "{} snapshots wait, not {n}",
-                self.waiting.load(Ordering::SeqCst)
-            );
-        }
-    }
-
-    /// Opens its gate when dropped.
-    struct Opens<'a>(&'a Gate);
-
-    impl Drop for Opens<'_> {
-        fn drop(&mut self) {
-            *self.0.closed.lock().unwrap() = false;
-            self.0.opened.notify_all();
-        }
-    }
-
-    impl BackupStore for Gate {
-        fn describe(&self) -> String {
-            self.inner.describe()
-        }
-        fn put(&self, name: &str, data: &[u8]) -> Result<()> {
-            self.inner.put(name, data)
-        }
-        fn put_file(&self, name: &str, path: &Path) -> Result<()> {
-            if name.starts_with("snapshots/") {
-                self.waiting.fetch_add(1, Ordering::SeqCst);
-                let mut closed = self.closed.lock().unwrap();
-                while *closed {
-                    closed = self.opened.wait(closed).unwrap();
-                }
-                drop(closed);
-                self.waiting.fetch_sub(1, Ordering::SeqCst);
-                self.sent.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.put_file(name, path)
-        }
-        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-            self.inner.get(name)
-        }
-        fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-            self.inner.get_file(name, dest)
-        }
-        fn size(&self, name: &str) -> Result<Option<u64>> {
-            self.inner.size(name)
-        }
-        fn list(&self, prefix: &str) -> Result<Vec<String>> {
-            self.inner.list(prefix)
-        }
-        fn delete(&self, name: &str) -> Result<()> {
-            self.inner.delete(name)
-        }
-    }
-
-    /// `open`, once the backup the upkeep thread sends when the database
-    /// opens is over: the test has the backups to itself, and nothing writes
-    /// to them after it has removed them.
-    fn open_quiet(dir: &Path, store: Arc<dyn BackupStore>) -> Embedded {
-        let db = open(dir, store);
-        assert!((0..2000).any(|_| {
-            std::thread::sleep(Duration::from_millis(5));
-            db.engine().backup_status().last_snapshot_at.is_some()
-        }));
-        db
-    }
-
-    /// The rows of the backup in `store`, restored into the empty `dst`.
-    fn restored(dst: &Path, store: &dyn BackupStore) -> String {
-        let _ = fs::remove_dir_all(dst);
-        assert!(restore(dst, store).unwrap());
-        let db = Embedded::open_with(dst, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
-        let rows = count(&db);
-        drop(db);
-        let _ = fs::remove_dir_all(dst);
-        rows
-    }
-
-    /// The last shipment of a server that stops does not wait for a snapshot
-    /// being sent (one the console asked for, to a slow bucket): the log goes
-    /// next to it, and the backup holds every write, whether that snapshot
-    /// ever arrives or not.
-    #[test]
-    fn the_last_shipment_does_not_wait_for_a_snapshot_being_sent() {
-        let (src, target, dst) = (temp("beside-src"), temp("beside-store"), temp("beside-dst"));
-        let store = Gate::new(&target);
-        let db = open_quiet(&src, store.clone());
-        insert(&db, 0..30);
-        let engine = db.engine();
-        std::thread::scope(|s| {
-            let gate = store.close();
-            let forced = s.spawn(|| engine.backup_now(true));
-            store.until_waiting(1);
-            insert(&db, 30..60);
-            // What a server that stops does.
-            engine.begin_shutdown();
-            engine.checkpoint().unwrap();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let last = engine.clone();
-            std::thread::spawn(move || tx.send(last.backup_now(false)));
-            rx.recv_timeout(Duration::from_secs(10)).expect("the log was shipped beside the snapshot").unwrap();
-            assert_eq!(store.waiting.load(Ordering::SeqCst), 1, "the snapshot is still being sent");
-            // The process ends there: what the backup holds is every write.
-            assert_eq!(restored(&dst, store.as_ref()), "60");
-            drop(gate);
-            forced.join().unwrap().unwrap();
-        });
-        // Or the snapshot arrived after all: every write too.
-        assert_eq!(restored(&dst, store.as_ref()), "60");
-        drop(db);
-        for dir in [src, target, dst] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Snapshots asked for while one is being sent wait for it, and the one
-    /// that follows serves them all: each began after they were asked, and
-    /// holds every row written before.
-    #[test]
-    fn snapshots_asked_for_meanwhile_share_the_next_one() {
-        let (src, target, dst) = (temp("share-src"), temp("share-store"), temp("share-dst"));
-        let store = Gate::new(&target);
-        let db = open_quiet(&src, store.clone());
-        insert(&db, 0..10);
-        let engine = db.engine();
-        let before = store.sent.load(Ordering::SeqCst);
-        std::thread::scope(|s| {
-            let gate = store.close();
-            let first = s.spawn(|| engine.backup_now(true));
-            store.until_waiting(1);
-            insert(&db, 10..20);
-            let others: Vec<_> = (0..3).map(|_| s.spawn(|| engine.backup_now(true))).collect();
-            // They have asked, and wait for their turn.
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(others.iter().all(|t| !t.is_finished()));
-            drop(gate);
-            first.join().unwrap().unwrap();
-            for t in others {
-                t.join().unwrap().unwrap();
-            }
-        });
-        assert_eq!(store.sent.load(Ordering::SeqCst) - before, 2, "the one being sent, then one for the others");
-        assert_eq!(restored(&dst, store.as_ref()), "20");
-        drop(db);
-        for dir in [src, target, dst] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Closing a database waits for its backup under way, and none is made
-    /// after: once it has returned, the backup location is left as it is. A
-    /// deleted application's backups are removed then, and none of its
-    /// objects lands afterwards for a new application of the same name to
-    /// find.
-    #[test]
-    fn closing_waits_for_the_backup_under_way() {
-        let (src, target) = (temp("close-src"), temp("close-store"));
-        let store = Gate::new(&target);
-        let db = open_quiet(&src, store.clone());
-        insert(&db, 0..10);
-        let engine = db.engine();
-        std::thread::scope(|s| {
-            let gate = store.close();
-            let forced = s.spawn(|| engine.backup_now(true));
-            store.until_waiting(1);
-            let closing = s.spawn(|| engine.close());
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(!closing.is_finished(), "close waits for the snapshot being sent");
-            drop(gate);
-            closing.join().unwrap().unwrap();
-            forced.join().unwrap().unwrap();
-        });
-        for force in [true, false] {
-            let e = engine.backup_now(force).unwrap_err().to_string();
-            assert!(e.contains("is closed"), "{e}");
-        }
-        delete_all(store.as_ref()).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(store.get(MANIFEST).unwrap(), None);
-        assert!(store.list("snapshots/").unwrap().is_empty() && store.list("wal/").unwrap().is_empty());
-        drop(db);
-        for dir in [src, target] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// An encrypted database whose header cannot be read sends no snapshot:
-    /// one would be unreadable, and the manifest goes on naming the last one
-    /// that can be read.
-    #[test]
-    fn no_snapshot_of_an_encrypted_database_without_its_header() {
-        let (src, target) = (temp("header-src"), temp("header-store"));
-        let store = Arc::new(DirectoryStore::new(&target));
-        let options = EngineOptions {
-            backup: Some(BackupOptions::new(store.clone())),
-            checkpoint_every: Duration::from_secs(3600),
-            encryption: Some(crate::Encryption::from_key([7; 32])),
-            sync: false,
-            ..EngineOptions::default()
-        };
-        let db = Embedded::open_with(&src, options).unwrap();
-        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
-        insert(&db, 0..10);
-        db.engine().backup_now(true).unwrap();
-        let (manifest, snapshots) = (store.get(MANIFEST).unwrap(), store.list("snapshots/").unwrap());
-        let header = fs::read(src.join(HEADER_FILE)).unwrap();
-        fs::remove_file(src.join(HEADER_FILE)).unwrap();
-        insert(&db, 10..20);
-        let e = db.engine().backup_now(true).unwrap_err().to_string();
-        assert!(e.contains(HEADER_FILE), "{e}");
-        assert_eq!(store.get(MANIFEST).unwrap(), manifest);
-        assert_eq!(store.list("snapshots/").unwrap(), snapshots);
-        fs::write(src.join(HEADER_FILE), header).unwrap();
-        db.engine().backup_now(true).unwrap();
-        drop(db);
-        for dir in [src, target] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Each object is written to a file of its own before it takes its name:
-    /// writers of the same object at the same time all succeed, and the
-    /// object is one of theirs, whole. A file a killed writer left is removed
-    /// once it is old; one that may still be written is not.
-    #[test]
-    fn a_directory_never_shows_or_keeps_half_an_object() {
-        let dir = temp("directory");
-        let store = DirectoryStore::new(&dir);
-        let bodies: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 3 << 20]).collect();
-        let source = temp("directory-source");
-        fs::create_dir_all(&source).unwrap();
-        std::thread::scope(|s| {
-            for (i, body) in bodies.iter().enumerate() {
-                let (store, source) = (&store, source.join(i.to_string()));
-                s.spawn(move || {
-                    fs::write(&source, body).unwrap();
-                    store.put_file("snapshots/1.db", &source).unwrap();
-                    store.put("snapshots/1.db", body).unwrap();
-                });
-            }
-        });
-        let stored = store.get("snapshots/1.db").unwrap().unwrap();
-        assert!(bodies.contains(&stored), "the object is what one writer wrote, whole");
-        assert_eq!(store.size("snapshots/1.db").unwrap(), Some(3 << 20));
-        assert!(store.size("snapshots/2.db").is_err());
-        assert_eq!(store.list("snapshots/").unwrap(), ["snapshots/1.db"]);
-        assert_eq!(fs::read_dir(dir.join("snapshots")).unwrap().count(), 1, "no file aside is left");
-        // A writer that failed leaves nothing either.
-        assert!(store.put_file("snapshots/3.db", &source.join("missing")).is_err());
-        assert_eq!(fs::read_dir(dir.join("snapshots")).unwrap().count(), 1);
-        // Left by writers that were killed: one long ago, one a moment ago (or still at it).
-        let (old, recent) = (dir.join("snapshots/9.db.old.partial"), dir.join("snapshots/9.db.new.partial"));
-        fs::write(&old, b"half").unwrap();
-        fs::write(&recent, b"half").unwrap();
-        let long_ago = std::time::SystemTime::now() - PARTIAL_LEFT - Duration::from_secs(60);
-        fs::File::options().write(true).open(&old).unwrap().set_modified(long_ago).unwrap();
-        store.put("snapshots/4.db", b"whole").unwrap();
-        assert!(!old.exists() && recent.exists());
-        assert_eq!(store.list("snapshots/").unwrap(), ["snapshots/1.db", "snapshots/4.db"]);
-        // Fetched to a file: the object, or no file.
-        assert!(store.get_file("snapshots/4.db", &source.join("back")).unwrap());
-        assert_eq!(fs::read(source.join("back")).unwrap(), b"whole");
-        assert!(!store.get_file("snapshots/5.db", &source.join("none")).unwrap());
-        assert!(!source.join("none").exists());
-        for dir in [dir, source] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// The copy of the page store a snapshot was sending when the process was
-    /// killed is removed when the database is opened again, whatever its name.
-    #[test]
-    fn a_copy_left_by_a_snapshot_cut_short_is_removed_at_opening() {
-        let (dir, target) = (temp("left"), temp("left-store"));
-        drop(open(&dir, Arc::new(DirectoryStore::new(&target))));
-        let left = [dir.join("snapshot.partial"), dir.join(partial_name(LOCAL_SNAPSHOT))];
-        for path in &left {
-            fs::write(path, vec![0u8; 4096]).unwrap();
-        }
-        let db = (0..400)
-            .find_map(|_| {
-                std::thread::sleep(Duration::from_millis(10));
-                Embedded::open_with(&dir, EngineOptions::default()).ok()
-            })
-            .expect("opens again");
-        assert!(left.iter().all(|path| !path.exists()));
-        assert_eq!(count(&db), "0");
-        drop(db);
-        for dir in [dir, target] {
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
 
     /// The backup of an earlier version is set aside once; when that version
     /// has run again since and gone further, its new backup takes the place of
@@ -1275,6 +871,49 @@ mod tests {
         delete_all(&part).unwrap();
         assert_eq!(store.get("before-import/apps/shop/manifest.json").unwrap(), None);
         assert_eq!(aside(MANIFEST).map(|m| m.len() > 10), Some(true), "the others' stay");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two places as one store: written in both, read from either, and an
+    /// application's part of it is the same part of each place. Emptying it
+    /// empties each place, even when the other cannot be emptied.
+    #[test]
+    fn a_mirror_is_two_places() {
+        let dir = std::env::temp_dir().join(format!("nuage-backup-mirror-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (a, b) = (DirectoryStore::new(dir.join("a")), DirectoryStore::new(dir.join("b")));
+        let both: Arc<dyn BackupStore> = Arc::new(MirrorStore::new(Arc::new(a.clone()), Arc::new(b.clone())));
+        assert_eq!(both.describe(), format!("{} and {}", a.describe(), b.describe()));
+        both.put("x", b"1").unwrap();
+        assert_eq!((a.get("x").unwrap(), b.get("x").unwrap()), (Some(b"1".to_vec()), Some(b"1".to_vec())));
+        b.put("y", b"2").unwrap();
+        assert_eq!(both.get("y").unwrap(), Some(b"2".to_vec()), "from the second when the first has none");
+        assert_eq!(both.list("").unwrap(), ["x", "y"]);
+        assert!(a.parts().is_none());
+
+        let shop = PrefixedStore::new(both.clone(), "apps/shop/");
+        let (one, two) = shop.parts().expect("the same prefix in each place");
+        assert_eq!(one.describe(), format!("{}/apps/shop", a.describe()));
+        assert_eq!(shop.describe(), format!("{} and {}", one.describe(), two.describe()));
+        assert!(shop.describe_aside(BEFORE_IMPORT).ends_with("b/before-import/apps/shop"));
+        for part in [&one, &two] {
+            part.put(MANIFEST, b"m").unwrap();
+            part.put("wal/00000000000000000001.log", b"w").unwrap();
+        }
+        delete_all(&shop).unwrap();
+        for place in [&a, &b] {
+            assert!(place.list("apps/shop/wal/").unwrap().is_empty());
+            assert_eq!(place.get("apps/shop/manifest.json").unwrap(), None);
+        }
+        assert_eq!(a.get("x").unwrap(), Some(b"1".to_vec()), "the rest stays");
+
+        // A place that cannot be emptied (a file where its folder should be).
+        fs::write(dir.join("not-a-folder"), b"").unwrap();
+        let broken: Arc<dyn BackupStore> = Arc::new(DirectoryStore::new(dir.join("not-a-folder")));
+        b.put("apps/blog/manifest.json", b"m").unwrap();
+        let blog = PrefixedStore::new(Arc::new(MirrorStore::new(broken, Arc::new(b.clone()))), "apps/blog/");
+        assert!(delete_all(&blog).is_err());
+        assert_eq!(b.get("apps/blog/manifest.json").unwrap(), None, "the other place is emptied all the same");
         let _ = fs::remove_dir_all(&dir);
     }
 }

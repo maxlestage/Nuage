@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
@@ -66,11 +66,6 @@ pub(crate) struct Snapshot {
     /// The branch's tree, then its ancestors', main last. `None`: not
     /// created yet (a branch that never wrote anything).
     layers: Vec<Option<Arc<Node>>>,
-    /// The view of a write that holds the writer lock: once this is set (the
-    /// server stops, see [`Store::stop_commits`]), its reads fail, and the
-    /// write with them, rather than run to a commit that would be refused
-    /// while the last checkpoint waits for the lock.
-    stop: Option<Arc<AtomicBool>>,
 }
 
 /// Decodes a stored value: `[1, data...]` or the tombstone `[0]`.
@@ -99,19 +94,8 @@ impl Snapshot {
         self.version.lsn()
     }
 
-    /// `true` once the write this view is for must stop (see [`Snapshot::stop`]).
-    fn stopped(&self) -> bool {
-        self.stop.as_ref().is_some_and(|stop| stop.load(Ordering::Relaxed))
-    }
-
-    /// An error once the write this view is for must stop.
-    fn going_on(&self) -> Result<()> {
-        if self.stopped() { Err(super::stopping_error()) } else { Ok(()) }
-    }
-
     /// The value of `key`, looking in `overlay` first.
     pub(crate) fn get(&self, overlay: Option<&Overlay>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.going_on()?;
         if let Some(v) = overlay.and_then(|o| o.get(key)) {
             return Ok(v.clone());
         }
@@ -126,7 +110,6 @@ impl Snapshot {
     /// The stored value of `key` (what is pending in a transaction aside),
     /// given to `f` where it is, without a copy.
     pub(crate) fn with<R>(&self, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
-        self.going_on()?;
         let mut f = Some(f);
         for layer in self.layers.iter().flatten() {
             let found = self.pages.find(layer, key, |v| match (v.split_first(), f.take()) {
@@ -150,7 +133,6 @@ impl Snapshot {
         end: &[u8],
         mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        self.going_on()?;
         if start >= end {
             return Ok(());
         }
@@ -163,11 +145,6 @@ impl Snapshot {
             let Some(root) = first else { return Ok(()) };
             let mut failed = None;
             self.pages.walk(root, start, end, &mut |k, v| match v.split_first() {
-                // A whole table can go by in one walk: the write stops in the middle of it.
-                _ if self.stopped() => {
-                    failed = Some(super::stopping_error());
-                    false
-                }
                 Some((1, value)) => f(k, value).unwrap_or_else(|e| {
                     failed = Some(e);
                     false
@@ -195,7 +172,6 @@ impl Snapshot {
     /// layers (the closest one wins). Returns them and where to continue
     /// (`None`: the range is exhausted).
     pub(crate) fn scan(&self, overlay: Option<&Overlay>, start: &[u8], end: &[u8], limit: usize) -> Result<Scanned> {
-        self.going_on()?;
         let limit = limit.max(1);
         let range = (Bound::Included(start), Bound::Excluded(end));
         let overlay = overlay.filter(|o| start < end && o.range::<[u8], _>(range).next().is_some());
@@ -280,63 +256,16 @@ impl Snapshot {
 pub(crate) struct Writer {
     pub wal: wal::Writer,
     pub next_lsn: u64,
+    pub checkpoint_lsn: u64,
+    pub last_checkpoint: Option<SystemTime>,
     pub commits_since_checkpoint: u64,
-}
-
-/// The writer lock, held (see [`Store::writer`]): the [`Writer`] it guards,
-/// and the store knows which thread holds it until it is dropped.
-pub(crate) struct WriterGuard<'a> {
-    guard: MutexGuard<'a, Writer>,
-    holder: &'a AtomicU64,
-}
-
-impl std::ops::Deref for WriterGuard<'_> {
-    type Target = Writer;
-
-    fn deref(&self) -> &Writer {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for WriterGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Writer {
-        &mut self.guard
-    }
-}
-
-impl Drop for WriterGuard<'_> {
-    fn drop(&mut self) {
-        // Before the lock itself is let go (the fields are dropped after this).
-        self.holder.store(NOBODY, Ordering::SeqCst);
-    }
-}
-
-/// What [`Store::writer_holder`] holds when no thread has the lock.
-const NOBODY: u64 = 0;
-
-/// A number of its own for each thread (never [`NOBODY`]): the store tells
-/// by it whether the thread that asks for a view is the one that holds its
-/// writer lock.
-fn thread_number() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(NOBODY + 1);
-    thread_local! {
-        static NUMBER: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
-    }
-    // A thread being torn down has no number left: it holds no lock either.
-    NUMBER.try_with(|n| *n).unwrap_or(u64::MAX)
 }
 
 /// The page file, the write-ahead log and the branch registry.
 pub(crate) struct Store {
     pub pages: Arc<Pages>,
     pub dir: PathBuf,
-    /// Taken through [`Store::writer`] only.
-    writer: Mutex<Writer>,
-    /// The [`thread_number`] of the thread that holds `writer` ([`NOBODY`]: none).
-    writer_holder: AtomicU64,
-    /// The first LSN of the log segment being written: whoever ships the
-    /// others needs it, and does not wait for a write to read it.
-    current_segment: AtomicU64,
+    pub writer: Mutex<Writer>,
     branches: RwLock<HashMap<String, BranchInfo>>,
     generation: AtomicU64,
     /// The last commit that wrote each table of each branch, for optimistic
@@ -352,16 +281,10 @@ pub(crate) struct Store {
     saved_generation: AtomicU64,
     /// LSN of the last applied commit (what snapshots see).
     applied_lsn: AtomicU64,
-    /// LSN of the last commit the page store holds on disk, and when the last
-    /// checkpoint ran (Unix ms, 0: not yet). Outside the writer lock: whoever
-    /// only shows them (the status, every second) never waits for a write.
-    checkpoint_lsn: AtomicU64,
-    last_checkpoint: AtomicI64,
-    /// No commit is accepted any more (see [`Store::stop_commits`]). Shared
-    /// with the views of the writes that hold the writer lock ([`Snapshot::stop`]).
-    stopping: Arc<AtomicBool>,
     /// Catalog entries already parsed (see [`Store::parsed`]).
     catalog: Mutex<Catalog>,
+    /// No commit is accepted any more ([`Store::stop_writes`]).
+    writes_stopped: AtomicBool,
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
     /// Commits the log read at opening does not hold, between two it does:
@@ -497,17 +420,19 @@ impl Store {
             },
             wal_file: Mutex::new(log.file()),
             sync,
-            current_segment: AtomicU64::new(log.first_lsn),
-            writer: Mutex::new(Writer { wal: log, next_lsn: last + 1, commits_since_checkpoint: 0 }),
-            writer_holder: AtomicU64::new(NOBODY),
+            writer: Mutex::new(Writer {
+                wal: log,
+                next_lsn: last + 1,
+                checkpoint_lsn,
+                last_checkpoint: None,
+                commits_since_checkpoint: 0,
+            }),
             branches: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(generation),
             saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
-            checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
-            last_checkpoint: AtomicI64::new(0),
-            stopping: Arc::new(AtomicBool::new(false)),
             catalog: Mutex::new(Catalog::default()),
+            writes_stopped: AtomicBool::new(false),
             log_gap,
         };
         store.load_branches()?;
@@ -616,22 +541,8 @@ impl Store {
     /// not yet: what a writer goes by. Whoever gives a caller something read
     /// from it first waits for [`wait_durable`](Self::wait_durable) of its
     /// [`lsn`](Snapshot::lsn).
-    ///
-    /// Asked for by the thread that holds the writer lock (a write from its
-    /// first statement to its commit), it is refused once the server stops,
-    /// and its reads fail from the moment it does: such a write would be
-    /// refused at its commit anyway, and it holds the lock the last
-    /// checkpoint needs. A transaction, which takes the lock only to commit,
-    /// goes on reading.
     pub(crate) fn snapshot_latest(&self, branch: &str) -> Result<Snapshot> {
-        let mut view = self.view(branch, self.pages.version())?;
-        if self.holds_writer() {
-            if self.stopping() {
-                return Err(super::stopping_error());
-            }
-            view.stop = Some(self.stopping.clone());
-        }
-        Ok(view)
+        self.view(branch, self.pages.version())
     }
 
     fn view(&self, branch: &str, version: Arc<Version>) -> Result<Snapshot> {
@@ -640,7 +551,7 @@ impl Store {
         } else {
             self.chain(branch)?.iter().map(|b| version.root(&branch_table(b))).collect()
         };
-        Ok(Snapshot { pages: self.pages.clone(), version, layers, stop: None })
+        Ok(Snapshot { pages: self.pages.clone(), version, layers })
     }
 
     /// A new, never used table generation.
@@ -783,6 +694,13 @@ impl Store {
         }
     }
 
+    /// The next sync of the log fails, as a disk that refuses a write would
+    /// (the tests of the key-value store in the database).
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn fail_next_sync(&self) {
+        self.durable.fail_next.store(true, Ordering::SeqCst);
+    }
+
     /// An error once a sync of the log has failed: the commits it covered
     /// may not be on disk, and no later sync can tell.
     fn log_is_sound(&self) -> Result<()> {
@@ -812,32 +730,16 @@ impl Store {
         }
         w.wal.rotate(w.next_lsn)?;
         *lock(&self.wal_file) = w.wal.file();
-        self.current_segment.store(w.wal.first_lsn, Ordering::SeqCst);
         Ok(())
     }
 
-    /// The first LSN of the log segment being written (the others are sealed).
-    pub(crate) fn current_segment(&self) -> u64 {
-        self.current_segment.load(Ordering::SeqCst)
-    }
-
-    /// Refuses every commit from now on, with the error [`super::Stopping`].
-    /// A commit holds the writer lock from before it is checked to after it
-    /// is applied: once this has returned, whoever takes that lock (the last
-    /// checkpoint) has every commit that was or ever will be acknowledged.
-    /// A write that holds the lock stops at its next read (see
-    /// [`snapshot_latest`](Self::snapshot_latest)), so that the lock is soon free.
-    pub(crate) fn stop_commits(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-    }
-
-    /// `true` once [`stop_commits`](Self::stop_commits) was called.
-    pub(crate) fn stopping(&self) -> bool {
-        self.stopping.load(Ordering::SeqCst)
-    }
-
-    fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
-        if self.stopping() {
+    /// Commits raw operations as one log record and applies them; returns
+    /// the commit's number. The caller holds the writer lock, and once it has
+    /// let go of it, waits for [`wait_durable`](Self::wait_durable) of that
+    /// number before telling anyone the commit is made.
+    pub(crate) fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
+        if self.writes_stopped.load(Ordering::SeqCst) {
+            // Typed: a server answers "not now" (HTTP 503, PostgreSQL 57P01), and the request is sent again.
             return Err(super::stopping_error());
         }
         self.log_is_sound()?;
@@ -877,20 +779,25 @@ impl Store {
         // The page store holds every commit so far: they are on disk whatever the log's state.
         save(&self.pages, lsn)?;
         self.durable.lsn.fetch_max(lsn, Ordering::SeqCst);
-        self.checkpoint_lsn.store(lsn, Ordering::SeqCst);
+        w.checkpoint_lsn = lsn;
         Ok(lsn)
     }
 
-    /// Takes the writer lock.
-    pub(crate) fn writer(&self) -> WriterGuard<'_> {
-        let guard = lock(&self.writer);
-        self.writer_holder.store(thread_number(), Ordering::SeqCst);
-        WriterGuard { guard, holder: &self.writer_holder }
+    /// Refuses every commit from now on: each one is an error, before
+    /// anything is logged. A commit holding the writer lock now ends first.
+    /// `true` once [`stop_writes`](Self::stop_writes) was called.
+    pub(crate) fn writes_stopped(&self) -> bool {
+        self.writes_stopped.load(Ordering::SeqCst)
     }
 
-    /// `true` when the calling thread holds the writer lock.
-    fn holds_writer(&self) -> bool {
-        self.writer_holder.load(Ordering::SeqCst) == thread_number()
+    pub(crate) fn stop_writes(&self) {
+        let _w = self.writer();
+        self.writes_stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Takes the writer lock.
+    pub(crate) fn writer(&self) -> MutexGuard<'_, Writer> {
+        lock(&self.writer)
     }
 
     /// Makes everything applied so far durable in the page store, starts a
@@ -903,7 +810,7 @@ impl Store {
 
     pub(crate) fn checkpoint_locked(&self, w: &mut Writer, keep_after: Option<u64>) -> Result<u64> {
         let lsn = self.flush(w)?;
-        self.last_checkpoint.store(now_millis(), Ordering::SeqCst);
+        w.last_checkpoint = Some(SystemTime::now());
         w.commits_since_checkpoint = 0;
         if w.wal.bytes > 0 || w.wal.spent() {
             self.next_segment(w)?;
@@ -1002,16 +909,6 @@ impl Store {
     pub(crate) fn applied_lsn(&self) -> u64 {
         self.applied_lsn.load(Ordering::SeqCst)
     }
-
-    /// The last commit the page store holds on disk.
-    pub(crate) fn checkpoint_lsn(&self) -> u64 {
-        self.checkpoint_lsn.load(Ordering::SeqCst)
-    }
-
-    /// When the last checkpoint ran (Unix ms), `None` before the first one.
-    pub(crate) fn last_checkpoint(&self) -> Option<i64> {
-        Some(self.last_checkpoint.load(Ordering::SeqCst)).filter(|at| *at > 0)
-    }
 }
 
 #[cfg(test)]
@@ -1057,93 +954,6 @@ mod tests {
         db.sql("INSERT INTO t (id, v) VALUES (4, 'after')", &[]).unwrap();
         assert_eq!(db.sql("SELECT count(*) FROM t WHERE id IN (1, 4)", &[]).unwrap()[0].rows[0][0].to_string(), "2");
         assert!(db.sql("SELECT count(*) FROM t WHERE id = 3", &[]).unwrap()[0].rows[0][0].to_string() == "0");
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The figures the status shows are read without the lock a write
-    /// holds: asked for in the middle of a long statement, a checkpoint or a
-    /// snapshot, they come at once.
-    #[test]
-    fn the_figures_do_not_wait_for_a_write() {
-        let dir = temp("stats");
-        let db = Embedded::open(&dir).unwrap();
-        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
-        db.sql("INSERT INTO t (id, v) VALUES (1, 'one')", &[]).unwrap();
-        let lsn = db.engine().checkpoint().unwrap();
-        db.sql("INSERT INTO t (id, v) VALUES (2, 'two')", &[]).unwrap();
-        let engine = db.engine().clone();
-        let before = engine.stats();
-        assert_eq!((before.lsn, before.checkpoint_lsn), (lsn + 1, lsn));
-        assert!(before.last_checkpoint.is_some_and(|at| at.elapsed().is_ok_and(|d| d.as_secs() < 60)));
-        // A write is in progress, for as long as the test says.
-        let writing = engine.store.writer();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let asked = engine.clone();
-        std::thread::spawn(move || tx.send(asked.stats()));
-        let during =
-            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the figures came while a write held the lock");
-        drop(writing);
-        let figures = |s: &crate::StorageStats| (s.lsn, s.checkpoint_lsn, s.last_checkpoint, s.file_bytes, s.pages);
-        assert_eq!(figures(&during), figures(&before));
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Once the server stops, the view of a write that holds the writer lock
-    /// reads no more, from the middle of a walk on; a write that takes the
-    /// lock is refused before it reads anything. A view taken without the
-    /// lock (a transaction's, a reader's) reads on.
-    #[test]
-    fn a_write_that_holds_the_lock_stops_with_the_server() {
-        use crate::engine::is_stopping;
-        let dir = temp("stopping");
-        let db = Embedded::open_with(&dir, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
-        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
-        for id in 0..10 {
-            db.sql("INSERT INTO t (id, v) VALUES (?, 'row')", &[id.into()]).unwrap();
-        }
-        let store = &db.engine().store;
-        let (start, end) = (b"".as_slice(), [0xff; 16]);
-        let all = |view: &super::Snapshot| {
-            let mut seen = 0;
-            view.each(None, start, &end, |_, _| {
-                seen += 1;
-                Ok(true)
-            })
-            .map(|()| seen)
-        };
-        let beside = store.snapshot_latest(super::MAIN).unwrap();
-        let writer = store.writer();
-        let (whole, cut) = (store.snapshot_latest(super::MAIN).unwrap(), store.snapshot_latest(super::MAIN).unwrap());
-        let entries = all(&whole).unwrap();
-        assert!(entries >= 10, "{entries}");
-        // The server stops while the write walks the table: it goes no further.
-        let mut seen = 0;
-        let e = cut
-            .each(None, start, &end, |_, _| {
-                seen += 1;
-                if seen == 3 {
-                    store.stop_commits();
-                }
-                Ok(true)
-            })
-            .unwrap_err();
-        assert!(is_stopping(&e), "{e}");
-        assert_eq!(seen, 3);
-        // Its next reads fail, and so does a write that begins.
-        assert!(all(&whole).is_err_and(|e| is_stopping(&e)));
-        assert!(whole.get(None, b"key").is_err_and(|e| is_stopping(&e)));
-        assert!(whole.with(b"key", |_| ()).is_err_and(|e| is_stopping(&e)));
-        assert!(whole.scan(None, start, &end, 10).is_err_and(|e| is_stopping(&e)));
-        assert!(store.snapshot_latest(super::MAIN).is_err_and(|e| is_stopping(&e)));
-        drop(writer);
-        // Without the lock, reads go on.
-        assert_eq!(all(&beside).unwrap(), entries);
-        assert_eq!(all(&store.snapshot_latest(super::MAIN).unwrap()).unwrap(), entries);
-        let e = db.sql("UPDATE t SET v = 'changed'", &[]).unwrap_err();
-        assert!(is_stopping(&e), "{e}");
-        assert_eq!(count(&db), "I64(10)");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

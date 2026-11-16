@@ -258,12 +258,6 @@ impl BackupStore for PresentDir {
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.inner.get(name)
     }
-    fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
-        self.inner.get_file(name, dest)
-    }
-    fn size(&self, name: &str) -> Result<Option<u64>> {
-        self.inner.size(name)
-    }
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list(prefix)
     }
