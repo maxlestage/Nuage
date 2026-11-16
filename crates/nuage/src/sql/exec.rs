@@ -22,6 +22,7 @@ use serde_json::{Value as Json, json};
 
 use super::ast::*;
 use super::lex::syntax;
+use super::limits::{Hold, Limits, row_bytes, rows_bytes, text_fits, value_bytes};
 use super::parse::{check_name, column_type, parse_expr};
 use super::value::{self as v, arith, bool_or_null, cast, compare, order_cmp, tri, truthy};
 use crate::embedded::EmbeddedTransaction;
@@ -42,11 +43,12 @@ pub struct SqlResult {
     pub returns_rows: bool,
 }
 
-/// Rows and their column names.
-#[derive(Clone, Debug, Default)]
+/// Rows and their column names, counted in the memory of the statement for
+/// as long as they are kept.
 struct Rows {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
+    hold: Hold,
 }
 
 /// One table (or derived table) of a `FROM`.
@@ -113,6 +115,9 @@ impl Scope {
 struct Env<'e> {
     scope: &'e Scope,
     row: &'e [Value],
+    /// The end of the row when it is in two pieces: a join tries a row of the
+    /// tables before with a row of the next one, without copying either.
+    tail: &'e [Value],
     group: Option<&'e [Vec<Value>]>,
     outer: Option<&'e Env<'e>>,
     used_outer: &'e Cell<bool>,
@@ -122,7 +127,9 @@ struct Env<'e> {
 impl Env<'_> {
     fn lookup(&self, table: Option<&str>, name: &str) -> Result<Value> {
         if let Some((p, c)) = self.scope.find(table, name)? {
-            return Ok(self.row.get(self.scope.parts[p].offset + c).cloned().unwrap_or(Value::Null));
+            let i = self.scope.parts[p].offset + c;
+            let held = if i < self.row.len() { self.row.get(i) } else { self.tail.get(i - self.row.len()) };
+            return Ok(held.cloned().unwrap_or(Value::Null));
         }
         if table.is_none()
             && let Some((cols, vals)) = self.output
@@ -146,22 +153,203 @@ pub(crate) struct Runner<'a> {
     pub tx: &'a EmbeddedTransaction,
     pub schemas: &'a SchemaCache,
     pub params: &'a [Value],
-    /// Results of subqueries that read nothing of the enclosing row.
-    cache: RefCell<HashMap<usize, Rc<Rows>>>,
+    /// Results of the statement's subqueries that read nothing of the
+    /// enclosing row, by the number of their `SELECT` ([`Select::id`]). Never
+    /// by where the `SELECT` is in memory: a copy of it is elsewhere, and
+    /// another one may come to the same place.
+    cache: RefCell<HashMap<u64, Rc<Rows>>>,
+    /// The memory and the time the statements may take.
+    limits: Rc<Limits>,
+    /// Levels of [`Runner::to_m`] at work (see [`M_DEPTH`]).
+    m_depth: Cell<usize>,
 }
 
-fn conj(e: &Expr, out: &mut Vec<Expr>) {
+/// How deep a condition handed to Memoire may be. Its evaluator calls itself
+/// once per level with larger frames than this module's: a deeper condition
+/// is evaluated here.
+const M_DEPTH: usize = 24;
+
+/// The conditions `e` is the `AND` of.
+fn conj<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     match e {
-        Expr::Bin(Op::And, a, b) => {
-            conj(a, out);
-            conj(b, out);
+        Expr::Chain(first, rest) if matches!(rest.first(), Some((Op::And, _))) => {
+            conj(first, out);
+            rest.iter().for_each(|(_, x)| conj(x, out));
         }
-        other => out.push(other.clone()),
+        other => out.push(other),
     }
 }
 
+/// `parts` joined by `op` as a tree no deeper than the logarithm of their
+/// number, in their order. Memoire evaluates (and copies, and drops) a
+/// condition by calling itself on each side: a long list joined one after
+/// the other would be as deep as it is long.
+fn balanced(op: BinOp, mut parts: Vec<M>) -> Option<M> {
+    while parts.len() > 1 {
+        let mut pairs = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut it = parts.into_iter();
+        while let Some(a) = it.next() {
+            pairs.push(match it.next() {
+                Some(b) => M::binary(op, a, b),
+                None => a,
+            });
+        }
+        parts = pairs;
+    }
+    parts.pop()
+}
+
 fn and_all(parts: Vec<M>) -> Option<M> {
-    parts.into_iter().reduce(|a, b| M::binary(BinOp::And, a, b))
+    balanced(BinOp::And, parts)
+}
+
+/// `column = v1 OR column = v2 OR ...` (each operand an equality of the same
+/// column with a value that is not NULL) as `column IN (v1, v2, ...)`: the
+/// same rows, found through the column's index instead of a read of the
+/// whole table. `None` when the operands are not all of that form.
+fn one_column_among(parts: &[M]) -> Option<M> {
+    let mut column: Option<ColumnRef> = None;
+    let mut list = Vec::with_capacity(parts.len());
+    for part in parts {
+        let M::Binary { op: BinOp::Eq, left, right } = part else { return None };
+        let (c, value) = match (&**left, &**right) {
+            (M::Column(c), M::Value(x)) | (M::Value(x), M::Column(c)) => (c, x),
+            _ => return None,
+        };
+        if value.is_null() || column.is_some_and(|k| k.table != c.table || k.index != c.index) {
+            return None;
+        }
+        column = Some(*c);
+        list.push(value.clone());
+    }
+    Some(M::InList { expr: Box::new(M::Column(column?)), list, negated: false })
+}
+
+/// What a join gives.
+struct Joined {
+    rows: Vec<Vec<Value>>,
+    hold: Hold,
+    /// How many rows it gives (the rows themselves are left out when only their number was asked).
+    count: usize,
+    /// For each condition of `WHERE` it applied, whether it failed on some row (see [`Runner::join`]).
+    failed: Vec<bool>,
+}
+
+/// What a join is asked for.
+#[derive(Clone, Copy)]
+struct Wanted {
+    /// Only how many rows it gives.
+    count: bool,
+    /// Only its first rows.
+    first: Option<usize>,
+}
+
+/// The rows of a group.
+type Group = Vec<Vec<Value>>;
+
+/// Rows an `UPDATE` or a `DELETE` reads at once (see [`Runner::each_target`]).
+const CHANGE_CHUNK: usize = 1024;
+
+/// What a key of a group, of `DISTINCT` or of a hash join takes beside its text.
+const KEY_BYTES: usize = 48;
+
+/// The values a column holds, as a hash join tells them apart.
+#[derive(Clone, Copy)]
+enum Family {
+    /// Integers and floats: SQL compares them by their value, whatever their type.
+    Number,
+    Text,
+    /// Values of one type only (dates, UUIDs...).
+    Exact(ColumnType),
+}
+
+impl Family {
+    /// `None`: no key tells the values apart as SQL does (JSON documents may
+    /// be equal and written differently).
+    fn of(kind: Option<ColumnType>) -> Option<Family> {
+        Some(match kind? {
+            ColumnType::SmallInt | ColumnType::Int | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
+                Family::Number
+            }
+            ColumnType::Text => Family::Text,
+            ColumnType::Json => return None,
+            other => Family::Exact(other),
+        })
+    }
+}
+
+/// The key of a value in a hash join: two values that SQL finds equal have
+/// the same key (two that do not may too; the join's condition is asked
+/// again of each pair).
+#[derive(Hash, PartialEq, Eq)]
+enum JoinKey {
+    Number(u64),
+    Text(String),
+    Other(String),
+}
+
+impl JoinKey {
+    /// `Ok(None)`: it equals nothing (NULL, NaN). `Err(())`: it is not of the
+    /// family, and is compared with each value instead.
+    fn of(v: &Value, family: Family) -> std::result::Result<Option<JoinKey>, ()> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(match (family, v) {
+            (Family::Number, Value::I32(_) | Value::I64(_) | Value::F64(_)) => {
+                let f = v.as_f64().ok_or(())?;
+                if f.is_nan() {
+                    return Ok(None);
+                }
+                // `0.0` and `-0.0` are equal.
+                JoinKey::Number(if f == 0.0 { 0 } else { f.to_bits() })
+            }
+            (Family::Text, Value::Text(t)) => JoinKey::Text(t.clone()),
+            (Family::Exact(kind), _) if v::kind_of(v) == Some(kind) => {
+                let mut k = String::new();
+                v::key(v, &mut k);
+                JoinKey::Other(k)
+            }
+            _ => return Err(()),
+        }))
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            JoinKey::Number(_) => 8,
+            JoinKey::Text(t) | JoinKey::Other(t) => t.len(),
+        }
+    }
+}
+
+/// The key of a row among others (`DISTINCT`, `UNION`).
+fn row_key(row: &[Value]) -> String {
+    let mut k = String::new();
+    row.iter().for_each(|x| v::key(x, &mut k));
+    k
+}
+
+/// `l op r` for Memoire. A value beside a column takes the column's type (an
+/// index holds typed values). `None`: Memoire would not compare them as SQL does.
+fn m_pair(op: BinOp, l: M, r: M) -> Option<M> {
+    let (l, r) = match (&l, &r) {
+        (M::Column(c), M::Value(x)) => {
+            let x = coerce(x, c.kind)?;
+            (l, M::Value(x))
+        }
+        (M::Value(x), M::Column(c)) => {
+            let x = coerce(x, c.kind)?;
+            (M::Value(x), r)
+        }
+        (M::Column(a), M::Column(b)) if !same_family(a.kind, b.kind) => return None,
+        (M::Value(_), M::Value(_))
+            if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
+        {
+            return None;
+        }
+        _ => (l, r),
+    };
+    Some(M::binary(op, l, r))
 }
 
 /// A column name for an expression without an alias.
@@ -187,9 +375,47 @@ fn unique_headers(names: Vec<(String, Option<String>)>) -> Vec<String> {
     out
 }
 
+/// A column of `scope` for Memoire (of part `only`, when given), or one of
+/// the enclosing row's as a value.
+fn m_column(
+    table: Option<&str>,
+    name: &str,
+    scope: &Scope,
+    only: Option<usize>,
+    outer: Option<&Env<'_>>,
+    used: &Cell<bool>,
+) -> Option<M> {
+    match scope.find(table, name).ok()? {
+        Some((p, c)) => {
+            if only.is_some_and(|o| o != p) {
+                return None;
+            }
+            let schema = scope.parts[p].schema?;
+            let col = &schema.columns[c];
+            Some(M::Column(ColumnRef { table: schema.name, name: col.name, index: c, kind: col.kind }))
+        }
+        None => {
+            let v = outer?.lookup(table, name).ok()?;
+            used.set(true);
+            Some(M::Value(v))
+        }
+    }
+}
+
 impl<'a> Runner<'a> {
+    /// A runner with the limits the settings give (see [`super::limits`]).
     pub(crate) fn new(tx: &'a EmbeddedTransaction, schemas: &'a SchemaCache, params: &'a [Value]) -> Self {
-        Runner { tx, schemas, params, cache: RefCell::new(HashMap::new()) }
+        Runner::with_limits(tx, schemas, params, Limits::from_settings())
+    }
+
+    /// A runner under `limits`: the scripts of one request share one budget.
+    pub(crate) fn with_limits(
+        tx: &'a EmbeddedTransaction,
+        schemas: &'a SchemaCache,
+        params: &'a [Value],
+        limits: Rc<Limits>,
+    ) -> Self {
+        Runner { tx, schemas, params, cache: RefCell::new(HashMap::new()), limits, m_depth: Cell::new(0) }
     }
 
     /// The schema of a table (its name in any case).
@@ -212,134 +438,283 @@ impl<'a> Runner<'a> {
     // Expressions
     // -----------------------------------------------------------------------
 
+    /// The value of `e`. Each kind of expression is computed by a function of
+    /// its own: an expression inside another is computed by calling this one
+    /// again, and every level would otherwise pay on the stack for the
+    /// variables of every kind (unoptimized builds give each its own place).
     fn eval(&self, e: &Expr, env: &Env<'_>) -> Result<Value> {
-        Ok(match e {
-            Expr::Lit(v) => v.clone(),
-            Expr::Param(i) => self.param(*i)?,
-            Expr::Col { table, name } => env.lookup(table.as_deref(), name)?,
-            Expr::Neg(x) => {
-                let v = self.eval(x, env)?;
-                match v {
-                    Value::I32(i) => Value::I32(-i),
-                    Value::F64(f) => Value::F64(-f),
-                    other => arith(Op::Sub, &Value::I64(0), &other)?,
-                }
-            }
-            Expr::Not(x) => bool_or_null(tri(&self.eval(x, env)?).map(|b| !b)),
-            Expr::Bin(Op::And, a, b) => {
-                let l = tri(&self.eval(a, env)?);
-                if l == Some(false) {
-                    return Ok(Value::Bool(false));
-                }
-                let r = tri(&self.eval(b, env)?);
-                bool_or_null(match (l, r) {
-                    (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                })
-            }
-            Expr::Bin(Op::Or, a, b) => {
-                let l = tri(&self.eval(a, env)?);
-                if l == Some(true) {
-                    return Ok(Value::Bool(true));
-                }
-                let r = tri(&self.eval(b, env)?);
-                bool_or_null(match (l, r) {
-                    (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                })
-            }
-            Expr::Bin(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge), a, b) => {
-                let (l, r) = (self.eval(a, env)?, self.eval(b, env)?);
-                if l.is_null() || r.is_null() {
-                    return Ok(Value::Null);
-                }
-                let ord = compare(&l, &r);
-                Value::Bool(match (op, ord) {
-                    (Op::Ne, None) => true,
-                    (_, None) => false,
-                    (Op::Eq, Some(o)) => o.is_eq(),
-                    (Op::Ne, Some(o)) => !o.is_eq(),
-                    (Op::Lt, Some(o)) => o.is_lt(),
-                    (Op::Le, Some(o)) => o.is_le(),
-                    (Op::Gt, Some(o)) => o.is_gt(),
-                    (_, Some(o)) => o.is_ge(),
-                })
-            }
-            Expr::Bin(op, a, b) => arith(*op, &self.eval(a, env)?, &self.eval(b, env)?)?,
-            Expr::IsNull(x, negated) => Value::Bool(self.eval(x, env)?.is_null() != *negated),
-            Expr::In(x, list, negated) => {
-                let v = self.eval(x, env)?;
-                let mut values = Vec::with_capacity(list.len());
-                for item in list {
-                    values.push(self.eval(item, env)?);
-                }
-                in_values(&v, &values, *negated)
-            }
-            Expr::InSelect(x, sub, negated) => {
-                let v = self.eval(x, env)?;
-                let rows = self.subquery(sub, env)?;
-                if rows.columns.len() != 1 {
-                    return Err(syntax("the subquery of IN must return one column"));
-                }
-                let values: Vec<Value> = rows.rows.iter().map(|r| r[0].clone()).collect();
-                in_values(&v, &values, *negated)
-            }
-            Expr::Exists(sub, negated) => Value::Bool(self.subquery(sub, env)?.rows.is_empty() == *negated),
-            Expr::Scalar(sub) => {
-                let rows = self.subquery(sub, env)?;
-                if rows.columns.len() != 1 {
-                    return Err(syntax("a subquery used as a value must return one column"));
-                }
-                rows.rows.first().map_or(Value::Null, |r| r[0].clone())
-            }
-            Expr::Between(x, low, high, negated) => {
-                let (v, l, h) = (self.eval(x, env)?, self.eval(low, env)?, self.eval(high, env)?);
-                if v.is_null() || l.is_null() || h.is_null() {
-                    return Ok(Value::Null);
-                }
-                let inside = compare(&v, &l).is_some_and(|o| o.is_ge()) && compare(&v, &h).is_some_and(|o| o.is_le());
-                Value::Bool(inside != *negated)
-            }
+        match e {
+            Expr::Lit(v) => Ok(v.clone()),
+            Expr::Param(i) => self.param(*i),
+            Expr::Col { table, name } => env.lookup(table.as_deref(), name),
+            Expr::Neg(x) => self.neg(x, env),
+            Expr::Not(x) => self.not(x, env),
+            Expr::Chain(first, rest) => self.chain(first, rest, env),
+            Expr::Bin(op, a, b) => self.binary(*op, a, b, env),
+            Expr::IsNull(x, negated) => self.is_null(x, *negated, env),
+            Expr::In(x, list, negated) => self.in_list(x, list, *negated, env),
+            Expr::InSelect(x, sub, negated) => self.in_select(x, sub, *negated, env),
+            Expr::Exists(sub, negated) => self.exists(sub, *negated, env),
+            Expr::Scalar(sub) => self.scalar_subquery(sub, env),
+            Expr::Between(x, low, high, negated) => self.between(x, low, high, *negated, env),
             Expr::Like { expr, pattern, ci, negated, escape } => {
-                let (s, p) = (self.eval(expr, env)?, self.eval(pattern, env)?);
-                let (Some(s), Some(p)) = (v::to_text(&s), v::to_text(&p)) else { return Ok(Value::Null) };
-                let esc = match escape {
-                    Some(e) => v::to_text(&self.eval(e, env)?).and_then(|t| t.chars().next()),
-                    None => None,
-                };
-                Value::Bool(v::like(&s, &p, *ci, esc) != *negated)
+                self.like(expr, pattern, *ci, *negated, escape.as_deref(), env)
             }
-            Expr::Case { operand, whens, otherwise } => {
-                let subject = match operand {
-                    Some(o) => Some(self.eval(o, env)?),
-                    None => None,
-                };
-                for (w, then) in whens {
-                    let hit = match &subject {
-                        Some(s) => compare(s, &self.eval(w, env)?).is_some_and(|o| o.is_eq()),
-                        None => truthy(&self.eval(w, env)?),
-                    };
-                    if hit {
-                        return self.eval(then, env);
+            Expr::Case { operand, whens, otherwise } => self.case(operand.as_deref(), whens, otherwise.as_deref(), env),
+            Expr::Cast(x, kind) => self.cast(x, *kind, env),
+            Expr::Func { .. } if e.is_aggregate() => self.aggregate(e, env),
+            Expr::Func { name, args, .. } => self.call(name, args, env),
+        }
+    }
+
+    fn neg(&self, x: &Expr, env: &Env<'_>) -> Result<Value> {
+        Ok(match self.eval(x, env)? {
+            // The smallest INT has no opposite among them.
+            Value::I32(i) => i.checked_neg().map_or(Value::I64(-i64::from(i)), Value::I32),
+            Value::F64(f) => Value::F64(-f),
+            other => arith(Op::Sub, &Value::I64(0), &other)?,
+        })
+    }
+
+    fn not(&self, x: &Expr, env: &Env<'_>) -> Result<Value> {
+        Ok(bool_or_null(tri(&self.eval(x, env)?).map(|b| !b)))
+    }
+
+    fn binary(&self, op: Op, a: &Expr, b: &Expr, env: &Env<'_>) -> Result<Value> {
+        let l = self.eval(a, env)?;
+        // The left side is kept while the right one is computed.
+        let mut live = self.limits.live();
+        live.add(&l)?;
+        let r = self.eval(b, env)?;
+        drop(live);
+        if !matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+            return arith(op, &l, &r);
+        }
+        if l.is_null() || r.is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(Value::Bool(match (op, compare(&l, &r)) {
+            (Op::Ne, None) => true,
+            (_, None) => false,
+            (Op::Eq, Some(o)) => o.is_eq(),
+            (Op::Ne, Some(o)) => !o.is_eq(),
+            (Op::Lt, Some(o)) => o.is_lt(),
+            (Op::Le, Some(o)) => o.is_le(),
+            (Op::Gt, Some(o)) => o.is_gt(),
+            (_, Some(o)) => o.is_ge(),
+        }))
+    }
+
+    fn is_null(&self, x: &Expr, negated: bool, env: &Env<'_>) -> Result<Value> {
+        Ok(Value::Bool(self.eval(x, env)?.is_null() != negated))
+    }
+
+    fn in_list(&self, x: &Expr, list: &[Expr], negated: bool, env: &Env<'_>) -> Result<Value> {
+        let v = self.eval(x, env)?;
+        let mut live = self.limits.live();
+        live.add(&v)?;
+        let mut values = Vec::with_capacity(list.len());
+        for item in list {
+            let item = self.eval(item, env)?;
+            live.add(&item)?;
+            values.push(item);
+        }
+        Ok(in_values(&v, &values, negated))
+    }
+
+    fn in_select(&self, x: &Expr, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
+        let v = self.eval(x, env)?;
+        let mut live = self.limits.live();
+        live.add(&v)?;
+        let rows = self.subquery(sub, env)?;
+        if rows.columns.len() != 1 {
+            return Err(syntax("the subquery of IN must return one column"));
+        }
+        let values: Vec<Value> = rows.rows.iter().map(|r| r[0].clone()).collect();
+        Ok(in_values(&v, &values, negated))
+    }
+
+    fn exists(&self, sub: &Select, negated: bool, env: &Env<'_>) -> Result<Value> {
+        // One row tells.
+        Ok(Value::Bool(self.subquery_first(sub, env, Some(1))?.rows.is_empty() == negated))
+    }
+
+    fn scalar_subquery(&self, sub: &Select, env: &Env<'_>) -> Result<Value> {
+        // Its first row is its value.
+        let rows = self.subquery_first(sub, env, Some(1))?;
+        if rows.columns.len() != 1 {
+            return Err(syntax("a subquery used as a value must return one column"));
+        }
+        Ok(rows.rows.first().map_or(Value::Null, |r| r[0].clone()))
+    }
+
+    fn between(&self, x: &Expr, low: &Expr, high: &Expr, negated: bool, env: &Env<'_>) -> Result<Value> {
+        let mut live = self.limits.live();
+        let v = self.eval(x, env)?;
+        live.add(&v)?;
+        let l = self.eval(low, env)?;
+        live.add(&l)?;
+        let h = self.eval(high, env)?;
+        drop(live);
+        if v.is_null() || l.is_null() || h.is_null() {
+            return Ok(Value::Null);
+        }
+        let inside = compare(&v, &l).is_some_and(|o| o.is_ge()) && compare(&v, &h).is_some_and(|o| o.is_le());
+        Ok(Value::Bool(inside != negated))
+    }
+
+    fn like(
+        &self,
+        expr: &Expr,
+        pattern: &Expr,
+        ci: bool,
+        negated: bool,
+        escape: Option<&Expr>,
+        env: &Env<'_>,
+    ) -> Result<Value> {
+        let mut live = self.limits.live();
+        let s = self.eval(expr, env)?;
+        live.add(&s)?;
+        let p = self.eval(pattern, env)?;
+        live.add(&p)?;
+        let (Some(s), Some(p)) = (v::to_text(&s), v::to_text(&p)) else { return Ok(Value::Null) };
+        let esc = match escape {
+            Some(e) => v::to_text(&self.eval(e, env)?).and_then(|t| t.chars().next()),
+            None => None,
+        };
+        let matched = v::like(&s, &p, ci, esc)?;
+        self.limits.work(s.len() + p.len())?;
+        Ok(Value::Bool(matched != negated))
+    }
+
+    fn case(
+        &self,
+        operand: Option<&Expr>,
+        whens: &[(Expr, Expr)],
+        otherwise: Option<&Expr>,
+        env: &Env<'_>,
+    ) -> Result<Value> {
+        let subject = match operand {
+            Some(o) => Some(self.eval(o, env)?),
+            None => None,
+        };
+        let mut live = self.limits.live();
+        if let Some(s) = &subject {
+            live.add(s)?;
+        }
+        for (w, then) in whens {
+            self.limits.tick()?;
+            let hit = match &subject {
+                Some(s) => compare(s, &self.eval(w, env)?).is_some_and(|o| o.is_eq()),
+                None => truthy(&self.eval(w, env)?),
+            };
+            if hit {
+                return self.eval(then, env);
+            }
+        }
+        match otherwise {
+            Some(o) => self.eval(o, env),
+            None => Ok(Value::Null),
+        }
+    }
+
+    fn cast(&self, x: &Expr, kind: ColumnType, env: &Env<'_>) -> Result<Value> {
+        let x = self.eval(x, env)?;
+        let out = cast(&x, kind)?;
+        if matches!(x, Value::Text(_) | Value::Bytes(_) | Value::Json(_)) {
+            self.limits.work(value_bytes(&x))?;
+        }
+        Ok(out)
+    }
+
+    fn call(&self, name: &str, args: &[Expr], env: &Env<'_>) -> Result<Value> {
+        self.limits.tick()?;
+        let mut values = Vec::with_capacity(args.len());
+        // The arguments computed are kept while the next ones are: each may be large.
+        let mut live = self.limits.live();
+        for a in args {
+            let x = self.eval(a, env)?;
+            live.add(&x)?;
+            values.push(x);
+        }
+        let read = live.bytes();
+        let out = v::scalar(name, values)?;
+        drop(live);
+        // What a function gets through counts toward the deadline, however few the rows.
+        self.limits.work(read.saturating_add(value_bytes(&out)))?;
+        Ok(out)
+    }
+
+    /// `first op x op y ...`, from the left, in a loop: a long list takes no
+    /// more of the stack than a short one.
+    fn chain(&self, first: &Expr, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        let acc = self.eval(first, env)?;
+        match rest.first().map(|(op, _)| *op) {
+            Some(Op::And) => self.all(acc, rest, env),
+            Some(Op::Or) => self.any(acc, rest, env),
+            _ => self.fold(acc, rest, env),
+        }
+    }
+
+    /// `AND`: false as soon as an operand is (the others are not evaluated),
+    /// NULL when one is unknown and none is false.
+    fn all(&self, first: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        let mut all = tri(&first);
+        for (_, x) in rest {
+            if all == Some(false) {
+                break;
+            }
+            self.limits.tick()?;
+            all = match (all, tri(&self.eval(x, env)?)) {
+                (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+        }
+        Ok(bool_or_null(all))
+    }
+
+    /// `OR`: true as soon as an operand is, NULL when one is unknown and none is true.
+    fn any(&self, first: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        let mut any = tri(&first);
+        for (_, x) in rest {
+            if any == Some(true) {
+                break;
+            }
+            self.limits.tick()?;
+            any = match (any, tri(&self.eval(x, env)?)) {
+                (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
+        Ok(bool_or_null(any))
+    }
+
+    /// Arithmetic and `||`, from the left.
+    fn fold(&self, mut acc: Value, rest: &[(Op, Expr)], env: &Env<'_>) -> Result<Value> {
+        for (op, x) in rest {
+            self.limits.tick()?;
+            acc = match (op, x.interval()) {
+                // `x + INTERVAL '1 day'`, `x - INTERVAL '2 hours'`.
+                (Op::Add, Some(span)) => v::shift(&acc, span, 1)?,
+                (Op::Sub, Some(span)) => v::shift(&acc, span, -1)?,
+                _ => {
+                    // What was computed so far is kept while the next operand is.
+                    let mut live = self.limits.live();
+                    live.add(&acc)?;
+                    let next = self.eval(x, env)?;
+                    drop(live);
+                    if *op == Op::Concat {
+                        self.limits.work(value_bytes(&next))?;
+                        v::concat(acc, &next)?
+                    } else {
+                        arith(*op, &acc, &next)?
                     }
                 }
-                match otherwise {
-                    Some(o) => self.eval(o, env)?,
-                    None => Value::Null,
-                }
-            }
-            Expr::Cast(x, kind) => cast(&self.eval(x, env)?, *kind)?,
-            Expr::Func { .. } if e.is_aggregate() => self.aggregate(e, env)?,
-            Expr::Func { name, args, .. } => {
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.eval(a, env)?);
-                }
-                v::scalar(name, values)?
-            }
-        })
+            };
+        }
+        Ok(acc)
     }
 
     fn aggregate(&self, e: &Expr, env: &Env<'_>) -> Result<Value> {
@@ -355,9 +730,19 @@ impl<'a> Runner<'a> {
         }
         let mut values = Vec::with_capacity(rows.len());
         let mut seen = std::collections::HashSet::new();
+        // The values of the group, and the keys that tell them apart, are held while it is computed.
+        let mut held = self.limits.hold();
         for row in rows {
-            let inner =
-                Env { scope: env.scope, row, group: None, outer: env.outer, used_outer: env.used_outer, output: None };
+            self.limits.tick()?;
+            let inner = Env {
+                scope: env.scope,
+                row,
+                tail: &[],
+                group: None,
+                outer: env.outer,
+                used_outer: env.used_outer,
+                output: None,
+            };
             let x = self.eval(&args[0], &inner)?;
             if x.is_null() {
                 continue;
@@ -365,10 +750,12 @@ impl<'a> Runner<'a> {
             if *distinct {
                 let mut k = String::new();
                 v::key(&x, &mut k);
+                held.add(k.len() + KEY_BYTES)?;
                 if !seen.insert(k) {
                     continue;
                 }
             }
+            held.add(value_bytes(&x))?;
             values.push(x);
         }
         Ok(match name.as_str() {
@@ -404,7 +791,10 @@ impl<'a> Runner<'a> {
                 }
                 best.unwrap_or(Value::Null)
             }
-            "array_agg" => Value::Json(Json::Array(values.iter().map(v::to_json).collect())),
+            "array_agg" => {
+                text_fits("array_agg()", values.iter().fold(0usize, |n, x| n.saturating_add(value_bytes(x))))?;
+                Value::Json(Json::Array(values.iter().map(v::to_json).collect()))
+            }
             // PostgreSQL's boolean aggregates: NULL without rows, NULLs left out.
             "bool_and" | "every" | "bool_or" => {
                 if values.is_empty() {
@@ -428,20 +818,40 @@ impl<'a> Runner<'a> {
                     Some(s) => v::to_text(&self.eval(s, env)?).unwrap_or_default(),
                     None => ",".into(),
                 };
-                Value::Text(values.iter().filter_map(v::to_text).collect::<Vec<_>>().join(&sep))
+                // Written straight into the result, its size known first: the values are
+                // held already, and a copy of them as texts would hold them twice.
+                let size = v::joined_len(values.iter().filter_map(v::text_ref).map(|t| t.len()), sep.len());
+                text_fits(&format!("{name}()"), size)?;
+                let mut out = String::with_capacity(size);
+                for (i, t) in values.iter().filter_map(v::text_ref).enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    out.push_str(&t);
+                }
+                self.limits.work(size)?;
+                Value::Text(out)
             }
         })
     }
 
     fn subquery(&self, sub: &Select, env: &Env<'_>) -> Result<Rc<Rows>> {
-        let key = sub as *const Select as usize;
-        if let Some(r) = self.cache.borrow().get(&key) {
+        self.subquery_first(sub, env, None)
+    }
+
+    /// The rows of a subquery, the first `want` of them when only those are
+    /// needed (`EXISTS`). A `SELECT` is in one place of a statement: its rows
+    /// are always asked for the same way.
+    fn subquery_first(&self, sub: &Select, env: &Env<'_>, want: Option<usize>) -> Result<Rc<Rows>> {
+        if let Some(r) = self.cache.borrow().get(&sub.id) {
             return Ok(r.clone());
         }
+        // A subquery that reads the enclosing row runs once per row: the clock is read at each run.
+        self.limits.check_time()?;
         let used = Cell::new(false);
-        let rows = Rc::new(self.select(sub, Some(env), &used)?);
+        let rows = Rc::new(self.select_first(sub, Some(env), &used, want)?);
         if !used.get() {
-            self.cache.borrow_mut().insert(key, rows.clone());
+            self.cache.borrow_mut().insert(sub.id, rows.clone());
         }
         Ok(rows)
     }
@@ -461,136 +871,240 @@ impl<'a> Runner<'a> {
         outer: Option<&Env<'_>>,
         used: &Cell<bool>,
     ) -> Option<M> {
-        Some(match e {
-            Expr::Lit(v) => M::Value(v.clone()),
-            Expr::Param(i) => M::Value(self.param(*i).ok()?),
-            Expr::Col { table, name } => match scope.find(table.as_deref(), name).ok()? {
-                Some((p, c)) => {
-                    if only.is_some_and(|o| o != p) {
-                        return None;
-                    }
-                    let schema = scope.parts[p].schema?;
-                    let col = &schema.columns[c];
-                    M::Column(ColumnRef { table: schema.name, name: col.name, index: c, kind: col.kind })
-                }
-                None => {
-                    let o = outer?;
-                    let v = o.lookup(table.as_deref(), name).ok()?;
-                    used.set(true);
-                    M::Value(v)
-                }
-            },
-            Expr::Not(x) => M::Not(Box::new(self.to_m(x, scope, only, outer, used)?)),
-            Expr::IsNull(x, negated) => {
-                M::IsNull { expr: Box::new(self.to_m(x, scope, only, outer, used)?), negated: *negated }
-            }
-            Expr::Bin(op, a, b) => {
-                let op = match op {
-                    Op::Eq => BinOp::Eq,
-                    Op::Ne => BinOp::Ne,
-                    Op::Lt => BinOp::Lt,
-                    Op::Le => BinOp::Le,
-                    Op::Gt => BinOp::Gt,
-                    Op::Ge => BinOp::Ge,
-                    Op::And => BinOp::And,
-                    Op::Or => BinOp::Or,
-                    Op::Add | Op::Sub | Op::Mul | Op::Div => return None,
-                    Op::Mod | Op::Concat => return None,
-                };
-                let (l, r) = (self.to_m(a, scope, only, outer, used)?, self.to_m(b, scope, only, outer, used)?);
-                // A value compared with a column: of the column's type (an
-                // index holds typed values).
-                let (l, r) = match (&l, &r) {
-                    (M::Column(c), M::Value(x)) => {
-                        let x = coerce(x, c.kind)?;
-                        (l, M::Value(x))
-                    }
-                    (M::Value(x), M::Column(c)) => {
-                        let x = coerce(x, c.kind)?;
-                        (M::Value(x), r)
-                    }
-                    (M::Column(a), M::Column(b)) if !same_family(a.kind, b.kind) => return None,
-                    (M::Value(_), M::Value(_))
-                        if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
-                    {
-                        return None;
-                    }
-                    _ => (l, r),
-                };
-                M::binary(op, l, r)
-            }
-            Expr::In(x, list, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                let mut values = Vec::with_capacity(list.len());
-                for item in list {
-                    let M::Value(v) = self.to_m(item, scope, only, outer, used)? else { return None };
-                    if v.is_null() {
-                        return None;
-                    }
-                    values.push(coerce(&v, c.kind)?);
-                }
-                M::InList { expr: Box::new(M::Column(c)), list: values, negated: *negated }
-            }
-            Expr::InSelect(x, sub, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                // Run it first (once), and look the values up: an index serves them.
-                let env =
-                    Env { scope: &Scope::default(), row: &[], group: None, outer, used_outer: used, output: None };
-                let rows = self.subquery(sub, &env).ok()?;
-                if rows.columns.len() != 1 || rows.rows.iter().any(|r| r[0].is_null()) {
-                    return None;
-                }
-                let list = rows.rows.iter().map(|r| coerce(&r[0], c.kind)).collect::<Option<Vec<_>>>()?;
-                M::InList { expr: Box::new(M::Column(c)), list, negated: *negated }
-            }
+        let depth = self.m_depth.get();
+        if depth >= M_DEPTH {
+            return None;
+        }
+        self.m_depth.set(depth + 1);
+        let m = self.m_expr(e, scope, only, outer, used);
+        self.m_depth.set(depth);
+        m
+    }
+
+    /// [`Runner::to_m`], one function per kind of expression as for [`Runner::eval`].
+    fn m_expr(
+        &self,
+        e: &Expr,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        match e {
+            Expr::Lit(v) => Some(M::Value(v.clone())),
+            Expr::Param(i) => Some(M::Value(self.param(*i).ok()?)),
+            Expr::Col { table, name } => m_column(table.as_deref(), name, scope, only, outer, used),
+            Expr::Not(x) => Some(M::Not(Box::new(self.to_m(x, scope, only, outer, used)?))),
+            Expr::IsNull(x, negated) => self.m_is_null(x, *negated, scope, only, outer, used),
+            Expr::Bin(op, a, b) => self.m_compare(*op, a, b, scope, only, outer, used),
+            Expr::Chain(first, rest) => self.m_logic(first, rest, scope, only, outer, used),
+            Expr::In(x, list, negated) => self.m_in(x, list, *negated, scope, only, outer, used),
+            Expr::InSelect(x, sub, negated) => self.m_in_select(x, sub, *negated, scope, only, outer, used),
             Expr::Between(x, low, high, negated) => {
-                let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
-                let (M::Value(l), M::Value(h)) =
-                    (self.to_m(low, scope, only, outer, used)?, self.to_m(high, scope, only, outer, used)?)
-                else {
-                    return None;
-                };
-                M::Between {
-                    expr: Box::new(M::Column(c)),
-                    low: Box::new(M::Value(coerce(&l, c.kind)?)),
-                    high: Box::new(M::Value(coerce(&h, c.kind)?)),
-                    negated: *negated,
-                }
+                self.m_between([&**x, &**low, &**high], *negated, scope, only, outer, used)
             }
             Expr::Like { expr, pattern, ci, negated, escape: None } => {
-                let M::Column(c) = self.to_m(expr, scope, only, outer, used)? else { return None };
-                if c.kind != ColumnType::Text {
-                    return None;
-                }
-                let M::Value(Value::Text(p)) = self.to_m(pattern, scope, only, outer, used)? else { return None };
-                if p.contains('\\') {
-                    return None;
-                }
-                M::Like {
-                    expr: Box::new(M::Column(c)),
-                    pattern: Box::new(M::Value(Value::Text(p))),
-                    case_insensitive: *ci,
-                    negated: *negated,
-                    escaped: false,
-                }
+                self.m_like(expr, pattern, *ci, *negated, scope, only, outer, used)
             }
             Expr::Func { name, args, distinct, star } if e.is_aggregate() => {
-                let func = match name.as_str() {
-                    "count" => AggFunc::Count,
-                    "sum" => AggFunc::Sum,
-                    "avg" => AggFunc::Avg,
-                    "min" => AggFunc::Min,
-                    "max" => AggFunc::Max,
-                    _ => return None,
-                };
-                let arg = if *star { None } else { Some(Box::new(self.to_m(&args[0], scope, only, outer, used)?)) };
-                if arg.as_deref().is_some_and(|a| !matches!(a, M::Column(_))) {
-                    return None;
-                }
-                M::Aggregate { func, arg, distinct: *distinct }
+                self.m_aggregate(name, args.first(), *distinct, *star, scope, only, outer, used)
             }
+            _ => None,
+        }
+    }
+
+    fn m_is_null(
+        &self,
+        x: &Expr,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        Some(M::IsNull { expr: Box::new(self.to_m(x, scope, only, outer, used)?), negated })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_compare(
+        &self,
+        op: Op,
+        a: &Expr,
+        b: &Expr,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let op = match op {
+            Op::Eq => BinOp::Eq,
+            Op::Ne => BinOp::Ne,
+            Op::Lt => BinOp::Lt,
+            Op::Le => BinOp::Le,
+            Op::Gt => BinOp::Gt,
+            Op::Ge => BinOp::Ge,
             _ => return None,
+        };
+        m_pair(op, self.to_m(a, scope, only, outer, used)?, self.to_m(b, scope, only, outer, used)?)
+    }
+
+    /// `AND` and `OR` lists (Memoire has no arithmetic).
+    fn m_logic(
+        &self,
+        first: &Expr,
+        rest: &[(Op, Expr)],
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let op = match rest.first()?.0 {
+            Op::And => BinOp::And,
+            Op::Or => BinOp::Or,
+            _ => return None,
+        };
+        let mut parts = Vec::with_capacity(rest.len() + 1);
+        parts.push(self.to_m(first, scope, only, outer, used)?);
+        for (_, x) in rest {
+            parts.push(self.to_m(x, scope, only, outer, used)?);
+        }
+        // `id = 1 OR id = 2 OR ...`: `id IN (1, 2, ...)`, which an index serves.
+        if op == BinOp::Or
+            && let Some(list) = one_column_among(&parts)
+        {
+            return Some(list);
+        }
+        // The first two as a pair (a value beside a column takes its type), the others after.
+        let mut parts = parts.into_iter();
+        let mut joined = vec![m_pair(op, parts.next()?, parts.next()?)?];
+        joined.extend(parts);
+        balanced(op, joined)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_in(
+        &self,
+        x: &Expr,
+        list: &[Expr],
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        let mut values = Vec::with_capacity(list.len());
+        for item in list {
+            let M::Value(v) = self.to_m(item, scope, only, outer, used)? else { return None };
+            if v.is_null() {
+                return None;
+            }
+            values.push(coerce(&v, c.kind)?);
+        }
+        Some(M::InList { expr: Box::new(M::Column(c)), list: values, negated })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_in_select(
+        &self,
+        x: &Expr,
+        sub: &Select,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        // Run it first (once), and look the values up: an index serves them.
+        let env =
+            Env { scope: &Scope::default(), row: &[], tail: &[], group: None, outer, used_outer: used, output: None };
+        let rows = self.subquery(sub, &env).ok()?;
+        if rows.columns.len() != 1 || rows.rows.iter().any(|r| r[0].is_null()) {
+            return None;
+        }
+        let list = rows.rows.iter().map(|r| coerce(&r[0], c.kind)).collect::<Option<Vec<_>>>()?;
+        Some(M::InList { expr: Box::new(M::Column(c)), list, negated })
+    }
+
+    /// `x BETWEEN low AND high`, `[x, low, high]`.
+    fn m_between(
+        &self,
+        [x, low, high]: [&Expr; 3],
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(x, scope, only, outer, used)? else { return None };
+        let (M::Value(l), M::Value(h)) =
+            (self.to_m(low, scope, only, outer, used)?, self.to_m(high, scope, only, outer, used)?)
+        else {
+            return None;
+        };
+        Some(M::Between {
+            expr: Box::new(M::Column(c)),
+            low: Box::new(M::Value(coerce(&l, c.kind)?)),
+            high: Box::new(M::Value(coerce(&h, c.kind)?)),
+            negated,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_like(
+        &self,
+        expr: &Expr,
+        pattern: &Expr,
+        ci: bool,
+        negated: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let M::Column(c) = self.to_m(expr, scope, only, outer, used)? else { return None };
+        if c.kind != ColumnType::Text {
+            return None;
+        }
+        let M::Value(Value::Text(p)) = self.to_m(pattern, scope, only, outer, used)? else { return None };
+        if p.contains('\\') {
+            return None;
+        }
+        Some(M::Like {
+            expr: Box::new(M::Column(c)),
+            pattern: Box::new(M::Value(Value::Text(p))),
+            case_insensitive: ci,
+            negated,
+            escaped: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m_aggregate(
+        &self,
+        name: &str,
+        arg: Option<&Expr>,
+        distinct: bool,
+        star: bool,
+        scope: &Scope,
+        only: Option<usize>,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+    ) -> Option<M> {
+        let func = match name {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return None,
+        };
+        let arg = if star { None } else { Some(Box::new(self.to_m(arg?, scope, only, outer, used)?)) };
+        if arg.as_deref().is_some_and(|a| !matches!(a, M::Column(_))) {
+            return None;
+        }
+        Some(M::Aggregate { func, arg, distinct })
     }
 
     /// The whole `SELECT` as one Memoire statement, when it can be.
@@ -733,20 +1247,46 @@ impl<'a> Runner<'a> {
     // -----------------------------------------------------------------------
 
     fn select(&self, sel: &Select, outer: Option<&Env<'_>>, used: &Cell<bool>) -> Result<Rows> {
-        if let Some((ast, columns)) = self.as_memoire(sel, outer, used) {
-            let rows = self.tx.fetch_rows(&Query::Select(&ast))?;
-            return Ok(Rows { columns, rows });
+        self.select_first(sel, outer, used, None)
+    }
+
+    /// [`Runner::select`], only its first `want` rows when given.
+    fn select_first(
+        &self,
+        sel: &Select,
+        outer: Option<&Env<'_>>,
+        used: &Cell<bool>,
+        want: Option<usize>,
+    ) -> Result<Rows> {
+        if let Some((mut ast, columns)) = self.as_memoire(sel, outer, used) {
+            if let Some(w) = want {
+                let w = w as u64;
+                ast.limit = Some(ast.limit.map_or(w, |l| l.min(w)));
+            }
+            self.limits.take_declined();
+            match self.tx.fetch_rows(&Query::Select(&ast)) {
+                Ok(rows) => return Ok(Rows { columns, hold: self.limits.hold_rows(&rows)?, rows }),
+                // The engine would have joined more rows than the statement
+                // may hold: they are joined below, each row counted.
+                Err(_) if self.limits.take_declined() => {}
+                Err(e) => return Err(e),
+            }
         }
-        let empty_env = Env { scope: &Scope::default(), row: &[], group: None, outer, used_outer: used, output: None };
+        let empty_env =
+            Env { scope: &Scope::default(), row: &[], tail: &[], group: None, outer, used_outer: used, output: None };
         let limit = match &sel.limit {
             Some(e) => match self.eval(e, &empty_env)? {
                 Value::Null => None,
-                v => v.as_i64().filter(|n| *n >= 0).map(|n| n as usize),
+                v => v.as_i64().filter(|n| *n >= 0).map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
             },
             None => None,
         };
+        let limit = match (limit, want) {
+            (Some(l), Some(w)) => Some(l.min(w)),
+            (l, w) => l.or(w),
+        };
         let offset = match &sel.offset {
-            Some(e) => self.eval(e, &empty_env)?.as_i64().unwrap_or(0).max(0) as usize,
+            Some(e) => usize::try_from(self.eval(e, &empty_env)?.as_i64().unwrap_or(0).max(0)).unwrap_or(usize::MAX),
             None => 0,
         };
         let mut out = if sel.rest.is_empty() {
@@ -754,40 +1294,102 @@ impl<'a> Runner<'a> {
             self.core(&sel.first, &sel.order, hint, outer, used)?
         } else {
             let mut acc = self.core(&sel.first, &[], None, outer, used)?;
+            // The keys of the rows of `acc` when they are all different (after a UNION, an
+            // INTERSECT or an EXCEPT): a UNION after it looks up only its own rows, instead
+            // of the rows of every step before, which made a long UNION take the square
+            // of its rows.
+            let mut distinct: Option<(std::collections::HashSet<String>, Hold)> = None;
             for (op, core) in &sel.rest {
                 let next = self.core(core, &[], None, outer, used)?;
                 if next.columns.len() != acc.columns.len() {
                     return Err(syntax("each SELECT of a UNION must have the same number of columns"));
                 }
-                let keyed = |r: &Vec<Value>| {
-                    let mut k = String::new();
-                    r.iter().for_each(|x| v::key(x, &mut k));
-                    k
-                };
-                acc.rows = match op {
-                    SetOp::UnionAll => acc.rows.into_iter().chain(next.rows).collect(),
+                match op {
+                    SetOp::UnionAll => {
+                        // The new rows after the others, where those are.
+                        acc.rows.extend(next.rows);
+                        acc.hold.absorb(next.hold);
+                        distinct = None;
+                    }
                     SetOp::Union => {
-                        let mut seen = std::collections::HashSet::new();
-                        acc.rows.into_iter().chain(next.rows).filter(|r| seen.insert(keyed(r))).collect()
+                        let (mut seen, mut keys) = match distinct.take() {
+                            Some(d) => d,
+                            None => {
+                                let mut seen = std::collections::HashSet::new();
+                                let mut keys = self.limits.hold();
+                                let mut dropped = 0;
+                                let rows = std::mem::take(&mut acc.rows);
+                                for r in rows {
+                                    self.limits.tick()?;
+                                    let k = row_key(&r);
+                                    if seen.contains(&k) {
+                                        dropped += row_bytes(&r);
+                                        continue;
+                                    }
+                                    keys.add(k.len() + KEY_BYTES)?;
+                                    seen.insert(k);
+                                    acc.rows.push(r);
+                                }
+                                acc.hold.less(dropped);
+                                (seen, keys)
+                            }
+                        };
+                        acc.hold.absorb(next.hold);
+                        let mut dropped = 0;
+                        for r in next.rows {
+                            self.limits.tick()?;
+                            let k = row_key(&r);
+                            if seen.contains(&k) {
+                                dropped += row_bytes(&r);
+                                continue;
+                            }
+                            keys.add(k.len() + KEY_BYTES)?;
+                            seen.insert(k);
+                            acc.rows.push(r);
+                        }
+                        acc.hold.less(dropped);
+                        distinct = Some((seen, keys));
                     }
-                    SetOp::Intersect => {
-                        let other: std::collections::HashSet<String> = next.rows.iter().map(keyed).collect();
+                    SetOp::Intersect | SetOp::Except => {
+                        // The keys of the step before are of no use here.
+                        drop(distinct.take());
+                        // The keys of the rows of both sides are held while this step runs.
+                        let mut keys = self.limits.hold();
+                        let mut other = std::collections::HashSet::new();
+                        for r in &next.rows {
+                            self.limits.tick()?;
+                            let k = row_key(r);
+                            keys.add(k.len() + KEY_BYTES)?;
+                            other.insert(k);
+                        }
+                        drop(next);
                         let mut seen = std::collections::HashSet::new();
-                        acc.rows.into_iter().filter(|r| other.contains(&keyed(r)) && seen.insert(keyed(r))).collect()
+                        let mut kept_keys = self.limits.hold();
+                        let mut kept = Vec::new();
+                        for r in std::mem::take(&mut acc.rows) {
+                            self.limits.tick()?;
+                            let k = row_key(&r);
+                            if other.contains(&k) == (*op == SetOp::Intersect) && !seen.contains(&k) {
+                                kept_keys.add(k.len() + KEY_BYTES)?;
+                                seen.insert(k);
+                                kept.push(r);
+                            }
+                        }
+                        acc.rows = kept;
+                        acc.hold.set(rows_bytes(&acc.rows))?;
+                        distinct = Some((seen, kept_keys));
                     }
-                    SetOp::Except => {
-                        let other: std::collections::HashSet<String> = next.rows.iter().map(keyed).collect();
-                        let mut seen = std::collections::HashSet::new();
-                        acc.rows.into_iter().filter(|r| !other.contains(&keyed(r)) && seen.insert(keyed(r))).collect()
-                    }
-                };
+                }
             }
+            drop(distinct);
             // ORDER BY of a compound: output columns, by name or position.
             if !sel.order.is_empty() {
                 let mut keys = Vec::new();
                 for o in &sel.order {
                     let i = match &o.expr {
-                        Expr::Lit(Value::I64(n)) => (*n as usize).checked_sub(1).filter(|i| *i < acc.columns.len()),
+                        Expr::Lit(Value::I64(n)) => {
+                            usize::try_from(*n).ok().and_then(|n| n.checked_sub(1)).filter(|i| *i < acc.columns.len())
+                        }
                         Expr::Col { name, .. } => acc.columns.iter().position(|c| c.eq_ignore_ascii_case(name)),
                         _ => None,
                     }
@@ -804,7 +1406,9 @@ impl<'a> Runner<'a> {
             acc
         };
         if offset > 0 || limit.is_some() {
-            out.rows = out.rows.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
+            out.rows.drain(..offset.min(out.rows.len()));
+            out.rows.truncate(limit.unwrap_or(usize::MAX));
+            out.hold.set(rows_bytes(&out.rows))?;
         }
         Ok(out)
     }
@@ -826,8 +1430,6 @@ impl<'a> Runner<'a> {
         self.tx.fetch_rows(&Query::Select(&ast))
     }
 
-    /// One `SELECT` core: rows read, joined, filtered, grouped, projected,
-    /// sorted (`order`), deduplicated; `hint`: only the first rows are needed.
     /// `SELECT jsonb_array_elements_text(x)::bigint` (no `FROM`): one row per
     /// element of the JSON array, the expression around the function (casts,
     /// arithmetic) computed for each. `None` when the SELECT is not one.
@@ -843,6 +1445,7 @@ impl<'a> Runner<'a> {
                 Expr::Func { name, args, .. } if v::SET_RETURNING.contains(&name.as_str()) => Some((name, args)),
                 Expr::Cast(x, _) | Expr::Neg(x) => find(x),
                 Expr::Bin(_, a, b) => find(a).or_else(|| find(b)),
+                Expr::Chain(first, rest) => find(first).or_else(|| rest.iter().find_map(|(_, x)| find(x))),
                 _ => None,
             }
         }
@@ -852,6 +1455,10 @@ impl<'a> Runner<'a> {
                 Expr::Cast(x, k) => Expr::Cast(Box::new(replace(x, with)), *k),
                 Expr::Neg(x) => Expr::Neg(Box::new(replace(x, with))),
                 Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(replace(a, with)), Box::new(replace(b, with))),
+                Expr::Chain(first, rest) => Expr::Chain(
+                    Box::new(replace(first, with)),
+                    rest.iter().map(|(op, x)| (*op, replace(x, with))).collect(),
+                ),
                 other => other.clone(),
             }
         }
@@ -861,16 +1468,43 @@ impl<'a> Runner<'a> {
             return Err(syntax(format!("{name}(): use it alone, without WHERE, GROUP BY or DISTINCT")));
         }
         let [arg] = args else { return Err(syntax(format!("{name}() takes one argument"))) };
-        let env = Env { scope, row: &[], group: None, outer, used_outer: used, output: None };
+        let env = Env { scope, row: &[], tail: &[], group: None, outer, used_outer: used, output: None };
         let elements = v::set_returning(name, &self.eval(arg, &env)?)?;
+        let mut held_elements = self.limits.hold();
+        held_elements.add(elements.iter().map(value_bytes).sum())?;
         let mut rows = Vec::with_capacity(elements.len());
+        let mut hold = self.limits.hold();
         for x in &elements {
-            rows.push(vec![self.eval(&replace(item, x), &env)?]);
+            self.limits.tick()?;
+            let row = vec![self.eval(&replace(item, x), &env)?];
+            hold.add(row_bytes(&row))?;
+            rows.push(row);
         }
         let column = alias.clone().unwrap_or_else(|| name.to_owned());
-        Ok(Some(Rows { columns: vec![column], rows }))
+        Ok(Some(Rows { columns: vec![column], rows, hold }))
     }
 
+    /// The last table of `scope` that `e` reads a column of (`Some(0)` when it
+    /// reads none). `None` when that cannot be told from the names: it has a
+    /// subquery (which may read any column of the row), or a name the scope
+    /// does not settle.
+    fn last_part_read(&self, e: &Expr, scope: &Scope) -> Option<usize> {
+        let mut last = Some(0);
+        e.walk(&mut |x| match x {
+            Expr::Col { table, name } => match scope.find(table.as_deref(), name) {
+                Ok(Some((p, _))) => last = last.map(|l| l.max(p)),
+                // A column of the enclosing statement: the same for every row here.
+                Ok(None) => {}
+                Err(_) => last = None,
+            },
+            Expr::Exists(..) | Expr::Scalar(_) | Expr::InSelect(..) => last = None,
+            _ => {}
+        });
+        last
+    }
+
+    /// One `SELECT` core: rows read, joined, filtered, grouped, projected,
+    /// sorted (`order`), deduplicated; `hint`: only the first rows are needed.
     fn core(
         &self,
         core: &Core,
@@ -881,7 +1515,7 @@ impl<'a> Runner<'a> {
     ) -> Result<Rows> {
         // The scope.
         let mut scope = Scope::default();
-        let mut sources: Vec<Option<Vec<Vec<Value>>>> = Vec::new();
+        let mut sources: Vec<Option<(Vec<Vec<Value>>, Hold)>> = Vec::new();
         let refs: Vec<(&TableRef, Option<&Join>)> =
             core.from.iter().map(|f| (f, None)).chain(core.joins.iter().map(|j| (&j.table, Some(j)))).collect();
         if refs.is_empty()
@@ -903,33 +1537,56 @@ impl<'a> Runner<'a> {
                     sources.push(None);
                 }
                 Source::Select(sub) => {
-                    let rows = self.select(sub, outer, used)?;
+                    let Rows { columns, rows, hold } = self.select(sub, outer, used)?;
                     let alias = t
                         .alias
                         .clone()
                         .ok_or_else(|| syntax("a subquery in FROM needs an alias: (SELECT ...) AS name"))?;
-                    let kinds = (0..rows.columns.len())
-                        .map(|i| rows.rows.iter().map(|r| &r[i]).find(|x| !x.is_null()).and_then(v::kind_of))
+                    let kinds = (0..columns.len())
+                        .map(|i| rows.iter().map(|r| &r[i]).find(|x| !x.is_null()).and_then(v::kind_of))
                         .collect();
-                    scope.push(alias, rows.columns.clone(), kinds, None);
-                    sources.push(Some(rows.rows));
+                    scope.push(alias, columns, kinds, None);
+                    sources.push(Some((rows, hold)));
                 }
             }
         }
         // WHERE, split: what each table's read can apply.
-        let mut where_parts = Vec::new();
+        let mut where_parts: Vec<&Expr> = Vec::new();
         if let Some(f) = &core.filter {
             conj(f, &mut where_parts);
         }
+        // Applied already: by a table's read, or while joining.
         let mut pushed = vec![false; where_parts.len()];
         let lone = refs.len() == 1;
         let grouped = !core.group_by.is_empty()
             || core.having.is_some()
             || core.items.iter().any(|i| matches!(i, SelItem::Expr(e, _) if e.has_aggregate()))
             || order.iter().any(|o| o.expr.has_aggregate());
+        // `SELECT count(*) FROM a, b ...` and nothing else: the rows of the last join are
+        // counted, not kept. `count(1)` counts the same.
+        let count_only = order.is_empty()
+            && !core.distinct
+            && core.group_by.is_empty()
+            && core.having.is_none()
+            && match core.items.as_slice() {
+                [SelItem::Expr(Expr::Func { name, star: true, .. }, _)] => name == "count",
+                [SelItem::Expr(Expr::Func { name, args, distinct: false, star: false }, _)] => {
+                    name == "count" && matches!(args.as_slice(), [Expr::Lit(v)] if !v.is_null())
+                }
+                _ => false,
+            };
+        // Only the first rows are needed, in the order they come: the last join stops there.
+        let first = hint.filter(|_| !grouped && !core.distinct && order.is_empty());
+        // For each condition of WHERE, the last table it reads: a join applies it as
+        // soon as that table is joined, instead of keeping rows it will refuse.
+        let reads: Vec<Option<usize>> =
+            if lone { Vec::new() } else { where_parts.iter().map(|w| self.last_part_read(w, &scope)).collect() };
+        let last = refs.len().saturating_sub(1);
         let mut rows: Vec<Vec<Value>> = if refs.is_empty() { vec![Vec::new()] } else { Vec::new() };
+        let mut held = self.limits.hold_rows(&rows)?;
+        let mut counted: Option<usize> = None;
         for (p, (_, join)) in refs.iter().enumerate() {
-            let part_rows = match sources[p].take() {
+            let (part_rows, part_hold) = match sources[p].take() {
                 Some(r) => r,
                 None => {
                     let schema = scope.parts[p].schema.expect("a base table");
@@ -971,22 +1628,93 @@ impl<'a> Runner<'a> {
                         }
                         _ => None,
                     };
-                    self.read_table(schema, and_all(filters), top)?
+                    let read = self.read_table(schema, and_all(filters), top)?;
+                    let hold = self.limits.hold_rows(&read)?;
+                    (read, hold)
                 }
             };
             if p == 0 {
                 rows = part_rows;
+                held = part_hold;
+                // What WHERE says of the first table alone, before its rows are joined
+                // (a condition that fails on a row is left for the whole rows, as in a join).
+                let now: Vec<usize> = (0..reads.len()).filter(|&i| !pushed[i] && reads[i] == Some(0)).collect();
+                if !now.is_empty() {
+                    let mut failed = vec![false; now.len()];
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        self.limits.tick()?;
+                        let env = Env {
+                            scope: &scope,
+                            row: &r,
+                            tail: &[],
+                            group: None,
+                            outer,
+                            used_outer: used,
+                            output: None,
+                        };
+                        let mut keep = true;
+                        for (n, &i) in now.iter().enumerate() {
+                            match self.eval(where_parts[i], &env) {
+                                Ok(v) if tri(&v) == Some(true) => {}
+                                Ok(_) => {
+                                    keep = false;
+                                    break;
+                                }
+                                Err(_) => {
+                                    failed[n] = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if keep {
+                            kept.push(r);
+                        }
+                    }
+                    rows = kept;
+                    held.set(rows_bytes(&rows))?;
+                    for (n, &i) in now.iter().enumerate() {
+                        pushed[i] = !failed[n];
+                    }
+                }
                 continue;
             }
             let join = join.expect("joins after the first table");
-            rows = self.join(&scope, p, rows, part_rows, join, outer, used)?;
+            // The conditions of WHERE this join can answer. At the last join, all that
+            // are left, in their order: the rows it gives are the rows of the result.
+            // Before, those that read only the tables joined so far.
+            let whole = p == last;
+            let now: Vec<usize> =
+                (0..where_parts.len()).filter(|&i| !pushed[i] && (whole || reads[i].is_some_and(|q| q <= p))).collect();
+            let also: Vec<&Expr> = now.iter().map(|&i| where_parts[i]).collect();
+            let wanted = Wanted { count: whole && count_only, first: if whole { first } else { None } };
+            let joined = self.join(&scope, p, &rows, &part_rows, join, &also, whole, wanted, outer, used)?;
+            for (&i, failed) in now.iter().zip(&joined.failed) {
+                pushed[i] = !failed;
+            }
+            if whole && count_only {
+                counted = Some(joined.count);
+            }
+            rows = joined.rows;
+            held = joined.hold;
+            drop(part_hold);
+        }
+        if let Some(n) = counted {
+            let [SelItem::Expr(e, alias)] = core.items.as_slice() else { unreachable!("count_only") };
+            let rows = vec![vec![Value::I64(i64::try_from(n).unwrap_or(i64::MAX))]];
+            return Ok(Rows {
+                columns: unique_headers(vec![(alias.clone().unwrap_or_else(|| header(e, 0)), None)]),
+                hold: self.limits.hold_rows(&rows)?,
+                rows,
+            });
         }
         // The rest of WHERE.
-        let residual: Vec<&Expr> = where_parts.iter().zip(&pushed).filter(|(_, p)| !**p).map(|(w, _)| w).collect();
+        let residual: Vec<&Expr> = where_parts.iter().zip(&pushed).filter(|(_, p)| !**p).map(|(w, _)| *w).collect();
         if !residual.is_empty() {
             let mut kept = Vec::with_capacity(rows.len());
             for r in rows {
-                let env = Env { scope: &scope, row: &r, group: None, outer, used_outer: used, output: None };
+                self.limits.tick()?;
+                let env = Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
                 let mut ok = true;
                 for w in &residual {
                     if tri(&self.eval(w, &env)?) != Some(true) {
@@ -999,6 +1727,7 @@ impl<'a> Runner<'a> {
                 }
             }
             rows = kept;
+            held.set(rows_bytes(&rows))?;
         }
         // Columns of the result.
         let mut names = Vec::new();
@@ -1042,63 +1771,85 @@ impl<'a> Runner<'a> {
             }
         }
         let columns = unique_headers(names);
-        // Groups: each with the row its plain columns are read from.
+        // Groups: the rows of each, the first one being where its plain columns are read.
         let null_row = vec![Value::Null; scope.width];
-        let groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = if grouped {
+        let (rows, groups): (Vec<Vec<Value>>, Option<Vec<Group>>) = if grouped {
             let mut index: HashMap<String, usize> = HashMap::new();
-            let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
+            let mut groups: Vec<Group> = Vec::new();
             for r in rows {
+                self.limits.tick()?;
                 let mut k = String::new();
                 {
-                    let env = Env { scope: &scope, row: &r, group: None, outer, used_outer: used, output: None };
+                    let env =
+                        Env { scope: &scope, row: &r, tail: &[], group: None, outer, used_outer: used, output: None };
+                    // The key grows with each expression: it is kept while the next one is computed.
+                    let mut live = self.limits.live();
                     for g in &core.group_by {
+                        let before = k.len();
                         v::key(&self.eval(g, &env)?, &mut k);
+                        live.add_bytes(k.len() - before)?;
                     }
                 }
                 match index.get(&k) {
-                    Some(&i) => groups[i].1.push(r),
+                    Some(&i) => groups[i].push(r),
                     None => {
+                        held.add(k.len() + KEY_BYTES)?;
                         index.insert(k, groups.len());
-                        groups.push((r.clone(), vec![r]));
+                        groups.push(vec![r]);
                     }
                 }
             }
             if groups.is_empty() && core.group_by.is_empty() {
-                groups.push((null_row.clone(), Vec::new()));
+                groups.push(Vec::new());
             }
-            groups
+            (Vec::new(), Some(groups))
         } else {
-            rows.into_iter().map(|r| (r, Vec::new())).collect()
+            (rows, None)
         };
         // Projection, HAVING and the sort keys.
-        let mut produced: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(groups.len());
-        for (row, members) in &groups {
-            let env = Env {
-                scope: &scope,
-                row,
-                group: grouped.then_some(members.as_slice()),
-                outer,
-                used_outer: used,
-                output: None,
+        let units = groups.as_ref().map_or(rows.len(), Vec::len);
+        let mut produced: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(units);
+        let mut produced_hold = self.limits.hold();
+        // Each row read is let go once its columns are computed: the statement holds the
+        // rows read, then the result, not both whole at once.
+        let mut read = rows.into_iter();
+        for unit in 0..units {
+            self.limits.tick()?;
+            let owned;
+            let (row, members): (&[Value], Option<&[Vec<Value>]>) = match &groups {
+                Some(groups) => {
+                    (groups[unit].first().map_or(null_row.as_slice(), Vec::as_slice), Some(groups[unit].as_slice()))
+                }
+                None => {
+                    owned = read.next().unwrap_or_default();
+                    (owned.as_slice(), None)
+                }
             };
+            let read_bytes = if members.is_none() { row_bytes(row) } else { 0 };
+            let env = Env { scope: &scope, row, tail: &[], group: members, outer, used_outer: used, output: None };
             if let Some(h) = &core.having
                 && tri(&self.eval(h, &env)?) != Some(true)
             {
                 continue;
             }
             let mut out = Vec::with_capacity(items.len());
+            // The columns computed are kept while the next ones are, and the sort keys after them.
+            let mut live = self.limits.live();
             for item in &items {
-                out.push(match item {
+                let x = match item {
                     Item::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
                     Item::Expr(e) => self.eval(e, &env)?,
-                });
+                };
+                live.add(&x)?;
+                out.push(x);
             }
             let mut keys = Vec::with_capacity(order.len());
             for o in order {
-                keys.push(match &o.expr {
+                let key = match &o.expr {
                     Expr::Lit(Value::I64(n)) => {
-                        let i = (*n as usize)
-                            .checked_sub(1)
+                        let i = usize::try_from(*n)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
                             .filter(|i| *i < out.len())
                             .ok_or_else(|| syntax(format!("ORDER BY {n}: there are {} columns", out.len())))?;
                         out[i].clone()
@@ -1114,32 +1865,36 @@ impl<'a> Runner<'a> {
                         match by_alias.and_then(|c| columns.iter().position(|x| x == c)) {
                             Some(i) => out[i].clone(),
                             None => {
-                                let env = Env {
-                                    output: Some((&columns, &out)),
-                                    ..Env {
-                                        scope: &scope,
-                                        row,
-                                        group: grouped.then_some(members.as_slice()),
-                                        outer,
-                                        used_outer: used,
-                                        output: None,
-                                    }
-                                };
+                                let env = Env { output: Some((&columns, &out)), ..env };
                                 self.eval(e, &env)?
                             }
                         }
                     }
-                });
+                };
+                live.add(&key)?;
+                keys.push(key);
             }
+            let bytes = live.bytes() + 2 * size_of::<Vec<Value>>();
+            drop(live);
+            produced_hold.add(bytes)?;
             produced.push((out, keys));
+            held.less(read_bytes);
         }
+        // What was read is no longer needed: only the result is held.
+        drop((read, groups, held));
         if core.distinct {
             let mut seen = std::collections::HashSet::new();
-            produced.retain(|(r, _)| {
-                let mut k = String::new();
-                r.iter().for_each(|x| v::key(x, &mut k));
-                seen.insert(k)
-            });
+            let mut keys = self.limits.hold();
+            let mut kept = Vec::with_capacity(produced.len());
+            for (r, k) in produced {
+                self.limits.tick()?;
+                let key = row_key(&r);
+                keys.add(key.len() + KEY_BYTES)?;
+                if seen.insert(key) {
+                    kept.push((r, k));
+                }
+            }
+            produced = kept;
         }
         if !order.is_empty() {
             produced.sort_by(|(_, a), (_, b)| {
@@ -1151,39 +1906,60 @@ impl<'a> Runner<'a> {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        Ok(Rows { columns, rows: produced.into_iter().map(|(r, _)| r).collect() })
+        let rows: Vec<Vec<Value>> = produced.into_iter().map(|(r, _)| r).collect();
+        produced_hold.set(rows_bytes(&rows))?;
+        Ok(Rows { columns, rows, hold: produced_hold })
     }
 
-    /// `rows` (the tables before `p`) joined with `right` (table `p`).
+    /// The rows of the tables before `p` (`left`) joined with those of table
+    /// `p` (`right`), the pairs `also` accepts: conditions of `WHERE` that can
+    /// be answered as soon as table `p` is there. Rows are refused there
+    /// instead of being kept until the end; a join without `ON` whose `WHERE`
+    /// sets two columns equal is not the product of the tables any more.
+    ///
+    /// `whole`: `also` is all that was left of `WHERE`, and what it says is
+    /// final. Otherwise a condition that fails on a row (a division by zero)
+    /// does not fail the statement here, where it is evaluated on rows the
+    /// rest of `WHERE` might refuse: the row is kept, the condition marked in
+    /// [`Joined::failed`], and it is asked again on the whole rows.
+    ///
+    /// `wanted`: what of the rows is needed.
     #[allow(clippy::too_many_arguments)]
     fn join(
         &self,
         scope: &Scope,
         p: usize,
-        left: Vec<Vec<Value>>,
-        right: Vec<Vec<Value>>,
+        left: &[Vec<Value>],
+        right: &[Vec<Value>],
         join: &Join,
+        also: &[&Expr],
+        whole: bool,
+        wanted: Wanted,
         outer: Option<&Env<'_>>,
         used: &Cell<bool>,
-    ) -> Result<Vec<Vec<Value>>> {
-        let width = scope.parts[p].columns.len();
-        let mut out = Vec::new();
+    ) -> Result<Joined> {
+        let Wanted { count, first } = wanted;
+        // Enough rows were given.
+        let full = |out: &Joined| first.is_some_and(|n| out.count >= n);
+        let part = &scope.parts[p];
+        let mut out = Joined { rows: Vec::new(), hold: self.limits.hold(), count: 0, failed: vec![false; also.len()] };
         let on = match (&join.kind, &join.on) {
             (JoinKind::Cross, _) | (_, None) => None,
             (_, Some(on)) => Some(on),
         };
-        let Some(on) = on else {
-            for l in &left {
-                for r in &right {
-                    out.push(l.iter().chain(r).cloned().collect());
-                }
-            }
+        let left_join = join.kind == JoinKind::Left && on.is_some();
+        if on.is_none() && also.is_empty() && count {
+            out.count = left.len().saturating_mul(right.len());
             return Ok(out);
-        };
+        }
+        if full(&out) {
+            return Ok(out);
+        }
         // A hash join on `right.col = <expression of the left tables>`.
         let mut ons = Vec::new();
-        conj(on, &mut ons);
-        let part = &scope.parts[p];
+        if let Some(on) = on {
+            conj(on, &mut ons);
+        }
         let local = |e: &Expr| -> Option<usize> {
             if let Expr::Col { table, name } = e
                 && let Ok(Some((q, c))) = scope.find(table.as_deref(), name)
@@ -1208,63 +1984,128 @@ impl<'a> Runner<'a> {
             });
             ok
         };
-        let equi = ons.iter().find_map(|o| match o {
-            Expr::Bin(Op::Eq, a, b) => match (local(a), local(b)) {
-                (Some(c), None) if refs_only_left(b) => Some((c, (**b).clone())),
-                (None, Some(c)) if refs_only_left(a) => Some((c, (**a).clone())),
-                _ => None,
-            },
-            _ => None,
-        });
-        let nulls = vec![Value::Null; width];
-        let matches = |l: &[Value], r: &[Value]| -> Result<bool> {
-            let row: Vec<Value> = l.iter().chain(r).cloned().collect();
-            let env = Env { scope, row: &row, group: None, outer, used_outer: used, output: None };
-            Ok(tri(&self.eval(on, &env)?) == Some(true))
-        };
-        match equi {
-            Some((c, left_key)) => {
-                let mut table: HashMap<String, Vec<usize>> = HashMap::new();
-                for (i, r) in right.iter().enumerate() {
-                    if r[c].is_null() {
-                        continue;
-                    }
-                    let mut k = String::new();
-                    v::key(&r[c], &mut k);
-                    table.entry(k).or_default().push(i);
+        // From ON; or, when the join is not a LEFT one (every row must satisfy WHERE
+        // as well), from an equality of two columns in WHERE: `FROM a, b WHERE a.x = b.y`.
+        let columns = |e: &Expr| matches!(e, Expr::Bin(Op::Eq, a, b) if matches!((&**a, &**b), (Expr::Col { .. }, Expr::Col { .. })));
+        let from_where = also.iter().copied().filter(|w| !left_join && columns(w));
+        let mut equi: Option<(usize, &Expr)> = None;
+        for o in ons.iter().copied().chain(from_where) {
+            let Expr::Bin(Op::Eq, a, b) = o else { continue };
+            equi = match (local(a), local(b)) {
+                (Some(c), None) if refs_only_left(b) => Some((c, &**b)),
+                (None, Some(c)) if refs_only_left(a) => Some((c, &**a)),
+                _ => continue,
+            };
+            break;
+        }
+        let nulls = vec![Value::Null; part.columns.len()];
+        // `l` with `r` after it: ON says whether they match, and WHERE whether the row is kept.
+        let pair = |out: &mut Joined, l: &[Value], r: &[Value], matched: &mut bool, null_side: bool| -> Result<()> {
+            self.limits.tick()?;
+            let env = Env { scope, row: l, tail: r, group: None, outer, used_outer: used, output: None };
+            if !null_side {
+                if let Some(on) = on
+                    && tri(&self.eval(on, &env)?) != Some(true)
+                {
+                    return Ok(());
                 }
-                for l in &left {
-                    let env = Env { scope, row: l, group: None, outer, used_outer: used, output: None };
-                    let lk = self.eval(&left_key, &env)?;
-                    let mut hit = false;
-                    if !lk.is_null() {
-                        // Keys compare as SQL does: an integer column and a text holding it.
-                        let lk = part.kinds[c].and_then(|k| cast(&lk, k).ok()).unwrap_or(lk);
-                        let mut k = String::new();
-                        v::key(&lk, &mut k);
-                        for &i in table.get(&k).map(Vec::as_slice).unwrap_or_default() {
-                            if matches(l, &right[i])? {
-                                out.push(l.iter().chain(&right[i]).cloned().collect());
-                                hit = true;
+                *matched = true;
+            }
+            for (i, w) in also.iter().enumerate() {
+                match self.eval(w, &env) {
+                    Ok(v) if tri(&v) == Some(true) => {}
+                    Ok(_) => return Ok(()),
+                    Err(e) if whole => return Err(e),
+                    Err(_) => {
+                        out.failed[i] = true;
+                        break;
+                    }
+                }
+            }
+            out.count += 1;
+            if !count {
+                let row: Vec<Value> = l.iter().chain(r).cloned().collect();
+                out.hold.add(row_bytes(&row))?;
+                out.rows.push(row);
+            }
+            Ok(())
+        };
+        // A hash join when the right column's values can be told apart by a key.
+        match equi.and_then(|(c, left_key)| Some((c, left_key, Family::of(part.kinds[c])?))) {
+            Some((c, left_key, family)) => {
+                let mut table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+                // Rows whose value is not of the column's type: tried with every row.
+                let mut loose: Vec<usize> = Vec::new();
+                let mut keys = self.limits.hold();
+                for (i, r) in right.iter().enumerate() {
+                    match JoinKey::of(&r[c], family) {
+                        Ok(Some(k)) => {
+                            keys.add(k.bytes() + KEY_BYTES)?;
+                            table.entry(k).or_default().push(i);
+                        }
+                        Ok(None) => {}
+                        Err(()) => loose.push(i),
+                    }
+                }
+                for l in left {
+                    if full(&out) {
+                        break;
+                    }
+                    self.limits.tick()?;
+                    let env = Env { scope, row: l, tail: &[], group: None, outer, used_outer: used, output: None };
+                    let lk = self.eval(left_key, &env)?;
+                    let mut matched = false;
+                    match JoinKey::of(&lk, family) {
+                        Ok(Some(k)) => {
+                            let found = table.get(&k).map(Vec::as_slice).unwrap_or_default();
+                            // The rows of the key and the loose ones, in their order.
+                            let (mut a, mut b) = (found.iter().copied().peekable(), loose.iter().copied().peekable());
+                            loop {
+                                let i = match (a.peek(), b.peek()) {
+                                    (Some(&x), Some(&y)) if x < y => a.next(),
+                                    (Some(_), Some(_)) | (None, Some(_)) => b.next(),
+                                    (Some(_), None) => a.next(),
+                                    (None, None) => None,
+                                };
+                                let Some(i) = i else { break };
+                                pair(&mut out, l, &right[i], &mut matched, false)?;
+                                if full(&out) {
+                                    break;
+                                }
+                            }
+                        }
+                        // NULL equals nothing.
+                        Ok(None) => {}
+                        // A value of another type than the column's: SQL may still find it
+                        // equal to some of them (`1` and `'01'`), each one is asked.
+                        Err(()) => {
+                            for r in right {
+                                pair(&mut out, l, r, &mut matched, false)?;
+                                if full(&out) {
+                                    break;
+                                }
                             }
                         }
                     }
-                    if !hit && join.kind == JoinKind::Left {
-                        out.push(l.iter().chain(&nulls).cloned().collect());
+                    if !matched && left_join {
+                        pair(&mut out, l, &nulls, &mut matched, true)?;
                     }
                 }
             }
             None => {
-                for l in &left {
-                    let mut hit = false;
-                    for r in &right {
-                        if matches(l, r)? {
-                            out.push(l.iter().chain(r).cloned().collect());
-                            hit = true;
+                for l in left {
+                    if full(&out) {
+                        break;
+                    }
+                    let mut matched = false;
+                    for r in right {
+                        pair(&mut out, l, r, &mut matched, false)?;
+                        if full(&out) {
+                            break;
                         }
                     }
-                    if !hit && join.kind == JoinKind::Left {
-                        out.push(l.iter().chain(&nulls).cloned().collect());
+                    if !matched && left_join {
+                        pair(&mut out, l, &nulls, &mut matched, true)?;
                     }
                 }
             }
@@ -1276,7 +2117,21 @@ impl<'a> Runner<'a> {
     // Statements
     // -----------------------------------------------------------------------
 
+    /// Runs one statement: under its deadline, within the memory of the
+    /// request, and with no memory of the statements before it.
     pub(crate) fn run(&self, stmt: &Stmt) -> Result<SqlResult> {
+        let _at_work = self.limits.begin();
+        let before = self.limits.held();
+        // What a statement remembers of its subqueries is its own: the next one reads again.
+        self.cache.borrow_mut().clear();
+        let result = self.statement(stmt);
+        self.cache.borrow_mut().clear();
+        // Of what it held, only its answer stays, until the request has answered.
+        self.limits.settle(before.saturating_add(result.as_ref().map_or(0, |r| rows_bytes(&r.rows))));
+        result
+    }
+
+    fn statement(&self, stmt: &Stmt) -> Result<SqlResult> {
         match stmt {
             Stmt::Select(sel) => {
                 let rows = self.select(sel, None, &Cell::new(false))?;
@@ -1385,7 +2240,10 @@ impl<'a> Runner<'a> {
     /// A value with no row: `VALUES`, `DEFAULT`, `LIMIT`.
     fn eval_const(&self, e: &Expr) -> Result<Value> {
         let (scope, used) = (Scope::default(), Cell::new(false));
-        self.eval(e, &Env { scope: &scope, row: &[], group: None, outer: None, used_outer: &used, output: None })
+        self.eval(
+            e,
+            &Env { scope: &scope, row: &[], tail: &[], group: None, outer: None, used_outer: &used, output: None },
+        )
     }
 
     /// Rows of `RETURNING`.
@@ -1416,28 +2274,42 @@ impl<'a> Runner<'a> {
             }
         }
         let mut out = Vec::with_capacity(rows.len());
+        let mut hold = self.limits.hold();
         let used = Cell::new(false);
         for r in rows {
-            let env = Env { scope, row: r, group: None, outer: None, used_outer: &used, output: None };
+            self.limits.tick()?;
+            let env = Env { scope, row: r, tail: &[], group: None, outer: None, used_outer: &used, output: None };
             let mut row = Vec::with_capacity(columns_of.len());
+            let mut live = self.limits.live();
             for c in &columns_of {
-                row.push(match c {
+                let x = match c {
                     Err(i) => r[*i].clone(),
                     Ok(e) => self.eval(e, &env)?,
-                });
+                };
+                live.add(&x)?;
+                row.push(x);
             }
+            let bytes = live.bytes() + size_of::<Vec<Value>>();
+            drop(live);
+            hold.add(bytes)?;
             out.push(row);
         }
         Ok(SqlResult { columns: unique_headers(names), rows: out, returns_rows: true, ..SqlResult::default() })
     }
 
-    /// The rows of `schema` matching `filter`, and the scope they live in.
-    fn target_rows(
+    /// The rows of `schema` matching `filter`, given to `each` a chunk at a
+    /// time; returns how many. Only the primary keys of the rows the indexable
+    /// part of the filter names are held, and one chunk of rows: an `UPDATE` or
+    /// a `DELETE` of a whole table holds no more. A rest of the filter with a
+    /// subquery (it may read the rows being changed) is asked of every row
+    /// before any is changed, as one chunk.
+    fn each_target(
         &self,
         schema: &'static TableSchema,
         alias: Option<&str>,
         filter: Option<&Expr>,
-    ) -> Result<(Scope, Vec<Vec<Value>>, bool)> {
+        mut each: impl FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<usize> {
         let scope = Scope::of_schema(alias.unwrap_or(schema.name), schema);
         let used = Cell::new(false);
         let mut parts = Vec::new();
@@ -1446,18 +2318,29 @@ impl<'a> Runner<'a> {
         }
         let mut pushed = Vec::new();
         let mut residual = Vec::new();
-        for p in &parts {
+        for p in parts {
             match self.to_m(p, &scope, Some(0), None, &used) {
                 Some(m) => pushed.push(m),
                 None => residual.push(p),
             }
         }
-        let all_pushed = residual.is_empty();
-        let mut rows = self.read_table(schema, and_all(pushed), None)?;
-        if !residual.is_empty() {
+        // The rows that the rest of the filter accepts.
+        let keep = |rows: Vec<Vec<Value>>, hold: &mut Hold| -> Result<Vec<Vec<Value>>> {
+            if residual.is_empty() {
+                return Ok(rows);
+            }
             let mut kept = Vec::new();
             for r in rows {
-                let env = Env { scope: &scope, row: &r, group: None, outer: None, used_outer: &used, output: None };
+                self.limits.tick()?;
+                let env = Env {
+                    scope: &scope,
+                    row: &r,
+                    tail: &[],
+                    group: None,
+                    outer: None,
+                    used_outer: &used,
+                    output: None,
+                };
                 let mut ok = true;
                 for w in &residual {
                     if tri(&self.eval(w, &env)?) != Some(true) {
@@ -1469,9 +2352,40 @@ impl<'a> Runner<'a> {
                     kept.push(r);
                 }
             }
-            rows = kept;
+            hold.set(rows_bytes(&kept))?;
+            Ok(kept)
+        };
+        let reads_rows = residual.iter().any(|w| {
+            let mut sub = false;
+            w.walk(&mut |x| sub |= matches!(x, Expr::Exists(..) | Expr::Scalar(_) | Expr::InSelect(..)));
+            sub
+        });
+        if reads_rows {
+            let rows = self.read_table(schema, and_all(pushed), None)?;
+            let mut hold = self.limits.hold_rows(&rows)?;
+            let rows = keep(rows, &mut hold)?;
+            let n = rows.len();
+            each(rows)?;
+            return Ok(n);
         }
-        Ok((scope, rows, all_pushed))
+        let c = &schema.columns[schema.primary_key];
+        let key = M::Column(ColumnRef { table: schema.name, name: c.name, index: schema.primary_key, kind: c.kind });
+        let mut ast = SelectAst::new(schema);
+        ast.filter = and_all(pushed);
+        ast.projection = Projection::Exprs(vec![key.clone()]);
+        let keys = self.tx.fetch_rows(&Query::Select(&ast))?;
+        let _keys_held = self.limits.hold_rows(&keys)?;
+        let mut n = 0;
+        for chunk in keys.chunks(CHANGE_CHUNK) {
+            let list = chunk.iter().filter_map(|r| r.first().cloned()).collect();
+            let by_key = M::InList { expr: Box::new(key.clone()), list, negated: false };
+            let rows = self.read_table(schema, Some(by_key), None)?;
+            let mut hold = self.limits.hold_rows(&rows)?;
+            let rows = keep(rows, &mut hold)?;
+            n += rows.len();
+            each(rows)?;
+        }
+        Ok(n)
     }
 
     fn update(
@@ -1521,34 +2435,56 @@ impl<'a> Runner<'a> {
                 None => Some(None),
             };
             if let (Some(sets), Some(filter)) = (consts, m_filter) {
-                let r = self.tx.execute_now(&Query::Update(&UpdateAst { table: schema, sets, filter }))?;
-                return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() });
-            }
-        }
-        let (scope, rows, _) = self.target_rows(schema, alias, filter)?;
-        let mut after = Vec::with_capacity(rows.len());
-        for old in &rows {
-            let env = Env { scope: &scope, row: old, group: None, outer: None, used_outer: &used, output: None };
-            let mut new = old.clone();
-            for (i, e) in &targets {
-                let col = &schema.columns[*i];
-                let value = cast(&self.eval(e, &env)?, col.kind)
-                    .map_err(|err| syntax(format!("column `{}`: {err}", col.name)))?;
-                if value.is_null() && !col.nullable {
-                    return Err(syntax(format!("column `{}` cannot be NULL", col.name)));
+                self.limits.take_declined();
+                match self.tx.execute_now(&Query::Update(&UpdateAst { table: schema, sets, filter })) {
+                    Ok(r) => return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() }),
+                    // The engine would have held more rows than the statement may (it wrote
+                    // nothing): they are changed below, a chunk at a time.
+                    Err(_) if self.limits.take_declined() => {}
+                    Err(e) => return Err(e),
                 }
-                new[*i] = value;
             }
-            if new != *old {
-                self.tx.execute_now(&Query::UpdateRow { table: schema, values: &new })?;
-            }
-            after.push(new);
         }
+        let mut after = Vec::new();
+        let mut after_hold = self.limits.hold();
+        let changed = self.each_target(schema, alias, filter, |rows| {
+            for old in &rows {
+                self.limits.tick()?;
+                let env = Env {
+                    scope: &scope,
+                    row: old,
+                    tail: &[],
+                    group: None,
+                    outer: None,
+                    used_outer: &used,
+                    output: None,
+                };
+                let mut new = old.clone();
+                for (i, e) in &targets {
+                    let col = &schema.columns[*i];
+                    let value = cast(&self.eval(e, &env)?, col.kind)
+                        .map_err(|err| syntax(format!("column `{}`: {err}", col.name)))?;
+                    if value.is_null() && !col.nullable {
+                        return Err(syntax(format!("column `{}` cannot be NULL", col.name)));
+                    }
+                    new[*i] = value;
+                }
+                if new != *old {
+                    self.tx.execute_now(&Query::UpdateRow { table: schema, values: &new })?;
+                }
+                // The new rows are kept for RETURNING only.
+                if returning.is_some() {
+                    after_hold.add(row_bytes(&new))?;
+                    after.push(new);
+                }
+            }
+            Ok(())
+        })?;
         let mut result = match returning {
             Some(items) => self.returning(items, &scope, &after)?,
             None => SqlResult::default(),
         };
-        result.rows_affected = rows.len() as u64;
+        result.rows_affected = changed as u64;
         Ok(result)
     }
 
@@ -1568,19 +2504,37 @@ impl<'a> Runner<'a> {
                 None => Some(None),
             };
             if let Some(filter) = m_filter {
-                let r = self.tx.execute_now(&Query::Delete(&DeleteAst { table: schema, filter }))?;
-                return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() });
+                self.limits.take_declined();
+                match self.tx.execute_now(&Query::Delete(&DeleteAst { table: schema, filter })) {
+                    Ok(r) => return Ok(SqlResult { rows_affected: r.rows_affected, ..SqlResult::default() }),
+                    // As for UPDATE: a chunk at a time below.
+                    Err(_) if self.limits.take_declined() => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
-        let (scope, rows, _) = self.target_rows(schema, alias, filter)?;
-        for r in &rows {
-            self.tx.execute_now(&Query::DeleteByKey { table: schema, key: &r[schema.primary_key] })?;
-        }
+        let mut gone = Vec::new();
+        let mut gone_hold = self.limits.hold();
+        let deleted = self.each_target(schema, alias, filter, |rows| {
+            for r in rows {
+                self.limits.tick()?;
+                self.tx.execute_now(&Query::DeleteByKey { table: schema, key: &r[schema.primary_key] })?;
+                // The rows are kept for RETURNING only.
+                if returning.is_some() {
+                    gone_hold.add(row_bytes(&r))?;
+                    gone.push(r);
+                }
+            }
+            Ok(())
+        })?;
         let mut result = match returning {
-            Some(items) => self.returning(items, &scope, &rows)?,
+            Some(items) => {
+                let scope = Scope::of_schema(alias.unwrap_or(schema.name), schema);
+                self.returning(items, &scope, &gone)?
+            }
             None => SqlResult::default(),
         };
-        result.rows_affected = rows.len() as u64;
+        result.rows_affected = deleted as u64;
         Ok(result)
     }
 
@@ -1664,16 +2618,37 @@ impl<'a> Runner<'a> {
             None => (0..schema.columns.len()).collect(),
         };
         // The new rows' values.
-        let source_rows: Vec<Vec<Value>> = match source {
-            InsertSource::Values(rows) => rows
-                .iter()
-                .map(|r| r.iter().map(|e| self.eval_const(e)).collect::<Result<Vec<_>>>())
-                .collect::<Result<_>>()?,
-            InsertSource::Select(sel) => self.select(sel, None, &Cell::new(false))?.rows,
-            InsertSource::Defaults => vec![Vec::new()],
+        let (source_rows, _source_hold): (Vec<Vec<Value>>, Hold) = match source {
+            InsertSource::Values(rows) => {
+                // Each row counted as it is computed: a row of large values fails before the next one is.
+                let mut values = Vec::with_capacity(rows.len());
+                let mut hold = self.limits.hold();
+                for r in rows {
+                    self.limits.tick()?;
+                    let mut row = Vec::with_capacity(r.len());
+                    let mut live = self.limits.live();
+                    for e in r {
+                        let x = self.eval_const(e)?;
+                        live.add(&x)?;
+                        row.push(x);
+                    }
+                    let bytes = live.bytes() + size_of::<Vec<Value>>();
+                    drop(live);
+                    hold.add(bytes)?;
+                    values.push(row);
+                }
+                (values, hold)
+            }
+            InsertSource::Select(sel) => {
+                let Rows { rows, hold, .. } = self.select(sel, None, &Cell::new(false))?;
+                (rows, hold)
+            }
+            InsertSource::Defaults => (vec![Vec::new()], self.limits.hold()),
         };
         let mut rows = Vec::with_capacity(source_rows.len());
+        let mut rows_hold = self.limits.hold();
         for r in source_rows {
+            self.limits.tick()?;
             let n = r.len();
             // `INSERT INTO t VALUES (...)` may leave out generated keys at the end.
             let fits = n == positions.len()
@@ -1685,7 +2660,9 @@ impl<'a> Runner<'a> {
                 return Err(syntax(format!("{} value(s) for {} column(s)", n, positions.len())));
             }
             let given: Vec<(usize, Value)> = positions.iter().copied().zip(r).collect();
-            rows.push(self.full_row(schema, &given)?);
+            let row = self.full_row(schema, &given)?;
+            rows_hold.add(row_bytes(&row))?;
+            rows.push(row);
         }
         let pk = schema.primary_key;
         let scope = Scope::of_schema(schema.name, schema);
@@ -1693,16 +2670,17 @@ impl<'a> Runner<'a> {
         // auto-increment column go one by one, below).
         let explicit_keys = schema.columns[pk].auto_increment && rows.iter().any(|r| !r[pk].is_null());
         if on_conflict.is_none() && !replace && returning.is_none() && !explicit_keys {
+            let count = rows.len() as u64;
+            let last_given = rows.last().map(|r| r[pk].clone()).filter(|v| !v.is_null());
             let r: ExecResult = if rows.len() == 1 {
                 self.tx.execute_now(&Query::InsertRow { table: schema, values: &rows[0] })?
             } else {
-                self.tx
-                    .execute_now(&Query::Insert(&memoire_orm::ast::InsertAst { table: schema, rows: rows.clone() }))?
+                // The rows are given, not copied: a large INSERT is held once.
+                self.tx.execute_now(&Query::Insert(&memoire_orm::ast::InsertAst { table: schema, rows }))?
             };
-            let last = r.last_insert_id.or_else(|| rows.last().map(|r| r[pk].clone()).filter(|v| !v.is_null()));
             return Ok(SqlResult {
-                rows_affected: r.rows_affected.max(rows.len() as u64),
-                last_insert_id: last,
+                rows_affected: r.rows_affected.max(count),
+                last_insert_id: r.last_insert_id.or(last_given),
                 ..SqlResult::default()
             });
         }
@@ -1732,7 +2710,9 @@ impl<'a> Runner<'a> {
         let mut last = None;
         let mut excluded_scope = scope.clone();
         excluded_scope.push("excluded".into(), scope.parts[0].columns.clone(), scope.parts[0].kinds.clone(), None);
+        let mut done_hold = self.limits.hold();
         for row in rows {
+            self.limits.tick()?;
             let existing = if on_conflict.is_some() || replace { self.colliding(schema, &keys, &row)? } else { None };
             match (existing, on_conflict.map(|(_, a)| a)) {
                 (Some(old), Some(Conflict::Nothing)) => {
@@ -1744,6 +2724,7 @@ impl<'a> Runner<'a> {
                     let env = Env {
                         scope: &excluded_scope,
                         row: &both,
+                        tail: &[],
                         group: None,
                         outer: None,
                         used_outer: &used,
@@ -1768,7 +2749,10 @@ impl<'a> Runner<'a> {
                     }
                     self.tx.execute_now(&Query::UpdateRow { table: schema, values: &new })?;
                     affected += 1;
-                    done.push(new);
+                    if returning.is_some() {
+                        done_hold.add(row_bytes(&new))?;
+                        done.push(new);
+                    }
                 }
                 (Some(old), None) => {
                     // REPLACE: the old row goes, the new one takes its place.
@@ -1776,14 +2760,20 @@ impl<'a> Runner<'a> {
                     let id = self.put_new(schema, &row)?;
                     last = Some(id.clone());
                     affected += 1;
-                    done.push(self.by_key(schema, &id)?.unwrap_or(row));
+                    if returning.is_some() {
+                        let stored = self.by_key(schema, &id)?.unwrap_or(row);
+                        done_hold.add(row_bytes(&stored))?;
+                        done.push(stored);
+                    }
                 }
                 (None, _) => {
                     let id = self.put_new(schema, &row)?;
                     last = Some(id.clone());
                     affected += 1;
                     if returning.is_some() {
-                        done.push(self.by_key(schema, &id)?.unwrap_or(row));
+                        let stored = self.by_key(schema, &id)?.unwrap_or(row);
+                        done_hold.add(row_bytes(&stored))?;
+                        done.push(stored);
                     }
                 }
             }
@@ -1838,6 +2828,8 @@ impl<'a> Runner<'a> {
         }
         let mut cols = columns.to_vec();
         let mut rows = None;
+        // The rows of `AS SELECT` are held until they are written.
+        let mut _rows_hold = None;
         if let Some(sel) = as_select {
             let r = self.select(sel, None, &Cell::new(false))?;
             for (i, c) in r.columns.iter().enumerate() {
@@ -1880,6 +2872,7 @@ impl<'a> Runner<'a> {
                 id.primary_key = true;
             }
             rows = Some(r.rows);
+            _rows_hold = Some(r.hold);
         }
         let mut seen = std::collections::HashSet::new();
         for c in &cols {
@@ -1929,6 +2922,7 @@ impl<'a> Runner<'a> {
         if let Some(rows) = rows {
             let positions: Vec<usize> = (0..rows.first().map_or(0, Vec::len)).collect();
             for r in rows {
+                self.limits.tick()?;
                 let given: Vec<(usize, Value)> = positions.iter().copied().zip(r).collect();
                 let full = self.full_row(schema, &given)?;
                 self.put_new(schema, &full)?;

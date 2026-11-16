@@ -27,6 +27,9 @@ const SYMS: [&str; 22] = [
     "<=", ">=", "<>", "!=", "==", "||", "::", "(", ")", ",", ".", ";", "*", "+", "-", "/", "%", "=", "<", ">", "&", "|",
 ];
 
+/// The highest parameter number (`$65535`): PostgreSQL's own limit.
+pub(crate) const MAX_PARAM: usize = 65_535;
+
 /// The tokens of `src`.
 pub(crate) fn tokenize(src: &str) -> Result<Vec<Tok>> {
     let chars: Vec<char> = src.chars().collect();
@@ -115,6 +118,11 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 if n == 0 {
                     return Err(syntax("parameters are numbered from 1"));
                 }
+                // The highest number sizes the list of parameters: `$1000000000000`
+                // would ask for a list of that many values.
+                if n > MAX_PARAM {
+                    return Err(syntax(format!("parameters are numbered up to {MAX_PARAM}")));
+                }
                 Some(n - 1)
             } else if c == '$' {
                 return Err(syntax("`$` must be followed by a number"));
@@ -155,5 +163,16 @@ mod tests {
         assert!(t.contains(&Tok::Sym("<>")) && t.contains(&Tok::Sym("||")));
         assert!(tokenize("'open").is_err());
         assert!(tokenize("select #").is_err());
+    }
+
+    #[test]
+    fn parameter_numbers_have_a_limit() {
+        assert_eq!(tokenize("$65535").unwrap(), vec![Tok::Param(Some(65_534))]);
+        assert_eq!(tokenize("?65535").unwrap(), vec![Tok::Param(Some(65_534))]);
+        for bad in ["$65536", "?65536", "$1000000000000", "$18446744073709551615", "$99999999999999999999999", "$0"] {
+            let e = tokenize(bad).unwrap_err().to_string();
+            assert!(e.contains("SQL: "), "{bad}: {e}");
+        }
+        assert!(tokenize("$1000000000000").unwrap_err().to_string().contains("up to 65535"));
     }
 }
