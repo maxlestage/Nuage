@@ -1547,7 +1547,8 @@ mod tests {
             if path.is_dir() {
                 sources(&path, into);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                let mut source = std::fs::read_to_string(&path).unwrap();
+                // Windows checkouts may have \r\n line ends.
+                let mut source = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
                 // These tests' own examples are not texts of the window.
                 if path.ends_with("i18n.rs")
                     && let Some(at) = source.find("#[cfg(test)]\nmod tests")
