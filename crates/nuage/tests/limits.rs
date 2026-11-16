@@ -82,10 +82,15 @@ async fn sql(addr: SocketAddr, auth: &str, body: &Json) -> Http {
 
 /// A table of `rows` rows, `t (id, v)`.
 async fn table(addr: SocketAddr, rows: usize) {
-    let made = sql(addr, "t0ken", &json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" })).await;
+    table_of(addr, "t0ken", rows).await;
+}
+
+/// A table of `rows` rows, `t (id, v)`, in the application of `token`.
+async fn table_of(addr: SocketAddr, token: &str, rows: usize) {
+    let made = sql(addr, token, &json!({ "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" })).await;
     assert_eq!(made.status, 200, "{}", made.body);
     let values: Vec<String> = (1..=rows).map(|i| format!("({i}, {})", i * 7 % 1000)).collect();
-    let filled = sql(addr, "t0ken", &json!({ "sql": format!("INSERT INTO t VALUES {}", values.join(",")) })).await;
+    let filled = sql(addr, token, &json!({ "sql": format!("INSERT INTO t VALUES {}", values.join(",")) })).await;
     assert_eq!(filled.status, 200, "{}", filled.body);
 }
 
@@ -427,4 +432,102 @@ async fn slow_reads_never_queue_without_end_nor_hold_up_writes() {
     for s in slow {
         assert_eq!(s.await.unwrap(), 200);
     }
+}
+
+/// More slow reads than there are threads for reads, from a page's token
+/// (read-only) and from its application's own: they never take a thread for
+/// writes, the page's token leaves some to its application, and the
+/// application leaves some of each kind to the others. Past their share,
+/// reads are turned away with 503, saying whose share is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_one_takes_every_thread() {
+    // Twelve threads: nine for reads, three for writes.
+    let server = Server::new(engine("shares"), ServerOptions { statement_threads: 12, ..options() });
+    let (_, shop) = server.create_app("shop", "").unwrap();
+    let (_, blog) = server.create_app("blog", "").unwrap();
+    let page = server.new_app_read_only_token("shop").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    table_of(addr, &shop, 2500).await;
+    table_of(addr, &blog, 10).await;
+    let slow = |token: &str, i: usize| {
+        let token = token.to_owned();
+        tokio::spawn(async move {
+            let r = sql(addr, &token, &json!({ "sql": SLOW, "params": [i] })).await;
+            (r.status, r.headers.get("retry-after").map(|v| v.to_str().unwrap().to_owned()), r.body)
+        })
+    };
+    // Nine from the page: six run (three quarters of the seven threads the
+    // shop may hold), three wait. Then three from the shop's own server: one runs.
+    let from_page: Vec<_> = (0..9).map(|i| slow(&page, i)).collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let from_shop: Vec<_> = (0..3).map(|i| slow(&shop, 100 + i)).collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = Instant::now();
+    let write = sql(addr, &shop, &json!({ "sql": "INSERT INTO t VALUES (?, 1)", "params": [99_999] })).await;
+    assert_eq!(write.status, 200, "{}", write.body);
+    let auth = format!("Bearer {shop}");
+    let raw = json!({ "query": { "raw": "INSERT INTO t VALUES (99998, 1)", "params": [] } }).to_string();
+    let execute = http(addr, "POST", "/v1/execute", &[("authorization", &auth)], raw).await;
+    assert_eq!(execute.status, 200, "{}", execute.body);
+    let read = sql(addr, &blog, &json!({ "sql": "SELECT count(*) AS n FROM t WHERE v >= ?", "params": [0] })).await;
+    assert_eq!((read.status, read.body.as_str()), (200, r#"{"columns":["n"],"rows":[{"n":10}]}"#));
+    let write = sql(addr, &blog, &json!({ "sql": "INSERT INTO t VALUES (?, 1)", "params": [11] })).await;
+    assert_eq!(write.status, 200, "{}", write.body);
+    assert_eq!(http(addr, "GET", "/api/health", &[], "").await.status, 200);
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+    let mut answers = Vec::new();
+    for (who, list) in [("page", from_page), ("shop", from_shop)] {
+        let mut statuses = Vec::new();
+        for s in list {
+            let (status, retry, body) = s.await.unwrap();
+            if status == 503 {
+                assert_eq!(retry.as_deref(), Some("1"));
+                assert!(body.contains("application `shop`"), "{body}");
+            }
+            statuses.push(status);
+        }
+        statuses.sort_unstable();
+        answers.push((who, statuses));
+    }
+    let page: Vec<u16> = [200; 6].into_iter().chain([503; 3]).collect();
+    assert_eq!(answers, [("page", page), ("shop", vec![200, 503, 503])]);
+}
+
+/// The answers to the reads of one `/v1/batch` are bounded: a request of a
+/// few KiB cannot ask for the same table a thousand times. A batch within the
+/// bound, writes included, answers as before.
+#[tokio::test]
+async fn batch_answers_are_bounded() {
+    let server = Server::new(engine("batch"), options());
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let schema = json!({ "name": "big", "pk": 0, "indexes": [], "columns": [
+        { "name": "id", "kind": "bigint", "primaryKey": true }, { "name": "v", "kind": "text" }] });
+    let post = |path: &'static str, body: Json| http(addr, "POST", path, &[AUTH], body.to_string());
+    let made = post("/v1/execute", json!({ "query": { "createTable": schema } })).await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let row = json!({ "sql": "INSERT INTO big VALUES (?, ?)", "params": [1, "x".repeat(100_000)] });
+    assert_eq!(sql(addr, "t0ken", &row).await.status, 200);
+    let all = json!({ "fetch": { "select": { "from": schema, "projection": { "tables": ["big"] } } } });
+
+    // 700 times a table of 100 KB: more than 64 MiB of answer.
+    let many = post("/v1/batch", json!({ "statements": vec![all.clone(); 700] })).await;
+    assert_eq!(many.status, 413, "{}", &many.body[..many.body.len().min(300)]);
+    assert!(many.body.contains("ask for fewer rows"), "{}", many.body);
+
+    // A few reads, and reads with a write, answer as they did.
+    let few = post("/v1/batch", json!({ "statements": [all, all] })).await;
+    assert_eq!(few.status, 200);
+    let results = few.json()["results"].as_array().unwrap().clone();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r["rows"].as_array().unwrap().len() == 1));
+    let insert = json!({ "execute": { "insert": schema, "rows": [[2, "y"]] } });
+    let mixed = post("/v1/batch", json!({ "statements": [insert, all] })).await;
+    assert_eq!(mixed.status, 200, "{}", &mixed.body[..mixed.body.len().min(300)]);
+    let results = mixed.json()["results"].as_array().unwrap().clone();
+    assert_eq!(results[0]["rowsAffected"], 1, "{}", results[0]);
+    assert_eq!(results[1]["rows"].as_array().unwrap().len(), 2);
 }

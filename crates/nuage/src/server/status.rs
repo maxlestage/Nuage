@@ -248,6 +248,11 @@ fn status_of(state: &State, view: &View, read: &Every) -> Json {
         "reliefs": state.memory_reliefs(),
         // What the requests being read may hold together.
         "request_bytes": state.request_memory.total(),
+        // What the schemas described by clients take (they stay), and the most they may.
+        "described_schemas": {
+            "bytes": state.described_total.usage().0,
+            "limit_bytes": state.described_total.usage().1,
+        },
         "process_bytes": m.process_bytes,
         "swap_total_bytes": m.swap_total_bytes,
         "swap_free_bytes": m.swap_free_bytes,
