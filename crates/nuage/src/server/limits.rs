@@ -4,7 +4,7 @@
 //! 429 or 503 and `Retry-After`), never a queue without end, nor memory that
 //! only grows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::panic::AssertUnwindSafe;
@@ -34,6 +34,10 @@ pub(crate) const MAX_PARAMS: usize = 65_535;
 pub(crate) const MAX_STATEMENTS: usize = 1_000;
 /// Most commands in one request to `/v1/kv`.
 pub(crate) const MAX_KV_COMMANDS: usize = 10_000;
+/// Longest answer to the reads of one `/v1/batch` request: a few bytes asking
+/// for the same table a thousand times would otherwise build a thousand
+/// copies of it before sending one.
+pub(crate) const MAX_BATCH_ANSWER: usize = 64 << 20;
 /// Longest form of the console's login page: a password and two tokens.
 pub(crate) const LOGIN_FORM_BYTES: usize = 8 << 10;
 /// Longest form of the console's other pages (the SQL of the query page).
@@ -149,13 +153,60 @@ pub(crate) fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "a bug in the server".to_owned())
 }
 
+/// Who asks for a thread: an application, with a token that only reads or not.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Asker<'a> {
+    pub(crate) app: &'a str,
+    pub(crate) read_only: bool,
+}
+
 /// Threads for statements: reads and writes have their own, so that a burst
 /// of slow reads never keeps a write waiting, and neither queues without
 /// end. They stay under the blocking pool's size, with room left for the
 /// status, the console and the workers' duties.
+///
+/// No one takes them all, either. When the server has several applications,
+/// one of them holds at most three quarters of the threads of a kind: the
+/// others always find some. And the tokens that only read (those of web
+/// pages, which anyone can copy) hold at most three quarters of what their
+/// application may hold for reads, and never a thread for writes: the
+/// application's own server always reads, and writes.
 pub(crate) struct Admission {
     reads: Arc<Semaphore>,
     writes: Arc<Semaphore>,
+    /// What one application may hold: of the threads for reads, for writes,
+    /// and for the reads of its tokens that only read.
+    shares: [usize; 3],
+    held: Mutex<HashMap<String, Arc<Shares>>>,
+}
+
+/// One application's share of the threads.
+struct Shares {
+    reads: Arc<Semaphore>,
+    writes: Arc<Semaphore>,
+    public: Arc<Semaphore>,
+}
+
+/// A thread for a statement, until dropped: the thread, and the shares it
+/// was counted in.
+#[derive(Debug)]
+pub(crate) struct Thread {
+    _held: [Option<OwnedSemaphorePermit>; 3],
+}
+
+/// Three quarters of `n`, less one at least (when there is more than one),
+/// so that the rest always has some.
+fn most_of(n: usize) -> usize {
+    n.saturating_sub((n / 4).max(1)).max(1)
+}
+
+/// A permit of `threads`: at once when one is free, else when one is given
+/// back before `until`.
+async fn take(threads: &Arc<Semaphore>, until: tokio::time::Instant) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = threads.clone().try_acquire_owned() {
+        return Some(permit);
+    }
+    tokio::time::timeout_at(until, threads.clone().acquire_owned()).await.ok()?.ok()
 }
 
 impl Admission {
@@ -163,37 +214,69 @@ impl Admission {
     pub(crate) fn new(threads: usize) -> Admission {
         let threads = threads.max(4);
         let writes = (threads / 4).max(2);
-        Admission { reads: Arc::new(Semaphore::new(threads - writes)), writes: Arc::new(Semaphore::new(writes)) }
+        let reads = threads - writes;
+        Admission {
+            reads: Arc::new(Semaphore::new(reads)),
+            writes: Arc::new(Semaphore::new(writes)),
+            shares: [most_of(reads), most_of(writes), most_of(most_of(reads))],
+            held: Mutex::new(HashMap::new()),
+        }
     }
 
-    /// A thread for a statement that reads (`false`) or writes (`true`): at
-    /// once when one is free, else after a short wait, else a 503.
-    pub(crate) async fn enter(&self, write: bool) -> Result<OwnedSemaphorePermit> {
+    fn shares_of(&self, app: &str) -> Arc<Shares> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shares) = held.get(app) {
+            return shares.clone();
+        }
+        let [reads, writes, public] = self.shares.map(|n| Arc::new(Semaphore::new(n)));
+        let shares = Arc::new(Shares { reads, writes, public });
+        held.insert(app.to_owned(), shares.clone());
+        shares
+    }
+
+    /// Forgets the shares of the applications that `exists` no longer knows.
+    pub(crate) fn forget(&self, exists: impl Fn(&str) -> bool) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).retain(|app, _| exists(app));
+    }
+
+    /// A thread for a statement of `who` that reads (`false`) or writes
+    /// (`true`): at once when one is free, else after a short wait, else a
+    /// 503. `alone`: the server has no other application (its share then
+    /// stops nothing).
+    pub(crate) async fn enter(&self, write: bool, who: Asker<'_>, alone: impl FnOnce() -> bool) -> Result<Thread> {
+        let kind = if write { "writes" } else { "reads" };
+        let until = tokio::time::Instant::now() + ADMISSION_WAIT;
+        let shares = self.shares_of(who.app);
+        // The narrowest share first: a request waiting for its own holds
+        // nothing that others wait for.
+        let public = if who.read_only && !write {
+            Some(take(&shares.public, until).await.ok_or_else(|| {
+                busy(format!(
+                    "every thread that the read-only tokens of application `{}` may use is busy (slow statements): \
+                     try again in a moment",
+                    who.app
+                ))
+            })?)
+        } else {
+            None
+        };
+        let own = if write { &shares.writes } else { &shares.reads };
+        let share = match own.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) if alone() => None,
+            Err(_) => Some(take(own, until).await.ok_or_else(|| {
+                busy(format!(
+                    "every thread for {kind} that application `{}` may use is busy (slow statements): \
+                     try again in a moment",
+                    who.app
+                ))
+            })?),
+        };
         let threads = if write { &self.writes } else { &self.reads };
-        if let Ok(permit) = threads.clone().try_acquire_owned() {
-            return Ok(permit);
-        }
-        match tokio::time::timeout(ADMISSION_WAIT, threads.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            _ => Err(busy(format!(
-                "every thread for {} is busy (slow statements): try again in a moment",
-                if write { "writes" } else { "reads" }
-            ))),
-        }
-    }
-
-    /// A thread to read a request with (its JSON, its SQL) before it is
-    /// known whether it writes: one for reads, or else one for writes when
-    /// one is free (`true`), so that a write is never kept from being read by
-    /// slow reads holding all theirs.
-    pub(crate) async fn enter_to_read(&self) -> Result<(OwnedSemaphorePermit, bool)> {
-        if let Ok(permit) = self.reads.clone().try_acquire_owned() {
-            return Ok((permit, false));
-        }
-        if let Ok(permit) = self.writes.clone().try_acquire_owned() {
-            return Ok((permit, true));
-        }
-        Ok((self.enter(false).await?, false))
+        let thread = take(threads, until)
+            .await
+            .ok_or_else(|| busy(format!("every thread for {kind} is busy (slow statements): try again in a moment")))?;
+        Ok(Thread { _held: [Some(thread), share, public] })
     }
 
     /// Threads free now, for reads and for writes.
@@ -501,10 +584,17 @@ pub(crate) fn json_weight(text: &[u8]) -> usize {
 /// the server runs (a client describes each table once, then sends its
 /// reference).
 pub(crate) const MAX_CLIENT_SCHEMAS: usize = 1_000;
-/// Most text those schemas and the names of their statements may hold, for
+/// Most memory those schemas and the names of their statements may take, for
 /// one application: what is kept stays for as long as the process (the
 /// protocol's statements point to schemas that live that long).
 pub(crate) const MAX_CLIENT_SCHEMA_BYTES: usize = 4 << 20;
+/// Most memory the schemas described by the clients of all the applications
+/// may take together, whatever the memory of the server (a 32nd of it when
+/// that is more).
+pub(crate) const MIN_ALL_CLIENT_SCHEMA_BYTES: usize = 16 << 20;
+/// Bytes of an entry of the cache's maps (its slot, its share of the room a
+/// map keeps to grow, the allocator's own), besides its text.
+const ENTRY: usize = 96;
 /// Longest name of a table, a column or an index: the engine's own rule
 /// (and PostgreSQL's).
 pub(crate) const MAX_NAME: usize = 63;
@@ -512,17 +602,94 @@ pub(crate) const MAX_NAME: usize = 63;
 const MAX_COLUMN_TEXT: usize = 4 << 10;
 /// Most columns of a table, and most indexes: PostgreSQL's limit.
 const MAX_COLUMNS: usize = 1_600;
+/// Most columns of one index: PostgreSQL's limit.
+const MAX_INDEX_COLUMNS: usize = 32;
 /// Longest description of one table.
 const MAX_SCHEMA_TEXT: usize = 512 << 10;
 
 /// The schemas that the clients of one application describe, kept apart
 /// from the tables' own (that the SQL layer and the other applications use):
 /// filling this one can never stop another application, nor SQL. Each new
-/// schema and name is checked before it is kept, and the whole is bounded.
+/// schema and name is checked before it is kept, and the whole is bounded,
+/// for the application and with all the others (see [`DescribedTotal`]).
 pub(crate) struct ClientSchemas {
     pub(crate) cache: SchemaCache,
     seen: Mutex<Seen>,
+    total: Arc<DescribedTotal>,
     hasher: std::collections::hash_map::RandomState,
+}
+
+/// The memory that the schemas described by the clients of all the
+/// applications take together, and the most they may. It never goes down:
+/// the schemas of an application deleted stay in memory as well.
+pub(crate) struct DescribedTotal {
+    bytes: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+impl DescribedTotal {
+    /// The total for a server of `memory` bytes (unknown: `None`).
+    pub(crate) fn for_memory(memory: Option<u64>) -> Arc<DescribedTotal> {
+        let share = memory.map_or(0, |m| usize::try_from(m / 32).unwrap_or(usize::MAX));
+        DescribedTotal::new(share.max(MIN_ALL_CLIENT_SCHEMA_BYTES))
+    }
+
+    pub(crate) fn new(limit: usize) -> Arc<DescribedTotal> {
+        Arc::new(DescribedTotal { bytes: std::sync::atomic::AtomicUsize::new(0), limit })
+    }
+
+    /// Bytes counted, and the most there may be.
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        (self.bytes.load(std::sync::atomic::Ordering::Relaxed), self.limit)
+    }
+
+    /// Counts `more` bytes: `false` when that would pass the limit.
+    fn add(&self, more: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut now = self.bytes.load(Relaxed);
+        loop {
+            let Some(next) = now.checked_add(more).filter(|n| *n <= self.limit) else { return false };
+            match self.bytes.compare_exchange_weak(now, next, Relaxed, Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => now = actual,
+            }
+        }
+    }
+}
+
+/// What the cache keeps of a schema described as `j`, whose text is `text`
+/// bytes long: that text, by which it finds it, its reference, the schema
+/// and its columns and indexes (not its names, counted apart, each once).
+fn schema_cost(j: &Json, text: usize) -> usize {
+    use std::mem::size_of;
+    let list = |key: &str| j.get(key).and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default();
+    let (columns, indexes) = (list("columns"), list("indexes"));
+    let index_columns: usize =
+        indexes.iter().map(|ix| ix.get("columns").and_then(Json::as_array).map_or(0, Vec::len)).sum();
+    // Its reference: its table's name, `#` and 32 digits.
+    let reference = MAX_NAME + 33;
+    text + ENTRY
+        + reference
+        + ENTRY
+        + size_of::<memoire_orm::TableSchema>()
+        + columns.len() * size_of::<memoire_orm::ColumnDef>()
+        + indexes.len() * (size_of::<memoire_orm::IndexDef>() + 16)
+        + index_columns * size_of::<usize>()
+}
+
+/// The names that the cache keeps of a schema described as `j` (each one
+/// once, with the names of every other statement).
+fn schema_names<'a>(j: &'a Json, names: &mut Vec<&'a str>) {
+    names.extend(text_of(j, "name"));
+    for c in j.get("columns").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
+        names.extend(["name", "field", "sqlType", "default"].into_iter().filter_map(|key| text_of(c, key)));
+        if let Some(r) = c.get("references") {
+            names.extend(["table", "column", "onDelete", "onUpdate"].into_iter().filter_map(|key| text_of(r, key)));
+        }
+    }
+    for ix in j.get("indexes").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
+        names.push(text_of(ix, "name").unwrap_or_default());
+    }
 }
 
 #[derive(Default)]
@@ -607,6 +774,9 @@ fn check_schema(j: &Json) -> Result<()> {
     }
     for ix in indexes {
         check_name("index", text_of(ix, "name").unwrap_or_default(), true)?;
+        if ix.get("columns").and_then(Json::as_array).is_some_and(|c| c.len() > MAX_INDEX_COLUMNS) {
+            return bad(format!("an index has {MAX_INDEX_COLUMNS} columns at most"));
+        }
     }
     Ok(())
 }
@@ -709,10 +879,11 @@ impl<'a> Found<'a> {
 }
 
 impl ClientSchemas {
-    pub(crate) fn new() -> ClientSchemas {
+    pub(crate) fn new(total: Arc<DescribedTotal>) -> ClientSchemas {
         ClientSchemas {
             cache: SchemaCache::new(MAX_CLIENT_SCHEMAS),
             seen: Mutex::new(Seen::default()),
+            total,
             hasher: std::collections::hash_map::RandomState::new(),
         }
     }
@@ -725,23 +896,26 @@ impl ClientSchemas {
     }
 
     /// Checks what the statement `j` would add to the cache (its schemas
-    /// described whole, the names of its columns) and counts it: refused when
-    /// a name or a schema is out of bounds, or when the application's clients
-    /// described too much already.
+    /// described whole, their names and those of its columns) and counts the
+    /// memory it would take: refused when a name or a schema is out of
+    /// bounds, or when the application's clients, or those of all the
+    /// applications, described too much already.
     pub(crate) fn admit(&self, j: &Json, app: &str) -> Result<()> {
         let mut found = Found::default();
         found.statement(j);
+        for name in &found.names {
+            check_name("column", name, true)?;
+        }
+        let mut names = std::mem::take(&mut found.names);
         let mut new: Vec<(u64, usize, bool)> = Vec::new();
         for schema in &found.schemas {
             check_schema(schema)?;
             // The text the cache keys it by.
             let text = serde_json::to_string(schema).map_err(|e| Error::Conversion(e.to_string()))?;
-            new.push((self.hash(0, &text), text.len(), true));
+            new.push((self.hash(0, &text), schema_cost(schema, text.len()), true));
+            schema_names(schema, &mut names);
         }
-        for name in &found.names {
-            check_name("column", name, true)?;
-            new.push((self.hash(1, name), name.len() + 64, false));
-        }
+        new.extend(names.iter().map(|name| (self.hash(1, name), name.len() + ENTRY, false)));
         if new.is_empty() {
             return Ok(());
         }
@@ -749,6 +923,9 @@ impl ClientSchemas {
         new.retain(|(h, _, _)| !seen.kept.contains(h));
         new.sort_unstable();
         new.dedup_by_key(|(h, _, _)| *h);
+        if new.is_empty() {
+            return Ok(());
+        }
         let bytes: usize = new.iter().map(|(_, n, _)| n).sum();
         let schemas = new.iter().filter(|(_, _, s)| *s).count();
         if seen.bytes + bytes > MAX_CLIENT_SCHEMA_BYTES || seen.schemas + schemas > MAX_CLIENT_SCHEMAS {
@@ -756,6 +933,14 @@ impl ClientSchemas {
                 "the clients of application `{app}` described more distinct table schemas than the server keeps \
                  ({MAX_CLIENT_SCHEMAS}, {} MiB) since it started: a client describes a table once, then sends its reference",
                 MAX_CLIENT_SCHEMA_BYTES >> 20
+            )));
+        }
+        if !self.total.add(bytes) {
+            return Err(Error::Unsupported(format!(
+                "the clients of the applications of this server described more distinct table schemas than it keeps \
+                 ({} MiB in all) since it started: a client describes a table once, then sends its reference \
+                 (a restart lets go of them)",
+                self.total.limit >> 20
             )));
         }
         seen.bytes += bytes;
@@ -797,7 +982,7 @@ mod tests {
 
     #[test]
     fn described_schemas_are_checked_and_bounded() {
-        let described = ClientSchemas::new();
+        let described = ClientSchemas::new(DescribedTotal::new(64 << 20));
         let fetch = |t: Json| json!({ "findByKey": t, "key": 1 });
         described.admit(&fetch(schema("users", 3)), "a").unwrap();
         // The same schema again, or by reference: nothing more is counted.
@@ -815,6 +1000,8 @@ mod tests {
             fetch(
                 json!({ "name": "t", "pk": 0, "columns": [{ "name": "x", "kind": "text", "default": "d".repeat(5000) }] }),
             ),
+            fetch(json!({ "name": "t", "pk": 0, "columns": [{ "name": "x", "kind": "int" }],
+                "indexes": [{ "name": "", "columns": vec![0; 33] }] })),
             json!({ "select": { "from": schema("t", 1), "projection": { "exprs": [] },
                 "filter": { "bin": ["=", { "col": ["t", "x".repeat(100), 0, "int"] }, { "val": 1 }] } } }),
             json!({ "select": { "from": "t#00", "projection": { "exprs": [] },
@@ -840,28 +1027,114 @@ mod tests {
         assert!(schemas <= MAX_CLIENT_SCHEMAS && bytes <= MAX_CLIENT_SCHEMA_BYTES);
         // What was kept before still works.
         described.admit(&fetch(schema("users", 3)), "a").unwrap();
-        ClientSchemas::new().admit(&fetch(schema("t0", 40)), "b").unwrap();
+        ClientSchemas::new(DescribedTotal::new(64 << 20)).admit(&fetch(schema("t0", 40)), "b").unwrap();
+    }
+
+    /// What is counted for a schema is what the cache keeps of it, not its
+    /// text: a column takes more memory once kept than its few bytes of JSON.
+    /// And the applications share one total besides their own.
+    #[test]
+    fn described_schemas_count_their_memory_and_share_a_total() {
+        use std::mem::size_of;
+        let described = ClientSchemas::new(DescribedTotal::new(64 << 20));
+        let one = schema("wide", 500);
+        described.admit(&json!({ "findByKey": one, "key": 1 }), "a").unwrap();
+        let text = serde_json::to_string(&one).unwrap().len();
+        let (_, bytes) = described.usage();
+        assert!(bytes >= text + 500 * size_of::<memoire_orm::ColumnDef>(), "{bytes} for {text} bytes of text");
+        // Its 500 names are counted once: a second schema with the same columns costs less.
+        let again = schema("wider", 500);
+        described.admit(&json!({ "findByKey": again, "key": 1 }), "a").unwrap();
+        assert!(described.usage().1 - bytes < bytes, "{:?}", described.usage());
+
+        // Two applications, each under its own limit, together past the server's total.
+        let total = DescribedTotal::new(MAX_CLIENT_SCHEMA_BYTES + MAX_CLIENT_SCHEMA_BYTES / 2);
+        let (a, b) = (ClientSchemas::new(total.clone()), ClientSchemas::new(total.clone()));
+        let fill = |c: &ClientSchemas, app: &str| {
+            (0..MAX_CLIENT_SCHEMAS)
+                .map(|i| c.admit(&json!({ "findByKey": schema(&format!("{app}{i}"), 60), "key": 1 }), app))
+                .find_map(Result::err)
+        };
+        let full = fill(&a, "a").expect("a is stopped by its own limit");
+        assert!(full.to_string().contains("application `a`"), "{full}");
+        let all = fill(&b, "b").expect("b is stopped by the total");
+        assert!(all.to_string().contains("MiB in all"), "{all}");
+        assert!(total.usage().0 <= total.usage().1);
+        assert_eq!(total.usage().0, a.usage().1 + b.usage().1);
+        // What was kept before still answers; a reference costs nothing.
+        a.admit(&json!({ "findByKey": schema("a0", 60), "key": 1 }), "a").unwrap();
+        b.admit(&json!({ "findByKey": "b0#00", "key": 1 }), "b").unwrap();
+        assert!(DescribedTotal::for_memory(Some(512 << 20)).usage().1 == MIN_ALL_CLIENT_SCHEMA_BYTES);
+        assert!(DescribedTotal::for_memory(Some(4 << 30)).usage().1 == 128 << 20);
     }
 
     #[tokio::test]
     async fn admission_keeps_threads_for_writes_and_turns_away() {
         assert_eq!(Admission::new(12).free(), (9, 3));
+        assert_eq!(Admission::new(12).shares, [7, 2, 6]);
         let a = Admission::new(1);
         assert_eq!(a.free(), (2, 2));
-        let held = (a.enter(false).await.unwrap(), a.enter(false).await.unwrap());
+        let who = Asker { app: "a", read_only: false };
+        let held = (a.enter(false, who, || true).await.unwrap(), a.enter(false, who, || true).await.unwrap());
         // No read thread free: a short wait, then a clear 503.
         let started = std::time::Instant::now();
-        let e = a.enter(false).await.unwrap_err();
+        let e = a.enter(false, who, || true).await.unwrap_err();
         assert!(started.elapsed() >= ADMISSION_WAIT);
         let r = refusal(&e).expect("a refusal");
         assert_eq!((r.status, r.kind), (503, "unavailable"));
         assert_eq!(refusal_response(r).headers()[header::RETRY_AFTER], "1");
         // Writes still have theirs, and a read thread given back is taken at once.
-        let write = a.enter(true).await.unwrap();
+        let write = a.enter(true, who, || true).await.unwrap();
         drop(held.0);
-        let read = a.enter(false).await.unwrap();
+        let read = a.enter(false, who, || true).await.unwrap();
         drop((held.1, write, read));
         assert_eq!(a.free(), (2, 2));
+    }
+
+    /// When the server has several applications, none takes every thread of
+    /// a kind; the tokens that only read never take all of their
+    /// application's, nor any for writes.
+    #[tokio::test]
+    async fn admission_shares_the_threads() {
+        let a = Admission::new(12);
+        let (shop, blog) = (Asker { app: "shop", read_only: false }, Asker { app: "blog", read_only: false });
+        let public = Asker { app: "shop", read_only: true };
+        let several = || false;
+        // A page's token: six of the nine threads for reads, then 503 naming why.
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            held.push(a.enter(false, public, several).await.unwrap());
+        }
+        let e = a.enter(false, public, several).await.unwrap_err();
+        assert!(e.to_string().contains("read-only tokens of application `shop`"), "{e}");
+        // Its application's own server still reads, up to its share (seven).
+        held.push(a.enter(false, shop, several).await.unwrap());
+        let e = a.enter(false, shop, several).await.unwrap_err();
+        assert!(e.to_string().contains("application `shop` may use"), "{e}");
+        assert_eq!(a.free(), (2, 3));
+        // The other application finds the rest, for reads and for writes.
+        held.push(a.enter(false, blog, several).await.unwrap());
+        held.push(a.enter(false, blog, several).await.unwrap());
+        for _ in 0..2 {
+            held.push(a.enter(true, shop, several).await.unwrap());
+        }
+        assert_eq!(a.free(), (0, 1));
+        held.push(a.enter(true, blog, several).await.unwrap());
+        // Alone on its server, an application takes every thread past its share.
+        held.clear();
+        let alone = || true;
+        let mut mine = Vec::new();
+        for _ in 0..9 {
+            mine.push(a.enter(false, shop, alone).await.unwrap());
+        }
+        for _ in 0..3 {
+            mine.push(a.enter(true, shop, alone).await.unwrap());
+        }
+        assert_eq!(a.free(), (0, 0));
+        drop(mine);
+        // The shares of an application deleted are let go of.
+        a.forget(|app| app == "blog");
+        assert_eq!(a.held.lock().unwrap().keys().collect::<Vec<_>>(), ["blog"]);
     }
 
     #[tokio::test]

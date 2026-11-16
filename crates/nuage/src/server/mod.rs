@@ -62,7 +62,9 @@ use serde_json::{Value as Json, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use self::limits::{MAX_PARAMS, MAX_SQL_TEXT, MAX_STATEMENTS, refused, too_large, too_many, unblocked};
+use self::limits::{
+    Asker, MAX_BATCH_ANSWER, MAX_PARAMS, MAX_SQL_TEXT, MAX_STATEMENTS, refused, too_large, too_many, unblocked,
+};
 
 pub use self::apps::{AppInfo, TokenInfo};
 use crate::embedded::{self, Embedded, EmbeddedTransaction};
@@ -417,6 +419,8 @@ pub(crate) struct State {
     /// The schemas the clients of each application describe, by its name:
     /// apart from the tables' own and from the other applications'.
     client_schemas: Mutex<HashMap<String, Arc<limits::ClientSchemas>>>,
+    /// The memory those schemas take, all the applications together.
+    pub(crate) described_total: Arc<limits::DescribedTotal>,
     /// How long reads take, by shape: the short ones run where they are.
     pub(crate) read_costs: Arc<fast::ReadCosts>,
     /// Reads that run where they are, and their watch (set by the first
@@ -520,10 +524,11 @@ impl Server {
             settings::Settings::open(engine.clone(), options.settings_env.clone(), options.settings_read_only);
         settings.declare_memory();
         let plan = settings.memory_plan(&options);
+        let memory = crate::memory::MemoryInfo::now().total_bytes;
         // A quarter of the memory for the requests being read, and room for two of the largest.
         let request_memory = options
             .request_memory
-            .unwrap_or_else(|| crate::memory::MemoryInfo::now().total_bytes.map_or(256 << 20, |m| (m / 4) as usize))
+            .unwrap_or_else(|| memory.map_or(256 << 20, |m| (m / 4) as usize))
             .max(options.max_body_bytes.saturating_mul(2));
         Server {
             state: Arc::new(State {
@@ -534,6 +539,7 @@ impl Server {
                 metrics: Metrics::new(),
                 schemas: SchemaCache::default(),
                 client_schemas: Mutex::new(HashMap::new()),
+                described_total: limits::DescribedTotal::for_memory(memory),
                 read_costs: Arc::new(fast::ReadCosts::new()),
                 inline: std::sync::OnceLock::new(),
                 admission: limits::Admission::new(options.statement_threads),
@@ -804,6 +810,7 @@ impl State {
             self.expire_transactions();
             self.sweep_keys();
             self.watch_memory();
+            self.forget_deleted_apps();
         }));
         if let Err(panic) = round {
             self.engine.event("error", format!("the server's upkeep failed: {}", limits::panic_text(&panic)));
@@ -1083,7 +1090,22 @@ impl State {
     /// The schemas the clients of application `app` describe.
     pub(crate) fn client_schemas(&self, app: &str) -> Arc<limits::ClientSchemas> {
         let mut all = self.client_schemas.lock().unwrap_or_else(|e| e.into_inner());
-        all.entry(app.to_owned()).or_insert_with(|| Arc::new(limits::ClientSchemas::new())).clone()
+        if let Some(described) = all.get(app) {
+            return described.clone();
+        }
+        let described = Arc::new(limits::ClientSchemas::new(self.described_total.clone()));
+        all.insert(app.to_owned(), described.clone());
+        described
+    }
+
+    /// Lets go of what was kept for the applications deleted since: their
+    /// shares of the threads, the maps of their clients' schemas (the
+    /// schemas themselves stay counted in the server's total, as they stay
+    /// in memory).
+    fn forget_deleted_apps(&self) {
+        let exists = |app: &str| self.apps.get(app).is_some();
+        self.admission.forget(exists);
+        self.client_schemas.lock().unwrap_or_else(|e| e.into_inner()).retain(|app, _| exists(app));
     }
 
     /// The schemas the clients of application `app` described: how many, and their bytes.
@@ -1092,14 +1114,20 @@ impl State {
         all.get(app).map_or((0, 0), |c| c.usage())
     }
 
-    /// Runs `f`, a statement, on a thread for reads or for writes (see
-    /// [`limits::Admission`]), off the runtime.
+    /// A thread for a statement of `who` that reads or writes (see [`limits::Admission`]).
+    pub(crate) async fn enter(&self, write: bool, who: Asker<'_>) -> Result<limits::Thread> {
+        self.admission.enter(write, who, || self.apps.all().len() <= 1).await
+    }
+
+    /// Runs `f`, a statement of `who`, on a thread for reads or for writes
+    /// (see [`limits::Admission`]), off the runtime.
     pub(crate) async fn statement<T: Send + 'static>(
         &self,
         write: bool,
+        who: Asker<'_>,
         f: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let _thread = self.admission.enter(write).await?;
+        let _thread = self.enter(write, who).await?;
         unblocked(f).await?
     }
 
@@ -1131,15 +1159,18 @@ impl State {
         .await
     }
 
-    /// Reads a request (its JSON, its SQL; `read` says whether it writes),
-    /// then runs it right there when the thread it was read on is of its
-    /// kind: a read on a thread for reads, a write on one for writes. Else it
-    /// waits for one of its kind. Slow reads holding every thread for reads
-    /// never keep a write from being read, nor take a thread for writes to
-    /// run.
+    /// Reads a request of `who` (its JSON, its SQL; `read` says whether it
+    /// writes) on a thread of the kind it looks like (`looks_like_write`, a
+    /// guess on its first words), then runs it right there when the guess was
+    /// right. Else it waits for a thread of its kind. A thread for writes only
+    /// ever reads what looks like a write of a token that writes: slow reads,
+    /// or a text that takes long to read, never keep the writes from their
+    /// threads.
     async fn read_then_run<P, T, F>(
         &self,
+        who: Asker<'_>,
         shape: Option<u64>,
+        looks_like_write: bool,
         read: impl FnOnce() -> Result<(P, bool)> + Send + 'static,
         run: F,
     ) -> Result<T>
@@ -1152,11 +1183,11 @@ impl State {
             Done(T),
             Later(P, F, bool),
         }
-        let (thread, for_writes) = self.admission.enter_to_read().await?;
+        let for_writes = looks_like_write && !who.read_only;
+        let thread = self.enter(for_writes, who).await?;
         // A write waits for the disk: never where it is.
-        let shape = shape.filter(|_| !for_writes);
         let step = self
-            .read(shape, move || -> Result<Step<T, P, F>> {
+            .read(shape.filter(|_| !for_writes), move || -> Result<Step<T, P, F>> {
                 let (read, writes) = read()?;
                 if writes != for_writes { Ok(Step::Later(read, run, writes)) } else { run(read).map(Step::Done) }
             })
@@ -1164,9 +1195,9 @@ impl State {
         drop(thread);
         match step {
             Step::Done(out) => Ok(out),
-            Step::Later(read, run, true) => self.statement(true, move || run(read)).await,
+            Step::Later(read, run, true) => self.statement(true, who, move || run(read)).await,
             Step::Later(read, run, false) => {
-                let _thread = self.admission.enter(false).await?;
+                let _thread = self.enter(false, who).await?;
                 self.read(shape, move || run(read)).await?
             }
         }
@@ -1567,6 +1598,7 @@ async fn app_protocol(
     let branch = header(BRANCH_HEADER).unwrap_or_else(|| MAIN.to_owned());
     let tx_id = header(TRANSACTION_HEADER);
     let engine = &app.engine;
+    let who = Asker { app: &app.name, read_only };
 
     if segments.first() == Some(&"kv") {
         return kv::route(state, app, read_only, req).await;
@@ -1645,7 +1677,7 @@ async fn app_protocol(
             };
             let (answer, cached) = if write {
                 // Writes, and a transaction's statements: on a thread for writes.
-                state.statement(true, move || run(decode()?)).await?
+                state.statement(true, who, move || run(decode()?)).await?
             } else {
                 // A read: decoded first (here, unless its body is large), for
                 // its shape, which tells where it runs.
@@ -1656,7 +1688,7 @@ async fn app_protocol(
                     }
                     query => fast::shape(query),
                 };
-                let _thread = state.admission.enter(false).await?;
+                let _thread = state.enter(false, who).await?;
                 state.read(shape, move || run(decoded)).await??
             };
             let mut res = json_bytes(200, answer);
@@ -1669,6 +1701,10 @@ async fn app_protocol(
             let (body, held) = json_body(state, req).await?;
             let db = state.db(engine, &branch)?;
             let (described, name) = (state.client_schemas(&app.name), app.name.clone());
+            let looks_like_write = body
+                .get("statements")
+                .and_then(Json::as_array)
+                .is_some_and(|list| list.iter().take(MAX_STATEMENTS + 1).any(|s| s.get("execute").is_some()));
             let read = move || -> Result<(_, bool)> {
                 let list = body
                     .get("statements")
@@ -1697,21 +1733,46 @@ async fn app_protocol(
                 let writes = statements.iter().any(|(fetch, _)| !fetch);
                 Ok(((statements, held), writes))
             };
-            let answer = state
-                .read_then_run(None, read, move |(statements, _held): (Vec<(bool, wire::OwnedQuery)>, limits::Held)| {
+            let run = move |(statements, _held): (Vec<(bool, wire::OwnedQuery)>, limits::Held)| {
+                // `{"results": [...]}`, each answer written as it comes.
+                let mut out = b"{\"results\":[".to_vec();
+                if statements.iter().all(|(fetch, _)| *fetch) {
+                    // Reads alone, as `Embedded::batch` runs them (one
+                    // transaction that only reads), stopped once their answers
+                    // pass what one answer may be.
+                    let tx = db.begin_read()?;
+                    for (i, (_, q)) in statements.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        out.extend_from_slice(&wire::rows_to_vec(&tx.fetch_rows(&q.as_query())?));
+                        if out.len() > MAX_BATCH_ANSWER {
+                            return Err(too_large(format!(
+                                "the answers to this batch pass {} MiB after {} of its {} statements: ask for fewer rows at once",
+                                MAX_BATCH_ANSWER >> 20,
+                                i + 1,
+                                statements.len()
+                            )));
+                        }
+                    }
+                } else {
                     let list: Vec<(bool, memoire_orm::Query<'_>)> =
                         statements.iter().map(|(f, q)| (*f, q.as_query())).collect();
-                    let results: Vec<Json> = db
-                        .batch(&list)?
-                        .into_iter()
-                        .map(|r| match r {
-                            Ok(rows) => json!({ "rows": wire::rows_to_json(&rows) }),
-                            Err(done) => wire::exec_result_to_json(&done),
-                        })
-                        .collect();
-                    serde_json::to_vec(&json!({ "results": results })).map_err(|e| Error::Conversion(e.to_string()))
-                })
-                .await?;
+                    for (i, r) in db.batch(&list)?.into_iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        match r {
+                            Ok(rows) => out.extend_from_slice(&wire::rows_to_vec(&rows)),
+                            Err(done) => serde_json::to_writer(&mut out, &wire::exec_result_to_json(&done))
+                                .map_err(|e| Error::Conversion(e.to_string()))?,
+                        }
+                    }
+                }
+                out.extend_from_slice(b"]}");
+                Ok(out)
+            };
+            let answer = state.read_then_run(who, None, looks_like_write, read, run).await?;
             let mut res = json_bytes(200, answer);
             res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             Ok(res)
@@ -1732,7 +1793,7 @@ async fn app_protocol(
                 return Err(full());
             }
             let db = state.db(engine, &branch)?;
-            let tx = state.statement(true, move || db.begin_now()).await?;
+            let tx = state.statement(true, who, move || db.begin_now()).await?;
             let id = random_token();
             let now = Instant::now();
             let open_tx = OpenTx { tx, app: app.name.clone(), branch, opened: now, last_used: Mutex::new(now) };
@@ -1756,13 +1817,15 @@ async fn app_protocol(
                 txs.remove(*id).ok_or(Error::TransactionFinished)?
             };
             let commit = *action == "commit";
-            state.statement(true, move || if commit { open.tx.commit_now() } else { open.tx.rollback_now() }).await?;
+            state
+                .statement(true, who, move || if commit { open.tx.commit_now() } else { open.tx.rollback_now() })
+                .await?;
             Ok(json_response(200, &json!({ "ok": true })))
         }
         (Method::GET, ["branches"]) => {
             let engine = engine.clone();
             let list: Vec<Json> = state
-                .statement(false, move || {
+                .statement(false, who, move || {
                     Ok(engine.branches().iter().map(memoire_orm::nuage::Branch::to_json).collect())
                 })
                 .await?;
@@ -1774,7 +1837,7 @@ async fn app_protocol(
             let body = read_json(state, req).await?;
             let engine = engine.clone();
             let branch = state
-                .statement(true, move || {
+                .statement(true, who, move || {
                     let name = body.get("name").and_then(Json::as_str).unwrap_or_default();
                     Ok(engine.create_branch(name, body.get("from").and_then(Json::as_str))?.to_json())
                 })
@@ -1783,7 +1846,7 @@ async fn app_protocol(
         }
         (Method::DELETE, ["branches", name]) => {
             let (engine, at) = (engine.clone(), (*name).to_owned());
-            if state.statement(true, move || engine.delete_branch(&at)).await? {
+            if state.statement(true, who, move || engine.delete_branch(&at)).await? {
                 Ok(json_response(200, &json!({ "deleted": name })))
             } else {
                 Err(Error::NotFound)
@@ -1791,7 +1854,7 @@ async fn app_protocol(
         }
         (Method::POST, ["branches", name, "reset"]) => {
             let (engine, at) = (engine.clone(), (*name).to_owned());
-            if state.statement(true, move || engine.reset_branch(&at)).await? {
+            if state.statement(true, who, move || engine.reset_branch(&at)).await? {
                 Ok(json_response(200, &json!({ "reset": name })))
             } else {
                 Err(Error::NotFound)
@@ -1799,20 +1862,25 @@ async fn app_protocol(
         }
         (Method::POST, ["sql"]) => {
             let (body, held) = json_body(state, req).await?;
-            // Its shape: its SQL texts (a large request runs off the runtime).
-            let shape = (!held.large()).then(|| {
+            let texts = || {
                 let one = body.get("sql").and_then(Json::as_str);
-                let several = body.get("statements").and_then(Json::as_array);
-                let texts = several.into_iter().flatten().filter_map(|s| s.get("sql").and_then(Json::as_str));
-                fast::sql_shape(one.into_iter().chain(texts))
-            });
+                let several = body.get("statements").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default();
+                let texts = several.iter().take(MAX_STATEMENTS + 1).filter_map(|s| s.get("sql").and_then(Json::as_str));
+                one.into_iter().chain(texts)
+            };
+            // Its shape: its SQL texts (a large request runs off the runtime).
+            let shape = (!held.large()).then(|| fast::sql_shape(texts()));
+            let looks_like_write = !read_only && texts().any(|sql| !reads_by_its_first_word(sql));
             let (engine, s) = (engine.clone(), state.clone());
             // Reading the SQL is part of the read (off the runtime unless its
-            // shape has proved short): a statement that writes then waits for
-            // a thread for writes.
+            // shape has proved short), on a thread of the kind its first words
+            // tell: a statement that turns out to be of the other kind then
+            // waits for a thread of its own.
             let (answer, cached) = state
                 .read_then_run(
+                    who,
                     shape,
+                    looks_like_write,
                     move || {
                         let request = sql_request(body, held, read_only)?;
                         let writes = request.writes;
@@ -1919,6 +1987,30 @@ fn check_sql(sql: &str, params: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The text `sql` reads, by its first word, before it is parsed (a guess
+/// that only says on which thread it is parsed: the parse decides). Only the
+/// start of the text is looked at, on the runtime.
+fn reads_by_its_first_word(sql: &str) -> bool {
+    let mut rest = &sql.as_bytes()[..sql.len().min(256)];
+    loop {
+        rest = rest.trim_ascii_start();
+        if let Some(after) = rest.strip_prefix(b"--") {
+            rest = after.iter().position(|b| *b == b'\n').map_or(&[], |n| &after[n..]);
+        } else if let Some(after) = rest.strip_prefix(b"/*") {
+            rest = after.windows(2).position(|w| w == b"*/").map_or(&[], |n| &after[n + 2..]);
+        } else if let Some(after) = rest.strip_prefix(b"(") {
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    let word = &rest[..rest.iter().position(|b| !b.is_ascii_alphabetic()).unwrap_or(rest.len())];
+    // The statements that change nothing (`Stmt::writes`), and a text with no word.
+    ["", "select", "with", "values", "explain", "begin", "start", "commit", "end", "rollback"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w.as_bytes()))
 }
 
 /// A `/v1/sql` request, read and checked.
@@ -2122,5 +2214,63 @@ mod tests {
         assert_eq!(status(&refused(json!({ "params": "x" }), false)), 400);
         let several = sql_request(json!({ "sql": "SELECT 1; SELECT 2" }), held(), false).unwrap();
         assert!(several.several);
+    }
+
+    /// The upkeep of every second runs on a thread of its own: it needs no
+    /// worker of a runtime (here there is no runtime at all), so it goes on
+    /// when every worker is busy.
+    #[test]
+    fn the_upkeep_needs_no_runtime() {
+        let dir = std::env::temp_dir().join(format!("nuage-upkeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::open(&dir, crate::EngineOptions { sync: false, ..Default::default() }).unwrap();
+        let options = ServerOptions { transaction_lifetime: Duration::from_millis(100), ..ServerOptions::default() };
+        let state = Server::new(engine.clone(), options).state;
+        let tx = state.db(&engine, MAIN).unwrap().begin_now().unwrap();
+        let now = Instant::now();
+        let open = OpenTx { tx, app: "a".into(), branch: MAIN.into(), opened: now, last_used: Mutex::new(now) };
+        state.transactions.lock().unwrap().insert("t".into(), Arc::new(open));
+        let (ticking, ticks) = std::sync::mpsc::channel();
+        assert!(start_ticks(&state, ticks));
+        let started = Instant::now();
+        while state.open_transactions() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "the upkeep did not run");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(ticking);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first word of an SQL text says on which thread it is parsed; the
+    /// parse decides what it is.
+    #[test]
+    fn sql_texts_are_told_apart_by_their_first_word() {
+        for reads in [
+            "SELECT 1",
+            "  select * from t",
+            "-- a comment\nWITH x AS (SELECT 1) SELECT * FROM x",
+            "/* a comment */ (SELECT 1) UNION (SELECT 2)",
+            "VALUES (1)",
+            "EXPLAIN SELECT 1",
+            "BEGIN",
+            "",
+            "-- nothing but a comment",
+        ] {
+            assert!(reads_by_its_first_word(reads), "{reads}");
+        }
+        for writes in [
+            "INSERT INTO t VALUES (1)",
+            "\n\tupdate t set v = 1",
+            "/* SELECT */ DELETE FROM t",
+            "CREATE TABLE t (id INTEGER)",
+            "DROP TABLE t",
+            "selection",
+            "SELECTION",
+        ] {
+            assert!(!reads_by_its_first_word(writes), "{writes}");
+        }
+        // Only the start of a text is looked at: a long comment says nothing.
+        assert!(reads_by_its_first_word(&format!("/*{}*/ DELETE FROM t", " ".repeat(1000))));
     }
 }
