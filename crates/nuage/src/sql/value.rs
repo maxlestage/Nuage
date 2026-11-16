@@ -331,6 +331,38 @@ impl PlusDays for &Value {
     }
 }
 
+/// A text written a piece at a time, that stops before it is larger than
+/// [`MAX_TEXT`] or than the statement may still hold (see [`text_fits`]).
+struct Capped {
+    text: String,
+    what: &'static str,
+    /// Why it stopped.
+    refused: Option<Error>,
+}
+
+impl std::fmt::Write for Capped {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let size = self.text.len().saturating_add(s.len());
+        // Checked as it crosses each MiB: the budget, then the largest size.
+        if (size >> 20 != self.text.len() >> 20 || size > MAX_TEXT)
+            && let Err(e) = text_fits(self.what, size)
+        {
+            self.refused = Some(e);
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(s);
+        Ok(())
+    }
+}
+
+/// [`to_text`], without a copy of a text.
+pub(crate) fn text_ref(v: &Value) -> Option<std::borrow::Cow<'_, str>> {
+    match v {
+        Value::Text(t) => Some(std::borrow::Cow::Borrowed(t.as_str())),
+        other => to_text(other).map(std::borrow::Cow::Owned),
+    }
+}
+
 /// A value as text (`None` for NULL): what `||`, `lower()`... work on.
 pub(crate) fn to_text(v: &Value) -> Option<String> {
     Some(match v {
@@ -761,7 +793,16 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 "ltrim" => Value::Text(s.trim_start_matches(set).to_owned()),
                 "rtrim" => Value::Text(s.trim_end_matches(set).to_owned()),
                 "reverse" => Value::Text(s.chars().rev().collect()),
-                "initcap" => Value::Text(
+                "initcap" => Value::Text({
+                    // As `upper` and `lower`: a character may become several.
+                    if s.len() > MAX_TEXT / 3 {
+                        let width = |c: char| {
+                            let up: usize = c.to_uppercase().map(char::len_utf8).sum();
+                            up.max(c.to_lowercase().map(char::len_utf8).sum())
+                        };
+                        let grown: usize = s.chars().map(width).sum();
+                        text_fits("initcap()", grown)?;
+                    }
                     s.split(' ')
                         .map(|w| {
                             let mut c = w.chars();
@@ -770,8 +811,8 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                             })
                         })
                         .collect::<Vec<_>>()
-                        .join(" "),
-                ),
+                        .join(" ")
+                }),
                 "md5" => return Err(syntax("md5() is not available: use sha256()")),
                 "sha256" => Value::Text(crate::hash::sha256(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()),
                 "hex" => {
@@ -1079,11 +1120,15 @@ pub(crate) fn scalar(name: &str, args: Vec<Value>) -> Result<Value> {
                 _ => return Err(conversion("strftime(): not a date")),
             };
             // A format chrono does not know (`%J`) fails when it is written, not before.
-            use std::fmt::Write as _;
-            let mut out = String::new();
-            write!(out, "{}", t.format(&fmt.replace("%f", "%.3f")))
-                .map_err(|_| conversion(format!("strftime(): `{fmt}` is not a format it knows")))?;
-            Value::Text(out)
+            // Each `%c` of a format writes 24 bytes: the text stops at its largest size,
+            // written a piece at a time (chrono's `Display` would build it whole first).
+            let mut out = Capped { text: String::new(), what: "strftime()", refused: None };
+            let written = t.format(&fmt.replace("%f", "%.3f")).write_to(&mut out);
+            if let Some(refused) = out.refused {
+                return Err(refused);
+            }
+            written.map_err(|_| conversion(format!("strftime(): `{fmt}` is not a format it knows")))?;
+            Value::Text(out.text)
         }
         "json_extract" | "json_value" => {
             arg_count(name, a, 2, 2)?;
