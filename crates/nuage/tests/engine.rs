@@ -609,6 +609,17 @@ fn half_written(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Waits for the snapshot the upkeep thread sends when a database with
+/// backups opens: dropped before, the database could still be writing it to
+/// a backup location the test has removed.
+fn first_backup_sent(db: &Embedded) {
+    let sent = (0..2000).any(|_| {
+        std::thread::sleep(Duration::from_millis(5));
+        db.engine().backup_status().last_snapshot_at.is_some()
+    });
+    assert!(sent, "{:?}", db.engine().backup_status());
+}
+
 /// Backups asked for at the same time (the console's button pressed twice,
 /// the upkeep thread's snapshot, the last backup of a server that stops) run
 /// one after the other: each one succeeds, no file is left half written, and
@@ -661,6 +672,7 @@ fn backups_at_the_same_time_leave_a_backup_that_restores() {
         assert!(left.is_empty(), "left half written: {left:?}");
     }
     let db = Embedded::open_with(&copy, options()).unwrap();
+    first_backup_sent(&db);
     assert!(db.engine().backup_status().restored);
     assert_eq!(
         db.sql("SELECT count(*), sum(length(body)) FROM big", &[]).unwrap()[0].rows[0],
@@ -740,6 +752,7 @@ fn no_write_is_acknowledged_after_the_last_backup() {
     acknowledged.sort_unstable();
     assert!(acknowledged.len() > 10, "the writers wrote: {}", acknowledged.len());
     let db = Embedded::open_with(&copy, options()).unwrap();
+    first_backup_sent(&db);
     assert!(db.engine().backup_status().restored);
     let restored: Vec<i64> = db.sql("SELECT id FROM t ORDER BY id", &[]).unwrap()[0]
         .rows
@@ -757,6 +770,51 @@ fn no_write_is_acknowledged_after_the_last_backup() {
     for d in [dir, target, copy] {
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// A statement that writes, and would read for hours, stops when the server
+/// does, in the middle of its reads: it holds the lock the last checkpoint
+/// needs, and its commit would be refused anyway. One that comes after is
+/// refused before it reads anything, and reads go on.
+#[test]
+fn a_long_write_stops_with_the_server() {
+    let dir = temp_dir("long-write");
+    let db = Embedded::open_with(&dir, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+    db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &[]).unwrap();
+    let tx = db.begin_now().unwrap();
+    for id in 0..1000 {
+        tx.sql("INSERT INTO t (id, v) VALUES (?, ?)", &[id.into(), id.into()]).unwrap();
+    }
+    tx.commit_now().unwrap();
+    // A thousand rows, each set from a thousand scans of the table, each row of which reads it
+    // again: a billion rows read.
+    let endless = "UPDATE t SET v = (SELECT count(*) FROM t AS u \
+                   WHERE u.v <= (SELECT count(*) FROM t AS w WHERE w.v <= u.v + t.v))";
+    let run = |db: &Embedded| {
+        let (db, (tx, rx)) = (db.clone(), std::sync::mpsc::channel());
+        // Not a scoped thread: without the stop, it would hold the test for hours.
+        std::thread::spawn(move || {
+            let _ = tx.send(db.sql(endless, &[]).map(|_| ()));
+        });
+        rx
+    };
+    let running = run(&db);
+    assert!(running.recv_timeout(Duration::from_millis(500)).is_err(), "the statement is still running");
+    let engine = db.engine();
+    let asked = std::time::Instant::now();
+    engine.begin_shutdown();
+    let e = running.recv_timeout(Duration::from_secs(10)).expect("the statement stopped").unwrap_err();
+    assert!(nuage::engine::is_stopping(&e), "{e}");
+    assert!(asked.elapsed() < Duration::from_secs(5), "it stopped {:?} after the server", asked.elapsed());
+    // The lock is free: the last checkpoint gets it at once.
+    engine.checkpoint().unwrap();
+    // A statement that comes after reads nothing.
+    let e = run(&db).recv_timeout(Duration::from_secs(5)).expect("refused at once").unwrap_err();
+    assert!(nuage::engine::is_stopping(&e), "{e}");
+    let rows = db.sql("SELECT count(*), sum(v) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].rows[0], [Value::I64(1000), Value::I64(999 * 1000 / 2)], "nothing was written");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The upkeep thread ships the first backup as soon as the database is open,
