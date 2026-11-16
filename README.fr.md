@@ -602,6 +602,31 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   même dossier ni sous le même préfixe de bucket (chacun écraserait l'autre). Un ordinateur à
   côté d'un serveur Heroku a son propre dossier, son bucket ou son `NUAGE_BACKUP_S3_PREFIX`.
 
+#### Une copie de secours, choisie plus tard
+
+En plus de la destination nommée par l'environnement, la page Réglages de la console (section
+*Sauvegardes*), `nuage backup second dir /Volumes/AutreDisque/nuage` (ou `nuage backup second s3
+<bucket> [endpoint] [region] [prefix]`, les clés dans `NUAGE_SECOND_S3_ACCESS_KEY_ID` et
+`NUAGE_SECOND_S3_SECRET_ACCESS_KEY`) et `POST /api/backup/second` choisissent une **copie de
+secours** : un dossier sur un autre disque, ou un stockage compatible S3. C'est la seule quand
+l'environnement n'en nomme aucune (sur un ordinateur dont le disque reste).
+
+- C'est une **copie complète de chaque base**, écrite quand elle est enregistrée, au démarrage
+  du serveur, puis **toutes les heures** : jusqu'à une heure d'écritures peut y manquer, là où la
+  première destination reçoit aussi le journal toutes les 30 secondes.
+- Chaque démarrage du serveur écrit dans **son propre dossier** (`lives/<début>-<id>/`) : rien
+  n'y est jamais écrasé, quoi que d'autre écrive au même endroit ; les trois plus récentes
+  complètes sont gardées.
+- L'endroit est vérifié avant d'être enregistré (écrit, relu ; jamais dans le dossier des
+  données, ni là où vont déjà les sauvegardes) ; son secret S3 est gardé avec les réglages,
+  chiffré avec les données, et n'est plus jamais affiché.
+- Le serveur **n'en restaure jamais de lui-même**. `nuage backup`, la page et `GET /api/backup`
+  donnent les lignes qui démarrent un serveur depuis la copie d'une exécution : mettez-les dans
+  son environnement, avec un dossier de données vide et la même `NUAGE_ENCRYPTION_KEY`.
+- Sur un hébergeur dont le disque est effacé à chaque redémarrage (Heroku), une copie de
+  secours demande une destination dans l'environnement : enregistrée seule, elle serait perdue
+  avec le disque.
+
 ## Démarrage rapide
 
 ```bash

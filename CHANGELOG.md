@@ -113,6 +113,24 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   memory and visibility lines starting values. `ServerOptions::settings_env`,
   `settings_read_only`, `startup`; `memory::declare`, `detected`.
 
+### A second copy of the backups, chosen later
+
+- **La copie de secours**: besides the destination the environment names, a second place for
+  the backups, a folder on another disk or S3-compatible storage, chosen and changed later from
+  the console's Settings page (section *Backups*), `nuage backup second dir|s3|remove` or `POST`
+  and `DELETE /api/backup/second`; `nuage backup` and `GET /api/backup` say how both go. It is
+  the only one when the environment names none.
+- A complete copy of every database, written when it is saved, when the server starts, then
+  every hour, on a thread of its own: a slow or unreachable place never holds the server, its
+  requests or its first backups. Each start writes into a folder of its own
+  (`lives/<start>-<id>/`), so nothing there is ever overwritten; the three newest complete ones
+  are kept.
+- Checked before it is saved (written to and read back; never inside the data directory nor
+  where the backups already go; refused on a host whose disk is erased at each restart without
+  a destination in the environment). Its S3 secret is kept with the settings, encrypted with the
+  data, never shown again. The server never restores from it by itself: the page, the API and
+  the command give the lines that start a server from it. `Engine::copy_to`.
+
 ### The management token: the websites, and the whole status
 
 - **`POST /api/apps/{name}/origins`** `{"origins": ["https://site.fr", "http://localhost:3000"]}`

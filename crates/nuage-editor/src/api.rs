@@ -43,7 +43,9 @@ impl Default for Transport {
     fn default() -> Transport {
         Transport {
             connect: Duration::from_secs(10),
-            connect_loopback: Duration::from_secs(2),
+            // Windows answers a closed port of this computer only after about two
+            // seconds (it tries the connection again first): past that, "not running".
+            connect_loopback: Duration::from_secs(if cfg!(windows) { 5 } else { 2 }),
             global: Duration::from_secs(45),
             body_limit: 1 << 20,
         }
@@ -480,6 +482,20 @@ pub struct Backup {
     pub last_ok: bool,
     /// The first failure, `application: what failed`.
     pub last_error: Option<String>,
+    /// The second copy the owner chose, when the token sees the whole server.
+    pub second: Option<SecondCopy>,
+}
+
+/// The second copy of the backups (la copie de secours): a complete copy of
+/// every database, every hour, in a place of the owner's choice.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SecondCopy {
+    pub target: String,
+    /// The last complete copy (RFC 3339).
+    pub last_at: Option<String>,
+    pub last_error: Option<String>,
+    pub running: bool,
 }
 
 /// What encrypts the data.

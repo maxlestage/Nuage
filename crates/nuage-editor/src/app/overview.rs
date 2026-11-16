@@ -10,7 +10,7 @@ use eframe::egui::{self, RichText};
 
 use super::{Here, Section, Session, help};
 use crate::address;
-use crate::api::{LastConnection, Settings, Status};
+use crate::api::{LastConnection, SecondCopy, Settings, Status};
 use crate::format;
 use crate::i18n::{Lang, t, tf};
 use crate::theme::{self, Mark};
@@ -253,24 +253,49 @@ fn backups(
         return lines;
     };
     let b = &status.backup;
-    if !b.enabled {
-        return none();
+    let mut lines = if !b.enabled {
+        // A second copy alone is a backup all the same.
+        if b.second.is_none() {
+            return none();
+        }
+        Vec::new()
+    } else {
+        let target = b.target.clone().unwrap_or_default();
+        if !b.last_ok {
+            let error = b.last_error.clone().unwrap_or_default();
+            vec![(
+                Mark::Warn,
+                tf(
+                    l,
+                    "The last copy failed: {}. The data is safe on the server's disk, but not copied elsewhere.",
+                    &[&error.trim_end_matches('.')],
+                ),
+            )]
+        } else {
+            match b.last_at.as_deref().and_then(format::parse_time) {
+                Some(at) => vec![(Mark::Ok, tf(l, "Last copy {}, to {}", &[&format::ago(l, at, now), &target]))],
+                None => vec![(Mark::Off, tf(l, "Waiting for the first copy, to {}", &[&target]))],
+            }
+        }
+    };
+    if let Some(c) = &b.second {
+        lines.push(second_copy(l, c, now));
     }
-    let target = b.target.clone().unwrap_or_default();
-    if !b.last_ok {
-        let error = b.last_error.clone().unwrap_or_default();
-        return vec![(
+    lines
+}
+
+/// How the second copy goes, in one line.
+fn second_copy(l: Lang, c: &SecondCopy, now: i64) -> (Mark, String) {
+    if let Some(error) = &c.last_error {
+        return (
             Mark::Warn,
-            tf(
-                l,
-                "The last copy failed: {}. The data is safe on the server's disk, but not copied elsewhere.",
-                &[&error.trim_end_matches('.')],
-            ),
-        )];
+            tf(l, "The second copy failed (tried again in a few minutes): {}.", &[&error.trim_end_matches('.')]),
+        );
     }
-    match b.last_at.as_deref().and_then(format::parse_time) {
-        Some(at) => vec![(Mark::Ok, tf(l, "Last copy {}, to {}", &[&format::ago(l, at, now), &target]))],
-        None => vec![(Mark::Off, tf(l, "Waiting for the first copy, to {}", &[&target]))],
+    match c.last_at.as_deref().and_then(format::parse_time) {
+        Some(at) => (Mark::Ok, tf(l, "Second copy {}, to {}", &[&format::ago(l, at, now), &c.target])),
+        None if c.running => (Mark::Off, tf(l, "The second copy is being written, to {}", &[&c.target])),
+        None => (Mark::Off, tf(l, "The second copy starts in a moment, to {}", &[&c.target])),
     }
 }
 
@@ -294,6 +319,7 @@ mod tests {
                 last_at: Some("2026-11-15T21:00:00Z".into()),
                 last_ok: true,
                 last_error: None,
+                second: None,
             },
             encryption: Encryption { enabled: true, scheme: Some("XTS-AES-256, AES-256-GCM".into()) },
             databases: vec![DbStatus {
@@ -348,6 +374,19 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0, Mark::Warn);
         assert!(lines[0].1.contains("shop: the bucket refused the key") && !lines[0].1.contains(".."), "{lines:?}");
+        // A second copy: a line of its own; alone, it is a backup all the same.
+        let mut second = s.clone();
+        second.backup.second = Some(SecondCopy {
+            target: "/Volumes/Autre/nuage".into(),
+            last_at: Some("2026-11-15T21:02:00Z".into()),
+            ..SecondCopy::default()
+        });
+        let lines = backups(Lang::Fr, Some(&second), None, false, now);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1], (Mark::Ok, "Copie de secours il y a 2 min, vers /Volumes/Autre/nuage".to_owned()));
+        second.backup.enabled = false;
+        let lines = backups(Lang::Fr, Some(&second), None, true, now);
+        assert!(lines.len() == 1 && lines[0].0 == Mark::Ok, "{lines:?}");
         let mut off = s.clone();
         off.backup.enabled = false;
         let lines = backups(Lang::Fr, Some(&off), None, true, now);

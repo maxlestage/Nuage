@@ -2009,6 +2009,191 @@
           }
         }
       }
+    },
+    "/api/backup": {
+      "get": {
+        "operationId": "getBackups",
+        "summary": "Where the backups go, and how the second copy goes",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The backups: the environment's destination (null: none) and the second copy (null: none), never its secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "environment": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "second": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "place (without its secret), target, run (this start's folder), last_at, last_error, running, next_at, every_minutes, restore (the lines that start a server from this run's copy)"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one"
+          }
+        }
+      }
+    },
+    "/api/backup/second": {
+      "post": {
+        "operationId": "setSecondCopy",
+        "summary": "Choose the second copy of the backups (checked: written to and read back), in force at once",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Where the second copy goes: {\"kind\": \"dir\", \"path\": \"/mnt/backup/nuage\"}, or {\"kind\": \"s3\", \"bucket\", \"access_key_id\", \"secret_access_key\" (left empty: the one saved stays), \"endpoint\"?, \"region\"?, \"prefix\"?}.",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "dir",
+                      "s3"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "bucket": {
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "region": {
+                    "type": "string"
+                  },
+                  "prefix": {
+                    "type": "string"
+                  },
+                  "access_key_id": {
+                    "type": "string"
+                  },
+                  "secret_access_key": {
+                    "type": "string",
+                    "writeOnly": true
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              "example": {
+                "kind": "dir",
+                "path": "/mnt/backup/nuage"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The backups: the environment's destination (null: none) and the second copy (null: none), never its secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "environment": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "second": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "place (without its secret), target, run (this start's folder), last_at, last_error, running, next_at, every_minutes, restore (the lines that start a server from this run's copy)"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Refused, with why (in the Accept-Language language)"
+          },
+          "401": {
+            "description": "No management token, or a wrong one"
+          },
+          "403": {
+            "description": "The settings come from the environment only (NUAGE_SETTINGS=environment)"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeSecondCopy",
+        "summary": "No second copy any more (the copies already there stay)",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The backups: the environment's destination (null: none) and the second copy (null: none), never its secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "environment": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "second": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "place (without its secret), target, run (this start's folder), last_at, last_error, running, next_at, every_minutes, restore (the lines that start a server from this run's copy)"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No management token, or a wrong one"
+          }
+        }
+      }
     }
   },
   "components": {

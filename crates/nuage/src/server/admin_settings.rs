@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use super::{Cx, Lang, app_base, bytes, esc, gigas, note};
+use super::{Cx, Lang, ago_ms, app_base, bytes, esc, gigas, note};
 use crate::server::State;
 use crate::server::apps::App;
 use crate::server::settings::{Kind, Refusal, Source, def, default_text, parse_mib, refused};
@@ -342,6 +342,8 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
         save = save_button(state, cx, "Save the visibility")
     );
 
+    body.push_str(&backups(state, cx));
+
     // What is read once, at startup.
     let _ = write!(
         body,
@@ -383,6 +385,156 @@ pub(super) fn body(state: &State, cx: &Cx, message: Option<String>) -> String {
     body
 }
 
+/// The Backups section: where the environment sends them, and the second
+/// copy the owner chooses here (la copie de secours).
+fn backups(state: &State, cx: &Cx) -> String {
+    let l = cx.l;
+    let read_only = state.settings.read_only();
+    let mut body = String::new();
+    let _ = write!(body, r#"<h2 id="backups">{}</h2>"#, cx.t("Backups"));
+    let status = state.engine.backup_status();
+    match &status.target {
+        Some(target) => {
+            let _ = write!(
+                body,
+                "<p>{}</p>",
+                cx.tf(
+                    "Named by the environment: <code>{}</code>. A start on an empty disk restores from it. It changes in the environment, then the server restarts.",
+                    &[&esc(target)]
+                )
+            );
+            match (&status.last_error, status.last_at) {
+                (Some(e), _) if !status.last_ok => {
+                    body.push_str(&note(false, &cx.tf("The last backup failed: {}", &[e])))
+                }
+                (_, Some(at)) => {
+                    let _ = write!(body, r#"<p class="muted">{}</p>"#, cx.tf("Last backup {}.", &[&ago_ms(l, at)]));
+                }
+                _ => {}
+            }
+        }
+        None => body.push_str(&note(
+            false,
+            cx.t(
+                "The environment names no destination for the backups: a second copy chosen here is then the only one.",
+            ),
+        )),
+    }
+    let _ = write!(
+        body,
+        r#"<h3>{}</h3><p class="muted">{}</p>"#,
+        cx.t("Second copy"),
+        cx.tf(
+            "A complete copy of every database, in a place of your choice besides the first: a folder on another disk, or S3-compatible storage. It is written when you save it, when the server starts, then every {} minutes. Each start of the server writes into a folder of its own there, so nothing is ever overwritten; the three newest complete ones are kept. The server never restores from it by itself: the lines below start a server from it.",
+            &[&(super::super::second_copy::EVERY_MS / 60_000)]
+        )
+    );
+    if let Some(why) = &state.second.unreadable {
+        body.push_str(&note(false, why));
+    }
+    let place = state.second.place();
+    if let Some(place) = &place {
+        let copy = state.second.state();
+        let _ = write!(body, "<p>{}</p>", cx.tf("To <code>{}</code>.", &[&esc(&place.describe())]));
+        let line = match (&copy.last_error, copy.last_at, copy.running) {
+            (_, _, true) => note(true, cx.t("A copy is being written.")),
+            (Some(e), _, _) => note(false, &cx.tf("The last copy failed (tried again in a few minutes): {}", &[e])),
+            (None, Some(at), _) => note(true, &cx.tf("Last complete copy {}.", &[&ago_ms(l, at)])),
+            (None, None, _) => note(true, cx.t("The first copy starts in a moment.")),
+        };
+        body.push_str(&line);
+        let _ = write!(
+            body,
+            r#"<p class="muted">{}</p><pre><code>{}</code></pre><p class="muted">{}</p>"#,
+            cx.t("To start a server from the copy of this run: these lines in its environment, on an empty data directory, with the same encryption key."),
+            esc(&super::super::second_copy::restore_lines(place, &state.second.life).join("\n")),
+            cx.t("The secret key of the storage is kept with the settings and never shown again: type it in its line."),
+        );
+    }
+    if read_only {
+        body.push_str(&note(
+            false,
+            cx.t("The settings of this server are those of its environment: the second copy cannot be changed here (it can be removed)."),
+        ));
+    }
+    let (kind, path, s3) = match &place {
+        Some(super::super::second_copy::Place::Dir(p)) => ("dir", p.display().to_string(), None),
+        Some(p @ super::super::second_copy::Place::S3 { .. }) => ("s3", String::new(), Some(p.shown())),
+        None => ("dir", String::new(), None),
+    };
+    let s3_text = |key: &str| s3.as_ref().and_then(|j| j[key].as_str()).map(esc).unwrap_or_default();
+    let off = if read_only { " disabled" } else { "" };
+    let _ = write!(
+        body,
+        r#"<form method="post" action="/admin/settings/backup">{f}
+<div class="set"><label class="check"><input type="radio" name="kind" value="dir"{dir_on}{off}> {dir}</label>
+<label>{path_label}<input name="path" value="{path}" placeholder="/mnt/backup/nuage · E:\Backup\nuage" autocomplete="off" spellcheck="false"{off}></label>
+<small class="muted">{path_help}</small></div>
+<div class="set"><label class="check"><input type="radio" name="kind" value="s3"{s3_on}{off}> {s3}</label>
+<label>{bucket_label}<input name="bucket" value="{bucket}" autocomplete="off"{off}></label>
+<label>{endpoint_label}<input name="endpoint" value="{endpoint}" placeholder="https://s3.eu-west-3.amazonaws.com" autocomplete="off"{off}></label>
+<label>{region_label}<input name="region" value="{region}" placeholder="eu-west-3" autocomplete="off"{off}></label>
+<label>{prefix_label}<input name="prefix" value="{prefix}" placeholder="nuage/" autocomplete="off"{off}></label>
+<label>{key_label}<input name="access_key_id" value="{key}" autocomplete="off"{off}></label>
+<label>{secret_label}<input type="password" name="secret_access_key" value="" autocomplete="new-password"{off}></label>
+<small class="muted">{secret_help}</small></div>{save}</form>"#,
+        f = cx.field(),
+        dir_on = if kind == "dir" { " checked" } else { "" },
+        s3_on = if kind == "s3" { " checked" } else { "" },
+        dir = cx.t("A folder (another disk, a network share)"),
+        path_label = cx.t("Folder"),
+        path = esc(&path),
+        path_help = cx
+            .t("Its full path. A folder on the data's own disk would be lost with it: an external disk, a NAS share."),
+        s3 = cx.t("S3-compatible storage"),
+        bucket_label = cx.t("Bucket"),
+        bucket = s3_text("bucket"),
+        endpoint_label = cx.t("Endpoint"),
+        endpoint = s3_text("endpoint"),
+        region_label = cx.t("Region"),
+        region = s3_text("region"),
+        prefix_label = cx.t("Prefix"),
+        prefix = s3_text("prefix"),
+        key_label = cx.t("Access key id"),
+        key = s3_text("access_key_id"),
+        secret_label = cx.t("Secret access key"),
+        secret_help = cx
+            .t("Kept with the settings, encrypted with the data, never shown again. Left empty: the one saved stays."),
+        save = save_button(state, cx, "Save the second copy"),
+    );
+    if place.is_some() {
+        let _ = write!(
+            body,
+            r#"<form method="post" action="/admin/settings/backup/remove">{}<p><button class="plain">{}</button> <small class="muted">{}</small></p></form>"#,
+            cx.field(),
+            cx.t("Remove the second copy"),
+            cx.t("The copies already there stay."),
+        );
+    }
+    body
+}
+
+/// A form of the Backups section was sent.
+fn post_backup(state: &State, sub: &str, form: &HashMap<String, String>, cx: &Cx) -> (bool, String) {
+    let saved = if sub == "/backup/remove" {
+        state.save_second_copy(None).map(|w| (w, cx.t("The second copy is removed; the copies already there stay.")))
+    } else {
+        let mut body = serde_json::Map::new();
+        for key in ["kind", "path", "bucket", "endpoint", "region", "prefix", "access_key_id", "secret_access_key"] {
+            if let Some(v) = form.get(key) {
+                body.insert(key.into(), serde_json::Value::String(v.trim().to_owned()));
+            }
+        }
+        state
+            .save_second_copy(Some(&serde_json::Value::Object(body)))
+            .map(|w| (w, cx.t("The second copy is saved: a complete copy starts now.")))
+    };
+    match saved {
+        Ok((unshipped, said)) => (true, note(true, said) + &not_in_the_backup(cx, unshipped)),
+        Err(refusal) => (false, note(false, &refusal.said(cx.l))),
+    }
+}
+
 /// The keys of each form of the page.
 fn keys_of(sub: &str) -> &'static [&'static str] {
     match sub {
@@ -396,6 +548,9 @@ fn keys_of(sub: &str) -> &'static [&'static str] {
 /// A form of `/admin/settings` was sent: saves what changed, and says so.
 /// Returns whether it went well, and the message to show above the page.
 pub(super) fn post(state: &State, sub: &str, form: &HashMap<String, String>, cx: &Cx) -> (bool, String) {
+    if sub == "/backup" || sub == "/backup/remove" {
+        return post_backup(state, sub, form, cx);
+    }
     let sent = |key: &str| form.get(key).map(|v| v.trim().to_owned());
     let mut changes: Vec<(&str, Option<String>)> = Vec::new();
     if sub == "/reset" {

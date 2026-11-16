@@ -50,6 +50,10 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("settings") {
         return settings(std::env::args().skip(2).collect());
     }
+    // `nuage backup`, `nuage backup second dir <folder>`, `… s3 …`, `… remove`.
+    if std::env::args().nth(1).as_deref() == Some("backup") {
+        return backup(std::env::args().skip(2).collect());
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("help" | "--help" | "-h")) {
         println!("{HELP}");
         return ExitCode::SUCCESS;
@@ -573,6 +577,69 @@ fn settings(args: Vec<String>) -> ExitCode {
     }
 }
 
+const BACKUP_USAGE: &str = "usage: nuage backup                          where the backups go
+       nuage backup second dir <folder>        a second copy in a folder (another disk)
+       nuage backup second s3 <bucket> [endpoint] [region] [prefix]
+                                               a second copy in S3-compatible storage; the keys
+                                               from NUAGE_SECOND_S3_ACCESS_KEY_ID and
+                                               NUAGE_SECOND_S3_SECRET_ACCESS_KEY (never arguments)
+       nuage backup second remove              no second copy (the copies there stay)";
+
+/// `nuage backup …`: the backups of a server, and its second copy.
+fn backup(args: Vec<String>) -> ExitCode {
+    let (url, token, _) = match apps_target() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("✗ {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).take_while(|a| *a != "--env-file").collect();
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let answer = match args.as_slice() {
+        [] | ["status"] => runtime.block_on(nuage::keepawake::backup_status(&url, &token)),
+        ["second", "dir", path @ ..] if !path.is_empty() => {
+            let place = serde_json::json!({ "kind": "dir", "path": path.join(" ") });
+            runtime.block_on(nuage::keepawake::set_second_copy(&url, &token, Some(place)))
+        }
+        ["second", "s3", bucket, rest @ ..] if rest.len() <= 3 => {
+            let at = |i: usize| rest.get(i).copied().unwrap_or_default();
+            let place = serde_json::json!({
+                "kind": "s3",
+                "bucket": bucket,
+                "endpoint": at(0),
+                "region": at(1),
+                "prefix": at(2),
+                "access_key_id": env("NUAGE_SECOND_S3_ACCESS_KEY_ID"),
+                "secret_access_key": env("NUAGE_SECOND_S3_SECRET_ACCESS_KEY"),
+            });
+            runtime.block_on(nuage::keepawake::set_second_copy(&url, &token, Some(place)))
+        }
+        ["second", "remove"] => runtime.block_on(nuage::keepawake::set_second_copy(&url, &token, None)),
+        _ => {
+            eprintln!("{BACKUP_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match answer {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 const HELP: &str = "Nuage DB: a database server, configured by environment variables (see the README).
 
 usage: nuage                              start the server
@@ -588,4 +655,7 @@ usage: nuage                              start the server
        nuage settings                     the settings of a server, and where each comes from
        nuage settings set <key> <value>   changes one, in force at once (memory.cache_mb 2G)
        nuage settings unset <key>         gives one back to the environment's value
+       nuage backup                       where the backups go, and the second copy
+       nuage backup second dir <folder>   a second copy of the backups (or: s3 <bucket> ...,
+                                          remove); see `nuage backup --help`
        nuage version                      the version";

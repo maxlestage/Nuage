@@ -444,6 +444,21 @@ impl Engine {
         self.backup(force_snapshot, true).map(|_| ())
     }
 
+    /// Writes a complete backup of the database to `place`, besides the
+    /// backup location of its options (which it neither waits for nor
+    /// changes): a snapshot of the page store, its encryption header and the
+    /// manifest naming them, written last. `place` restores by itself, as a
+    /// backup location: the second copy of the backups. Returns the
+    /// snapshot's LSN. Keeps the two newest snapshots there.
+    pub fn copy_to(&self, place: &dyn BackupStore) -> Result<u64> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(closed());
+        }
+        // The checkpoint of a snapshot removes no log segment (`Some(0)`):
+        // what the backup location has not received yet stays on disk.
+        backup::snapshot(&self.store, place, 2, self.encryption.is_some()).map(|(lsn, _)| lsn)
+    }
+
     /// [`backup_now`](Self::backup_now). `wait: false` gives up (`Ok(false)`)
     /// where it would wait for another backup: the upkeep thread's, which
     /// tries again at a later round.

@@ -282,6 +282,82 @@ fn in_force(line: String, json: &serde_json::Value) -> std::result::Result<Strin
     }
 }
 
+/// `nuage backup`: where the backups go, and how the second copy goes.
+pub async fn backup_status(url: &str, admin_token: &str) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let (status, answer) = fetch(&format!("{base}/api/backup"), Some(admin_token)).await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(settings_refusal(base, status, &json));
+    }
+    Ok(backup_lines(&json))
+}
+
+/// `nuage backup second dir <path>`, `… s3 …` (`place` a JSON object), or
+/// `… remove` (`None`).
+pub async fn set_second_copy(
+    url: &str,
+    admin_token: &str,
+    place: Option<serde_json::Value>,
+) -> std::result::Result<String, String> {
+    let base = url.trim_end_matches('/');
+    let sent = match place {
+        Some(place) => {
+            send("POST", &format!("{base}/api/backup/second"), Some(admin_token), Some(place.to_string().into_bytes()))
+                .await
+        }
+        None => send("DELETE", &format!("{base}/api/backup/second"), Some(admin_token), None).await,
+    };
+    let (status, answer) = sent.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
+    if status != 200 {
+        return Err(settings_refusal(base, status, &json));
+    }
+    in_force(backup_lines(&json), &json)
+}
+
+/// The answer of `/api/backup`, as `nuage backup` prints it.
+fn backup_lines(json: &serde_json::Value) -> String {
+    let when = |v: &serde_json::Value| {
+        v.as_i64()
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map_or_else(|| "-".to_owned(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+    };
+    let mut lines = Vec::new();
+    match json["environment"].as_object() {
+        Some(e) => {
+            lines.push(format!(
+                "environment\t{}\tlast {}",
+                e["target"].as_str().unwrap_or_default(),
+                when(&e["last_at"])
+            ));
+            if let Some(err) = e["last_error"].as_str().filter(|_| e["ok"] == false) {
+                lines.push(format!("\tfailed: {err}"));
+            }
+        }
+        None => lines.push("environment\tnone (NUAGE_BACKUP_DIR or NUAGE_BACKUP_S3_* name one)".to_owned()),
+    }
+    match json["second"].as_object() {
+        Some(c) => {
+            lines.push(format!(
+                "second copy\t{}\tlast complete {}\tevery {} min",
+                c["target"].as_str().unwrap_or_default(),
+                when(&c["last_at"]),
+                c["every_minutes"]
+            ));
+            if let Some(err) = c["last_error"].as_str() {
+                lines.push(format!("\tfailed (tried again later): {err}"));
+            }
+            lines.push("to start a server from this run's copy (empty data directory, same key):".to_owned());
+            for line in c["restore"].as_array().into_iter().flatten() {
+                lines.push(format!("\t{}", line.as_str().unwrap_or_default()));
+            }
+        }
+        None => lines.push("second copy\tnone (nuage backup second dir <folder>, or s3)".to_owned()),
+    }
+    lines.join("\n")
+}
+
 /// `nuage apps memory <name> <page cache> [key-value store]`: the memory of
 /// one application, each an amount (`256`, `2G`) or `auto`.
 pub async fn set_app_memory(

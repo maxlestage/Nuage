@@ -593,6 +593,30 @@ el comando:
   el mismo prefijo de bucket (cada uno sobrescribiría al otro). Un ordenador junto a un
   servidor de Heroku usa su propia carpeta, su bucket o su `NUAGE_BACKUP_S3_PREFIX`.
 
+#### Una segunda copia, elegida más tarde
+
+Además del destino que indica el entorno, la página de Ajustes de la consola (sección
+*Copias de seguridad*), `nuage backup second dir /Volumes/OtroDisco/nuage` (o `nuage backup
+second s3 <bucket> [endpoint] [region] [prefix]`, las claves en `NUAGE_SECOND_S3_ACCESS_KEY_ID`
+y `NUAGE_SECOND_S3_SECRET_ACCESS_KEY`) y `POST /api/backup/second` eligen una **segunda copia**:
+una carpeta en otro disco, o un almacenamiento compatible con S3. Es la única cuando el entorno
+no indica ninguna (en un equipo cuyo disco se conserva).
+
+- Es una **copia completa de cada base**, escrita al guardarla, al arrancar el servidor y luego
+  **cada hora**: le puede faltar hasta una hora de escrituras, mientras que el primer destino
+  recibe además el registro cada 30 segundos.
+- Cada arranque del servidor escribe en **su propia carpeta** (`lives/<inicio>-<id>/`): nunca se
+  sobrescribe nada, escriba lo que escriba otro en el mismo lugar; se guardan las tres completas
+  más recientes.
+- El lugar se comprueba antes de guardarlo (se escribe y se relee; nunca dentro de la carpeta de
+  datos, ni donde ya van las copias); su secreto S3 se guarda con los ajustes, cifrado con los
+  datos, y no se vuelve a mostrar.
+- El servidor **nunca restaura desde ella por sí solo**. `nuage backup`, la página y `GET
+  /api/backup` dan las líneas que arrancan un servidor desde la copia de una ejecución:
+  ponlas en su entorno, con una carpeta de datos vacía y la misma `NUAGE_ENCRYPTION_KEY`.
+- En un alojamiento cuyo disco se borra en cada reinicio (Heroku), una segunda copia necesita un
+  destino en el entorno: guardada sola, se perdería con el disco.
+
 ## Inicio rápido
 
 ```bash
