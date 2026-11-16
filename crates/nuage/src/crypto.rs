@@ -274,6 +274,20 @@ impl Header {
     }
 }
 
+/// `true` when `a` and `b`, the contents of two `encryption.json` files, are
+/// the header of one database. The salt is drawn once, when a data directory
+/// is created, and a backup and a restore copy the file as it is, so the same
+/// database has the same header everywhere and another database has another
+/// salt. Two headers that can be read are compared field by field (kind of
+/// secret, salt, check value), whatever their layout; when one cannot be read,
+/// the bytes are compared.
+pub(crate) fn same_database(a: &[u8], b: &[u8]) -> bool {
+    match (Header::from_json(a), Header::from_json(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn keys(root: &[u8]) -> Keys {
     let pages = derive::<64>(root, b"nuage/v1/pages");
     let wal = derive::<KEY_LEN>(root, b"nuage/v1/wal");
@@ -530,6 +544,26 @@ mod tests {
         let (h2, _) = Header::create(&phrase).unwrap();
         assert!(h2.unlock(&phrase).is_ok());
         assert!(String::from_utf8(h2.to_json()).unwrap().contains("argon2id"));
+    }
+
+    /// One database has one header wherever it is copied, whatever its
+    /// layout; another database, even with the same secret, has another.
+    #[test]
+    fn a_header_tells_one_database_from_another() {
+        let key = Encryption::from_key([5; 32]);
+        let (one, _) = Header::create(&key).unwrap();
+        let (other, _) = Header::create(&key).unwrap();
+        let json = one.to_json();
+        assert!(same_database(&json, &json));
+        // The same fields on one line: the same database.
+        let compact = serde_json::to_vec(&serde_json::from_slice::<Json>(&json).unwrap()).unwrap();
+        assert_ne!(compact, json);
+        assert!(same_database(&json, &compact));
+        assert!(!same_database(&json, &other.to_json()), "another salt is another database");
+        // A header that cannot be read is compared as bytes.
+        assert!(same_database(b"damaged", b"damaged"));
+        assert!(!same_database(&json, b"damaged"));
+        assert!(!same_database(b"damaged", b"damaged too"));
     }
 }
 #[cfg(test)]

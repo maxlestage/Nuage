@@ -1132,7 +1132,7 @@ pub(crate) struct Pages {
     state: Mutex<State>,
     /// Held by whatever writes the page file (a checkpoint, a compaction) for
     /// as long as it does, and by whoever needs the file to stay as it is
-    /// ([`hold_file`](Pages::hold_file)). Taken before every other lock here.
+    /// (a copy of it). Taken before every other lock here.
     file: Mutex<()>,
     /// Bytes of the nodes changed since the last checkpoint, about.
     dirty: AtomicUsize,
@@ -1323,14 +1323,6 @@ impl Pages {
 
     fn disk(&self) -> std::sync::RwLockReadGuard<'_, Disk> {
         self.disk.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Keeps the page file as it is until the guard is dropped: checkpoints
-    /// and compactions, the only writers of the file, wait for it. Commits do
-    /// not: they change nodes in memory, which reach the file at a checkpoint.
-    /// For a snapshot, which copies the file as a checkpoint just left it.
-    pub(crate) fn hold_file(&self) -> MutexGuard<'_, ()> {
-        lock(&self.file)
     }
 
     /// Copies the page file, byte for byte (encrypted as it is), to `dest`, through the handle

@@ -77,8 +77,8 @@ See [Create an application in one command](../README.md#create-an-application-in
 
 ## The key-value store
 
-Each application also has a key-value store in memory (a cache,
-sessions, counters, locks). Every language reaches it over HTTP, with the same token:
+Each application also has a key-value store (a cache, sessions, counters, locks), in the
+server's memory or in its database. Every language reaches it over HTTP, with the same token:
 
 ```bash
 curl -X PUT "$NUAGE_URL/v1/kv/session:42?ttl=1800" -H "Authorization: Bearer $NUAGE_TOKEN" -d 'ada'

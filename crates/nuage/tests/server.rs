@@ -577,8 +577,8 @@ async fn console() {
     running.shutdown().await;
 }
 
-/// A minimal S3 server in memory (it checks that requests are signed, not
-/// the signatures themselves).
+/// A minimal S3 server in memory with one bucket, `bucket` (it checks that
+/// requests are signed, not the signatures themselves).
 async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
     let objects: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,12 +600,17 @@ async fn fake_s3() -> (SocketAddr, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
                             || req.uri().query().is_some_and(|q| {
                                 q.contains("X-Amz-Credential=key%2F") && q.contains("&X-Amz-Signature=")
                             });
-                        let path = req.uri().path().trim_start_matches("/bucket").trim_start_matches('/').to_owned();
+                        // `/bucket` or `/bucket/<key>`: any other bucket does not exist.
+                        let rest = req.uri().path().strip_prefix("/bucket");
+                        let bucket = rest.is_some_and(|p| p.is_empty() || p.starts_with('/'));
+                        let path = rest.unwrap_or_default().trim_start_matches('/').to_owned();
                         let query = req.uri().query().unwrap_or_default().to_owned();
                         let method = req.method().clone();
                         let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
                         let (status, out) = if !signed {
                             (403, b"<Error><Code>AccessDenied</Code></Error>".to_vec())
+                        } else if !bucket {
+                            (404, b"<Error><Code>NoSuchBucket</Code></Error>".to_vec())
                         } else {
                             let mut objects = store.lock().unwrap();
                             match method.as_str() {
@@ -721,6 +726,1016 @@ async fn s3_backup_and_restore() {
     .unwrap();
     assert!(db.engine().backup_status().restored);
     assert_eq!(common::User::count(&db).await.unwrap(), 2);
+    let gone = Arc::downgrade(db.engine());
+    drop(db);
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+
+    // The bucket first, a folder second, kept in step: each one alone restores it all.
+    let (src, folder) = (temp_dir("s3-two-src"), temp_dir("s3-two-folder"));
+    let two = |bucket: Arc<S3Store>| -> Arc<dyn BackupStore> {
+        Arc::new(nuage::MirrorStore::new(bucket, Arc::new(nuage::DirectoryStore::new(&folder))))
+    };
+    let at = |store: Arc<dyn BackupStore>| EngineOptions {
+        backup: Some(BackupOptions::new(store)),
+        ..EngineOptions::default()
+    };
+    let in_two = Arc::new(
+        S3Store::new(S3Options {
+            endpoint: format!("http://{addr}"),
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            prefix: "two/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap(),
+    );
+    let gone = {
+        let db = Embedded::open_with(&src, at(two(in_two.clone()))).unwrap();
+        db.create_table::<common::User>().await.unwrap();
+        common::user("one@two.dev", "One", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        common::user("two@two.dev", "Two", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || {
+            engine.checkpoint().unwrap();
+            engine.backup_now(false)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let status = db.engine().backup_status();
+        assert!(status.last_ok, "{status:?}");
+        assert_eq!(status.target, Some(format!("s3://bucket/two/ and {}", folder.display())));
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+    let wal = |key: &str| key.starts_with("two/wal/");
+    assert!(objects.lock().unwrap().keys().any(|k| wal(k)) && folder.join("wal").exists());
+    let places: [(&str, Arc<dyn BackupStore>); 3] = [
+        ("bucket", in_two.clone()),
+        ("folder", Arc::new(nuage::DirectoryStore::new(&folder))),
+        ("both", two(in_two.clone())),
+    ];
+    for (name, store) in places {
+        let dst = temp_dir(&format!("s3-two-restored-{name}"));
+        let db = Embedded::open_with(&dst, at(store)).unwrap();
+        let status = db.engine().backup_status();
+        assert!(status.restored, "{name}");
+        assert_eq!(common::User::count(&db).await.unwrap(), 2, "{name}");
+        if name == "both" {
+            // In step: the first.
+            assert_eq!(status.restored_from.as_deref(), Some("s3://bucket/two/"));
+        }
+        let gone = Arc::downgrade(db.engine());
+        drop(db);
+        tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+    for d in [src, folder, temp_dir("s3-src"), temp_dir("s3-dst")] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A store in the bucket `bucket` at `addr`, under `prod/`.
+fn s3_at(addr: SocketAddr) -> nuage::s3::S3Store {
+    nuage::s3::S3Store::new(nuage::s3::S3Options {
+        endpoint: format!("http://{addr}"),
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        prefix: "prod/".into(),
+        access_key_id: "key".into(),
+        secret_access_key: "secret".into(),
+    })
+    .unwrap()
+}
+
+/// A bucket that takes connections and never answers. It reads what it is
+/// sent, and says on the channel each time a client hangs up.
+fn stalled_s3() -> (SocketAddr, std::sync::mpsc::Receiver<()>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (hung_up, closed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let (mut stream, hung_up) = (stream.unwrap(), hung_up.clone());
+            std::thread::spawn(move || {
+                let mut buf = [0; 4096];
+                while stream.read(&mut buf).is_ok_and(|n| n > 0) {}
+                let _ = hung_up.send(());
+            });
+        }
+    });
+    (addr, closed)
+}
+
+/// A bucket that accepts the connection and then says nothing cannot hold a
+/// backup round, a restore or the shutdown: every request fails once the
+/// store's timeout has passed, and gives its connection up.
+#[test]
+fn a_stalled_bucket_times_out() {
+    use nuage::BackupStore;
+    let (addr, closed) = stalled_s3();
+    let store = s3_at(addr).with_timeout(Duration::from_millis(200));
+    let calls: [(&str, &dyn Fn() -> Option<String>); 4] = [
+        ("GET prod/a/one", &|| store.get("a/one").err().map(|e| e.to_string())),
+        ("PUT prod/a/one", &|| store.put("a/one", b"1").err().map(|e| e.to_string())),
+        ("LIST", &|| store.list("a/").err().map(|e| e.to_string())),
+        ("DELETE prod/a/one", &|| store.delete("a/one").err().map(|e| e.to_string())),
+    ];
+    for (what, call) in calls {
+        let started = std::time::Instant::now();
+        let e = call().unwrap_or_else(|| panic!("{what}: a bucket that does not answer is an error"));
+        assert!(started.elapsed() < Duration::from_secs(1), "{what} took {:?}", started.elapsed());
+        assert!(e.contains(&format!("{what}: s3://bucket/prod/ did not answer within 0.2 seconds")), "{e}");
+        closed.recv_timeout(Duration::from_secs(1)).expect("the connection of a request that timed out is closed");
+    }
+}
+
+/// A bucket on a slow line: it reads the body of a request 16 KiB at a time
+/// and sends its answer (1000 bytes) 100 bytes at a time, `pause` before each
+/// piece. For a key ending in `half`, it stops after half the answer and keeps
+/// the connection.
+fn slow_s3(pause: Duration) -> SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let half = head.lines().next().is_some_and(|line| line.contains("half "));
+                let mut left: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |n| n.trim().parse().unwrap());
+                let mut piece = [0; 16 * 1024];
+                while left > 0 {
+                    std::thread::sleep(pause);
+                    match stream.read(&mut piece[..left.min(16 * 1024)]) {
+                        Ok(n) if n > 0 => left -= n,
+                        _ => return,
+                    }
+                }
+                if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n").is_err() {
+                    return;
+                }
+                for (i, piece) in [b'x'; 1000].chunks(100).enumerate() {
+                    if half && i == 5 {
+                        while stream.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
+                        return;
+                    }
+                    std::thread::sleep(pause);
+                    if stream.write_all(piece).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The time limit cuts a bucket that has stopped, never one that is slow
+/// while bytes keep moving: an upload goes on while the connection takes its
+/// pieces, its answer has one more second per 64 KiB that may still be on
+/// its way (4 at most), and an answer may take as long as it needs while
+/// each piece comes in time.
+#[test]
+fn a_slow_bucket_is_not_cut_while_bytes_keep_moving() {
+    use nuage::BackupStore;
+    let store = s3_at(slow_s3(Duration::from_millis(60))).with_timeout(Duration::from_millis(300));
+
+    // 256 KiB taken 16 KiB at a time: about a second before the answer starts,
+    // more than the timeout and less than its 4 extra seconds.
+    let started = std::time::Instant::now();
+    store.put("a/big", &vec![7; 256 * 1024]).unwrap();
+    assert!(started.elapsed() > Duration::from_millis(900), "{:?}", started.elapsed());
+
+    // Ten pieces 60 ms apart: twice the timeout in all.
+    let started = std::time::Instant::now();
+    assert_eq!(store.get("a/big").unwrap(), Some(vec![b'x'; 1000]));
+    assert!(started.elapsed() > Duration::from_millis(550), "{:?}", started.elapsed());
+
+    // An answer that stops halfway is an error, and says so.
+    let e = store.get("a/half").unwrap_err().to_string();
+    assert!(e.contains("GET prod/a/half: s3://bucket/prod/ stopped answering for 0.3 seconds"), "{e}");
+}
+
+/// A bucket that does not exist (a mistyped name) is an error, never an empty
+/// backup: an empty disk does not start an empty database from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bucket_that_does_not_exist_is_not_an_empty_backup() {
+    use nuage::{BackupOptions, BackupStore};
+    let (addr, objects) = fake_s3().await;
+    let other = || {
+        nuage::s3::S3Store::new(nuage::s3::S3Options {
+            endpoint: format!("http://{addr}"),
+            bucket: "other".into(),
+            region: "us-east-1".into(),
+            prefix: "prod/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+    };
+    let e = other().get("manifest.json").unwrap_err().to_string();
+    assert!(e.contains("GET prod/manifest.json: the bucket `other` does not exist (HTTP 404 NoSuchBucket)"), "{e}");
+    let dir = temp_dir("no-bucket");
+    let options = EngineOptions { backup: Some(BackupOptions::new(Arc::new(other()))), ..EngineOptions::default() };
+    let e = Engine::open(&dir, options).unwrap_err().to_string();
+    assert!(e.contains("the bucket `other` does not exist"), "{e}");
+    assert!(!dir.join("nuage.db").exists() && !dir.join("encryption.json").exists(), "nothing was created");
+    // In the bucket that exists, a missing object is no error.
+    assert_eq!(s3_at(addr).get("manifest.json").unwrap(), None);
+    assert!(objects.lock().unwrap().is_empty());
+}
+
+/// A place in a bucket holds the backup of one database: the same database,
+/// restored onto an empty disk, goes on backing up there; another one, even
+/// with the same key, writes nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bucket_holds_the_backup_of_one_database() {
+    use nuage::{BackupOptions, Embedded, Encryption};
+    let (addr, objects) = fake_s3().await;
+    let with = || EngineOptions {
+        backup: Some(BackupOptions::new(Arc::new(s3_at(addr)))),
+        encryption: Some(Encryption::from_key([1; 32])),
+        sync: false,
+        ..EngineOptions::default()
+    };
+    // Waits until a dropped database is closed: nothing writes to its backup after that.
+    let closed = |engine: std::sync::Weak<Engine>| {
+        for _ in 0..400 {
+            if engine.upgrade().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the database is still open");
+    };
+    let dirs = ["one", "restored", "again", "other"].map(|name| temp_dir(&format!("s3-db-{name}")));
+    let gone = {
+        let db = Embedded::open_with(&dirs[0], with()).unwrap();
+        db.create_table::<common::User>().await.unwrap();
+        common::user("one@x.dev", "One", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    let gone = {
+        let db = Embedded::open_with(&dirs[1], with()).unwrap();
+        assert!(db.engine().backup_status().restored);
+        common::user("two@x.dev", "Two", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    let before = objects.lock().unwrap().clone();
+    assert!(before.contains_key("prod/encryption.json"));
+    // Another database (a new one, told not to restore), pointed at the same place.
+    let gone = {
+        let backup = BackupOptions { restore_when_empty: false, ..BackupOptions::new(Arc::new(s3_at(addr))) };
+        let db = Embedded::open_with(&dirs[3], EngineOptions { backup: Some(backup), ..with() }).unwrap();
+        let engine = db.engine().clone();
+        let e = tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap_err().to_string();
+        assert!(e.contains("s3://bucket/prod/ holds the backup of another database"), "{e}");
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || closed(gone)).await.unwrap();
+    assert!(*objects.lock().unwrap() == before, "nothing written, nothing removed");
+    let db = Embedded::open_with(&dirs[2], with()).unwrap();
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(common::User::count(&db).await.unwrap(), 2);
+    drop(db);
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Waits until every engine is closed: nothing writes to their backups after that.
+fn all_closed(engines: &[std::sync::Weak<Engine>]) {
+    for _ in 0..400 {
+        if engines.iter().all(|e| e.upgrade().is_none()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("a database is still open");
+}
+
+/// With a restore required, a place in a bucket that holds no backup (an
+/// empty prefix, or `prod` written for `prod/`) does not start an empty
+/// database: nothing is made on the disk and nothing is sent to the bucket.
+/// The place that holds the backup restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_required_finds_the_backup_or_starts_nothing() {
+    use nuage::{BackupOptions, Embedded, Encryption};
+    let (addr, objects) = fake_s3().await;
+    let with = |prefix: &str| {
+        let store = nuage::s3::S3Store::new(nuage::s3::S3Options {
+            endpoint: format!("http://{addr}"),
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            prefix: prefix.into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap();
+        EngineOptions {
+            backup: Some(BackupOptions::new(Arc::new(store))),
+            encryption: Some(Encryption::from_key([1; 32])),
+            sync: false,
+            ..EngineOptions::default()
+        }
+    };
+    let (src, dir) = (temp_dir("required-s3-src"), temp_dir("required-s3-dir"));
+    let e = Engine::open_existing(&dir, with("prod/")).unwrap_err().to_string();
+    assert!(e.contains("s3://bucket/prod/ holds no backup to restore: an empty database is not started here"), "{e}");
+    assert!(!dir.exists() && objects.lock().unwrap().is_empty(), "nothing made, nothing sent");
+    let gone = {
+        let db = Embedded::open_with(&src, with("prod/")).unwrap();
+        db.create_table::<common::User>().await.unwrap();
+        common::user("one@x.dev", "One", None, 0.0).insert(&db).await.unwrap();
+        let engine = db.engine().clone();
+        tokio::task::spawn_blocking(move || engine.backup_now(true)).await.unwrap().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+    let before = objects.lock().unwrap().clone();
+    let e = Engine::open_existing(&dir, with("prod")).unwrap_err().to_string();
+    assert!(e.contains("s3://bucket/prod holds no backup to restore"), "{e}");
+    assert!(!dir.exists() && *objects.lock().unwrap() == before, "nothing made, nothing sent");
+    let db = Embedded::from_engine(Engine::open_existing(&dir, with("prod/")).unwrap());
+    assert!(db.engine().backup_status().restored);
+    assert_eq!(common::User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for d in [src, dir] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The `nuage` binary with the settings `vars`, and none of the variables of
+/// the tests' own environment that it reads.
+fn nuage_binary(vars: &[(&str, &str)]) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_nuage"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("NUAGE_") || name.starts_with("AWS_") || name == "PORT" || name == "SITE_URL" {
+            command.env_remove(&key);
+        }
+    }
+    command.envs(vars.iter().copied()).stdin(std::process::Stdio::null());
+    command
+}
+
+/// Runs the binary, which must stop by itself: its exit code and what it
+/// wrote to standard error.
+fn stopped(mut command: std::process::Command) -> (Option<i32>, String) {
+    use std::io::Read;
+    let mut child = command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the server started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    (status.code(), err)
+}
+
+/// Starts the binary and returns what it printed until it listened, then
+/// stops it: the lines of its standard output, and its standard error.
+fn started(mut command: std::process::Command) -> (Vec<String>, String) {
+    use std::io::{BufRead, Read};
+    let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(line) => {
+                let listening = line.contains("listening on");
+                out.push(line);
+                if listening {
+                    break;
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let mut err = String::new();
+                let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+                panic!("the server did not start: {out:#?}\n{err}");
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut err = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+    (out, err)
+}
+
+/// NUAGE_RESTORE_REQUIRED: an empty data directory with nothing to restore
+/// stops the binary (exit 1) with what to check, and nothing is made or sent,
+/// whether the backup goes to a folder, to a bucket or nowhere. A value
+/// mistyped stops it too, and another error says nothing of the setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_refuses_an_empty_start_when_a_restore_is_required() {
+    let (addr, objects) = fake_s3().await;
+    // The runs wait for the binary: off the threads that serve the bucket.
+    tokio::task::spawn_blocking(move || refused_runs(addr, &objects)).await.unwrap();
+}
+
+fn refused_runs(addr: SocketAddr, objects: &Mutex<HashMap<String, Vec<u8>>>) {
+    let (data, folder, other) = (temp_dir("bin-required-data"), temp_dir("bin-required-folder"), temp_dir("bin-other"));
+    std::fs::create_dir_all(&folder).unwrap();
+    let key = "07".repeat(32);
+    let (data_dir, folder_dir) = (data.display().to_string(), folder.display().to_string());
+    let endpoint = format!("http://{addr}");
+    let base = [
+        ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+        ("NUAGE_DATA_DIR", data_dir.as_str()),
+        ("NUAGE_RESTORE_REQUIRED", "true"),
+        ("PORT", "0"),
+        ("NUAGE_BIND", "127.0.0.1"),
+    ];
+    let s3 = [
+        ("NUAGE_BACKUP_S3_BUCKET", "bucket"),
+        ("NUAGE_BACKUP_S3_ENDPOINT", endpoint.as_str()),
+        ("NUAGE_BACKUP_S3_PREFIX", "prod"),
+        ("NUAGE_BACKUP_S3_ACCESS_KEY_ID", "key"),
+        ("NUAGE_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+    ];
+    let run = |extra: &[(&str, &str)]| {
+        let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        let (code, err) = stopped(nuage_binary(&vars));
+        assert!(!data.exists(), "nothing was made in the data directory: {err}");
+        (code, err)
+    };
+    let (code, err) = run(&[("NUAGE_BACKUP_DIR", folder_dir.as_str())]);
+    assert_eq!(code, Some(1), "{err}");
+    let refused = format!(
+        "Nuage DB storage: this directory is empty and {folder_dir} holds no backup to restore: an empty database \
+         is not started here"
+    );
+    assert!(err.starts_with(&format!("nuage: cannot open the data directory {data_dir}: ")), "{err}");
+    assert!(err.contains(&refused), "{err}");
+    assert!(
+        err.contains(
+            "nuage: NUAGE_RESTORE_REQUIRED is set. Nothing was created and nothing was written. Check NUAGE_BACKUP_DIR"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("for the first start of a new server, remove NUAGE_RESTORE_REQUIRED"), "{err}");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing was written to the backup");
+    let (code, err) = run(&s3);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("s3://bucket/prod holds no backup to restore"), "{err}");
+    assert!(err.contains("Check NUAGE_BACKUP_S3_BUCKET and NUAGE_BACKUP_S3_PREFIX (used as written"), "{err}");
+    assert!(objects.lock().unwrap().is_empty(), "nothing was sent to the bucket");
+    let (code, err) = run(&[]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("this directory is empty and no backup destination is set"), "{err}");
+    assert!(err.contains("No backup destination is set: put the backup settings"), "{err}");
+    let (code, err) = run(&[("NUAGE_RESTORE_REQUIRED", "ture"), ("NUAGE_BACKUP_DIR", folder_dir.as_str())]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.starts_with("nuage: configuration error: "), "{err}");
+    assert!(err.contains("NUAGE_RESTORE_REQUIRED=`ture`: `true` or `false`"), "{err}");
+    // A data directory that holds a database the key does not open: the error
+    // is the key's, and the setting has nothing to say about it.
+    let options = EngineOptions {
+        encryption: Some(nuage::Encryption::from_key([9; 32])),
+        sync: false,
+        ..EngineOptions::default()
+    };
+    let gone = Arc::downgrade(&Engine::open(&other, options).unwrap());
+    all_closed(&[gone]);
+    let other_dir = other.display().to_string();
+    let vars = [base[0], ("NUAGE_DATA_DIR", other_dir.as_str()), base[2], base[3], base[4]];
+    let (code, err) = stopped(nuage_binary(&vars));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("cannot open the data directory") && !err.contains("Nothing was created"), "{err}");
+    for d in [data, folder, other] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Without NUAGE_RESTORE_REQUIRED, an empty start is allowed and said: a new,
+/// empty database in the log, and a registered application whose backup
+/// holds nothing.
+#[test]
+fn the_server_says_when_it_starts_empty() {
+    let (data, folder) = (temp_dir("bin-empty-data"), temp_dir("bin-empty-folder"));
+    let (first, restored) = (temp_dir("bin-apps-first"), temp_dir("bin-apps-restored"));
+    let backups = temp_dir("bin-apps-backup");
+    std::fs::create_dir_all(&folder).unwrap();
+    let key = "07".repeat(32);
+    let binary = |data: &std::path::Path, folder: &std::path::Path| {
+        let (data, folder) = (data.display().to_string(), folder.display().to_string());
+        nuage_binary(&[
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_BACKUP_DIR", folder.as_str()),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ])
+    };
+    let out = started(binary(&data, &folder)).0.join("\n");
+    let new = format!(
+        "nuage: warning: the data directory was empty and {} holds no backup: this is a NEW, EMPTY database. \
+         If this server had data, stop it now and check NUAGE_BACKUP_DIR (an external disk must be plugged in",
+        folder.display()
+    );
+    assert!(out.contains(&new), "{out}");
+    assert!(out.contains("NUAGE_RESTORE_REQUIRED=true refuses to start in this case"), "{out}");
+    // The second destination alone (the end of a move without a stop): the settings named are its own.
+    let _ = std::fs::remove_dir_all(&data);
+    let (data_dir, folder_dir) = (data.display().to_string(), folder.display().to_string());
+    let out = started(nuage_binary(&[
+        ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+        ("NUAGE_DATA_DIR", data_dir.as_str()),
+        ("NUAGE_BACKUP2_DIR", folder_dir.as_str()),
+        ("PORT", "0"),
+        ("NUAGE_BIND", "127.0.0.1"),
+    ]))
+    .0
+    .join("\n");
+    assert!(out.contains("stop it now and check NUAGE_BACKUP2_DIR (an external disk must be plugged in"), "{out}");
+    assert!(!out.contains("NUAGE_BACKUP_DIR") && !out.contains("NUAGE_BACKUP_*"), "{out}");
+
+    // The application's backup loses its manifest, and the server starts on
+    // an empty disk.
+    shop_without_its_manifest(&first, &backups);
+    let out = started(binary(&restored, &backups)).0.join("\n");
+    assert!(out.contains("nuage: the data directory was empty: restored from the backup"), "{out}");
+    let shop = format!(
+        "nuage: warning: application `shop` is registered but its backup ({}/apps/shop) holds nothing: it starts empty",
+        backups.display()
+    );
+    assert!(out.contains(&shop), "{out}");
+    assert!(!out.contains("NEW, EMPTY"), "{out}");
+    for d in [data, folder, first, restored, backups] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A server in `first` with an application `shop`, backed up to the folder
+/// `backups` with the key of the binary's tests, then closed. Then shop's
+/// backup loses its manifest: a copy by hand that missed a file.
+fn shop_without_its_manifest(first: &std::path::Path, backups: &std::path::Path) {
+    let options = EngineOptions {
+        sync: false,
+        encryption: Some(nuage::Encryption::from_key([7; 32])),
+        backup: Some(nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(backups)))),
+        ..EngineOptions::default()
+    };
+    let engines = {
+        let server = Server::new(Engine::open(first, options).unwrap(), ServerOptions::default());
+        server.create_app("shop", "").unwrap();
+        let engines: Vec<_> = server.apps().iter().filter_map(|a| server.app_engine(&a.name)).collect();
+        for engine in &engines {
+            engine.backup_now(true).unwrap();
+        }
+        engines.iter().map(Arc::downgrade).collect::<Vec<_>>()
+    };
+    all_closed(&engines);
+    std::fs::remove_file(backups.join("apps/shop/manifest.json")).unwrap();
+}
+
+/// With NUAGE_RESTORE_REQUIRED, the binary does not serve a registered
+/// application whose backup holds nothing: it says it cannot be opened, with
+/// the engine's sentence, and starts with the others. Nothing is made for it
+/// on the disk or sent to its backup.
+#[test]
+fn the_server_does_not_serve_an_application_it_cannot_restore() {
+    let (first, data, backups) = (temp_dir("bin-unserved-first"), temp_dir("bin-unserved"), temp_dir("bin-unserved-b"));
+    shop_without_its_manifest(&first, &backups);
+    let before = files_in(&backups.join("apps/shop"));
+    let key = "07".repeat(32);
+    let (data_dir, folder) = (data.display().to_string(), backups.display().to_string());
+    let (out, err) = started(nuage_binary(&[
+        ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+        ("NUAGE_DATA_DIR", data_dir.as_str()),
+        ("NUAGE_BACKUP_DIR", folder.as_str()),
+        ("NUAGE_RESTORE_REQUIRED", "true"),
+        ("PORT", "0"),
+        ("NUAGE_BIND", "127.0.0.1"),
+    ]));
+    let out = out.join("\n");
+    assert!(out.contains("nuage: the data directory was empty: restored from the backup"), "{out}");
+    assert!(err.contains("nuage: application `shop` cannot be opened, its data is left as it was: "), "{err}");
+    let sentence = format!(
+        "Nuage DB storage: this directory is empty and {folder}/apps/shop holds no backup to restore: an empty \
+         database is not started here"
+    );
+    assert!(err.contains(&sentence), "{err}");
+    assert!(!out.contains("application `shop`"), "it is not served: {out}");
+    assert!(!data.join("apps/shop").exists(), "nothing was made for it");
+    assert_eq!(files_in(&backups.join("apps/shop")), before, "nothing was sent to its backup");
+    for d in [first, data, backups] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The binary, started: it listens on `addr`; `lines` brings what it prints
+/// on its standard output.
+struct Running {
+    child: std::process::Child,
+    addr: SocketAddr,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+/// Starts the binary and waits until it listens; returns it, with what it
+/// printed until then.
+fn running(mut command: std::process::Command) -> (Running, Vec<String>) {
+    use std::io::BufRead;
+    let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    let mut server = Running { child, addr: ([0, 0, 0, 0], 0).into(), lines };
+    let stdout = server.child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut out = Vec::new();
+    loop {
+        let Ok(line) = server.lines.recv_timeout(Duration::from_secs(60)) else {
+            let _ = server.child.kill();
+            let _ = server.child.wait();
+            panic!("the server did not start: {out:#?}");
+        };
+        out.push(line.clone());
+        if let Some(addr) = line.strip_prefix("nuage: listening on ") {
+            server.addr = addr.parse().unwrap();
+            return (server, out);
+        }
+    }
+}
+
+impl Running {
+    /// Stops it as a host does (SIGTERM), and waits for its end: its exit
+    /// code, the rest of its standard output, and its standard error.
+    #[cfg(unix)]
+    fn stop(mut self) -> (Option<i32>, Vec<String>, String) {
+        use std::io::Read;
+        // SAFETY: the pid is our child's, still running or not yet waited for.
+        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("the server did not stop");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut err = String::new();
+        self.child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        // Every line, up to the end of its output.
+        (status.code(), self.lines.iter().collect(), err)
+    }
+}
+
+/// The binary with two backup folders: it says where the backups go and
+/// how an empty disk is restored, and its stop (SIGTERM) sends the last
+/// commits to both, so that either one alone restores them. An empty disk
+/// is not restored when the second does not answer: the start stops, and
+/// says which settings to remove. A restore required with both empty names
+/// both settings; two
+/// destinations that are one place, or a second that is a folder and a
+/// bucket, stop the start.
+#[cfg(unix)]
+#[test]
+fn the_server_backs_up_to_two_destinations() {
+    let (data, again, one, two) =
+        (temp_dir("bin-two-data"), temp_dir("bin-two-again"), temp_dir("bin-two-one"), temp_dir("bin-two-two"));
+    let not_a_folder = temp_dir("bin-two-file");
+    for folder in [&one, &two] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    std::fs::write(&not_a_folder, b"a file, not a folder").unwrap();
+    let key = "07".repeat(32);
+    let (one_dir, two_dir, file) =
+        (one.display().to_string(), two.display().to_string(), not_a_folder.display().to_string());
+    let binary = |data: &std::path::Path, extra: &[(&str, &str)]| {
+        let data = data.display().to_string();
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_TOKEN", "t0ken"),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend_from_slice(extra);
+        nuage_binary(&vars)
+    };
+    let both = [("NUAGE_BACKUP_DIR", one_dir.as_str()), ("NUAGE_BACKUP2_DIR", two_dir.as_str())];
+
+    // A restore required, and nothing in either.
+    let (code, err) = stopped(binary(&data, &[&both[..], &[("NUAGE_RESTORE_REQUIRED", "true")]].concat()));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(&format!("this directory is empty and neither {one_dir} nor {two_dir} holds a backup to restore"))
+    );
+    assert!(err.contains("Check NUAGE_BACKUP_DIR (an external disk"), "{err}");
+    assert!(err.contains("; and NUAGE_BACKUP2_DIR (an external disk"), "{err}");
+    assert!(!data.exists(), "nothing was made");
+
+    let (server, out) = running(binary(&data, &both));
+    let out = out.join("\n");
+    let line = format!(
+        "nuage: backups go to {one_dir} and {two_dir}, kept in step; an empty data directory is restored from the one \
+         that reaches furthest"
+    );
+    assert!(out.contains(&line), "{out}");
+    assert!(out.contains(&format!("the data directory was empty and neither {one_dir} nor {two_dir} holds a backup")));
+    // A row written just before the stop: only the stop sends it.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let sql = |statement: &str| {
+        let body = serde_json::json!({ "sql": statement, "params": [] }).to_string();
+        let res = runtime.block_on(http(server.addr, "POST", "/v1/sql", &[("authorization", "Bearer t0ken")], &body));
+        assert_eq!(res.status, 200, "{}", res.body);
+    };
+    sql("CREATE TABLE notes (id BIGINT PRIMARY KEY AUTOINCREMENT, body TEXT)");
+    sql("INSERT INTO notes (body) VALUES ('the last one')");
+    let (code, rest, err) = server.stop();
+    assert_eq!(code, Some(0), "{rest:?}\n{err}");
+    assert!(!err.contains("last backup"), "{err}");
+    for folder in [&one, &two] {
+        let options = EngineOptions {
+            sync: false,
+            encryption: Some(nuage::Encryption::from_key([7; 32])),
+            backup: Some(nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(folder)))),
+            ..EngineOptions::default()
+        };
+        let disk = temp_dir("bin-two-alone");
+        let engine = Engine::open(&disk, options).unwrap();
+        assert!(engine.backup_status().restored, "{}", folder.display());
+        let tables = nuage::Embedded::from_engine(engine.clone()).tables().unwrap();
+        assert!(tables.iter().any(|t| t.name == "notes" && t.rows == 1), "{}: {tables:?}", folder.display());
+        let gone = Arc::downgrade(&engine);
+        drop(engine);
+        all_closed(&[gone]);
+        let _ = std::fs::remove_dir_all(&disk);
+    }
+
+    // The second does not answer: it may hold more than the first, so nothing is restored.
+    let (code, err) = stopped(binary(&again, &[both[0], ("NUAGE_BACKUP2_DIR", file.as_str())]));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(&format!("the second backup destination does not answer ({file}: ")), "{err}");
+    assert!(err.contains(&format!("To start from the first alone ({one_dir}), take the second out")), "{err}");
+    assert!(err.contains("nuage: that destination is NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_*"), "{err}");
+    assert!(!again.exists(), "nothing was made");
+
+    // One place twice, or a second that is two places: no start.
+    let (code, err) = stopped(binary(&data, &[both[0], ("NUAGE_BACKUP2_DIR", &format!("{one_dir}/"))]));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(&format!("the two backup destinations are the same place ({one_dir})")), "{err}");
+    let (code, err) = stopped(binary(&data, &[both[1], ("NUAGE_BACKUP2_S3_BUCKET", "bucket")]));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("set NUAGE_BACKUP2_DIR or NUAGE_BACKUP2_S3_BUCKET, not both"), "{err}");
+    for d in [data, again, one, two, not_a_folder] {
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_file(&d);
+    }
+}
+
+/// Every file under `dir`, with its bytes.
+fn files_in(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_in(&path));
+        } else {
+            out.insert(path.clone(), std::fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// Drops `server` and waits until every engine it opened is closed (call
+/// `shutdown` on what it listens on first).
+async fn closed(server: Server) {
+    let engines: Vec<_> =
+        server.apps().iter().filter_map(|a| server.app_engine(&a.name)).map(|e| Arc::downgrade(&e)).collect();
+    drop(server);
+    tokio::task::spawn_blocking(move || all_closed(&engines)).await.unwrap();
+}
+
+/// The options of the engines of the applications' tests below: encrypted,
+/// backed up to the folder `backups`.
+fn backed_up_to(backups: &std::path::Path) -> EngineOptions {
+    let mut backup = nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(backups)));
+    backup.snapshot_every = Duration::from_secs(3600);
+    EngineOptions {
+        sync: false,
+        encryption: Some(nuage::Encryption::from_key([7; 32])),
+        backup: Some(backup),
+        ..EngineOptions::default()
+    }
+}
+
+/// The status of `GET /v1/info` with `token`, and the application it names.
+async fn info(addr: SocketAddr, token: &str) -> (u16, Option<String>) {
+    let res = http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {token}"))], "").await;
+    let body: serde_json::Value = serde_json::from_str(&res.body).unwrap_or_default();
+    (res.status, body["application"].as_str().map(str::to_owned))
+}
+
+fn names(server: &Server) -> Vec<String> {
+    server.apps().into_iter().map(|a| a.name).collect()
+}
+
+/// A server whose first engine was opened with `Engine::open_existing` (what
+/// NUAGE_RESTORE_REQUIRED does) does not serve a registered application whose
+/// directory is empty and whose backup holds nothing: it is in the failed list
+/// with the engine's sentence, its token opens nothing, nothing is made for it
+/// on the disk or sent to its backup, and the other applications are served.
+/// Once its backup is complete again, a restart brings it back; or the
+/// console deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_without_its_backup_is_not_served_empty() {
+    use common::{User, user};
+    let (dir, backups) = (temp_dir("unserved"), temp_dir("unserved-backup"));
+    let (restored, again) = (temp_dir("unserved-restored"), temp_dir("unserved-again"));
+
+    // A server with two applications, each with a row, backed up.
+    let server = Server::new(Engine::open(&dir, backed_up_to(&backups)).unwrap(), options());
+    assert!(!server.engine().restore_required(), "Engine::open requires nothing");
+    let (_, shop) = server.create_app("shop", "").unwrap();
+    let (_, blog) = server.create_app("blog", "").unwrap();
+    for name in ["shop", "blog"] {
+        let db = nuage::Embedded::from_engine(server.app_engine(name).unwrap());
+        db.create_table::<User>().await.unwrap();
+        user(&format!("one@{name}.dev"), name, None, 1.0).insert(&db).await.unwrap();
+    }
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    closed(server).await;
+
+    // The copy of the backup missed one file: shop's manifest.
+    let manifest = backups.join("apps/shop/manifest.json");
+    let kept = std::fs::read(&manifest).unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    let before = files_in(&backups.join("apps/shop"));
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.engine().restore_required() && server.engine().backup_status().restored);
+    assert_eq!(names(&server), ["nuage", "blog"]);
+    let sentence = format!(
+        "Nuage DB storage: this directory is empty and {}/apps/shop holds no backup to restore: an empty database \
+         is not started here",
+        backups.display()
+    );
+    let failed = server.failed_apps();
+    assert!(failed.len() == 1 && failed[0].0 == "shop" && failed[0].1.contains(&sentence), "{failed:?}");
+    let said = server.engine().events().0.into_iter().any(|e| {
+        e.level == "error" && e.message.contains("application `shop` cannot be opened") && e.message.contains(&sentence)
+    });
+    assert!(said, "{:?}", server.engine().events().0);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    assert_eq!(info(addr, &shop).await, (401, None), "its token opens nothing");
+    assert_eq!(info(addr, &blog).await, (200, Some("blog".into())));
+    let db = NuageDb::connect(&running.url(), &blog).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    assert!(!restored.join("apps/shop").exists(), "nothing was made for it");
+    assert_eq!(files_in(&backups.join("apps/shop")), before, "nothing was sent to its backup");
+    // The console shows why.
+    let mut c = Console { addr, cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let list = c.request("GET", "/admin", &[]).await;
+    assert!(list.body.contains("cannot be opened") && list.body.contains(&sentence), "{}", list.body);
+    running.shutdown().await;
+    closed(server).await;
+
+    // The copy is completed: a restart brings the application back.
+    std::fs::write(&manifest, &kept).unwrap();
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    assert_eq!(names(&server), ["nuage", "blog", "shop"]);
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    assert_eq!(info(running.local_addr(), &shop).await, (200, Some("shop".into())));
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+
+    // Or the console deletes it, with what is left of its backup.
+    std::fs::remove_file(&manifest).unwrap();
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert_eq!(server.failed_apps().len(), 1);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let mut c = Console { addr: running.local_addr(), cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let settings = c.request("GET", "/admin/apps/shop/settings", &[]).await;
+    assert!(settings.body.contains("could not be opened at startup"), "{}", settings.body);
+    let token = csrf(&settings.body);
+    let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "shop")]).await;
+    assert!(res.body.contains("Application shop deleted"), "{}", res.body);
+    assert!(server.failed_apps().is_empty() && files_in(&backups.join("apps/shop")).is_empty());
+    running.shutdown().await;
+    closed(server).await;
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty() && names(&server) == ["nuage", "blog"]);
+    closed(server).await;
+    for d in [dir, backups, restored, again] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Creating an application is not restoring one: under a server that
+/// requires a restore (here restored from its backup onto an empty disk), a
+/// new application starts empty and is served. A restart on the same disk
+/// keeps it, and once it is backed up, an empty disk gets it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creating_an_application_works_when_a_restore_is_required() {
+    use common::{User, user};
+    let (dir, backups) = (temp_dir("required-create"), temp_dir("required-create-backup"));
+    let (restored, again) = (temp_dir("required-create-restored"), temp_dir("required-create-again"));
+    let server = Server::new(Engine::open(&dir, backed_up_to(&backups)).unwrap(), options());
+    server.engine().backup_now(true).unwrap();
+    closed(server).await;
+
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.engine().restore_required() && server.engine().backup_status().restored);
+    let (_, shop) = server.create_app("shop", "").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    assert_eq!(info(running.local_addr(), &shop).await, (200, Some("shop".into())));
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    db.create_table::<User>().await.unwrap();
+    user("one@shop.dev", "One", None, 1.0).insert(&db).await.unwrap();
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+
+    // The same disk.
+    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    let db = nuage::Embedded::from_engine(server.app_engine("shop").unwrap());
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    for app in server.apps() {
+        server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+    }
+    closed(server).await;
+
+    // An empty disk.
+    let server = Server::new(Engine::open_existing(&again, backed_up_to(&backups)).unwrap(), options());
+    assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let db = NuageDb::connect(&running.url(), &shop).await.unwrap();
+    assert_eq!(User::count(&db).await.unwrap(), 1);
+    drop(db);
+    running.shutdown().await;
+    closed(server).await;
+    for d in [dir, backups, restored, again] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 const NEEDLE: &str = "ONLY-IN-SHOP";
@@ -749,11 +1764,29 @@ fn token_in(page: &str) -> String {
 /// tokens and backups; the console makes, lists and deletes them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn applications() {
+    applications_backed_up(false).await;
+}
+
+/// The same with two backup folders kept in step: each application backs up
+/// under `apps/<name>/` of both, deleting one empties both, and an empty disk
+/// restores them all from either folder alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applications_with_two_backup_folders() {
+    applications_backed_up(true).await;
+}
+
+async fn applications_backed_up(two: bool) {
     use common::{User, user};
-    let dir = temp_dir("apps");
-    let backups = temp_dir("apps-backup");
-    let open = |dir: &std::path::Path| {
-        let mut backup = nuage::BackupOptions::new(Arc::new(nuage::DirectoryStore::new(&backups)));
+    let end = if two { "-two" } else { "" };
+    let dir = temp_dir(&format!("apps{end}"));
+    let backups = temp_dir(&format!("apps-backup{end}"));
+    let second = temp_dir(&format!("apps-second{end}"));
+    // Where the backups are: the folder, and the second one with `two`.
+    let folders: Vec<std::path::PathBuf> =
+        if two { vec![backups.clone(), second.clone()] } else { vec![backups.clone()] };
+    let folder = |at: &std::path::Path| -> Arc<dyn nuage::BackupStore> { Arc::new(nuage::DirectoryStore::new(at)) };
+    let open_to = |dir: &std::path::Path, store: Arc<dyn nuage::BackupStore>| {
+        let mut backup = nuage::BackupOptions::new(store);
         backup.snapshot_every = Duration::from_secs(3600);
         let options = EngineOptions {
             sync: false,
@@ -770,6 +1803,11 @@ async fn applications() {
             }
         }
         panic!("{} stays open", dir.display())
+    };
+    let open = |dir: &std::path::Path| {
+        let store =
+            if two { Arc::new(nuage::MirrorStore::new(folder(&backups), folder(&second))) } else { folder(&backups) };
+        open_to(dir, store)
     };
     let server = Server::new(open(&dir), options());
     let running = server.listen("127.0.0.1:0").await.unwrap();
@@ -857,7 +1895,7 @@ async fn applications() {
 
     // Tokens: a new one, and a revoked one opens nothing.
     let page = c.request("POST", "/admin/apps/shop/tokens", &[("csrf", &token)]).await;
-    let second = token_in(&page.body);
+    let second_token = token_in(&page.body);
     let first_id = server.apps().iter().find(|a| a.name == "shop").unwrap().tokens[0].id.clone();
     let res = c.request("POST", &format!("/admin/apps/shop/tokens/{first_id}/revoke"), &[("csrf", &token)]).await;
     assert!(res.body.contains("revoked"), "{}", res.body);
@@ -865,27 +1903,68 @@ async fn applications() {
         http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {shop_token}"))], "").await.status,
         401
     );
-    let info = http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {second}"))], "").await;
+    let info = http(addr, "GET", "/v1/info", &[("authorization", &format!("Bearer {second_token}"))], "").await;
     let info: serde_json::Value = serde_json::from_str(&info.body).unwrap();
     assert_eq!((info["application"].as_str(), info["encrypted"].as_bool()), (Some("shop"), Some(true)));
 
-    // Backups: each application under its own prefix.
+    // Backups: each application under its own prefix (of each folder).
     for app in server.apps() {
         server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
     }
-    assert!(backups.join("apps/shop/manifest.json").exists() && backups.join("apps/blog/encryption.json").exists());
-    assert_eq!(files_with(&backups, NEEDLE), 0);
+    if two {
+        let shop = server.app_engine("shop").unwrap().backup_status();
+        let to = format!("{}/apps/shop and {}/apps/shop", backups.display(), second.display());
+        assert!(shop.last_ok && shop.target == Some(to), "{shop:?}");
+        // Each destination, in the status and on the console's Storage page.
+        let status: serde_json::Value = serde_json::from_str(&c.request("GET", "/api/status", &[]).await.body).unwrap();
+        let each = status["backup"]["destinations"].as_array().unwrap();
+        let targets: Vec<&str> = each.iter().map(|d| d["target"].as_str().unwrap()).collect();
+        assert_eq!(targets, [backups.display().to_string(), second.display().to_string()]);
+        assert!(each.iter().all(|d| d["last_ok"] == true && d["last_at"].is_string()), "{each:?}");
+        let shop_json = status["databases"].as_array().unwrap().iter().find(|d| d["name"] == "shop").unwrap();
+        let mine = shop_json["backup_destinations"].as_array().unwrap();
+        assert_eq!(mine[1]["target"], format!("{}/apps/shop", second.display()));
+        let storage = c.request("GET", "/admin/apps/shop/storage", &[]).await;
+        assert!(storage.body.contains(&format!("Last backup to {}/apps/shop", second.display())), "{}", storage.body);
+    }
+    for at in &folders {
+        assert!(at.join("apps/shop/manifest.json").exists() && at.join("apps/blog/encryption.json").exists());
+        assert_eq!(files_with(at, NEEDLE), 0);
+    }
 
     // A restart keeps them; an empty disk restores them all.
     running.shutdown().await;
     drop((server, first, shop, blog));
-    for d in [dir.clone(), temp_dir("apps-restored")] {
+    let restored = temp_dir(&format!("apps-restored{end}"));
+    for d in [dir.clone(), restored.clone()] {
         let server = Server::new(open(&d), options());
         assert_eq!(server.apps().len(), 3, "{}", d.display());
+        // The same databases: each goes on backing up in its own place.
+        for app in server.apps() {
+            server.app_engine(&app.name).unwrap().backup_now(true).unwrap();
+        }
         let running = server.listen("127.0.0.1:0").await.unwrap();
-        let shop = NuageDb::connect(&running.url(), &second).await.unwrap();
+        let shop = NuageDb::connect(&running.url(), &second_token).await.unwrap();
         assert_eq!(User::count(&shop).await.unwrap(), 5);
         running.shutdown().await;
+        drop(shop);
+        closed(server).await;
+    }
+    // From either folder alone, too.
+    let alone: Vec<std::path::PathBuf> = folders
+        .iter()
+        .map(|at| temp_dir(&format!("apps-alone{end}-{}", at.file_name().unwrap().to_string_lossy())))
+        .collect();
+    if two {
+        for (at, d) in folders.iter().zip(&alone) {
+            let server = Server::new(open_to(d, folder(at)), options());
+            let apps: Vec<String> = server.apps().into_iter().map(|a| a.name).collect();
+            assert_eq!(apps, ["nuage", "blog", "shop"], "{}", at.display());
+            let db = nuage::Embedded::from_engine(server.app_engine("shop").unwrap());
+            assert_eq!(User::count(&db).await.unwrap(), 5, "{}", at.display());
+            drop(db);
+            closed(server).await;
+        }
     }
 
     // Deleting: only with its name typed, never the first application.
@@ -900,18 +1979,21 @@ async fn applications() {
     let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "shop")]).await;
     assert!(res.body.contains("Application shop deleted"), "{}", res.body);
     assert!(server.app_engine("shop").is_none() && !dir.join("apps/shop").exists());
-    assert!(!backups.join("apps/shop/manifest.json").exists());
+    for at in &folders {
+        assert!(files_in(&at.join("apps/shop")).is_empty(), "{} keeps nothing of it", at.display());
+        assert!(at.join("apps/blog/manifest.json").exists());
+    }
     assert!(server.delete_app("nuage").is_err());
     let settings = c.request("GET", "/admin/apps/nuage/settings", &[]).await;
     assert!(settings.body.contains("cannot be deleted"));
     assert_eq!(
-        http(running.local_addr(), "GET", "/v1/info", &[("authorization", &format!("Bearer {second}"))], "")
+        http(running.local_addr(), "GET", "/v1/info", &[("authorization", &format!("Bearer {second_token}"))], "")
             .await
             .status,
         401
     );
     running.shutdown().await;
-    for d in [dir, backups, temp_dir("apps-restored")] {
+    for d in [dir, backups, second, restored].into_iter().chain(alone) {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
@@ -1729,9 +2811,24 @@ async fn files_through_signed_links() {
 /// `/v1/kv` and the key-value port: the key-value store of each application.
 #[tokio::test]
 async fn key_value_store() {
+    key_value_store_in(engine("kv"), false).await;
+}
+
+/// The same requests and the same answers with the keys in each
+/// application's database (`NUAGE_KV_STORAGE=database`).
+#[tokio::test]
+async fn key_value_store_in_the_database() {
+    let options = EngineOptions { sync: false, kv_in_database: true, ..EngineOptions::default() };
+    key_value_store_in(Engine::open(temp_dir("kv-database"), options).unwrap(), true).await;
+}
+
+/// The key-value store end to end, on a server whose first engine is
+/// `engine`: in memory, or in the databases (`in_database`).
+async fn key_value_store_in(engine: Arc<Engine>, in_database: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let json = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap();
-    let server = Server::new(engine("kv"), ServerOptions { kv_bytes: 1 << 20, ..options() });
+    let storage = if in_database { "database" } else { "memory" };
+    let server = Server::new(engine, ServerOptions { kv_bytes: 1 << 20, ..options() });
     let (_, token) = server.create_app("shop", "").unwrap();
     let read = server.new_app_read_only_token("shop").unwrap();
     let running = server.listen("127.0.0.1:0").await.unwrap();
@@ -1792,7 +2889,10 @@ async fn key_value_store() {
     assert_eq!(list["keys"][0]["key"], "session:42");
     assert_eq!(list["keys"][0]["size"], 6);
     assert_eq!(list["stats"]["keys"], 4);
-    assert_eq!(list["stats"]["max_bytes"], 1 << 20);
+    // In the database, nothing is evicted: no limit.
+    assert_eq!(list["stats"]["max_bytes"], if in_database { 0 } else { 1 << 20 });
+    assert_eq!(list["stats"]["evictions"], 0);
+    assert_eq!(list["stats"]["storage"], storage);
 
     // A read-only token reads, and nothing else; no token, nothing.
     assert_eq!(http(addr, "PUT", "/v1/kv/k", read_only, "v").await.status, 403);
@@ -1926,16 +3026,202 @@ async fn key_value_store() {
         assert!(!kv.delete("job").await.unwrap());
     }
 
-    // The status says what the store holds.
+    // The status says what the store holds, and where.
     let status = json(&http(addr, "GET", "/api/status", write, "").await);
     assert!(status.to_string().contains("\"kv\""), "{status}");
+    assert_eq!(status["databases"][0]["kv"]["storage"], storage, "{status}");
+    let all = server.status();
+    assert!(all["databases"].as_array().unwrap().iter().all(|d| d["kv"]["storage"] == storage), "{all}");
 
     // Everything deleted.
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv/hits", write, "").await)["deleted"], 1);
     assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 4);
     assert_eq!(json(&http(addr, "GET", "/v1/kv", write, "").await)["count"], 0);
+
+    // Many clients at once: each increment counts once, and each one sees
+    // its own value.
+    let clients: Vec<_> = (0..20)
+        .map(|_| {
+            let header = format!("Bearer {token}");
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..10 {
+                    let res = http(addr, "POST", "/v1/kv/racing?incr", &[("authorization", &header)], "").await;
+                    seen.push(serde_json::from_str::<serde_json::Value>(&res.body).unwrap()["value"].as_i64().unwrap());
+                }
+                seen
+            })
+        })
+        .collect();
+    let mut seen = Vec::new();
+    for client in clients {
+        seen.extend(client.await.unwrap());
+    }
+    seen.sort();
+    assert_eq!(seen, (1..=200).collect::<Vec<i64>>());
+    assert_eq!(http(addr, "GET", "/v1/kv/racing", read_only, "").await.body, "200");
+    assert_eq!(json(&http(addr, "DELETE", "/v1/kv", write, "").await)["deleted"], 1);
     port.shutdown().await;
     running.shutdown().await;
+}
+
+/// The keys in the database are in its backup: written over HTTP and over
+/// the port, they come back on a server whose disk is empty, with their
+/// expiry dates; the first application's too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_key_value_store_in_the_database_comes_back_with_the_backup() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (dir, backups, restored) = (temp_dir("kv-backed"), temp_dir("kv-backed-up"), temp_dir("kv-backed-restored"));
+    let engine_options = EngineOptions { kv_in_database: true, ..backed_up_to(&backups) };
+    let server = Server::new(Engine::open(&dir, engine_options.clone()).unwrap(), options());
+    let (_, token) = server.create_app("shop", "").unwrap();
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let port = server.listen_kv("127.0.0.1:0", nuage::KvOptions::default()).await.unwrap();
+    let addr = running.local_addr();
+    let shop = format!("Bearer {token}");
+    let shop: &[(&str, &str)] = &[("authorization", &shop)];
+    let first: &[(&str, &str)] = &[("authorization", "Bearer t0ken")];
+    assert_eq!(http(addr, "PUT", "/v1/kv/session?ttl=600", shop, "ada").await.status, 200);
+    assert_eq!(http(addr, "POST", "/v1/kv/visits?incr=41", shop, "").await.status, 200);
+    assert_eq!(http(addr, "PUT", "/v1/kv/of-the-first", first, "1").await.status, 200);
+    let secret = "KV-SECRET-4f1c9e";
+    assert_eq!(http(addr, "PUT", "/v1/kv/secret", shop, secret).await.status, 200);
+    let mut conn = TcpStream::connect(port.local_addr()).await.unwrap();
+    let mut wire = Vec::new();
+    for command in [
+        &["AUTH", token.as_str()][..],
+        &["SET", "from-the-port", "yes"],
+        &["MULTI"],
+        &["INCR", "visits"],
+        &["SET", "in-a-transaction", "yes"],
+        &["EXEC"],
+    ] {
+        wire.extend_from_slice(format!("*{}\r\n", command.len()).as_bytes());
+        for arg in command {
+            wire.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+    }
+    conn.write_all(&wire).await.unwrap();
+    let mut answer = String::new();
+    while !answer.ends_with("*2\r\n:42\r\n+OK\r\n") {
+        let mut buf = [0u8; 256];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n > 0, "{answer:?}");
+        answer.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert_eq!(answer, "+OK\r\n+OK\r\n+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:42\r\n+OK\r\n");
+    drop(conn);
+    for app in server.apps() {
+        let engine = server.app_engine(&app.name).unwrap();
+        engine.checkpoint().unwrap();
+        engine.backup_now(true).unwrap();
+    }
+    // Encrypted like the rows: on the disk and in the backup.
+    assert_eq!((files_with(&dir, secret), files_with(&backups, secret)), (0, 0));
+    port.shutdown().await;
+    running.shutdown().await;
+    closed(server).await;
+
+    // A new disk: everything is restored from the backup, the keys with it.
+    let server = Server::new(Engine::open(&restored, engine_options).unwrap(), options());
+    assert!(server.app_engine("shop").unwrap().backup_status().restored);
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let addr = running.local_addr();
+    let got = http(addr, "GET", "/v1/kv/session", shop, "").await;
+    assert_eq!((got.status, got.body.as_str()), (200, "ada"));
+    let ttl: u64 = got.headers["nuage-ttl-ms"].to_str().unwrap().parse().unwrap();
+    assert!(ttl > 500_000 && ttl <= 600_000, "the same date: {ttl}");
+    for (key, value) in [("visits", "42"), ("from-the-port", "yes"), ("in-a-transaction", "yes"), ("secret", secret)] {
+        assert_eq!(http(addr, "GET", &format!("/v1/kv/{key}"), shop, "").await.body, value, "{key}");
+    }
+    assert_eq!(http(addr, "GET", "/v1/kv/of-the-first", first, "").await.body, "1");
+    assert_eq!(http(addr, "GET", "/v1/kv/of-the-first", shop, "").await.status, 404, "each its own");
+    let list: serde_json::Value = serde_json::from_str(&http(addr, "GET", "/v1/kv", shop, "").await.body).unwrap();
+    assert_eq!((list["count"].as_u64(), list["stats"]["storage"].as_str()), (Some(5), Some("database")));
+    running.shutdown().await;
+    closed(server).await;
+    for d in [dir, backups, restored] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Going back to memory leaves the keys in the database, unread: they are
+/// there again when the setting comes back. Nothing is dropped at start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn back_to_memory_leaves_the_keys_where_they_are() {
+    let dir = temp_dir("kv-back");
+    let start = async |kv_in_database: bool| {
+        let engine_options = EngineOptions { sync: false, kv_in_database, ..EngineOptions::default() };
+        let engine = (0..400)
+            .find_map(|_| match Engine::open(&dir, engine_options.clone()) {
+                Ok(e) => Some(e),
+                Err(e) if e.to_string().contains("already open") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(e) => panic!("{e}"),
+            })
+            .expect("opens again");
+        let server = Server::new(engine, options());
+        let running = server.listen("127.0.0.1:0").await.unwrap();
+        (server, running)
+    };
+    let token: &[(&str, &str)] = &[("authorization", "Bearer t0ken")];
+    let storage = |r: &Http| serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["stats"]["storage"].clone();
+
+    let (server, running) = start(true).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "PUT", "/v1/kv/kept", token, "in the database").await.status, 200);
+    assert_eq!(storage(&http(addr, "GET", "/v1/kv", token, "").await), "database");
+    running.shutdown().await;
+    closed(server).await;
+
+    let (server, running) = start(false).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "GET", "/v1/kv/kept", token, "").await.status, 404, "not read in memory");
+    assert_eq!(http(addr, "PUT", "/v1/kv/fleeting", token, "in memory").await.status, 200);
+    assert_eq!(storage(&http(addr, "GET", "/v1/kv", token, "").await), "memory");
+    running.shutdown().await;
+    closed(server).await;
+
+    let (server, running) = start(true).await;
+    let addr = running.local_addr();
+    assert_eq!(http(addr, "GET", "/v1/kv/kept", token, "").await.body, "in the database");
+    assert_eq!(http(addr, "GET", "/v1/kv/fleeting", token, "").await.status, 404);
+    running.shutdown().await;
+    closed(server).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The binary says at startup where the key-value stores are when they are in
+/// the databases, and nothing without the setting; a value mistyped stops it.
+#[test]
+fn the_server_says_where_the_key_value_stores_are() {
+    let data = temp_dir("bin-kv-storage");
+    let (key, data_dir) = ("07".repeat(32), data.display().to_string());
+    let binary = |storage: Option<&str>| {
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data_dir.as_str()),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend(storage.map(|s| ("NUAGE_KV_STORAGE", s)));
+        nuage_binary(&vars)
+    };
+    let said = "nuage: key-value stores are kept in each application's database (NUAGE_KV_STORAGE=database): they \
+                survive a restart and are in the backups; a write waits for the disk";
+    let out = started(binary(Some("database"))).0.join("\n");
+    assert!(out.contains(said), "{out}");
+    let out = started(binary(None)).0.join("\n");
+    assert!(!out.contains("key-value stores are kept"), "{out}");
+    let (code, err) = stopped(binary(Some("disk")));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("nuage: configuration error: ") && err.contains("NUAGE_KV_STORAGE=`disk`: `memory` or `database`"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&data);
 }
 
 #[tokio::test]
@@ -2143,5 +3429,512 @@ async fn settings_change_while_the_server_runs() {
         let r = http(addr, "POST", "/api/apps/shop/memory", auth, "[1]").await;
         assert_eq!(r.status, 400, "{}", r.body);
         running.shutdown().await;
+    }
+}
+
+/// The stop of the binary (SIGTERM) while its second backup destination
+/// hangs (a network folder that never answers: here, a file that cannot be
+/// read until something writes to it). The first gets every commit, the
+/// stop gives the second 20 seconds and says so, and the process ends: a
+/// new disk restored from the first alone has every row. A Back up now
+/// clicked meanwhile says, within seconds, that a round to the second is
+/// still running, and holds neither the stop nor the end of the process.
+#[cfg(unix)]
+#[test]
+fn the_stop_ends_while_the_second_destination_hangs() {
+    let (data, again, one, two) =
+        (temp_dir("bin-hang-data"), temp_dir("bin-hang-again"), temp_dir("bin-hang-one"), temp_dir("bin-hang-two"));
+    for folder in [&one, &two] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    // Reading it waits for a writer that never comes.
+    let fifo = two.join("encryption.json");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let key = "07".repeat(32);
+    let (one_dir, two_dir) = (one.display().to_string(), two.display().to_string());
+    let binary = |data: &std::path::Path, extra: &[(&str, &str)]| {
+        let data = data.display().to_string();
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_TOKEN", "t0ken"),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend_from_slice(extra);
+        nuage_binary(&vars)
+    };
+    let (server, _) = running(binary(
+        &data,
+        &[
+            ("NUAGE_BACKUP_DIR", one_dir.as_str()),
+            ("NUAGE_BACKUP2_DIR", two_dir.as_str()),
+            ("NUAGE_ADMIN_PASSWORD", "correct horse"),
+        ],
+    ));
+    // The first round: the first gets its snapshot, the second hangs.
+    for _ in 0..500 {
+        if one.join("manifest.json").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(one.join("manifest.json").exists(), "no snapshot in the first");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let sql = |statement: &str| {
+        let body = serde_json::json!({ "sql": statement, "params": [] }).to_string();
+        let res = runtime.block_on(http(server.addr, "POST", "/v1/sql", &[("authorization", "Bearer t0ken")], &body));
+        assert_eq!(res.status, 200, "{}", res.body);
+    };
+    sql("CREATE TABLE notes (id BIGINT PRIMARY KEY AUTOINCREMENT, body TEXT)");
+    for n in 0..20 {
+        sql(&format!("INSERT INTO notes (body) VALUES ('note {n}')"));
+    }
+    // Back up now, from the console, while the round to the second hangs.
+    let addr = server.addr;
+    let clicked = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut c = Console { addr, cookies: HashMap::new() };
+            let login = c.request("GET", "/admin/login", &[]).await;
+            c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+            let token = csrf(&c.request("GET", "/admin/apps/nuage/storage", &[]).await.body);
+            c.request("POST", "/admin/apps/nuage/storage/backup", &[("csrf", &token)]).await.body
+        })
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let started = std::time::Instant::now();
+    let (code, rest, err) = server.stop();
+    let took = started.elapsed();
+    assert_eq!(code, Some(0), "{rest:?}\n{err}");
+    assert!(took < Duration::from_secs(28), "{took:?}");
+    let rest = rest.join("\n");
+    assert!(rest.contains("the second backup destination did not get everything within 20 seconds"), "{rest}");
+    let page = clicked.join().unwrap();
+    assert!(page.contains("a backup round to it has been running for"), "{page}");
+    let (server, out) = running(binary(&again, &[("NUAGE_BACKUP_DIR", one_dir.as_str())]));
+    assert!(out.join("\n").contains("restored from the backup"), "{out:?}");
+    let body = serde_json::json!({ "sql": "SELECT COUNT(*) AS n FROM notes", "params": [] }).to_string();
+    let res = runtime.block_on(http(server.addr, "POST", "/v1/sql", &[("authorization", "Bearer t0ken")], &body));
+    assert!(res.status == 200 && res.body.contains("20"), "{}", res.body);
+    let _ = server.stop();
+    for d in [data, again, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A store whose deletions fail: a destination that refuses them (a quota,
+/// credentials that may read and write but not delete).
+struct NoDeletes(nuage::DirectoryStore);
+
+impl nuage::BackupStore for NoDeletes {
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+    fn put(&self, name: &str, data: &[u8]) -> memoire_orm::Result<()> {
+        self.0.put(name, data)
+    }
+    fn put_file(&self, name: &str, path: &std::path::Path) -> memoire_orm::Result<()> {
+        self.0.put_file(name, path)
+    }
+    fn get(&self, name: &str) -> memoire_orm::Result<Option<Vec<u8>>> {
+        self.0.get(name)
+    }
+    fn list(&self, prefix: &str) -> memoire_orm::Result<Vec<String>> {
+        self.0.list(prefix)
+    }
+    fn delete(&self, name: &str) -> memoire_orm::Result<()> {
+        let e = std::io::Error::other(format!("{} refuses to delete {name}", self.describe()));
+        Err(memoire_orm::Error::Database(Box::new(e)))
+    }
+}
+
+/// Deleting an application while one destination cannot be emptied: the
+/// console and the event log say which one still holds its backup, and no
+/// application of that name can be created until it is gone there, instead
+/// of starting with the deleted one's rows. Once it is gone, a new one
+/// starts empty.
+#[tokio::test]
+async fn an_application_whose_backup_stays_is_not_created_again() {
+    use common::{User, user};
+    let (dir, one, two) = (temp_dir("kept-data"), temp_dir("kept-one"), temp_dir("kept-two"));
+    let store: Arc<dyn nuage::BackupStore> = Arc::new(nuage::MirrorStore::new(
+        Arc::new(nuage::DirectoryStore::new(&one)),
+        Arc::new(NoDeletes(nuage::DirectoryStore::new(&two))),
+    ));
+    let settings = EngineOptions { backup: Some(nuage::BackupOptions::new(store)), ..backed_up_to(&one) };
+    let server = Server::new(Engine::open(&dir, settings).unwrap(), options());
+    server.create_app("shop", "").unwrap();
+    let shop = nuage::Embedded::from_engine(server.app_engine("shop").unwrap());
+    shop.create_table::<User>().await.unwrap();
+    user("kept@shop.dev", "Kept", None, 1.0).insert(&shop).await.unwrap();
+    drop(shop);
+    server.app_engine("shop").unwrap().backup_now(true).unwrap();
+    for place in [&one, &two] {
+        assert!(place.join("apps/shop/manifest.json").exists(), "{}", place.display());
+    }
+    let running = server.listen("127.0.0.1:0").await.unwrap();
+    let mut c = Console { addr: running.local_addr(), cookies: HashMap::new() };
+    let login = c.request("GET", "/admin/login", &[]).await;
+    c.request("POST", "/admin/login", &[("csrf", &csrf(&login.body)), ("password", "correct horse")]).await;
+    let token = csrf(&c.request("GET", "/admin/apps/shop/settings", &[]).await.body);
+    let res = c.request("POST", "/admin/apps/shop/delete", &[("csrf", &token), ("confirm", "shop")]).await;
+    let kept = format!("{}/apps/shop", two.display());
+    assert!(res.body.contains("Application shop deleted, with its data, but its backup is still in"), "{}", res.body);
+    assert!(res.body.contains(&kept), "{}", res.body);
+    let said = format!("application `shop` deleted, with its data, but its backup is still in {kept} (");
+    assert!(server.engine().events().0.iter().any(|e| e.level == "error" && e.message.starts_with(&said)));
+    assert!(!one.join("apps/shop/manifest.json").exists(), "the first is emptied");
+    // Not again under that name while the backup is there.
+    let e = server.create_app("shop", "").unwrap_err().to_string();
+    assert!(
+        e.contains(&format!("{kept} still holds the backup of an application named `shop`, deleted earlier")),
+        "{e}"
+    );
+    assert!(server.app_engine("shop").is_none() && !dir.join("apps/shop").exists());
+    // Gone there: a new application, empty.
+    std::fs::remove_dir_all(two.join("apps/shop")).unwrap();
+    server.create_app("shop", "").unwrap();
+    let tables = nuage::Embedded::from_engine(server.app_engine("shop").unwrap()).tables().unwrap();
+    assert!(tables.is_empty(), "{tables:?}");
+    running.shutdown().await;
+    closed(server).await;
+    for d in [dir, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A backup folder that holds every call while `hang` is set (a network
+/// folder that stops answering), and takes `slow_snapshots` milliseconds to
+/// upload each snapshot (a slow line).
+struct Gate {
+    folder: nuage::DirectoryStore,
+    hang: std::sync::atomic::AtomicBool,
+    held: std::sync::atomic::AtomicUsize,
+    slow_snapshots: std::sync::atomic::AtomicU64,
+    snapshots_begun: std::sync::atomic::AtomicUsize,
+}
+
+impl Gate {
+    fn new(root: &std::path::Path) -> Arc<Gate> {
+        Arc::new(Gate {
+            folder: nuage::DirectoryStore::new(root),
+            hang: Default::default(),
+            held: Default::default(),
+            slow_snapshots: Default::default(),
+            snapshots_begun: Default::default(),
+        })
+    }
+
+    fn set_hang(&self, hang: bool) {
+        self.hang.store(hang, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn answer(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.hang.load(SeqCst) {
+            self.held.fetch_add(1, SeqCst);
+            while self.hang.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.held.fetch_sub(1, SeqCst);
+        }
+    }
+
+    /// Waits until a call is held.
+    fn wait_held(&self) {
+        for _ in 0..2000 {
+            if self.held.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no call reached {}", nuage::BackupStore::describe(&self.folder));
+    }
+
+    /// Waits until a snapshot upload begins after `before` began.
+    fn wait_snapshot(&self, before: usize) {
+        for _ in 0..2000 {
+            if self.snapshots_begun.load(std::sync::atomic::Ordering::SeqCst) > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no snapshot reached {}", nuage::BackupStore::describe(&self.folder));
+    }
+}
+
+impl nuage::BackupStore for Gate {
+    fn describe(&self) -> String {
+        self.folder.describe()
+    }
+    fn put(&self, name: &str, data: &[u8]) -> memoire_orm::Result<()> {
+        self.answer();
+        self.folder.put(name, data)
+    }
+    fn put_file(&self, name: &str, path: &std::path::Path) -> memoire_orm::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.answer();
+        if name.contains("snapshots/") {
+            // Read at once, as an upload does, then on the line for a while.
+            let data = std::fs::read(path).unwrap();
+            self.snapshots_begun.fetch_add(1, SeqCst);
+            std::thread::sleep(Duration::from_millis(self.slow_snapshots.load(SeqCst)));
+            return self.folder.put(name, &data);
+        }
+        self.folder.put_file(name, path)
+    }
+    fn get(&self, name: &str) -> memoire_orm::Result<Option<Vec<u8>>> {
+        self.answer();
+        self.folder.get(name)
+    }
+    fn list(&self, prefix: &str) -> memoire_orm::Result<Vec<String>> {
+        self.answer();
+        self.folder.list(prefix)
+    }
+    fn delete(&self, name: &str) -> memoire_orm::Result<()> {
+        self.answer();
+        self.folder.delete(name)
+    }
+}
+
+/// The files under `dir`, by their path from there (none when it is missing).
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// A server backed up to the folder `one` and to `two`, with its data in
+/// `dir`.
+fn server_backed_up_to(dir: &std::path::Path, one: &std::path::Path, two: Arc<Gate>) -> Server {
+    let store: Arc<dyn nuage::BackupStore> =
+        Arc::new(nuage::MirrorStore::new(Arc::new(nuage::DirectoryStore::new(one)), two));
+    let settings = EngineOptions { backup: Some(nuage::BackupOptions::new(store)), ..backed_up_to(one) };
+    Server::new(Engine::open(dir, settings).unwrap(), options())
+}
+
+/// Deleting an application while a backup round sends a snapshot of it: the
+/// deletion waits for that round, then empties each destination, so that
+/// nothing of the deleted application is written there afterwards. A new
+/// application of the same name then starts empty, and its backup is its
+/// own: the second destination alone restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_an_application_waits_for_its_backup_round() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (dir, one, two) = (temp_dir("delete-round-data"), temp_dir("delete-round-one"), temp_dir("delete-round-two"));
+    let gate = Gate::new(&two);
+    let server = server_backed_up_to(&dir, &one, gate.clone());
+    server.create_app("shop", "").unwrap();
+    let shop = server.app_engine("shop").unwrap();
+    let db = nuage::Embedded::from_engine(shop.clone());
+    db.sql("CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT)", &[]).unwrap();
+    db.sql("INSERT INTO notes (id, body) VALUES (1, 'the old shop')", &[]).unwrap();
+    drop(db);
+    shop.backup_now(true).unwrap();
+    // The server's own database has sent its first snapshots too.
+    for _ in 0..500 {
+        if server.engine().backup_status().last_at.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(server.engine().backup_status().last_at.is_some());
+    // A snapshot on its way to the second when it is deleted.
+    gate.slow_snapshots.store(3000, SeqCst);
+    let before = gate.snapshots_begun.load(SeqCst);
+    let sending = shop.clone();
+    let round = std::thread::spawn(move || sending.backup_to(1, true));
+    gate.wait_snapshot(before);
+    drop(shop);
+    let started = std::time::Instant::now();
+    assert!(server.delete_app("shop").unwrap());
+    assert!(started.elapsed() > Duration::from_secs(2), "it waited for the round: {:?}", started.elapsed());
+    assert!(round.is_finished(), "the round ended before the second was emptied");
+    let _ = round.join();
+    let said = "application `shop` deleted, with its data and backups";
+    assert!(server.engine().events().0.iter().any(|e| e.message == said), "{:?}", server.engine().events().0);
+    std::thread::sleep(Duration::from_millis(500));
+    for place in [&one, &two] {
+        assert_eq!(files_under(&place.join("apps/shop")), Vec::<String>::new(), "{}", place.display());
+    }
+    // A new one of that name, with a backup of its own.
+    gate.slow_snapshots.store(0, SeqCst);
+    server.create_app("shop", "").unwrap();
+    let shop = server.app_engine("shop").unwrap();
+    let db = nuage::Embedded::from_engine(shop.clone());
+    assert!(db.tables().unwrap().is_empty());
+    db.sql("CREATE TABLE fresh (id BIGINT PRIMARY KEY, body TEXT)", &[]).unwrap();
+    db.sql("INSERT INTO fresh (id, body) VALUES (1, 'the new shop')", &[]).unwrap();
+    drop(db);
+    shop.backup_now(true).unwrap();
+    drop(shop);
+    let fresh = temp_dir("delete-round-fresh");
+    let from_two: Arc<dyn nuage::BackupStore> =
+        Arc::new(nuage::PrefixedStore::new(Arc::new(nuage::DirectoryStore::new(&two)), "apps/shop/"));
+    let restored =
+        Engine::open(&fresh, EngineOptions { backup: Some(nuage::BackupOptions::new(from_two)), ..backed_up_to(&one) })
+            .unwrap();
+    let tables: Vec<String> =
+        nuage::Embedded::from_engine(restored.clone()).tables().unwrap().into_iter().map(|t| t.name).collect();
+    assert_eq!(tables, ["fresh"]);
+    let gone = Arc::downgrade(&restored);
+    drop(restored);
+    tokio::task::spawn_blocking(move || all_closed(&[gone])).await.unwrap();
+    closed(server).await;
+    for d in [dir, one, two, fresh] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A second destination that stops answering (a network folder that hangs)
+/// holds no other change to the applications: creating one says, within
+/// seconds, that the destination could not be checked; deleting one says
+/// which destination still holds its backup, whose emptying goes on; and
+/// meanwhile a token, a website or a description is changed at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_that_hangs_holds_no_other_change() {
+    let (dir, one, two) = (temp_dir("hang-apps-data"), temp_dir("hang-apps-one"), temp_dir("hang-apps-two"));
+    let gate = Gate::new(&two);
+    let server = server_backed_up_to(&dir, &one, gate.clone());
+    server.create_app("blog", "").unwrap();
+    server.app_engine("blog").unwrap().backup_now(true).unwrap();
+    gate.set_hang(true);
+    let at_once = |what: &str, change: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        change();
+        assert!(started.elapsed() < Duration::from_secs(2), "{what}: {:?}", started.elapsed());
+    };
+    std::thread::scope(|s| {
+        let started = std::time::Instant::now();
+        let creating = s.spawn(|| server.create_app("shop", ""));
+        gate.wait_held();
+        at_once("a token", &|| drop(server.new_app_token("blog").unwrap()));
+        at_once("a website", &|| drop(server.set_app_origins("blog", &["https://blog.example"]).unwrap()));
+        let e = creating.join().unwrap().unwrap_err().to_string();
+        let said = format!("cannot check that {}/apps/shop holds no backup", two.display());
+        assert!(e.contains(&said) && e.contains("did not answer within 10 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(server.app_engine("shop").is_none() && !dir.join("apps/shop").exists());
+
+        let started = std::time::Instant::now();
+        let deleting = s.spawn(|| server.delete_app("blog"));
+        std::thread::sleep(Duration::from_millis(300));
+        at_once("a token", &|| drop(server.new_app_token(&server.engine().options().name.clone()).unwrap()));
+        assert!(deleting.join().unwrap().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        let said =
+            format!("application `blog` deleted; its backup is still in {}/apps/blog (not emptied", two.display());
+        assert!(
+            server.engine().events().0.iter().any(|e| e.message.starts_with(&said)),
+            "{:?}",
+            server.engine().events().0
+        );
+        assert!(files_under(&one.join("apps/blog")).is_empty(), "the first is emptied");
+        let e = server.create_app("blog", "").unwrap_err().to_string();
+        assert!(e.contains("the application named `blog` is being deleted"), "{e}");
+    });
+    // It answers again: the deletion ends, and the name is free.
+    gate.set_hang(false);
+    let deleted = "application `blog` deleted, with its data and backups";
+    for _ in 0..500 {
+        if server.engine().events().0.iter().any(|e| e.message == deleted) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(files_under(&two.join("apps/blog")).is_empty() && !dir.join("apps/blog").exists());
+    server.create_app("blog", "").unwrap();
+    closed(server).await;
+    for d in [dir, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The binary's stop while its first backup destination hangs (a folder
+/// whose `encryption.json` is a FIFO): the upkeep kept sending to the
+/// second, the stop sends the last commits to the second at the same time
+/// as it waits for the first, and says so. A new disk restored from the
+/// second alone has every row.
+#[cfg(unix)]
+#[test]
+fn the_stop_sends_to_the_second_while_the_first_hangs() {
+    let (data, again, one, two) = (
+        temp_dir("bin-first-hang-data"),
+        temp_dir("bin-first-hang-again"),
+        temp_dir("bin-first-hang-one"),
+        temp_dir("bin-first-hang-two"),
+    );
+    for folder in [&one, &two] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let fifo = one.join("encryption.json");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let key = "07".repeat(32);
+    let (one_dir, two_dir) = (one.display().to_string(), two.display().to_string());
+    let binary = |data: &std::path::Path, extra: &[(&str, &str)]| {
+        let data = data.display().to_string();
+        let mut vars = vec![
+            ("NUAGE_ENCRYPTION_KEY", key.as_str()),
+            ("NUAGE_DATA_DIR", data.as_str()),
+            ("NUAGE_TOKEN", "t0ken"),
+            ("PORT", "0"),
+            ("NUAGE_BIND", "127.0.0.1"),
+        ];
+        vars.extend_from_slice(extra);
+        nuage_binary(&vars)
+    };
+    let (mut server, _) =
+        running(binary(&data, &[("NUAGE_BACKUP_DIR", one_dir.as_str()), ("NUAGE_BACKUP2_DIR", two_dir.as_str())]));
+    // The first round: the second gets its snapshot, the first hangs.
+    for _ in 0..500 {
+        if two.join("manifest.json").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(two.join("manifest.json").exists(), "no snapshot in the second");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let sql = |addr: SocketAddr, statement: &str| {
+        let body = serde_json::json!({ "sql": statement, "params": [] }).to_string();
+        runtime.block_on(http(addr, "POST", "/v1/sql", &[("authorization", "Bearer t0ken")], &body))
+    };
+    assert_eq!(sql(server.addr, "CREATE TABLE notes (id BIGINT PRIMARY KEY AUTOINCREMENT, body TEXT)").status, 200);
+    for n in 0..20 {
+        assert_eq!(sql(server.addr, &format!("INSERT INTO notes (body) VALUES ('note {n}')")).status, 200);
+    }
+    // SAFETY: the pid is our child's, still running.
+    assert_eq!(unsafe { libc::kill(server.child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    let waiting = "the first backup destination has not got everything after 20 seconds, and the second has \
+                   everything: the stop waits for it";
+    let mut seen = Vec::new();
+    while let Ok(line) = server.lines.recv_timeout(Duration::from_secs(40)) {
+        seen.push(line.clone());
+        if line.contains(waiting) {
+            break;
+        }
+    }
+    assert!(seen.iter().any(|l| l.contains(waiting)), "{seen:#?}");
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+    let (server, out) = running(binary(&again, &[("NUAGE_BACKUP_DIR", two_dir.as_str())]));
+    assert!(out.join("\n").contains("restored from the backup"), "{out:?}");
+    let res = sql(server.addr, "SELECT COUNT(*) AS n FROM notes");
+    assert!(res.status == 200 && res.body.contains("20"), "{}", res.body);
+    let _ = server.stop();
+    for d in [data, again, one, two] {
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

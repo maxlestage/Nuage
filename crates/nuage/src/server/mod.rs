@@ -641,7 +641,7 @@ impl Server {
     /// Deletes the application `name`, its data and its backups (not the
     /// first one).
     pub fn delete_app(&self, name: &str) -> Result<bool> {
-        self.state.apps.delete(name)
+        Ok(self.state.apps.delete(name)?.is_some())
     }
 
     /// Saves a setting, as the console's Settings page does (`None` gives it
@@ -1209,8 +1209,9 @@ impl State {
         }
         place.check_folder(self.engine.dir())?;
         let store = place.store()?;
-        if let Some(b) = environment {
-            let (a, b) = (store.describe(), b.store.describe());
+        // Each destination of the environment (the first, and NUAGE_BACKUP2_* when set).
+        for existing in environment.map(|b| crate::engine::backup::places(&b.store)).unwrap_or_default() {
+            let (a, b) = (store.describe(), existing.describe());
             let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
             if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")) {
                 return Err(Refusal::new(refused::SAME, &[&place.describe()]));

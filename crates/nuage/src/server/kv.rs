@@ -1,5 +1,8 @@
-//! `/v1/kv`: the key-value store of an application, in memory (see
-//! [`crate::kv`]): a cache, counters, locks.
+//! `/v1/kv`: the key-value store of an application (see [`crate::kv`]): a
+//! cache, counters, locks. It is in the server's memory, or in the
+//! application's database with `NUAGE_KV_STORAGE=database` (the same
+//! requests, the same answers; a write then waits for the disk, and a write
+//! the disk refuses is the server's storage error).
 //!
 //! | Request | What |
 //! |---|---|
@@ -16,6 +19,8 @@
 //! takes 10,000 commands at most, and its answers 16 MiB
 //! ([`MAX_ANSWER`](crate::kv::MAX_ANSWER)): past that, the commands left are
 //! not run and answer an error.
+//! A read-only token reads; writing takes a read-write token. The figures
+//! say where the keys are: `"storage": "memory"` or `"database"`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +33,18 @@ use serde_json::{Value as Json, json};
 
 use super::limits::{MAX_KV_COMMANDS, too_large, unblocked};
 use super::{HttpBody, READ_ONLY, State, apps::App, forbidden, full, json_body, json_response, read_body};
+use crate::kv::database::AppKv;
 use crate::kv::{KvError, MAX_ANSWER, Reply, SetOptions, Ttl};
+
+/// Runs `f` on the key-value store of `app`: where it is in memory, on the
+/// blocking threads in the database (a call reads or waits for the disk).
+pub(super) async fn on<T: Send + 'static>(app: &Arc<App>, f: impl FnOnce(&AppKv) -> T + Send + 'static) -> Result<T> {
+    if !app.kv.in_database() {
+        return Ok(f(&app.kv));
+    }
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || f(&app.kv)).await.map_err(|e| Error::Pool(e.to_string()))
+}
 
 fn refusal(status: u16, kind: &str, message: impl Into<String>) -> Response<HttpBody> {
     json_response(status, &json!({ "error": { "kind": kind, "message": message.into() } }))
@@ -130,7 +146,6 @@ pub(super) async fn route(
     read_only: bool,
     req: Request<Incoming>,
 ) -> Result<Response<HttpBody>> {
-    let kv = &app.kv;
     let method = req.method().clone();
     let query = req.uri().query().unwrap_or_default().to_owned();
     let raw = req.uri().path().strip_prefix("/v1/kv").unwrap_or_default().to_owned();
@@ -142,12 +157,12 @@ pub(super) async fn route(
             Method::GET => {
                 let prefix = param(&query, "prefix").map(|p| decode(p, true)).unwrap_or_default();
                 let limit = param(&query, "limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(1000).min(10_000);
-                let keys: Vec<Json> = kv
-                    .keys(&prefix, limit)
+                let keys: Vec<Json> = on(app, move |kv| kv.keys(&prefix, limit))
+                    .await??
                     .into_iter()
                     .map(|k| json!({ "key": String::from_utf8_lossy(&k.key), "size": k.size, "ttl_ms": ttl_json(k.ttl) }))
                     .collect();
-                let s = kv.stats();
+                let s = on(app, |kv| kv.stats()).await??;
                 Ok(json_response(
                     200,
                     &json!({
@@ -156,12 +171,13 @@ pub(super) async fn route(
                         "stats": {
                             "keys": s.keys, "expiring": s.expiring, "bytes": s.bytes, "max_bytes": s.max_bytes,
                             "hits": s.hits, "misses": s.misses, "evictions": s.evictions, "expired": s.expired,
+                            "storage": app.kv.storage(),
                         },
                     }),
                 ))
             }
             Method::DELETE if read_only => Ok(forbidden(READ_ONLY)),
-            Method::DELETE => Ok(json_response(200, &json!({ "deleted": kv.clear() }))),
+            Method::DELETE => Ok(json_response(200, &json!({ "deleted": on(app, |kv| kv.clear()).await?? }))),
             Method::POST => {
                 let (body, _held) = json_body(state, req).await?;
                 let list = body.get("commands").unwrap_or(&body);
@@ -180,23 +196,32 @@ pub(super) async fn route(
                         return Ok(refusal(400, "validation", BAD_COMMAND));
                     };
                     drop(body);
-                    // The answers together are bounded as one command's are: past
-                    // the bound, the commands left are not run.
-                    let mut size = 0usize;
-                    let replies: Vec<Reply> = commands
-                        .iter()
-                        .map(|c| {
+                    // In the database, the list is one call: one record for all it writes.
+                    // The answers together are bounded as one command's are: past the
+                    // bound, the commands left are not run.
+                    let (replies, size) = on(app, move |kv| {
+                        if kv.in_database() {
+                            return kv.transaction(&commands, read_only).map(|replies| {
+                                let size = replies.iter().map(Reply::weight).sum::<usize>();
+                                (replies, size)
+                            });
+                        }
+                        let (mut replies, mut size) = (Vec::with_capacity(commands.len()), 0usize);
+                        for c in &commands {
                             if size > MAX_ANSWER {
-                                return Reply::Error(format!(
+                                replies.push(Reply::Error(format!(
                                     "ERR the answers of this request passed {} MiB: the commands after were not run",
                                     MAX_ANSWER >> 20
-                                ));
+                                )));
+                                continue;
                             }
-                            let reply = kv.command(c, read_only);
+                            let reply = kv.command(c, read_only)?;
                             size = size.saturating_add(reply.weight());
-                            reply
-                        })
-                        .collect();
+                            replies.push(reply);
+                        }
+                        Ok((replies, size))
+                    })
+                    .await??;
                     return answer(
                         size,
                         move || json!({ "results": replies.into_iter().map(reply_json).collect::<Vec<_>>() }),
@@ -207,7 +232,7 @@ pub(super) async fn route(
                     return Ok(refusal(400, "validation", BAD_COMMAND));
                 };
                 drop(body);
-                match kv.command(&command, read_only) {
+                match on(app, move |kv| kv.command(&command, read_only)).await?? {
                     Reply::Error(e) if e.starts_with("READONLY") => Ok(forbidden(READ_ONLY)),
                     Reply::Error(e) => Ok(refusal(400, "validation", e.strip_prefix("ERR ").unwrap_or(&e))),
                     reply => answer(reply.weight(), move || json!({ "result": reply_json(reply) })).await,
@@ -221,7 +246,7 @@ pub(super) async fn route(
         return Ok(forbidden(READ_ONLY));
     }
     match method {
-        Method::GET | Method::HEAD => match kv.get_with_ttl(&key) {
+        Method::GET | Method::HEAD => match on(app, move |kv| kv.get_with_ttl(&key)).await?? {
             Some((value, ttl)) => {
                 let mut res = Response::new(full(value));
                 let h = res.headers_mut();
@@ -249,19 +274,22 @@ pub(super) async fn route(
                 only_if_present: param(&query, "xx").is_some(),
             };
             let value = read_body(state, req).await?.to_vec();
-            Ok(match kv.set(&key, value, &options) {
+            Ok(match on(app, move |kv| kv.set(&key, value, &options)).await?? {
                 Ok(set) => json_response(200, &json!({ "set": set })),
                 Err(e) => refused(&e),
             })
         }
-        Method::DELETE => Ok(json_response(200, &json!({ "deleted": u8::from(kv.delete(&key)) }))),
+        Method::DELETE => {
+            let deleted = on(app, move |kv| kv.delete(&key)).await??;
+            Ok(json_response(200, &json!({ "deleted": u8::from(deleted) })))
+        }
         Method::POST => {
             if let Some(by) = param(&query, "incr") {
                 let Some(by) = (if by.is_empty() { Some(1) } else { by.parse::<i64>().ok() }) else {
                     return Ok(refusal(400, "validation", "`incr` is a whole number"));
                 };
                 let ttl = param(&query, "ttl").and_then(seconds);
-                return Ok(match kv.incr_by(&key, by, ttl) {
+                return Ok(match on(app, move |kv| kv.incr_by(&key, by, ttl)).await?? {
                     Ok(value) => json_response(200, &json!({ "value": value })),
                     Err(e) => refused(&e),
                 });
@@ -270,10 +298,12 @@ pub(super) async fn route(
                 let Some(ttl) = seconds(ttl) else {
                     return Ok(refusal(400, "validation", "`expire` is a number of seconds, more than 0"));
                 };
-                return Ok(json_response(200, &json!({ "set": kv.expire(&key, Some(ttl)) })));
+                let set = on(app, move |kv| kv.expire(&key, Some(ttl))).await??;
+                return Ok(json_response(200, &json!({ "set": set })));
             }
             if param(&query, "persist").is_some() {
-                return Ok(json_response(200, &json!({ "set": kv.expire(&key, None) })));
+                let set = on(app, move |kv| kv.expire(&key, None)).await??;
+                return Ok(json_response(200, &json!({ "set": set })));
             }
             Ok(refusal(400, "validation", "POST on a key takes `?incr`, `?expire=<seconds>` or `?persist`"))
         }
