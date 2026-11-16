@@ -154,11 +154,12 @@ pub struct ServerOptions {
     pub cache_ceiling: Option<usize>,
     /// PostgreSQL connections served at once (each has a thread); the next
     /// ones are refused as PostgreSQL does (`too_many_connections`).
+    /// Read-only tokens have half of them at most.
     pub pg_max_connections: usize,
-    /// Key-value port connections served at once ([`Server::listen_kv`]);
-    /// the next ones are told `max number of clients reached`, as Redis
-    /// says it, and closed. Default: 1,000, less when the system lets the
-    /// process open few files.
+    /// Key-value port connections served at once ([`Server::listen_kv`]),
+    /// and no more than an eighth of the files the process may open; the
+    /// next ones are told `max number of clients reached`, as Redis says it,
+    /// and closed. Read-only tokens have half of them at most. Default: 256.
     pub kv_max_connections: usize,
     /// What the environment (or the settings file) says for the settings the
     /// owner may change while the server runs, by variable (`NUAGE_CACHE_MB`
@@ -230,7 +231,7 @@ impl Default for ServerOptions {
             cache_budget: None,
             cache_ceiling: None,
             pg_max_connections: 100,
-            kv_max_connections: net::default_kv_connections(),
+            kv_max_connections: net::KV_CONNECTIONS,
             settings_env: None,
             settings_read_only: false,
             startup: Vec::new(),
@@ -578,6 +579,9 @@ impl Server {
         let stop = Arc::new(Notify::new());
         let state = self.state.clone();
         let stopped = stop.clone();
+        net::raise_open_files_limit();
+        // What its sessions share: memory, places for read-only tokens.
+        let port = pg::Port::new(&options, state.options.max_body_bytes);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -612,11 +616,11 @@ impl Server {
                         // its statements block on the engine. Not a runtime
                         // task, so an idle client never delays a shutdown.
                         // Its stack has room for deeply nested statements.
-                        let counted = state.clone();
+                        let (counted, port) = (state.clone(), port.clone());
                         let spawned = std::thread::Builder::new()
                             .name("nuage-pg".into())
                             .stack_size(pg::THREAD_STACK)
-                            .spawn(move || pg::serve(state, stream, options));
+                            .spawn(move || pg::serve(state, stream, options, port));
                         if spawned.is_err() {
                             counted.pg_connections.fetch_sub(1, Ordering::Relaxed);
                         }
@@ -639,9 +643,12 @@ impl Server {
         let stop = Arc::new(Notify::new());
         let state = self.state.clone();
         let stopped = stop.clone();
+        net::raise_open_files_limit();
+        // What its connections share: places (each holds a socket and its
+        // buffers), memory.
+        let most = net::connections_within_files(state.options.kv_max_connections);
+        let port = kv_port::Port::new(None, state.options.max_body_bytes, most);
         let task = tokio::spawn(async move {
-            // Connections open now: each holds a socket and its buffers.
-            let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 tokio::select! {
                     _ = stopped.notified() => break,
@@ -655,11 +662,10 @@ impl Server {
                         };
                         // Past the limit the client is told so, as Redis tells
                         // it, and the socket closed at once.
-                        if open.load(Ordering::Relaxed) >= state.options.kv_max_connections.max(1) {
+                        let Some(place) = kv_port::Place::take(&port) else {
                             let _ = stream.try_write(kv_port::TOO_MANY_CLIENTS);
                             continue;
-                        }
-                        let place = kv_port::Place::take(&open);
+                        };
                         tokio::spawn(kv_port::serve(state.clone(), stream, peer, options.clone(), place));
                     }
                 }
