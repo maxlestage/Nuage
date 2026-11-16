@@ -58,6 +58,8 @@ use memoire_orm::{Error, Result, Value};
 use serde_json::Value as Json;
 
 pub use exec::SqlResult;
+#[cfg(feature = "server")]
+pub(crate) use limits::memory_changed;
 pub use limits::{set_statement_memory, set_statement_timeout, statement_memory, statement_timeout};
 
 use crate::embedded::Embedded;

@@ -918,6 +918,10 @@ impl Ended {
 
 /// The SQLSTATE of an error.
 fn sqlstate(e: &Error) -> &'static str {
+    // A write refused while the server stops: the driver connects again (admin_shutdown).
+    if crate::engine::is_stopping(e) {
+        return "57P01";
+    }
     let kind = wire::error_to_json(e).1["error"]["kind"].as_str().unwrap_or_default().to_owned();
     let message = e.to_string();
     if message.contains("current transaction is aborted") {

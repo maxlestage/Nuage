@@ -774,6 +774,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Le chiffre de l'environnement est plus bas : {} est en vigueur (une mémoire enregistrée ne peut que la baisser).",
         "La cifra del entorno es más baja: {} está en vigor (una memoria guardada solo puede bajarla).",
     ),
+    (
+        "`statement.memory_mb`: {} MiB is more than half of the {} MiB this server counts on: {} MiB at most",
+        "`statement.memory_mb` : {} Mio, c'est plus de la moitié des {} Mio sur lesquels ce serveur compte : {} Mio au plus",
+        "`statement.memory_mb`: {} MiB es más de la mitad de los {} MiB con los que cuenta este servidor: {} MiB como máximo",
+    ),
     ("Saved, and ignored", "Enregistrés mais ignorés", "Guardados pero ignorados"),
     ("Remove", "Retirer", "Quitar"),
     // The second copy of the backups.

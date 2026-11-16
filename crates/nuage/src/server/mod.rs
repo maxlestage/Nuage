@@ -1005,6 +1005,29 @@ impl State {
             self.apps.set_cache_lesson(0);
         }
         self.apps.set_plan(self.settings.memory_plan(&self.options));
+        self.apply_statement_limits();
+    }
+
+    /// What one SQL request may hold and how long a statement may run
+    /// (`statement.memory_mb`, `statement.seconds`), for every request from
+    /// now on. A server built by hand with nothing saved keeps what its
+    /// program set ([`crate::sql::set_statement_memory`]).
+    fn apply_statement_limits(&self) {
+        crate::sql::memory_changed();
+        if let Some(said) = self.settings.said("statement.memory_mb") {
+            let mib = said.filter(|v| !v.trim().eq_ignore_ascii_case("auto")).and_then(|v| settings::parse_mib(&v));
+            let total = crate::memory::MemoryInfo::now().total_bytes;
+            // Restored on a smaller server: half of its memory at most.
+            let bytes = mib.map_or(0, |mib| {
+                let bytes = usize::try_from(mib << 20).unwrap_or(usize::MAX);
+                total.map_or(bytes, |t| bytes.min(usize::try_from(t / 2).unwrap_or(usize::MAX)))
+            });
+            crate::sql::set_statement_memory(bytes);
+        }
+        if let Some(said) = self.settings.said("statement.seconds") {
+            let seconds = said.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(settings::STATEMENT_SECONDS);
+            crate::sql::set_statement_timeout((seconds > 0).then(|| Duration::from_secs(seconds)));
+        }
     }
 
     /// Saves settings and puts them in force at once: `(key, value)` pairs,
@@ -1091,6 +1114,13 @@ impl State {
             {
                 return Err(refusal);
             }
+        }
+        if let Some(Some(mib)) = checked.iter().find(|(key, _)| *key == "statement.memory_mb").map(|(_, v)| v)
+            && let Ok(mib) = mib.parse::<u64>()
+            && let Some(total) = crate::memory::MemoryInfo::now().total_bytes.map(|t| t >> 20)
+            && mib > total / 2
+        {
+            return Err(Refusal::new(refused::STATEMENT_MORE_THAN_HALF, &[&mib, &total, &(total / 2)]));
         }
         if let Some(Some(n)) = checked.iter().find(|(key, _)| *key == "postgres.connections").map(|(_, v)| v)
             && let Ok(n) = n.parse::<usize>()
@@ -1336,12 +1366,25 @@ pub(crate) fn error_response(e: &Error) -> Response<HttpBody> {
     if let Some(refusal) = limits::refusal(e) {
         return limits::refusal_response(refusal);
     }
+    if crate::engine::is_stopping(e) {
+        // The write was not made: the client tries again once the server is back.
+        let mut res = json_response(
+            503,
+            &json!({ "error": { "kind": "unavailable", "message": "the server is restarting: nothing was written, try again in a moment" } }),
+        );
+        res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        res.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+        return res;
+    }
     let (status, body) = wire::error_to_json(e);
     json_response(status, &body)
 }
 
 /// The HTTP status of the answer to `e`.
 fn error_status(e: &Error) -> u16 {
+    if crate::engine::is_stopping(e) {
+        return 503;
+    }
     limits::refusal(e).map_or_else(|| wire::error_to_json(e).0, |r| r.status)
 }
 
@@ -2258,6 +2301,16 @@ pub(crate) fn pg_connections_most() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write refused because the server stops answers 503, to try again.
+    #[test]
+    fn a_write_while_stopping_is_tried_again() {
+        let e = crate::engine::stopping_error();
+        let res = error_response(&e);
+        assert_eq!(res.status(), 503);
+        assert_eq!(res.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(error_status(&e), 503);
+    }
 
     /// A request that panics answers 500, and is no longer counted as active.
     #[tokio::test]
