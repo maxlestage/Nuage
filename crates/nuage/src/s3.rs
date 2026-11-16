@@ -48,6 +48,12 @@ const LIMITS: Limits =
 /// Bytes per second of the slowest transfer that is waited for to its end.
 const SLOWEST: u64 = 16 << 10;
 
+/// Bytes of a request the system may still hold, on their way out, once they
+/// were handed to the socket: its send buffer, which it grows up to about
+/// this much (Linux, macOS). They leave at the pace of the link, and nothing
+/// moves here meanwhile.
+const BUFFERED: u64 = 4 << 20;
+
 /// Bytes of a body handed to the connection at a time.
 const PIECE: usize = 256 << 10;
 
@@ -200,12 +206,28 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
-/// A socket that counts the bytes it takes and gives: whoever waits for a
-/// request sees whether its connection still moves, whatever is in transit
-/// (a body being sent, an answer being received, a TLS handshake).
+/// What went through a connection: whoever waits for a request sees whether
+/// it still moves, whatever is in transit (a body being sent, an answer being
+/// received, a TLS handshake).
+#[derive(Default)]
+struct Traffic {
+    /// Bytes either way.
+    moved: AtomicU64,
+    /// Bytes handed to the socket.
+    sent: AtomicU64,
+}
+
+impl Traffic {
+    fn wrote(&self, n: usize) {
+        self.moved.fetch_add(n as u64, Ordering::Relaxed);
+        self.sent.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// A socket that counts the bytes it takes and gives (see [`Traffic`]).
 struct Counted {
     socket: TcpStream,
-    moved: Arc<AtomicU64>,
+    traffic: Arc<Traffic>,
 }
 
 impl AsyncRead for Counted {
@@ -213,7 +235,7 @@ impl AsyncRead for Counted {
         let this = self.get_mut();
         let before = buf.filled().len();
         let read = Pin::new(&mut this.socket).poll_read(cx, buf);
-        this.moved.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        this.traffic.moved.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
         read
     }
 }
@@ -223,7 +245,7 @@ impl AsyncWrite for Counted {
         let this = self.get_mut();
         let written = Pin::new(&mut this.socket).poll_write(cx, data);
         if let Poll::Ready(Ok(n)) = &written {
-            this.moved.fetch_add(*n as u64, Ordering::Relaxed);
+            this.traffic.wrote(*n);
         }
         written
     }
@@ -236,7 +258,7 @@ impl AsyncWrite for Counted {
         let this = self.get_mut();
         let written = Pin::new(&mut this.socket).poll_write_vectored(cx, data);
         if let Poll::Ready(Ok(n)) = &written {
-            this.moved.fetch_add(*n as u64, Ordering::Relaxed);
+            this.traffic.wrote(*n);
         }
         written
     }
@@ -538,11 +560,11 @@ impl S3Store {
         Self::check(&answer, &format!("DELETE {key}"))
     }
 
-    /// Connects to the endpoint: TCP, then TLS when it is `https`. `moved`
-    /// counts the bytes that go through the connection, either way.
-    async fn connect(&self, moved: Arc<AtomicU64>) -> Result<Box<dyn Stream>> {
+    /// Connects to the endpoint: TCP, then TLS when it is `https`. `traffic`
+    /// counts the bytes that go through the connection.
+    async fn connect(&self, traffic: Arc<Traffic>) -> Result<Box<dyn Stream>> {
         let socket = TcpStream::connect((self.host.as_str(), self.port)).await.map_err(s3_err)?;
-        let socket = Counted { socket, moved };
+        let socket = Counted { socket, traffic };
         if !self.https {
             return Ok(Box::new(socket));
         }
@@ -590,6 +612,7 @@ impl S3Store {
                 query.iter().map(|(k, v)| format!("{}={}", uri_encode(k, false), uri_encode(v, false))).collect();
             uri = format!("{uri}?{}", q.join("&"));
         }
+        let length = body.left;
         let request = Request::builder()
             .method(method)
             .uri(uri)
@@ -597,13 +620,14 @@ impl S3Store {
             .header("x-amz-content-sha256", &body.sha256)
             .header("x-amz-date", &amz_date)
             .header("authorization", auth)
-            .header("content-length", body.left)
+            .header("content-length", length)
             .body(body)
             .map_err(s3_err)?;
-        let moved = Arc::new(AtomicU64::new(0));
-        let stream = tokio::time::timeout(self.limits.connect, self.connect(moved.clone())).await.map_err(|_| {
-            s3_err(format!("{what}: no connection to {host} within {} s", self.limits.connect.as_secs_f32()))
-        })??;
+        let traffic = Arc::new(Traffic::default());
+        let stream =
+            tokio::time::timeout(self.limits.connect, self.connect(traffic.clone())).await.map_err(|_| {
+                s3_err(format!("{what}: no connection to {host} within {} s", self.limits.connect.as_secs_f32()))
+            })??;
         let exchange = async {
             let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.map_err(s3_err)?;
             let _driver = Driver(tokio::spawn(async move {
@@ -634,22 +658,29 @@ impl S3Store {
             }
             Ok(Answer { status, length, body })
         };
-        self.watched(&what, &moved, exchange).await
+        self.watched(&what, &traffic, length, exchange).await
     }
 
-    /// Waits for `exchange`, a request on a connection that counts in `moved`
-    /// the bytes it carries, and gives it up when they stop moving or when it
-    /// is slower than the slowest link waited for (see [`Limits`]).
+    /// Waits for `exchange`, a request with a body of `body` bytes on a
+    /// connection that counts its bytes in `traffic`, and gives it up when
+    /// they stop moving or when it is slower than the slowest link waited for
+    /// (see [`Limits`]).
     async fn watched<T>(
         &self,
         what: &str,
-        moved: &AtomicU64,
+        traffic: &Traffic,
+        body: u64,
         exchange: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         let mut exchange = std::pin::pin!(exchange);
         let started = Instant::now();
         // Looked at often enough for either limit to be noticed soon after it is passed.
         let every = self.limits.stall.min(self.limits.total) / 4;
+        // Once the body is handed over whole, what the system holds of it
+        // leaves at the pace of the link before any answer can come: as long
+        // as that takes on the slowest link, nothing moving is no silence.
+        let leaving = Duration::from_secs(body.min(BUFFERED) / SLOWEST);
+        let moved = &traffic.moved;
         // What had moved when it last did, and when that was.
         let mut last = (moved.load(Ordering::Relaxed), started);
         loop {
@@ -658,9 +689,11 @@ impl S3Store {
             }
             let now = moved.load(Ordering::Relaxed);
             let waited = started.elapsed();
+            let handed_over = body > 0 && traffic.sent.load(Ordering::Relaxed) >= body;
+            let stall = if handed_over { self.limits.stall + leaving } else { self.limits.stall };
             if now != last.0 {
                 last = (now, Instant::now());
-            } else if last.1.elapsed() >= self.limits.stall {
+            } else if last.1.elapsed() >= stall {
                 return Err(s3_err(format!(
                     "{what}: {} stopped answering ({now} bytes in {} s)",
                     self.host,
@@ -1045,22 +1078,55 @@ mod tests {
         let limits = Limits { stall: Duration::from_secs(5), total: Duration::from_millis(200), ..LIMITS };
         let store = S3Store { limits, ..store };
         let run = |pace: Duration, step: u64, steps: u64| {
-            let moved = AtomicU64::new(0);
+            let traffic = Traffic::default();
             let transfer = async {
                 for _ in 0..steps {
                     tokio::time::sleep(pace).await;
-                    moved.fetch_add(step, Ordering::Relaxed);
+                    traffic.moved.fetch_add(step, Ordering::Relaxed);
                 }
                 Ok(())
             };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(store.watched("PUT snapshots/1.db", &moved, transfer))
+            runtime.block_on(store.watched("PUT snapshots/1.db", &traffic, 0, transfer))
         };
         // A second in all, five times what a request without a body has: its bytes pay for it.
         run(Duration::from_millis(20), SLOWEST, 50).unwrap();
         // It moves, a few bytes at a time: far too slowly to ever end.
         let e = run(Duration::from_millis(20), 1, 50).unwrap_err().to_string();
         assert!(e.contains("too slow"), "{e}");
+    }
+
+    /// A body handed to the socket whole may still be in the system's
+    /// buffers, leaving at the pace of a slow link while nothing moves here:
+    /// the answer is waited for as long as that takes on the slowest link
+    /// waited for, and no longer. Before the body is handed over, or without
+    /// one, silence is silence.
+    #[test]
+    fn a_body_handed_over_is_given_the_time_to_leave() {
+        let store = StandIn::start().store();
+        let limits = Limits { stall: Duration::from_millis(300), ..LIMITS };
+        let store = S3Store { limits, ..store };
+        // Handed over: `sent` of a body of `body` bytes, then nothing moves for `silent`.
+        let run = |body: u64, sent: u64, silent: Duration| {
+            let traffic = Traffic::default();
+            traffic.wrote(sent as usize);
+            let answer = async {
+                tokio::time::sleep(silent).await;
+                Ok(())
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(store.watched("PUT snapshots/1.db", &traffic, body, answer))
+        };
+        // A second of the slowest link to leave the buffers: 0.8 s without a byte is waited for.
+        run(SLOWEST, SLOWEST + 300, Duration::from_millis(800)).unwrap();
+        // ... 2 s is not.
+        let e = run(SLOWEST, SLOWEST + 300, Duration::from_secs(2)).unwrap_err().to_string();
+        assert!(e.contains("stopped answering"), "{e}");
+        // Half the body still to hand over, or no body: no time to leave.
+        for (body, sent) in [(SLOWEST, SLOWEST / 2), (0, 300)] {
+            let e = run(body, sent, Duration::from_millis(800)).unwrap_err().to_string();
+            assert!(e.contains("stopped answering"), "{e}");
+        }
     }
 
     /// A backup to a bucket that went silent fails and says so, instead of

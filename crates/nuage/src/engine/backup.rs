@@ -390,7 +390,9 @@ pub(crate) fn keep_aside(backup: &dyn BackupStore, encrypted: bool) -> Result<bo
 /// cover (everything up to it is in the backup).
 pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u64) -> Result<u64> {
     let segments = wal::segments(&store.dir.join("wal"))?;
-    let current = store.writer().wal.first_lsn;
+    // Not under the writer lock: a long write, or the last checkpoint of a
+    // server that stops, would hold the shipment for as long as it runs.
+    let current = store.current_segment();
     let mut last = shipped;
     for (i, (first, path)) in segments.iter().enumerate() {
         let Some((next_first, _)) = segments.get(i + 1) else { break };
@@ -407,9 +409,21 @@ pub(crate) fn ship_segments(store: &Store, backup: &dyn BackupStore, shipped: u6
 /// Older snapshots and the segments before them are pruned, keeping `keep`.
 /// The backup of a version up to 0.4 is first set aside ([`keep_aside`]).
 /// Returns the snapshot's LSN, and whether an earlier version's backup was
-/// set aside now.
-pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> Result<(u64, bool)> {
-    let kept = keep_aside(backup, store.dir.join(HEADER_FILE).exists())?;
+/// set aside now. `encrypted`: the store is, and its snapshot is sent with its
+/// header.
+pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize, encrypted: bool) -> Result<(u64, bool)> {
+    // An encrypted snapshot is unreadable without its header (salt, check
+    // value): without the header, no snapshot, rather than one a manifest
+    // would call in clear.
+    let header = if encrypted {
+        let read = fs::read(store.dir.join(HEADER_FILE));
+        Some(read.map_err(|e| {
+            storage_err(format!("cannot read {HEADER_FILE}, without which an encrypted snapshot cannot be read: {e}"))
+        })?)
+    } else {
+        None
+    };
+    let kept = keep_aside(backup, encrypted)?;
     // A file of its own: nothing else, whatever it does at the same time,
     // writes to it or removes it.
     let local = store.dir.join(partial_name(LOCAL_SNAPSHOT));
@@ -441,8 +455,6 @@ pub(crate) fn snapshot(store: &Store, backup: &dyn BackupStore, keep: usize) -> 
     });
     let _ = fs::remove_file(&local);
     let (lsn, bytes, name) = sent?;
-    // An encrypted snapshot needs its header (salt, check value) to be read.
-    let header = fs::read(store.dir.join(HEADER_FILE)).ok();
     if let Some(h) = &header {
         backup.put(HEADER_FILE, h)?;
     }
@@ -741,7 +753,7 @@ mod tests {
             store.on.store(false, Ordering::SeqCst);
             db.engine().backup_now(false).unwrap();
         }
-        let db = open(&dst, store);
+        let db = open_quiet(&dst, store);
         assert!(db.engine().backup_status().restored);
         assert_eq!(count(&db), "60");
         assert!(db.engine().check_integrity().unwrap());
@@ -773,7 +785,7 @@ mod tests {
         assert!(!dst.join("nuage.db.partial").exists());
         // Whole again, it comes back.
         fs::write(&snapshot, &whole).unwrap();
-        let db = open(&dst, store);
+        let db = open_quiet(&dst, store);
         assert!(db.engine().backup_status().restored);
         assert_eq!(count(&db), "2000");
         drop(db);
@@ -885,6 +897,260 @@ mod tests {
             assert!(copied < whole, "the commit returned once {copied} bytes of {whole} were copied");
         });
         assert_eq!(count(&db), "129");
+        drop(db);
+        for dir in [src, target] {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A directory where a snapshot being sent waits, when told to, until it
+    /// is let through: a snapshot to a slow bucket.
+    struct Gate {
+        inner: DirectoryStore,
+        closed: Mutex<bool>,
+        opened: std::sync::Condvar,
+        /// Snapshots stored, and snapshots waiting to be.
+        sent: std::sync::atomic::AtomicUsize,
+        waiting: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate {
+        fn new(root: &Path) -> Arc<Gate> {
+            Arc::new(Gate {
+                inner: DirectoryStore::new(root),
+                closed: Mutex::new(false),
+                opened: std::sync::Condvar::new(),
+                sent: Default::default(),
+                waiting: Default::default(),
+            })
+        }
+
+        /// Snapshots wait from now on, until the guard is dropped (whatever
+        /// happens to the test: nothing is left waiting).
+        fn close(&self) -> Opens<'_> {
+            *self.closed.lock().unwrap() = true;
+            Opens(self)
+        }
+
+        /// Waits until `n` snapshots wait at the gate.
+        fn until_waiting(&self, n: usize) {
+            assert!(
+                (0..2000).any(|_| {
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.waiting.load(Ordering::SeqCst) == n
+                }),
+                "{} snapshots wait, not {n}",
+                self.waiting.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    /// Opens its gate when dropped.
+    struct Opens<'a>(&'a Gate);
+
+    impl Drop for Opens<'_> {
+        fn drop(&mut self) {
+            *self.0.closed.lock().unwrap() = false;
+            self.0.opened.notify_all();
+        }
+    }
+
+    impl BackupStore for Gate {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn put(&self, name: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(name, data)
+        }
+        fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+            if name.starts_with("snapshots/") {
+                self.waiting.fetch_add(1, Ordering::SeqCst);
+                let mut closed = self.closed.lock().unwrap();
+                while *closed {
+                    closed = self.opened.wait(closed).unwrap();
+                }
+                drop(closed);
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                self.sent.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put_file(name, path)
+        }
+        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(name)
+        }
+        fn get_file(&self, name: &str, dest: &Path) -> Result<bool> {
+            self.inner.get_file(name, dest)
+        }
+        fn size(&self, name: &str) -> Result<Option<u64>> {
+            self.inner.size(name)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, name: &str) -> Result<()> {
+            self.inner.delete(name)
+        }
+    }
+
+    /// `open`, once the backup the upkeep thread sends when the database
+    /// opens is over: the test has the backups to itself, and nothing writes
+    /// to them after it has removed them.
+    fn open_quiet(dir: &Path, store: Arc<dyn BackupStore>) -> Embedded {
+        let db = open(dir, store);
+        assert!((0..2000).any(|_| {
+            std::thread::sleep(Duration::from_millis(5));
+            db.engine().backup_status().last_snapshot_at.is_some()
+        }));
+        db
+    }
+
+    /// The rows of the backup in `store`, restored into the empty `dst`.
+    fn restored(dst: &Path, store: &dyn BackupStore) -> String {
+        let _ = fs::remove_dir_all(dst);
+        assert!(restore(dst, store).unwrap());
+        let db = Embedded::open_with(dst, EngineOptions { sync: false, ..EngineOptions::default() }).unwrap();
+        let rows = count(&db);
+        drop(db);
+        let _ = fs::remove_dir_all(dst);
+        rows
+    }
+
+    /// The last shipment of a server that stops does not wait for a snapshot
+    /// being sent (one the console asked for, to a slow bucket): the log goes
+    /// next to it, and the backup holds every write, whether that snapshot
+    /// ever arrives or not.
+    #[test]
+    fn the_last_shipment_does_not_wait_for_a_snapshot_being_sent() {
+        let (src, target, dst) = (temp("beside-src"), temp("beside-store"), temp("beside-dst"));
+        let store = Gate::new(&target);
+        let db = open_quiet(&src, store.clone());
+        insert(&db, 0..30);
+        let engine = db.engine();
+        std::thread::scope(|s| {
+            let gate = store.close();
+            let forced = s.spawn(|| engine.backup_now(true));
+            store.until_waiting(1);
+            insert(&db, 30..60);
+            // What a server that stops does.
+            engine.begin_shutdown();
+            engine.checkpoint().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let last = engine.clone();
+            std::thread::spawn(move || tx.send(last.backup_now(false)));
+            rx.recv_timeout(Duration::from_secs(10)).expect("the log was shipped beside the snapshot").unwrap();
+            assert_eq!(store.waiting.load(Ordering::SeqCst), 1, "the snapshot is still being sent");
+            // The process ends there: what the backup holds is every write.
+            assert_eq!(restored(&dst, store.as_ref()), "60");
+            drop(gate);
+            forced.join().unwrap().unwrap();
+        });
+        // Or the snapshot arrived after all: every write too.
+        assert_eq!(restored(&dst, store.as_ref()), "60");
+        drop(db);
+        for dir in [src, target, dst] {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Snapshots asked for while one is being sent wait for it, and the one
+    /// that follows serves them all: each began after they were asked, and
+    /// holds every row written before.
+    #[test]
+    fn snapshots_asked_for_meanwhile_share_the_next_one() {
+        let (src, target, dst) = (temp("share-src"), temp("share-store"), temp("share-dst"));
+        let store = Gate::new(&target);
+        let db = open_quiet(&src, store.clone());
+        insert(&db, 0..10);
+        let engine = db.engine();
+        let before = store.sent.load(Ordering::SeqCst);
+        std::thread::scope(|s| {
+            let gate = store.close();
+            let first = s.spawn(|| engine.backup_now(true));
+            store.until_waiting(1);
+            insert(&db, 10..20);
+            let others: Vec<_> = (0..3).map(|_| s.spawn(|| engine.backup_now(true))).collect();
+            // They have asked, and wait for their turn.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(others.iter().all(|t| !t.is_finished()));
+            drop(gate);
+            first.join().unwrap().unwrap();
+            for t in others {
+                t.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(store.sent.load(Ordering::SeqCst) - before, 2, "the one being sent, then one for the others");
+        assert_eq!(restored(&dst, store.as_ref()), "20");
+        drop(db);
+        for dir in [src, target, dst] {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Closing a database waits for its backup under way, and none is made
+    /// after: once it has returned, the backup location is left as it is. A
+    /// deleted application's backups are removed then, and none of its
+    /// objects lands afterwards for a new application of the same name to
+    /// find.
+    #[test]
+    fn closing_waits_for_the_backup_under_way() {
+        let (src, target) = (temp("close-src"), temp("close-store"));
+        let store = Gate::new(&target);
+        let db = open_quiet(&src, store.clone());
+        insert(&db, 0..10);
+        let engine = db.engine();
+        std::thread::scope(|s| {
+            let gate = store.close();
+            let forced = s.spawn(|| engine.backup_now(true));
+            store.until_waiting(1);
+            let closing = s.spawn(|| engine.close());
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!closing.is_finished(), "close waits for the snapshot being sent");
+            drop(gate);
+            closing.join().unwrap().unwrap();
+            forced.join().unwrap().unwrap();
+        });
+        for force in [true, false] {
+            let e = engine.backup_now(force).unwrap_err().to_string();
+            assert!(e.contains("is closed"), "{e}");
+        }
+        delete_all(store.as_ref()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(store.get(MANIFEST).unwrap(), None);
+        assert!(store.list("snapshots/").unwrap().is_empty() && store.list("wal/").unwrap().is_empty());
+        drop(db);
+        for dir in [src, target] {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An encrypted database whose header cannot be read sends no snapshot:
+    /// one would be unreadable, and the manifest goes on naming the last one
+    /// that can be read.
+    #[test]
+    fn no_snapshot_of_an_encrypted_database_without_its_header() {
+        let (src, target) = (temp("header-src"), temp("header-store"));
+        let store = Arc::new(DirectoryStore::new(&target));
+        let options = EngineOptions {
+            backup: Some(BackupOptions::new(store.clone())),
+            checkpoint_every: Duration::from_secs(3600),
+            encryption: Some(crate::Encryption::from_key([7; 32])),
+            sync: false,
+            ..EngineOptions::default()
+        };
+        let db = Embedded::open_with(&src, options).unwrap();
+        db.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+        insert(&db, 0..10);
+        db.engine().backup_now(true).unwrap();
+        let (manifest, snapshots) = (store.get(MANIFEST).unwrap(), store.list("snapshots/").unwrap());
+        let header = fs::read(src.join(HEADER_FILE)).unwrap();
+        fs::remove_file(src.join(HEADER_FILE)).unwrap();
+        insert(&db, 10..20);
+        let e = db.engine().backup_now(true).unwrap_err().to_string();
+        assert!(e.contains(HEADER_FILE), "{e}");
+        assert_eq!(store.get(MANIFEST).unwrap(), manifest);
+        assert_eq!(store.list("snapshots/").unwrap(), snapshots);
+        fs::write(src.join(HEADER_FILE), header).unwrap();
+        db.engine().backup_now(true).unwrap();
         drop(db);
         for dir in [src, target] {
             let _ = fs::remove_dir_all(&dir);
