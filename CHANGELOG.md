@@ -2,7 +2,7 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.4.7 (2026-11-16)
 
 ### Memory you can count on, and a steadier server
 
@@ -50,6 +50,25 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   memory is 1024³ bytes, as memory is sold: a 512 MB dyno shows `0.50 GB`), on the dashboard
   and on the console's Server page; the caches, smaller, in megabytes of the same base. The
   dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
+
+### Faster
+
+Measured with `cargo run --release -p nuage --example bench` (two new lines), before (0.4.6)
+and after, run in turn on the same machine (4 cores, busy with other builds; medians of three
+runs):
+
+| | 0.4.6 | 0.4.7 |
+|---|---|---|
+| three pages of 200 rows in one `/v1/batch` | 2.91 ms | **2.07 ms** (−29 %) |
+| 1,000 rows of `db.raw(...)` (`/v1/fetch`) | 12.46 ms | **10.58 ms** (−15 %) |
+
+- **`/v1/batch` and `db.raw(...)` answer straight as their text** (Memoire's
+  `wire::rows_to_vec`), as `/v1/fetch` and `/v1/sql` already did, instead of a JSON tree that
+  `json!` then copied whole (for a batch, each statement's rows, then the list of them) before
+  it was serialized and dropped. The same bytes, tested against the tree they replace. Writing
+  the answer alone: 1,000 rows in 0.32 ms instead of 1.50 ms, a batch of three times 1,000 rows
+  in 1.01 ms instead of 6.07 ms.
+- The bench measures both.
 
 ## 0.4.6 (2026-11-15)
 
