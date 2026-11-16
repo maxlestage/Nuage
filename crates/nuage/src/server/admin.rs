@@ -1494,6 +1494,18 @@ fn storage_body(cx: &Cx, app: &App, message: Option<String>) -> String {
     ] {
         body.push_str(&card(cx.t(label), &v));
     }
+    // With two destinations, each one's: a destination added since the start
+    // shows "none yet" until it has received a whole snapshot.
+    if b.destinations.len() > 1 {
+        for d in &b.destinations {
+            let v = match (&d.error, d.last_snapshot_at, d.last_at) {
+                (Some(e), _, _) => cx.tf("failed: {}", &[e]),
+                (None, Some(_), Some(at)) => ago_ms(l, at),
+                _ => cx.t("none yet").into(),
+            };
+            body.push_str(&card(&cx.tf("Last backup to {}", &[&d.target]), &v));
+        }
+    }
     let _ = write!(
         body,
         r#"</div><p class="muted">{}</p><h2>{}</h2><div class="row">"#,
@@ -1692,8 +1704,18 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
             };
         }
         let msg = match state.apps.delete(&name) {
-            Ok(true) => note(true, &cx.tf("Application {} deleted, with its data and backups.", &[&name])),
-            Ok(false) => note(false, &cx.tf("There is no application {}.", &[&name])),
+            Ok(Some(kept)) if kept.is_empty() => {
+                note(true, &cx.tf("Application {} deleted, with its data and backups.", &[&name]))
+            }
+            Ok(Some(kept)) => note(
+                false,
+                &cx.tf(
+                    "Application {} deleted, with its data, but its backup is still in {}: delete it there. Until \
+                     then, no application named {} can be created.",
+                    &[&name, &kept.join("; "), &name],
+                ),
+            ),
+            Ok(None) => note(false, &cx.tf("There is no application {}.", &[&name])),
             Err(e) => note(false, &e.to_string()),
         };
         return html(200, cx.page(cx.t("Applications"), &apps_body(state, cx, Some(msg))));
@@ -1738,7 +1760,9 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
         p if p.starts_with("/storage/") => {
             let msg = match &p["/storage/".len()..] {
                 "checkpoint" => engine.checkpoint().map(|lsn| note(true, &cx.tf("Checkpoint at {}.", &[&lsn]))),
-                "backup" => engine.backup_now(true).map(|()| note(true, cx.t("Backup done."))),
+                "backup" => engine
+                    .backup_now_within(true, Some(crate::engine::BUSY_WAIT))
+                    .map(|()| note(true, cx.t("Backup done."))),
                 "integrity" => engine.check_integrity().map(|ok| {
                     note(
                         ok,

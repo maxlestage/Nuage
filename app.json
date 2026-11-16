@@ -21,6 +21,14 @@
     "NUAGE_BACKUP_S3_PREFIX": { "description": "Prefix of the backup objects.", "value": "nuage/", "required": false },
     "NUAGE_BACKUP_S3_ACCESS_KEY_ID": { "description": "Access key of the bucket." },
     "NUAGE_BACKUP_S3_SECRET_ACCESS_KEY": { "description": "Secret key of the bucket." },
+    "NUAGE_BACKUP2_S3_BUCKET": { "description": "Optional: a second bucket for the backups, kept in step with the first; a boot restores from the one that reaches furthest, and does not start while either cannot be read. To move the backups without a stop: set it, wait until /admin shows each backup with no error, swap the NUAGE_BACKUP_S3_* and NUAGE_BACKUP2_S3_* values, then remove the NUAGE_BACKUP2_S3_* variables (see the README).", "required": false },
+    "NUAGE_BACKUP2_S3_REGION": { "description": "Region of the second bucket (us-east-1 when empty).", "required": false },
+    "NUAGE_BACKUP2_S3_ENDPOINT": { "description": "Endpoint URL of the second bucket's storage (leave empty for AWS).", "required": false },
+    "NUAGE_BACKUP2_S3_PREFIX": { "description": "Prefix of the backup objects in the second bucket (nuage/ when empty).", "required": false },
+    "NUAGE_BACKUP2_S3_ACCESS_KEY_ID": { "description": "Access key of the second bucket.", "required": false },
+    "NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY": { "description": "Secret key of the second bucket.", "required": false },
+    "NUAGE_RESTORE_REQUIRED": { "description": "Leave empty on a first deployment, which has nothing to restore. Once the server holds data, set it to true: a dyno that finds nothing to restore (a mistyped bucket or prefix) then refuses to start, instead of starting a new, empty database.", "required": false },
+    "NUAGE_KV_STORAGE": { "description": "Where the key-value stores (/v1/kv) are kept: memory (empty: the fastest, emptied at each restart) or database (in each application's database: kept across restarts and in the backups; a write waits for the disk).", "required": false },
     "SITE_URL": { "description": "Public address of the website (canonical links, share card), e.g. https://my-nuage.herokuapp.com. Empty: taken from each request.", "required": false }
   },
   "success_url": "/"

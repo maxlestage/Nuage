@@ -6,6 +6,11 @@
 //! the disk, so a read or a write costs well under a microsecond, and a
 //! restart empties it. What must survive belongs in the database.
 //!
+//! A server can keep each application's keys in that application's database
+//! instead (`NUAGE_KV_STORAGE=database`): the same commands give the same
+//! answers, run by the same code, and the keys survive restarts and are in
+//! the backups; a write then waits for the disk, like a row.
+//!
 //! Memory is bounded ([`Kv::new`]): past the limit, the keys that expired go
 //! first, then the least recently used ones.
 //!
@@ -27,6 +32,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The store in an application's database (`NUAGE_KV_STORAGE=database`).
+#[cfg(feature = "server")]
+pub(crate) mod database;
 
 /// Longest key, in bytes.
 pub const MAX_KEY: usize = 1024;
@@ -198,7 +207,8 @@ pub enum KvError {
     NotInteger,
     /// The counter would leave the 64-bit integers.
     Overflow,
-    /// The key and its value are larger than the whole store.
+    /// The key and its value are larger than the whole store (in memory), or
+    /// the value is larger than 64 MiB (in an application's database).
     TooLarge,
     /// The key is longer than [`MAX_KEY`], or empty.
     BadKey,
@@ -209,7 +219,9 @@ impl std::fmt::Display for KvError {
         f.write_str(match self {
             KvError::NotInteger => "value is not an integer or out of range",
             KvError::Overflow => "increment or decrement would overflow",
-            KvError::TooLarge => "the value is larger than the memory of the key-value store (NUAGE_KV_MB)",
+            KvError::TooLarge => {
+                "the value is larger than the key-value store takes (NUAGE_KV_MB in memory, 64 MiB in the database)"
+            }
             KvError::BadKey => "a key is 1 to 1024 bytes",
         })
     }
@@ -559,6 +571,46 @@ fn upper(arg: &[u8]) -> String {
 
 const NOT_INTEGER: &str = "value is not an integer or out of range";
 
+/// The refusal of a command that writes, sent with a read-only token.
+const READ_ONLY: &str = "READONLY this token only reads: use a read-write token";
+
+/// The pattern of `SCAN`'s options (`MATCH p`, `COUNT n`, `TYPE t`), or the
+/// refusal of options it does not take.
+fn scan_pattern(options: &[Vec<u8>]) -> Result<&[u8], Reply> {
+    let mut pattern: &[u8] = b"*";
+    for pair in options.chunks(2) {
+        match (upper(&pair[0]).as_str(), pair.get(1)) {
+            ("MATCH", Some(p)) => pattern = p,
+            ("COUNT" | "TYPE", Some(_)) => {}
+            _ => return Err(Reply::err("syntax error")),
+        }
+    }
+    Ok(pattern)
+}
+
+/// The answer to `INFO`. `redis_version` is what clients read to choose how
+/// they talk. A store with no limit (`max_bytes` 0) evicts nothing.
+fn info(s: &KvStats) -> Reply {
+    let policy = if s.max_bytes == 0 { "noeviction" } else { "allkeys-lru" };
+    Reply::Bulk(
+        format!(
+            "# Server\r\nredis_version:7.0.0\r\nnuage_version:{}\r\n# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n\
+             maxmemory_policy:{policy}\r\n# Stats\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\nevicted_keys:{}\r\n\
+             expired_keys:{}\r\n# Keyspace\r\ndb0:keys={},expires={}\r\n",
+            crate::VERSION,
+            s.bytes,
+            s.max_bytes,
+            s.hits,
+            s.misses,
+            s.evictions,
+            s.expired,
+            s.keys,
+            s.expiring
+        )
+        .into_bytes(),
+    )
+}
+
 /// The store, held: what runs on it runs alone.
 struct Locked<'a> {
     max_bytes: usize,
@@ -726,7 +778,7 @@ impl Locked<'_> {
             return Reply::err("empty command");
         };
         if read_only && writes(&name) {
-            return Reply::Error("READONLY this token only reads: use a read-write token".into());
+            return Reply::Error(READ_ONLY.into());
         }
         let args = &args[1..];
         let wrong = || Reply::err(format!("wrong number of arguments for '{}' command", name.to_lowercase()));
@@ -772,7 +824,7 @@ impl Locked<'_> {
                     _ => return Reply::err("syntax error"),
                 };
                 if expiry.is_some() && read_only {
-                    return Reply::Error("READONLY this token only reads: use a read-write token".into());
+                    return Reply::Error(READ_ONLY.into());
                 }
                 self.with(|inner, now| {
                     let value = inner.read(key, now).map(|e| e.value.clone());
@@ -869,15 +921,10 @@ impl Locked<'_> {
             ("KEYS", [pattern]) => Reply::Array(self.matching(pattern).into_iter().map(Reply::Bulk).collect()),
             ("SCAN", [_cursor, options @ ..]) => {
                 // The whole answer in one page: the cursor that comes back is 0.
-                let mut pattern: &[u8] = b"*";
-                let mut options = options.chunks(2);
-                for pair in &mut options {
-                    match (upper(&pair[0]).as_str(), pair.get(1)) {
-                        ("MATCH", Some(p)) => pattern = p,
-                        ("COUNT" | "TYPE", Some(_)) => {}
-                        _ => return Reply::err("syntax error"),
-                    }
-                }
+                let pattern = match scan_pattern(options) {
+                    Ok(p) => p,
+                    Err(refused) => return refused,
+                };
                 Reply::Array(vec![
                     Reply::Bulk(b"0".to_vec()),
                     Reply::Array(self.matching(pattern).into_iter().map(Reply::Bulk).collect()),
@@ -888,27 +935,7 @@ impl Locked<'_> {
                 self.clear();
                 Reply::Ok
             }
-            // `redis_version` is what clients read to choose how they talk.
-            ("INFO", _) => {
-                let s = self.stats();
-                Reply::Bulk(
-                    format!(
-                        "# Server\r\nredis_version:7.0.0\r\nnuage_version:{}\r\n# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n\
-                         maxmemory_policy:allkeys-lru\r\n# Stats\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\nevicted_keys:{}\r\n\
-                         expired_keys:{}\r\n# Keyspace\r\ndb0:keys={},expires={}\r\n",
-                        crate::VERSION,
-                        s.bytes,
-                        s.max_bytes,
-                        s.hits,
-                        s.misses,
-                        s.evictions,
-                        s.expired,
-                        s.keys,
-                        s.expiring
-                    )
-                    .into_bytes(),
-                )
-            }
+            ("INFO", _) => info(&self.stats()),
             (
                 "PING" | "ECHO" | "GET" | "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "GETEX" | "MGET"
                 | "MSET" | "MSETNX" | "APPEND" | "STRLEN" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "DEL" | "UNLINK"
