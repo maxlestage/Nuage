@@ -352,11 +352,37 @@ fn main() -> ExitCode {
             }
         };
         log(&format!("listening on {}", running.local_addr()));
+        // HTTPS beside it, with the certificate: no proxy needed in front.
+        let https = match (config.https_port, &config.tls) {
+            (Some(port), Some((cert, key))) => {
+                let tls = match nuage::tls::server_config(cert, key, config.tls_post_quantum) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("nuage: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match server.listen_https((config.bind.as_str(), port), tls).await {
+                    Ok(r) => {
+                        log(&format!(
+                            "HTTPS on {} (post-quantum key exchange X25519MLKEM768 first)",
+                            r.local_addr()
+                        ));
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("nuage: HTTPS: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            _ => None,
+        };
         // The PostgreSQL protocol: every language's PostgreSQL driver.
         let pg = match config.pg_port {
             Some(port) => {
                 let tls = match &config.tls {
-                    Some((cert, key)) => match nuage::tls_config(cert, key) {
+                    Some((cert, key)) => match nuage::tls::server_config(cert, key, config.tls_post_quantum) {
                         Ok(t) => Some(t),
                         Err(e) => {
                             eprintln!("nuage: {e}");
@@ -368,7 +394,11 @@ fn main() -> ExitCode {
                 let encrypted = tls.is_some();
                 match server.listen_pg((config.pg_bind.as_str(), port), nuage::PgOptions { tls, ..Default::default() }).await {
                     Ok(r) => {
-                        let how = if encrypted { "with TLS" } else { "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)" };
+                        let how = if encrypted {
+                            "with TLS (post-quantum key exchange X25519MLKEM768 first)"
+                        } else {
+                            "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)"
+                        };
                         log(&format!(
                             "PostgreSQL protocol on {} {how}: any PostgreSQL driver connects, its password a token",
                             r.local_addr()
@@ -387,7 +417,7 @@ fn main() -> ExitCode {
         let kv_port = match config.kv_port {
             Some(port) => {
                 let tls = match &config.tls {
-                    Some((cert, key)) => match nuage::tls_config(cert, key) {
+                    Some((cert, key)) => match nuage::tls::server_config(cert, key, config.tls_post_quantum) {
                         Ok(t) => Some(t),
                         Err(e) => {
                             eprintln!("nuage: {e}");
@@ -400,7 +430,7 @@ fn main() -> ExitCode {
                 match server.listen_kv((config.kv_bind.as_str(), port), nuage::KvOptions { tls }).await {
                     Ok(r) => {
                         let how = if encrypted {
-                            "in clear and with TLS"
+                            "in clear and with TLS (post-quantum key exchange X25519MLKEM768 first)"
                         } else {
                             "in clear (NUAGE_TLS_CERT and NUAGE_TLS_KEY add TLS)"
                         };
@@ -453,6 +483,9 @@ fn main() -> ExitCode {
         log("stopping: last checkpoint and backup");
         events.abort();
         running.shutdown().await;
+        if let Some(https) = https {
+            https.shutdown().await;
+        }
         if let Some(pg) = pg {
             pg.shutdown().await;
         }

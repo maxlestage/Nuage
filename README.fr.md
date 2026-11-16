@@ -139,6 +139,30 @@ Le mode intégré chiffre aussi, avec
 `EngineOptions { encryption: Some(Encryption::parse(clé)?), .. }` ou `NUAGE_ENCRYPTION_KEY`
 avec `nuage::Db::from_env()`.
 
+### Contre les ordinateurs quantiques
+
+Ce que Nuage DB stocke est chiffré par des algorithmes symétriques et des clés de 256 bits
+(AES-256, HKDF-SHA256, Argon2id, SHA-256 pour les empreintes des jetons) : un ordinateur
+quantique ne fait que diviser par deux la force d'une telle clé (Grover), il reste 128 bits. Ce
+qu'un ordinateur quantique casse, c'est l'échange de clés publiques de TLS : une conversation
+enregistrée aujourd'hui pourrait être déchiffrée plus tard. Chaque connexion que Nuage DB
+chiffre lui-même convient donc de ses clés avec **X25519MLKEM768** en premier, un hybride de
+X25519 et de ML-KEM-768, l'encapsulation de clé post-quantique de la norme FIPS 203, sûr tant que
+l'un des deux tient (aws-lc-rs, dont le ML-KEM est validé FIPS 140-3, via rustls) :
+
+- les ports PostgreSQL et clé-valeur avec `NUAGE_TLS_CERT` et `NUAGE_TLS_KEY` ;
+- **HTTPS sur un port à lui** avec `NUAGE_HTTPS_PORT` (le même certificat) : la console, son mot
+  de passe, les jetons et l'API chiffrés de bout en bout, sans proxy devant ;
+- les sauvegardes vers S3, `nuage check`, `nuage apps` et `nuage settings`, et Nuage DB Éditeur,
+  en tant que clients (quand l'autre côté le parle ; sinon X25519, comme avant).
+
+Un client plus ancien (un pilote PostgreSQL sur OpenSSL avant 3.5) obtient X25519 ou P-256, sauf
+avec `NUAGE_TLS_POST_QUANTUM=required` : seul TLS 1.3 avec un échange post-quantique est alors
+accepté. Les jetons que Nuage DB fabrique font 256 bits aléatoires. Sur Heroku, HTTPS s'arrête au
+routeur d'Heroku, que Nuage DB ne contrôle pas : pour un site post-quantique là-bas, mettez devant
+un service qui parle X25519MLKEM768 (Cloudflare le fait par défaut), ou utilisez le port
+PostgreSQL avec TLS.
+
 ### En venant de la version 0.4
 
 Jusqu'à la 0.4, les pages étaient un fichier [redb](https://docs.rs/redb), `nuage.redb`.
@@ -960,6 +984,8 @@ et l'éditeur dit comment les changer sur cet hébergement. Lancé avec `NUAGE_U
 | `NUAGE_PG_PORT` | sert aussi le protocole PostgreSQL sur ce port (`5432`) : le pilote PostgreSQL de chaque langage, un jeton comme mot de passe | désactivé |
 | `NUAGE_PG_BIND` | son adresse, quand le site reste derrière un proxy sur `127.0.0.1` | `NUAGE_BIND` |
 | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | fichiers PEM d'un certificat et de sa clé : TLS pour le protocole PostgreSQL | aucun |
+| `NUAGE_TLS_POST_QUANTUM` | `required` : TLS n'accepte que les clients qui conviennent de leurs clés par un échange post-quantique (X25519MLKEM768, TLS 1.3) ; `preferred` : il passe en premier, les clients plus anciens obtiennent X25519 ou P-256 (voir [Contre les ordinateurs quantiques](#contre-les-ordinateurs-quantiques)) | `preferred` |
+| `NUAGE_HTTPS_PORT` | HTTPS aussi sur ce port (la console, l'API et le site), avec le certificat de `NUAGE_TLS_CERT` : chiffré de bout en bout sans proxy devant | aucun |
 | `NUAGE_BIND` | adresse d'écoute (`127.0.0.1` : cette machine seulement, derrière un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | répertoire de données | `nuage-data` |
 | `NUAGE_NAME` | nom de la première application (et de sa base) | `nuage` |

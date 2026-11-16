@@ -662,6 +662,30 @@ impl Server {
     /// Binds `addr` and serves in the background on the current Tokio
     /// runtime.
     pub async fn listen(&self, addr: impl tokio::net::ToSocketAddrs) -> Result<RunningServer> {
+        self.serve(addr, None).await
+    }
+
+    /// Binds `addr` and serves the same over HTTPS, with `tls` (see
+    /// [`crate::tls::server_config`]: its keys agreed with the post-quantum
+    /// exchange X25519MLKEM768 first), beside [`listen`](Self::listen): the
+    /// console, its password and the tokens are then encrypted all the way,
+    /// with no proxy in front. A handshake not done within the header timeout
+    /// closes the connection.
+    pub async fn listen_https(
+        &self,
+        addr: impl tokio::net::ToSocketAddrs,
+        tls: Arc<rustls::ServerConfig>,
+    ) -> Result<RunningServer> {
+        self.serve(addr, Some(tokio_rustls::TlsAcceptor::from(tls))).await
+    }
+
+    async fn serve(
+        &self,
+        addr: impl tokio::net::ToSocketAddrs,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Result<RunningServer> {
+        // The upkeep of every second is started once, by the plain listener.
+        let upkeep = tls.is_none();
         let listener = TcpListener::bind(addr).await.map_err(|e| Error::Pool(format!("cannot listen: {e}")))?;
         let addr = listener.local_addr().map_err(|e| Error::Pool(e.to_string()))?;
         let stop = Arc::new(Notify::new());
@@ -672,7 +696,7 @@ impl Server {
         // listener and the runtime's workers are doing; it stops with the
         // listener (when `ticking` is dropped).
         let (ticking, ticks) = std::sync::mpsc::channel::<()>();
-        let threaded = start_ticks(&self.state, ticks);
+        let threaded = !upkeep || start_ticks(&self.state, ticks);
         let task = tokio::spawn(async move {
             let _ticking = ticking;
             let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -712,16 +736,34 @@ impl Server {
                         let _ = stream.set_nodelay(true);
                         let state = state.clone();
                         let http = http.clone();
+                        let tls = tls.clone();
+                        let encrypted = tls.is_some();
                         tokio::spawn(async move {
                             let _slot = slot;
                             let _open = Counted::new(&state.metrics.open_connections);
                             let conn_state = state.clone();
-                            let service = service_fn(move |req| {
+                            let service = service_fn(move |mut req: Request<Incoming>| {
+                                // Over this server's own HTTPS, what a proxy in front would say:
+                                // the console's cookies are then `Secure`, its links https.
+                                if encrypted {
+                                    req.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("https"));
+                                }
                                 let state = conn_state.clone();
                                 async move { Ok::<_, Infallible>(handle(state, req, peer).await) }
                             });
                             let stream = limits::Patient::new(stream, state.options.send_timeout);
-                            let _ = http.serve_connection(TokioIo::new(stream), service).await;
+                            match tls {
+                                None => {
+                                    let _ = http.serve_connection(TokioIo::new(stream), service).await;
+                                }
+                                Some(tls) => {
+                                    let accepted =
+                                        tokio::time::timeout(state.options.header_timeout, tls.accept(stream)).await;
+                                    if let Ok(Ok(stream)) = accepted {
+                                        let _ = http.serve_connection(TokioIo::new(stream), service).await;
+                                    }
+                                }
+                            }
                         });
                     }
                 }
@@ -1529,8 +1571,10 @@ pub(crate) fn unauthorized(message: &str) -> Response<HttpBody> {
 /// much of a secret was right.
 pub(crate) use crate::hash::same_secret;
 
+/// 256 random bits, in hex: a quantum computer searching for one (Grover)
+/// still faces 128 bits of work.
 pub(crate) fn random_token() -> String {
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("the operating system has no random source");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

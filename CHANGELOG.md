@@ -4,6 +4,22 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
+### Against quantum computers
+
+- **Post-quantum key exchange on every connection Nuage DB encrypts itself**: X25519MLKEM768, a
+  hybrid of X25519 and ML-KEM-768 (FIPS 203), offered and chosen first, safe while either
+  holds: a conversation recorded today cannot be decrypted by a quantum computer later. TLS now
+  uses aws-lc-rs (its ML-KEM is FIPS 140-3 validated) through rustls, for the PostgreSQL and
+  key-value ports, the backups to S3, `nuage check`, `nuage apps`, `nuage settings` and Nuage DB
+  Editor. Older clients still get X25519 or P-256.
+- **`NUAGE_TLS_POST_QUANTUM=required`**: only TLS 1.3 with a post-quantum exchange is accepted.
+- **`NUAGE_HTTPS_PORT`**: HTTPS on a port of its own with the certificate of `NUAGE_TLS_CERT`,
+  beside the plain port: the console, its password, the tokens and the API encrypted all the
+  way with no proxy in front (its cookies `Secure`). `Server::listen_https`, `nuage::tls`.
+- The tokens Nuage DB makes (applications, console sessions) are 256 random bits (they were
+  192). What is stored stays encrypted with AES-256 and 256-bit keys, which a quantum computer
+  does not break.
+
 ### Nuage DB Editor: the settings in a window
 
 - **For those who would rather not use a terminal**: a program with a window, for macOS

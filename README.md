@@ -137,6 +137,28 @@ the data nor the backups can be read. The embedded mode encrypts too, with
 `EngineOptions { encryption: Some(Encryption::parse(key)?), .. }` or `NUAGE_ENCRYPTION_KEY`
 with `nuage::Db::from_env()`.
 
+### Against quantum computers
+
+What Nuage DB stores is encrypted with symmetric algorithms and keys of 256 bits (AES-256,
+HKDF-SHA256, Argon2id, SHA-256 for the tokens' digests): a quantum computer only halves the
+strength of such a key (Grover), which leaves 128 bits. What a quantum computer breaks is the
+public-key exchange of TLS: a conversation recorded today could be decrypted later. So every
+connection Nuage DB encrypts itself agrees on its keys with **X25519MLKEM768** first, a hybrid of
+X25519 and ML-KEM-768, the post-quantum key encapsulation of FIPS 203, safe while either holds
+(aws-lc-rs, whose ML-KEM is FIPS 140-3 validated, through rustls):
+
+- the PostgreSQL and key-value ports with `NUAGE_TLS_CERT` and `NUAGE_TLS_KEY`;
+- **HTTPS on a port of its own** with `NUAGE_HTTPS_PORT` (the same certificate): the console, its
+  password, the tokens and the API encrypted all the way, with no proxy in front;
+- the backups to S3, `nuage check`, `nuage apps` and `nuage settings`, and Nuage DB Editor, as
+  clients (where the other side speaks it; else X25519, as before).
+
+An older client (a PostgreSQL driver on OpenSSL before 3.5) gets X25519 or P-256, unless
+`NUAGE_TLS_POST_QUANTUM=required`: then only TLS 1.3 with a post-quantum exchange is accepted.
+The tokens Nuage DB makes are 256 random bits. On Heroku, HTTPS ends at Heroku's router, which
+Nuage DB does not control: for a post-quantum website there, put a service that speaks
+X25519MLKEM768 in front (Cloudflare does by default), or use the PostgreSQL port with TLS.
+
 ### Coming from 0.4
 
 Up to 0.4 the pages were a [redb](https://docs.rs/redb) file, `nuage.redb`. Since then they
@@ -901,6 +923,8 @@ From the sources: `cargo run --profile release-editor -p nuage-editor`.
 | `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver, a token as the password | off |
 | `NUAGE_PG_BIND` | its address, when the website stays behind a proxy on `127.0.0.1` | `NUAGE_BIND` |
 | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol | none |
+| `NUAGE_TLS_POST_QUANTUM` | `required`: TLS accepts only clients that agree on their keys with a post-quantum exchange (X25519MLKEM768, TLS 1.3); `preferred`: it comes first, older clients get X25519 or P-256 (see [Against quantum computers](#against-quantum-computers)) | `preferred` |
+| `NUAGE_HTTPS_PORT` | HTTPS on this port too (the console, the API and the website), with the certificate of `NUAGE_TLS_CERT`: encrypted all the way with no proxy in front | none |
 | `NUAGE_BIND` | address to listen on (`127.0.0.1`: this machine only, behind a proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | data directory | `nuage-data` |
 | `NUAGE_NAME` | name of the first application (and of its database) | `nuage` |

@@ -77,8 +77,10 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread", "time",
 hyper = { version = "1", optional = true }
 hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 http-body-util = { version = "0.1", optional = true }
-tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+# TLS with aws-lc-rs: its key exchange X25519MLKEM768 (X25519 and ML-KEM-768, FIPS 203) keeps
+# what crosses the network safe from quantum computers, and it is offered first (src/tls.rs).
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws_lc_rs", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
 
 # Memory figures and free disk space on Unix systems (Windows uses its own calls).

@@ -7,6 +7,8 @@
 //! | `NUAGE_PG_PORT` | also serve the PostgreSQL protocol on this port (`5432`): every language's PostgreSQL driver connects, with a token as its password | off |
 //! | `NUAGE_PG_BIND` | address of the PostgreSQL protocol (`0.0.0.0` while the website stays behind a proxy on `127.0.0.1`) | `NUAGE_BIND` |
 //! | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | PEM files of a certificate and its key: TLS for the PostgreSQL protocol (`sslmode=require`) and the key-value port | none: in clear |
+//! | `NUAGE_TLS_POST_QUANTUM` | `required`: that TLS accepts only clients that agree on their keys with a post-quantum exchange (X25519MLKEM768, TLS 1.3); `preferred`: it comes first, older clients get X25519 or P-256 | `preferred` |
+//! | `NUAGE_HTTPS_PORT` | HTTPS on this port too (the console, the API and the website), with the certificate of `NUAGE_TLS_CERT`: encrypted all the way with no proxy in front, the keys agreed with the post-quantum exchange first | none |
 //! | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the protocol Redis clients speak: they connect to an application's store, with a token as their password | off |
 //! | `NUAGE_KV_BIND` | address of the key-value port | `NUAGE_BIND` |
 //! | `NUAGE_KV_MB` | memory of each application's key-value store (`/v1/kv`, the key-value port), in MiB, or `auto`; past it, the least recently used keys go. Not used with `NUAGE_KV_STORAGE=database` | `auto`: a sixteenth of the memory (4 to 256 MiB) each, and an eighth of it for all of them together |
@@ -76,10 +78,15 @@ pub struct Config {
     pub pg_bind: String,
     /// Port of the key-value store, if it has one of its own.
     pub kv_port: Option<u16>,
+    /// Port of HTTPS beside `port`, with the certificate of `tls`.
+    pub https_port: Option<u16>,
     /// Address of the key-value port.
     pub kv_bind: String,
     /// Certificate and key (PEM files) for TLS on the PostgreSQL protocol.
     pub tls: Option<(PathBuf, PathBuf)>,
+    /// Whether that TLS refuses a client without a post-quantum key exchange
+    /// (`NUAGE_TLS_POST_QUANTUM`).
+    pub tls_post_quantum: crate::tls::PostQuantum,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Engine settings.
@@ -301,7 +308,7 @@ fn file_store(get: &impl Fn(&str) -> Option<String>, bucket: String) -> Result<c
 /// The settings read once at startup, in the order the console shows them,
 /// and whether each is a secret (shown as set or not, never its value).
 #[cfg(feature = "server")]
-const STARTUP: [(&str, bool); 34] = [
+const STARTUP: [(&str, bool); 36] = [
     ("PORT", false),
     ("NUAGE_BIND", false),
     ("NUAGE_DATA_DIR", false),
@@ -315,6 +322,8 @@ const STARTUP: [(&str, bool); 34] = [
     ("NUAGE_KV_PORT", false),
     ("NUAGE_KV_BIND", false),
     ("NUAGE_TLS_CERT", false),
+    ("NUAGE_TLS_POST_QUANTUM", false),
+    ("NUAGE_HTTPS_PORT", false),
     ("NUAGE_TLS_KEY", false),
     ("NUAGE_BACKUP_DIR", false),
     ("NUAGE_BACKUP_S3_BUCKET", false),
@@ -361,6 +370,17 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
         (None, None) => None,
         _ => return Err(Error::Validation("set both NUAGE_TLS_CERT and NUAGE_TLS_KEY, or neither".into())),
+    };
+    let tls_post_quantum =
+        crate::tls::PostQuantum::parse(get("NUAGE_TLS_POST_QUANTUM").as_deref()).map_err(Error::Validation)?;
+    let https_port = match get("NUAGE_HTTPS_PORT") {
+        Some(p) if tls.is_none() => {
+            return Err(Error::Validation(format!(
+                "NUAGE_HTTPS_PORT={p} needs a certificate: set NUAGE_TLS_CERT and NUAGE_TLS_KEY too"
+            )));
+        }
+        Some(p) => Some(p.parse().map_err(|_| bad("NUAGE_HTTPS_PORT", &p))?),
+        None => None,
     };
     let admin_token = get("NUAGE_ADMIN_TOKEN");
     if let Some(t) = &admin_token
@@ -453,9 +473,11 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Config> {
         bind: get("NUAGE_BIND").unwrap_or_else(|| "0.0.0.0".into()),
         pg_bind: get("NUAGE_PG_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
         kv_port,
+        https_port,
         kv_bind: get("NUAGE_KV_BIND").or_else(|| get("NUAGE_BIND")).unwrap_or_else(|| "0.0.0.0".into()),
         pg_port,
         tls,
+        tls_post_quantum,
         data_dir,
         engine,
         server,

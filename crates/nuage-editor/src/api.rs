@@ -663,6 +663,22 @@ enum Method {
     Delete,
 }
 
+/// The cryptography of HTTPS: aws-lc-rs, the post-quantum key exchange
+/// X25519MLKEM768 offered first (a hybrid: safe while either X25519 or
+/// ML-KEM-768 holds), X25519 and P-256 for servers that lack it.
+pub fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> = std::sync::OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            use rustls::crypto::aws_lc_rs::kx_group;
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            provider.kx_groups =
+                vec![kx_group::X25519MLKEM768, kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
+            Arc::new(provider)
+        })
+        .clone()
+}
+
 impl Server {
     /// The server at `address` (as typed: it is normalized), opened with
     /// `token`. Its refusals come back in `lang`.
@@ -675,7 +691,8 @@ impl Server {
             .max_redirects(0)
             .timeout_connect(Some(connect))
             .timeout_global(Some(transport.global))
-            .user_agent(concat!("nuage-editor/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("nuage-editor/", env!("CARGO_PKG_VERSION")))
+            .tls_config(ureq::tls::TlsConfig::builder().unversioned_rustls_crypto_provider(tls_provider()).build());
         // The proxy of the environment (HTTPS_PROXY, ALL_PROXY) is for the Internet: through it,
         // "this computer" and its network would be the proxy's, and the token would go there.
         if matches!(address.class(), Class::Loopback | Class::Private) {
@@ -1203,6 +1220,13 @@ impl TokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn https_agrees_on_its_keys_with_a_post_quantum_exchange_first() {
+        let groups: Vec<rustls::NamedGroup> = tls_provider().kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(groups.first(), Some(&rustls::NamedGroup::X25519MLKEM768));
+        assert!(groups.contains(&rustls::NamedGroup::X25519), "servers without it still answer");
+    }
 
     #[test]
     fn answers_are_read_as_the_server_writes_them() {
