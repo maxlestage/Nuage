@@ -606,7 +606,7 @@ mod tests {
         // The editor's test takes the site's place on the server: it never says the site did not connect.
         db.last_connection = Some(LastConnection {
             at: "2026-11-15T21:04:00Z".into(),
-            client: "nuage-editor/0.4.7".into(),
+            client: "nuage-editor/0.4.8".into(),
             ..LastConnection::default()
         });
         assert_eq!(connection(Lang::Fr, &db, None, now), (Mark::Ok, "Testée depuis l'éditeur il y a 5 s".to_owned()));

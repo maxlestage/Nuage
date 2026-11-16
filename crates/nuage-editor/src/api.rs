@@ -55,7 +55,7 @@ impl Default for Transport {
 /// What a server has, besides applications and tokens (0.4.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Caps {
-    /// `/api/settings` (0.4.7): memory, limits, what it was started with.
+    /// `/api/settings` (0.4.8): memory, limits, what it was started with.
     pub settings: bool,
     /// `/api/status` opened by the management token, with the version.
     pub status: bool,
@@ -951,7 +951,7 @@ impl Server {
         self.parse(self.call(Route::App, Method::Post, &path, Some(json!({ "origins": origins })), true)?)
     }
 
-    /// The settings, the memory and the applications' amounts (0.4.7).
+    /// The settings, the memory and the applications' amounts (0.4.8).
     pub fn settings(&self) -> Result<Settings, ApiError> {
         self.parse(self.call(Route::Settings, Method::Get, "/api/settings", None, true)?)
     }
@@ -1415,10 +1415,10 @@ mod tests {
             assert_eq!(origin(bad), None, "{bad}");
         }
         let status: Status = serde_json::from_value(json!({
-            "version": "0.4.7", "uptime_s": 90, "memory": { "process_bytes": 5, "total_bytes": 9 },
+            "version": "0.4.8", "uptime_s": 90, "memory": { "process_bytes": 5, "total_bytes": 9 },
             "backup": { "enabled": true, "target": "/var/backups", "last_at": "2026-11-15T21:04:00Z", "last_ok": true, "last_error": null },
             "databases": [{ "name": "shop", "status": "ok", "tables": 2, "rows": 3, "websites": ["https://x.fr"],
-                            "last_connection": { "at": "2026-11-15T21:04:00Z", "via": "HTTP API", "client": "nuage-editor/0.4.7" } }],
+                            "last_connection": { "at": "2026-11-15T21:04:00Z", "via": "HTTP API", "client": "nuage-editor/0.4.8" } }],
         }))
         .unwrap();
         assert!(

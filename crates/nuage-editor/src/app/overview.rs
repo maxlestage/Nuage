@@ -1,7 +1,7 @@
 //! The overview: does the server work, how many applications and when they
 //! last connected, how much memory it uses, and whether its backups work.
 //! The answers come from `/api/status` when the management token opens it
-//! (0.4.7 and later); an older server is told apart, and the page says what
+//! (0.4.8 and later); an older server is told apart, and the page says what
 //! updating it would show.
 
 use std::collections::BTreeMap;
@@ -182,7 +182,7 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
             Mark::Warn,
             t(
                 l,
-                "This server (before the settings came, 0.4.7) lets the editor manage applications and tokens only: update it for memory and limits.",
+                "This server (before the settings came, 0.4.8) lets the editor manage applications and tokens only: update it for memory and limits.",
             ),
         );
     }
@@ -218,7 +218,7 @@ pub(super) fn page(ui: &mut egui::Ui, session: &mut Session, here: &Here, l: Lan
     }
 }
 
-/// "running for 3 days · version 0.4.7 · everything it stores is encrypted".
+/// "running for 3 days · version 0.4.8 · everything it stores is encrypted".
 fn answers(l: Lang, s: &Status) -> String {
     let mut parts = vec![tf(l, "running for {}", &[&format::span(l, s.uptime_s)]), tf(l, "version {}", &[&s.version])];
     if s.encryption.enabled {
@@ -419,7 +419,7 @@ mod tests {
 
     fn status() -> Status {
         Status {
-            version: "0.4.7".into(),
+            version: "0.4.8".into(),
             uptime_s: 3 * 86_400 + 60,
             memory: StatusMemory {
                 total_bytes: Some(16 << 30),
@@ -452,7 +452,7 @@ mod tests {
         let s = status();
         assert_eq!(
             answers(Lang::Fr, &s),
-            "en marche depuis 3 jours · version 0.4.7 · tout ce qu'il stocke est chiffré"
+            "en marche depuis 3 jours · version 0.4.8 · tout ce qu'il stocke est chiffré"
         );
         assert_eq!(
             applications(Lang::En, 3, Some(&s), &BTreeMap::new(), now),
@@ -463,7 +463,7 @@ mod tests {
         let mut tested = s.clone();
         tested.databases[0].last_connection = Some(LastConnection {
             at: "2026-11-15T21:03:58Z".into(),
-            client: "nuage-editor/0.4.7".into(),
+            client: "nuage-editor/0.4.8".into(),
             ..LastConnection::default()
         });
         assert_eq!(applications(Lang::En, 3, Some(&tested), &BTreeMap::new(), now), "3 applications");

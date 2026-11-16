@@ -439,9 +439,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Este es el token de una aplicación (NUAGE_TOKEN), no el token de gestión.",
     ),
     (
-        "This server (before the settings came, 0.4.7) lets the editor manage applications and tokens only: update it for memory and limits.",
-        "Ce serveur (antérieur aux réglages, 0.4.7) ne laisse l'éditeur gérer que les applications et les jetons : mettez-le à jour pour la mémoire et les limites.",
-        "Este servidor (anterior a los ajustes, 0.4.7) solo deja al editor gestionar las aplicaciones y los tokens: actualízalo para la memoria y los límites.",
+        "This server (before the settings came, 0.4.8) lets the editor manage applications and tokens only: update it for memory and limits.",
+        "Ce serveur (antérieur aux réglages, 0.4.8) ne laisse l'éditeur gérer que les applications et les jetons : mettez-le à jour pour la mémoire et les limites.",
+        "Este servidor (anterior a los ajustes, 0.4.8) solo deja al editor gestionar las aplicaciones y los tokens: actualízalo para la memoria y los límites.",
     ),
     (
         "This server is older than Nuage DB 0.4.2: update it to manage it from here.",
@@ -481,9 +481,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Type another token", "Taper un autre jeton", "Escribir otro token"),
     (
-        "Update the server to see this here: its version has no settings for the editor (they came with Nuage DB 0.4.7).",
-        "Mettez le serveur à jour pour voir ceci ici : sa version n'a pas de réglages pour l'éditeur (ils sont arrivés avec Nuage DB 0.4.7).",
-        "Actualiza el servidor para ver esto aquí: su versión no tiene ajustes para el editor (llegaron con Nuage DB 0.4.7).",
+        "Update the server to see this here: its version has no settings for the editor (they came with Nuage DB 0.4.8).",
+        "Mettez le serveur à jour pour voir ceci ici : sa version n'a pas de réglages pour l'éditeur (ils sont arrivés avec Nuage DB 0.4.8).",
+        "Actualiza el servidor para ver esto aquí: su versión no tiene ajustes para el editor (llegaron con Nuage DB 0.4.8).",
     ),
     ("Use {}", "Utiliser {}", "Usar {}"),
     ("Waiting for your keyring…", "En attente de votre trousseau…", "Esperando a tu llavero…"),
