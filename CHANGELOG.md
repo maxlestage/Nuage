@@ -4,53 +4,6 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 
 ## Unreleased
 
-### Memory you can count on, and a steadier server
-
-- **The right figures.** The memory shown is the one this server may use: its container's
-  limit (cgroup v2 and v1, in a group of its own or not), else the machine's. What is used is
-  the container's usage, or this process's where the host gives the limit and nothing else
-  (a Heroku dyno): there, the dashboard said that everything was free. The swap is the
-  container's; the swap of the whole machine it shares is no longer shown as its own.
-  `NUAGE_MEMORY_MB` says the memory by hand. `/api/status`: `memory.used_bytes`, `limited`,
-  `cache_budget_bytes`, `reliefs`.
-- **One cache budget for all the applications** (`NUAGE_CACHE_MB`, by default a quarter of
-  the memory), shared equally and shared again when an application is created or deleted.
-  It was an eighth of the memory for each application: six of them could hold three quarters
-  of it. `Engine::set_cache_bytes`, `cache_capacity`, `drop_cache`;
-  `ServerOptions::cache_budget`.
-- **The caches use the memory there is.** With `NUAGE_CACHE_MB=auto` the budget follows the
-  memory of the server, whatever its size: a quarter of it at first; every ten seconds a
-  thirty-second more while the caches are full and the memory in use would stay under 65 %
-  once they have filled (up to six tenths of the memory), a thirty-second less past 78 %.
-  Each application has what it holds plus an equal part of what is free
-  (`memory::cache_shares`), given again every ten seconds: one busy application takes what
-  five nearly empty ones leave, where equal parts kept it to a sixth. What the allocator keeps
-  of memory freed since a burst goes back to the system when the caches want room.
-  `memory::cache_move`, `ServerOptions::cache_ceiling`, `Engine::cache_used`; `/api/status`:
-  `memory.cache_ceiling_bytes`.
-- **A memory guard.** Every two seconds; past 85 % in use, the caches are emptied, their
-  budget halved (16 MiB at least) and the freed memory returned to the system, while requests
-  go on; for five minutes the budget does not grow again, and for an hour it stays under
-  three quarters of the one that did not fit. Said in the event log and in the server's log.
-- **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
-  memory held under load, for a few percent of throughput.
-- **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them
-  together hold an eighth of the memory at most; each has the smaller of its own limit and
-  its equal part. `Kv::set_max_bytes`; `ServerOptions::kv_budget`.
-- **Threads are bounded**: blocking work on four threads a core (16 to 64, less where the
-  system allows few: a Heroku dyno has 256 in all), instead of up to 512; more requests wait
-  their turn. PostgreSQL connections, a thread each, are limited
-  (`NUAGE_PG_MAX_CONNECTIONS`, 100 by default); the next ones are told
-  `too_many_connections` (53300).
-- **The upkeep thread survives a failure**: a round that panics is reported, and the
-  checkpoints and backups go on.
-- The dashboard has a **Memory** card (used, free, of how much), with its details; the
-  console's Server page shows the same.
-- **Memory reads in gigabytes**: `0.45 GB free`, `0.05 GB / 0.50 GB` used (a gigabyte of
-  memory is 1024³ bytes, as memory is sold: a 512 MB dyno shows `0.50 GB`), on the dashboard
-  and on the console's Server page; the caches, smaller, in megabytes of the same base. The
-  dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
-
 ### The key-value store in the database, and backups a setting cannot lose
 
 - **The key-value store can live in the database**: `NUAGE_KV_STORAGE=database`, for every
@@ -236,6 +189,74 @@ stop, as the README shows). Known limits:
   `Engine::stop_writes`, `Engine::wait_for_backups`, `BackupOptions::stuck_after`, `BackupStatus::destinations` and `DestinationStatus`,
   `engine::backup::inspect` and `BackupInfo` (what a location holds, and how far it
   reaches), `BackupStatus::restored_from`; `Config::backups`.
+
+## 0.4.7 (2026-11-16)
+
+### Memory you can count on, and a steadier server
+
+- **The right figures.** The memory shown is the one this server may use: its container's
+  limit (cgroup v2 and v1, in a group of its own or not), else the machine's. What is used is
+  the container's usage, or this process's where the host gives the limit and nothing else
+  (a Heroku dyno): there, the dashboard said that everything was free. The swap is the
+  container's; the swap of the whole machine it shares is no longer shown as its own.
+  `NUAGE_MEMORY_MB` says the memory by hand. `/api/status`: `memory.used_bytes`, `limited`,
+  `cache_budget_bytes`, `reliefs`.
+- **One cache budget for all the applications** (`NUAGE_CACHE_MB`, by default a quarter of
+  the memory), shared equally and shared again when an application is created or deleted.
+  It was an eighth of the memory for each application: six of them could hold three quarters
+  of it. `Engine::set_cache_bytes`, `cache_capacity`, `drop_cache`;
+  `ServerOptions::cache_budget`.
+- **The caches use the memory there is.** With `NUAGE_CACHE_MB=auto` the budget follows the
+  memory of the server, whatever its size: a quarter of it at first; every ten seconds a
+  thirty-second more while the caches are full and the memory in use would stay under 65 %
+  once they have filled (up to six tenths of the memory), a thirty-second less past 78 %.
+  Each application has what it holds plus an equal part of what is free
+  (`memory::cache_shares`), given again every ten seconds: one busy application takes what
+  five nearly empty ones leave, where equal parts kept it to a sixth. What the allocator keeps
+  of memory freed since a burst goes back to the system when the caches want room.
+  `memory::cache_move`, `ServerOptions::cache_ceiling`, `Engine::cache_used`; `/api/status`:
+  `memory.cache_ceiling_bytes`.
+- **A memory guard.** Every two seconds; past 85 % in use, the caches are emptied, their
+  budget halved (16 MiB at least) and the freed memory returned to the system, while requests
+  go on; for five minutes the budget does not grow again, and for an hour it stays under
+  three quarters of the one that did not fit. Said in the event log and in the server's log.
+- **The allocator** keeps to eight arenas on a server of 2 GiB or less: a quarter less
+  memory held under load, for a few percent of throughput.
+- **The key-value stores keep to a budget too**: with `NUAGE_KV_MB=auto`, all of them
+  together hold an eighth of the memory at most; each has the smaller of its own limit and
+  its equal part. `Kv::set_max_bytes`; `ServerOptions::kv_budget`.
+- **Threads are bounded**: blocking work on four threads a core (16 to 64, less where the
+  system allows few: a Heroku dyno has 256 in all), instead of up to 512; more requests wait
+  their turn. PostgreSQL connections, a thread each, are limited
+  (`NUAGE_PG_MAX_CONNECTIONS`, 100 by default); the next ones are told
+  `too_many_connections` (53300).
+- **The upkeep thread survives a failure**: a round that panics is reported, and the
+  checkpoints and backups go on.
+- The dashboard has a **Memory** card (used, free, of how much), with its details; the
+  console's Server page shows the same.
+- **Memory reads in gigabytes**: `0.45 GB free`, `0.05 GB / 0.50 GB` used (a gigabyte of
+  memory is 1024³ bytes, as memory is sold: a 512 MB dyno shows `0.50 GB`), on the dashboard
+  and on the console's Server page; the caches, smaller, in megabytes of the same base. The
+  dashboard writes sizes in the units of its language: `Go`, `Mo`, `ko` in French.
+
+### Faster
+
+Measured with `cargo run --release -p nuage --example bench` (two new lines), before (0.4.6)
+and after, run in turn on the same machine (4 cores, busy with other builds; medians of three
+runs):
+
+| | 0.4.6 | 0.4.7 |
+|---|---|---|
+| three pages of 200 rows in one `/v1/batch` | 2.91 ms | **2.07 ms** (−29 %) |
+| 1,000 rows of `db.raw(...)` (`/v1/fetch`) | 12.46 ms | **10.58 ms** (−15 %) |
+
+- **`/v1/batch` and `db.raw(...)` answer straight as their text** (Memoire's
+  `wire::rows_to_vec`), as `/v1/fetch` and `/v1/sql` already did, instead of a JSON tree that
+  `json!` then copied whole (for a batch, each statement's rows, then the list of them) before
+  it was serialized and dropped. The same bytes, tested against the tree they replace. Writing
+  the answer alone: 1,000 rows in 0.32 ms instead of 1.50 ms, a batch of three times 1,000 rows
+  in 1.01 ms instead of 6.07 ms.
+- The bench measures both.
 
 ## 0.4.6 (2026-11-15)
 

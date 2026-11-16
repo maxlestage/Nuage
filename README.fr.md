@@ -304,7 +304,7 @@ chaque pilote PostgreSQL se connecte aussi : voir plus bas.
 
 **Ma connexion marche-t-elle ?** `GET /v1/ping` répond quelle application le jeton ouvre :
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <jeton>"` donne
-`Connected to Nuage DB 0.4.6: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.7: application blog, read and write, branch main, 3 table(s).`,
 et sans jeton, ou avec un jeton qui n'ouvre rien, il dit ce qui ne va pas. Depuis n'importe
 quelle machine : `nuage check <url> <jeton>`. Une connexion PostgreSQL reçoit la même phrase
 en avis (psql l'affiche), et la page de chaque application dans la console montre sa dernière
@@ -558,7 +558,7 @@ SYSTEM, lisible des seuls administrateurs, avec une règle de pare-feu pour le r
   fonctionne, mais prévient que le mot de passe circule en clair.
 - **Mise à jour** : relancez la commande ; données, clé, réglages et sauvegardes restent.
 - **Options** : `NUAGE_PORT`, `NUAGE_PG_PORT` (`0` : coupé), `NUAGE_SWAP_MB` (`0` : pas de
-  swap), `NUAGE_VERSION=v0.4.6`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
+  swap), `NUAGE_VERSION=v0.4.7`, `NUAGE_BINARY=/chemin/vers/nuage`, `NUAGE_FROM_SOURCE=1`
   (compiler avec cargo). Sur Windows, définissez-les avant : `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Désinstaller** : `... | sudo bash -s uninstall` garde les données, les réglages et les
   sauvegardes ; `... | sudo bash -s purge` efface les données et les réglages, jamais les
@@ -593,7 +593,7 @@ Le binaire `nuage` arrive dans `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` sur Wi
 le site et le tableau de bord en direct. Un serveur plus léger, sans eux (`/` est alors une
 petite page d'accueil ; la console, l'API et tout le reste demeurent) :
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-Une version précise : `--tag v0.4.6`. Mise à jour : la même commande, avec `--force`.
+Une version précise : `--tag v0.4.7`. Mise à jour : la même commande, avec `--force`.
 
 `cargo install` ne pose que le binaire : ni service, ni réglages, ni sauvegardes. Donnez-le à
 l'installateur, qui fait le reste (réglages, sauvegardes, service lancé avec l'ordinateur) :

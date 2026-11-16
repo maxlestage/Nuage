@@ -132,6 +132,23 @@ async fn main() -> memoire_orm::Result<()> {
     })
     .await;
     println!("update      {}", summary(writes));
+    // Three pages of 200 rows in one request (`POST /v1/batch`).
+    let pages: Vec<_> = (0..3)
+        .map(|c| Article::query().filter(Article::CATEGORY.eq(c)).order_by(Article::ID.desc()).limit(200).into_ast())
+        .collect();
+    let batches = timed(n / 4, |_| {
+        let db = db.clone();
+        let pages = &pages;
+        async move {
+            let mut batch = db.batch();
+            for page in pages {
+                batch = batch.fetch(memoire_orm::Query::Select(page));
+            }
+            assert_eq!(batch.run().await.unwrap().len(), 3);
+        }
+    })
+    .await;
+    println!("batch 3x200 {}", summary(batches));
 
     // What a website sees: `POST /v1/sql` over one kept-alive connection,
     // with and without gzip.
@@ -177,6 +194,13 @@ async fn main() -> memoire_orm::Result<()> {
     // same kept-alive connection.
     for (label, method, path, body) in [
         ("http floor ", "GET", "/api/health".to_owned(), ""),
+        // `db.raw(...)` of Memoire's client: 1,000 rows of raw SQL.
+        (
+            "raw 1000   ",
+            "POST",
+            "/v1/fetch".to_owned(),
+            r#"{"query":{"raw":"SELECT * FROM articles WHERE id <= 1000","params":[]}}"#,
+        ),
         ("kv set     ", "PUT", "/v1/kv/session:".to_owned(), "a value of a few dozen bytes, as a session is"),
         ("kv get     ", "GET", "/v1/kv/session:".to_owned(), ""),
         ("kv incr    ", "POST", "/v1/kv/hits?incr".to_owned(), ""),

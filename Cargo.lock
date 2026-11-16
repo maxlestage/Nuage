@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "active"
 version = "0.3.0"
-source = "git+https://github.com/maxlestage/Active#c43f8aece9ff03c241e483f6b69cbfc4f26c4d0b"
+source = "git+https://github.com/maxlestage/Active#b4993f5181516b47f283e117e5871c6c3117b145"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "nuage"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1414,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "vitesse"
 version = "0.2.0"
-source = "git+https://github.com/maxlestage/Vitesse#385ddf5b32275126ed8d71e02ad0c63396ce0ac3"
+source = "git+https://github.com/maxlestage/Vitesse#c1e4b61e53af6b338133a166ecae096a1bd1199b"
 dependencies = [
  "brotli",
  "bytes",
