@@ -68,6 +68,8 @@ pub mod server;
 #[cfg(feature = "site")]
 mod site;
 pub mod sql;
+#[cfg(feature = "s3")]
+pub mod tls;
 
 use memoire_orm::{Database, Dialect, ExecResult, Executor, FromRow, Query, Result, Transaction};
 #[cfg(feature = "server")]

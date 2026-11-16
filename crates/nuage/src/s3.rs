@@ -454,14 +454,8 @@ impl S3Store {
             Some((h, p)) => (h.to_owned(), p.parse().map_err(|_| s3_err("invalid endpoint port"))?),
             None => (authority.to_owned(), if https { 443 } else { 80 }),
         };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(s3_err)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // The post-quantum key exchange first, where the storage speaks it.
+        let config = crate::tls::client_config().map_err(s3_err)?;
         Ok(S3Store {
             options,
             https,

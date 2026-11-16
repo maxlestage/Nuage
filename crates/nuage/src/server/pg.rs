@@ -122,23 +122,10 @@ impl Drop for ReadOnlyPlace<'_> {
 }
 
 /// A TLS configuration from a certificate chain and its private key, as PEM
-/// files (those of Let's Encrypt, for instance).
+/// files (those of Let's Encrypt, for instance): the post-quantum key
+/// exchange first, the classic ones for older clients (see [`crate::tls`]).
 pub fn tls_config(cert_pem: &std::path::Path, key_pem: &std::path::Path) -> Result<Arc<rustls::ServerConfig>> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let bad = |what: &str, e: &dyn std::fmt::Display| Error::Validation(format!("TLS: {what}: {e}"));
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_pem)
-        .map_err(|e| bad(&cert_pem.display().to_string(), &e))?
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| bad(&cert_pem.display().to_string(), &e))?;
-    let key = PrivateKeyDer::from_pem_file(key_pem).map_err(|e| bad(&key_pem.display().to_string(), &e))?;
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| bad("protocol versions", &e))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| bad("certificate", &e))?;
-    Ok(Arc::new(config))
+    crate::tls::server_config(cert_pem, key_pem, crate::tls::PostQuantum::Preferred)
 }
 
 // ---------------------------------------------------------------------------

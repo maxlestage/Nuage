@@ -135,14 +135,7 @@ async fn send(method: &str, url: &str, token: Option<&str>, json: Option<Vec<u8>
     let request = request.body(Full::new(Bytes::from(json.unwrap_or_default()))).map_err(|e| err(&e))?;
     let tcp = TcpStream::connect((host, port)).await.map_err(|e| err(&e))?;
     let response = if https {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| err(&e))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let config = crate::tls::client_config().map_err(|e| err(&e))?;
         let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| err(&e))?;
         let stream =
             tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp).await.map_err(|e| err(&e))?;

@@ -138,6 +138,30 @@ versión anterior se cifra al abrirla con una clave, y la copia en claro se sust
 también cifra, con `EngineOptions { encryption: Some(Encryption::parse(clave)?), .. }` o
 `NUAGE_ENCRYPTION_KEY` con `nuage::Db::from_env()`.
 
+### Frente a los ordenadores cuánticos
+
+Lo que Nuage DB guarda se cifra con algoritmos simétricos y claves de 256 bits (AES-256,
+HKDF-SHA256, Argon2id, SHA-256 para las huellas de los tokens): un ordenador cuántico solo
+divide por dos la fuerza de una clave así (Grover), y quedan 128 bits. Lo que un ordenador
+cuántico rompe es el intercambio de claves públicas de TLS: una conversación grabada hoy podría
+descifrarse más tarde. Por eso cada conexión que Nuage DB cifra por sí mismo acuerda sus claves
+primero con **X25519MLKEM768**, un híbrido de X25519 y ML-KEM-768, el encapsulado de claves
+poscuántico de la norma FIPS 203, seguro mientras uno de los dos resista (aws-lc-rs, cuyo ML-KEM
+está validado FIPS 140-3, a través de rustls):
+
+- los puertos PostgreSQL y clave-valor con `NUAGE_TLS_CERT` y `NUAGE_TLS_KEY`;
+- **HTTPS en un puerto propio** con `NUAGE_HTTPS_PORT` (el mismo certificado): la consola, su
+  contraseña, los tokens y la API cifrados de extremo a extremo, sin proxy delante;
+- las copias hacia S3, `nuage check`, `nuage apps` y `nuage settings`, y Nuage DB Editor, como
+  clientes (cuando el otro lado lo habla; si no, X25519, como antes).
+
+Un cliente más antiguo (un driver PostgreSQL sobre OpenSSL anterior a 3.5) obtiene X25519 o
+P-256, salvo con `NUAGE_TLS_POST_QUANTUM=required`: entonces solo se acepta TLS 1.3 con un
+intercambio poscuántico. Los tokens que Nuage DB crea tienen 256 bits aleatorios. En Heroku,
+HTTPS termina en el router de Heroku, que Nuage DB no controla: para un sitio poscuántico allí,
+pon delante un servicio que hable X25519MLKEM768 (Cloudflare lo hace por defecto), o usa el
+puerto PostgreSQL con TLS.
+
 ### Viniendo de la versión 0.4
 
 Hasta la 0.4, las páginas eran un archivo [redb](https://docs.rs/redb), `nuage.redb`.
@@ -944,6 +968,8 @@ entorno, se conecta al momento. Desde el código fuente: `cargo run --profile re
 | `NUAGE_PG_PORT` | sirve también el protocolo PostgreSQL en este puerto (`5432`): el driver PostgreSQL de cada lenguaje, un token como contraseña | apagado |
 | `NUAGE_PG_BIND` | su dirección, cuando el sitio queda detrás de un proxy en `127.0.0.1` | `NUAGE_BIND` |
 | `NUAGE_TLS_CERT`, `NUAGE_TLS_KEY` | archivos PEM de un certificado y su clave: TLS para el protocolo PostgreSQL | ninguno |
+| `NUAGE_TLS_POST_QUANTUM` | `required`: TLS solo acepta clientes que acuerdan sus claves con un intercambio poscuántico (X25519MLKEM768, TLS 1.3); `preferred`: va primero, los clientes más antiguos obtienen X25519 o P-256 (ver [Frente a los ordenadores cuánticos](#frente-a-los-ordenadores-cuánticos)) | `preferred` |
+| `NUAGE_HTTPS_PORT` | HTTPS también en este puerto (la consola, la API y el sitio), con el certificado de `NUAGE_TLS_CERT`: cifrado de extremo a extremo sin proxy delante | ninguno |
 | `NUAGE_BIND` | dirección de escucha (`127.0.0.1`: solo esta máquina, detrás de un proxy) | `0.0.0.0` |
 | `NUAGE_DATA_DIR` | directorio de datos | `nuage-data` |
 | `NUAGE_NAME` | nombre de la primera aplicación (y de su base) | `nuage` |
