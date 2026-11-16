@@ -32,7 +32,8 @@ pub struct Transport {
     /// Reaching a server of this computer: it answers at once, or it is not running.
     pub connect_loopback: Duration,
     /// A whole call. Saving a setting sends it to the backup at once, and
-    /// Heroku's router gives up after 30 s anyway.
+    /// Heroku's router gives up after 30 s anyway, with a page of its own
+    /// (a change may have been made all the same).
     pub global: Duration,
     /// The largest answer read (answers are a few KB).
     pub body_limit: u64,
@@ -155,6 +156,39 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// The server itself refused, in its own words (its JSON answer): what it
+    /// has and does is known. Else the network, the host or the time failed
+    /// on the way, and the call says nothing about the server.
+    pub fn from_the_server(&self) -> bool {
+        matches!(
+            self,
+            ApiError::TokenRefused
+                | ApiError::ManagementOff
+                | ApiError::ReadOnly(_)
+                | ApiError::TooOld
+                | ApiError::Unsupported
+                | ApiError::NotFound(_)
+                | ApiError::Conflict(_)
+                | ApiError::Invalid(_)
+        )
+    }
+
+    /// A change sent with this answer may or may not have been made: the
+    /// answer was lost on the way (a timeout, a reset, a page of the host
+    /// such as Heroku's after 30 s), or the server failed while making it.
+    /// The other failures are a refusal, or the call never left.
+    pub fn change_unknown(&self) -> bool {
+        match self {
+            ApiError::Timeout { .. }
+            | ApiError::Network(_)
+            | ApiError::NotNuage(_)
+            | ApiError::TooLarge
+            | ApiError::Bug(_) => true,
+            ApiError::HostAnswered(status) | ApiError::Server(status, _) => *status >= 500,
+            _ => false,
+        }
+    }
+
     /// What it means for the person, and what they can do, in `l`.
     pub fn explain(&self, l: Lang) -> String {
         let with = |what: &str, detail: &str| {
@@ -232,7 +266,7 @@ impl ApiError {
             .to_owned(),
             ApiError::ManagementOff => t(
                 l,
-                "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Set it in its settings file or its host's variables (`nuage genkey` makes one), then restart the server.",
+                "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Tools, Generate a token makes one. Then set it: on Heroku in Settings, Config Vars (Heroku restarts the server by itself); with Docker in the .env file, then restart the container; for a server installed with the installer, in its settings file, then restart its service.",
             )
             .to_owned(),
             ApiError::ReadOnly(detail) => with(
@@ -561,8 +595,12 @@ pub struct Connected {
     /// `None`: an older server without settings, or they failed (`settings_error`).
     pub settings: Option<Settings>,
     pub settings_error: Option<ApiError>,
-    /// `None`: the management token does not open the status (an older server).
+    /// `None`: the management token does not open the status (an older
+    /// server), or it failed on the way (`status_error`).
     pub status: Option<Status>,
+    /// The network or the host failed while the status was asked: it is
+    /// asked again at the next refresh.
+    pub status_error: Option<ApiError>,
 }
 
 /// A Nuage DB server and its management token.
@@ -615,15 +653,19 @@ impl Server {
     pub fn new(address: &str, token: Secret, lang: Lang, transport: &Transport) -> Result<Server, ApiError> {
         let address = address::normalize(address).map_err(|_| ApiError::BadAddress(address.trim().to_owned()))?;
         let connect = if address.class() == Class::Loopback { transport.connect_loopback } else { transport.connect };
-        let agent = ureq::Agent::config_builder()
+        let mut config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             // A 3xx comes back as it is: the token goes nowhere else.
             .max_redirects(0)
             .timeout_connect(Some(connect))
             .timeout_global(Some(transport.global))
-            .user_agent(concat!("nuage-editor/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
+            .user_agent(concat!("nuage-editor/", env!("CARGO_PKG_VERSION")));
+        // The proxy of the environment (HTTPS_PROXY, ALL_PROXY) is for the Internet: through it,
+        // "this computer" and its network would be the proxy's, and the token would go there.
+        if matches!(address.class(), Class::Loopback | Class::Private) {
+            config = config.proxy(None);
+        }
+        let agent = config.build().into();
         let base = address.base();
         Ok(Server {
             address,
@@ -663,6 +705,14 @@ impl Server {
         &self.caps
     }
 
+    /// What a later read of the status says of it: a status, with its
+    /// version (`Some`), or the server's own no (`None`, an older server).
+    pub fn learned_status(&mut self, version: Option<String>) {
+        self.caps.status = version.is_some();
+        self.caps.origins = self.caps.status;
+        self.caps.version = version;
+    }
+
     /// The token, for the one place that keeps it (the password store).
     pub fn token(&self) -> &Secret {
         &self.token
@@ -693,16 +743,22 @@ impl Server {
                 std::thread::Builder::new().name("nuage-editor-call".into()).spawn_scoped(scope, || this.status());
             let settings = this.settings();
             let status = match status {
-                Ok(handle) => handle.join().unwrap_or(Err(ApiError::Unsupported)),
+                Ok(handle) => handle.join().unwrap_or_else(|_| Err(ApiError::Bug("the status call stopped".into()))),
                 // No thread: one after the other.
                 Err(_) => this.status(),
             };
             (settings, status)
         });
         // An older server answers a token it does not know with its public
-        // status, which has no version: that is no status (S1 and S2 came together).
-        let status = status.ok();
-        self.caps.status = status.is_some();
+        // status, which has no version, or with 401: that is no status (S1 and
+        // S2 came together). A failure on the way (a 503 page while it wakes, a
+        // timeout) says nothing: the next refresh asks again.
+        let (status, status_error) = match status {
+            Ok(status) => (Some(status), None),
+            Err(e) if e.from_the_server() => (None, None),
+            Err(e) => (None, Some(e)),
+        };
+        self.caps.status = status.is_some() || status_error.is_some();
         self.caps.origins = self.caps.status;
         self.caps.version = status.as_ref().map(|s| s.version.clone());
         let (settings, settings_error) = match settings {
@@ -711,7 +767,7 @@ impl Server {
             Err(e) => (None, Some(e)),
         };
         self.caps.settings = settings.is_some() || settings_error.is_some();
-        Ok(Connected { server: self, apps, settings, settings_error, status })
+        Ok(Connected { server: self, apps, settings, settings_error, status, status_error })
     }
 
     /// One call with the management token (`bearer`), or without any.
@@ -792,6 +848,8 @@ impl Server {
                     _ => self.transport.global,
                 },
             },
+            // The system found no address for the name (ureq says HostNotFound only for an empty list).
+            ureq::Error::Io(io) if lookup_failed(&io) => ApiError::HostNotFound(self.address.host.clone()),
             ureq::Error::Io(io) => match io.kind() {
                 std::io::ErrorKind::ConnectionRefused => ApiError::Refused {
                     address: self.base.clone(),
@@ -937,6 +995,18 @@ impl Server {
     }
 }
 
+/// The system could not turn a name into an address: no such name, or no
+/// answer from the name servers (this computer is offline). std says it
+/// `failed to lookup address information: …` on Unix and macOS; Windows
+/// gives the WSA code (HOST_NOT_FOUND, TRY_AGAIN, NO_RECOVERY, NO_DATA).
+fn lookup_failed(io: &std::io::Error) -> bool {
+    if cfg!(windows) {
+        matches!(io.raw_os_error(), Some(11001..=11004))
+    } else {
+        io.raw_os_error().is_none() && io.to_string().starts_with("failed to lookup address information")
+    }
+}
+
 /// What a refused answer means, by route: `status`, its JSON (`None`: not
 /// JSON, a page), and its `Location`.
 pub fn refusal(route: Route, base: &str, status: u16, json: Option<&Json>, location: Option<&str>) -> ApiError {
@@ -1011,8 +1081,11 @@ pub fn typed_token(typed: &str) -> Result<Secret, TokenError> {
         Err(TokenError::Application)
     } else if !text.chars().all(|c| c.is_ascii_graphic()) {
         Err(TokenError::Characters)
-    } else if text.chars().count() < MIN_ADMIN_TOKEN {
+    } else if text.chars().count() < MIN_ADMIN_TOKEN / 2 {
         Err(TokenError::Short)
+    } else if text.chars().count() < MIN_ADMIN_TOKEN {
+        // The installer's console password has 24 characters.
+        Err(TokenError::Password)
     } else {
         Ok(Secret::new(text.to_owned()))
     }
@@ -1078,8 +1151,11 @@ pub fn origin(typed: &str) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenError {
     Empty,
-    /// Under [`MIN_ADMIN_TOKEN`] characters.
+    /// Under half of [`MIN_ADMIN_TOKEN`] characters.
     Short,
+    /// Under [`MIN_ADMIN_TOKEN`] characters, as many as a password: the
+    /// console's, perhaps.
+    Password,
     /// `nuage_…`: an application's token.
     Application,
     /// Spaces or characters a token does not have.
@@ -1093,6 +1169,11 @@ impl TokenError {
             TokenError::Short => {
                 tf(l, "A management token has {} characters at least: is part of it missing?", &[&MIN_ADMIN_TOKEN])
             }
+            TokenError::Password => tf(
+                l,
+                "A management token has {} characters at least: is part of it missing, or is this the console password (NUAGE_ADMIN_PASSWORD)? The editor needs NUAGE_ADMIN_TOKEN, 64 characters when the installer or Heroku made it.",
+                &[&MIN_ADMIN_TOKEN],
+            ),
             TokenError::Application => {
                 t(l, "This is an application's token (NUAGE_TOKEN), not the management token.").to_owned()
             }
@@ -1239,7 +1320,13 @@ mod tests {
                 let text = e.explain(l);
                 assert!(!text.is_empty() && !text.contains("{}"), "{l:?} {e:?}: {text}");
             }
-            for e in [TokenError::Empty, TokenError::Short, TokenError::Application, TokenError::Characters] {
+            for e in [
+                TokenError::Empty,
+                TokenError::Short,
+                TokenError::Password,
+                TokenError::Application,
+                TokenError::Characters,
+            ] {
                 assert!(!e.explain(l).is_empty());
             }
         }
@@ -1261,6 +1348,9 @@ mod tests {
         }
         assert_eq!(typed_token("  ").map(|_| ()), Err(TokenError::Empty));
         assert_eq!(typed_token("short").map(|_| ()), Err(TokenError::Short));
+        // The installer's console password (24 characters): the hint names it.
+        assert_eq!(typed_token("0123456789abcdef01234567").map(|_| ()), Err(TokenError::Password));
+        assert!(TokenError::Password.explain(Lang::Fr).contains("NUAGE_ADMIN_PASSWORD"));
         assert_eq!(typed_token("nuage_0123456789abcdef0123456789abcdef").map(|_| ()), Err(TokenError::Application));
         assert_eq!(typed_token("0123456789abcdef 0123456789abcdef").map(|_| ()), Err(TokenError::Characters));
         assert_eq!(segment("ma boutique/é"), "ma%20boutique%2F%C3%A9");
@@ -1315,5 +1405,72 @@ mod tests {
             (server.public_address(), public.public_address()),
             ("http://localhost:8080", "https://nuage.example.com")
         );
+    }
+
+    #[test]
+    fn this_computer_and_its_network_are_called_without_a_proxy() {
+        // Whatever HTTPS_PROXY says: never through it (tests/fake_servers.rs calls with one set).
+        for address in ["http://127.0.0.1:8080", "localhost:8080", "http://192.168.1.20:8080", "nas:8080"] {
+            let server = Server::new(address, Secret::new("t".into()), Lang::En, &Transport::default()).unwrap();
+            assert!(server.agent.config().proxy().is_none(), "{address}");
+        }
+    }
+
+    #[test]
+    fn a_name_no_computer_has() {
+        let server =
+            Server::new("https://nuage-typo.example.com", Secret::new("t".into()), Lang::En, &Transport::default())
+                .unwrap();
+        // What std gives ureq when the system's lookup fails, on each system.
+        let failed = if cfg!(windows) {
+            std::io::Error::from_raw_os_error(11001)
+        } else {
+            std::io::Error::other("failed to lookup address information: Name or service not known")
+        };
+        assert_eq!(
+            server.failed(ureq::Error::Io(failed), true),
+            ApiError::HostNotFound("nuage-typo.example.com".into())
+        );
+        assert_eq!(
+            server.failed(ureq::Error::HostNotFound, true),
+            ApiError::HostNotFound("nuage-typo.example.com".into())
+        );
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer");
+        assert!(matches!(server.failed(ureq::Error::Io(reset), false), ApiError::Network(_)));
+    }
+
+    #[test]
+    fn what_a_failure_says_of_the_server_and_of_a_change() {
+        let on_the_way = [
+            ApiError::Timeout { address: "x".into(), after: Duration::from_secs(45) },
+            ApiError::HostAnswered(503),
+            ApiError::Network("connection reset".into()),
+            ApiError::NotNuage("x".into()),
+            ApiError::TooLarge,
+            ApiError::Bug("x".into()),
+            ApiError::Server(500, "disk full".into()),
+        ];
+        for e in &on_the_way {
+            assert!(e.change_unknown() && !e.from_the_server(), "{e:?}");
+        }
+        let refusals = [
+            ApiError::TokenRefused,
+            ApiError::ManagementOff,
+            ApiError::Unsupported,
+            ApiError::NotFound("x".into()),
+            ApiError::Conflict("x".into()),
+            ApiError::Invalid("x".into()),
+        ];
+        for e in &refusals {
+            assert!(!e.change_unknown() && e.from_the_server(), "{e:?}");
+        }
+        // Never sent: nothing was made, and nothing is known of the server either.
+        for e in [
+            ApiError::Busy,
+            ApiError::Refused { address: "x".into(), loopback: true, port: 1 },
+            ApiError::HostAnswered(407),
+        ] {
+            assert!(!e.change_unknown() && !e.from_the_server(), "{e:?}");
+        }
     }
 }

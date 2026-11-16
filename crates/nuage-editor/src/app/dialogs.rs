@@ -66,7 +66,7 @@ pub(super) fn reveal(ctx: &egui::Context, session: &mut Session, l: Lang, clipbo
                 format!("nuage_{MASK}")
             });
             let lines = Zeroizing::new(format!("NUAGE_URL={}\nNUAGE_TOKEN={}", reveal.connection.url, *token));
-            super::apps::code(ui, &lines);
+            super::apps::secret_code(ui, &lines);
             ui.horizontal_wrapped(|ui| {
                 let show = if reveal.shown { t(l, "Hide the token") } else { t(l, "Show the token") };
                 if ui.button(show).clicked() {
@@ -127,11 +127,12 @@ pub(super) fn reveal(ctx: &egui::Context, session: &mut Session, l: Lang, clipbo
                 } else {
                     help(ui, tf(l, "Websites allowed: {}.", &[&websites.join(", ")]));
                 }
-                ui.label(t(l, "Paste this in the page's script:"));
-                let page = Zeroizing::new(page_snippet(&reveal.connection.url, &token));
-                super::apps::code(ui, &page);
+                ui.label(t(l, "Paste this in the page's HTML, where the page reads its data:"));
+                let page = Zeroizing::new(page_snippet(l, &reveal.connection.url, &token));
+                super::apps::secret_code(ui, &page);
                 if ui.button(t(l, "Copy for the web page")).clicked() {
-                    let snippet = Zeroizing::new(page_snippet(&reveal.connection.url, reveal.connection.token.expose()));
+                    let snippet =
+                        Zeroizing::new(page_snippet(l, &reveal.connection.url, reveal.connection.token.expose()));
                     reveal.copied = Some(clipboard.copy_secret(ui.ctx(), &snippet));
                     reveal.cleared = false;
                 }
@@ -179,17 +180,23 @@ pub(super) fn reveal(ctx: &egui::Context, session: &mut Session, l: Lang, clipbo
     }
 }
 
-/// What the page's script holds: the address, the read-only token, a call.
-fn page_snippet(url: &str, token: &str) -> String {
+/// What the page holds: the address, the read-only token, a call. A module
+/// script (`type="module"`), where `await` may stand outside a function.
+fn page_snippet(l: Lang, url: &str, token: &str) -> String {
+    let table = t(l, "articles: the name of one of your tables");
     format!(
-        r#"const NUAGE_URL = "{url}";
+        r#"<script type="module">
+const NUAGE_URL = "{url}";
 const NUAGE_TOKEN = "{token}";
+// {table}
 const res = await fetch(NUAGE_URL + "/v1/sql", {{
   method: "POST",
   headers: {{ "Authorization": "Bearer " + NUAGE_TOKEN, "Content-Type": "application/json" }},
   body: JSON.stringify({{ sql: "SELECT * FROM articles LIMIT 20" }}),
 }});
-const {{ rows }} = await res.json();"#
+const {{ rows, error }} = await res.json();
+console.log(rows ?? error);
+</script>"#
     )
 }
 
@@ -305,7 +312,10 @@ mod tests {
         assert_eq!(test_answer(Lang::En, &Err(ApiError::TokenRefused), "x").0, Mark::Bad);
         let unreachable = test_answer(Lang::Es, &Err(ApiError::Busy), "x");
         assert_eq!(unreachable.0, Mark::Warn);
-        let snippet = page_snippet("https://n.example.com", "nuage_abc");
+        let snippet = page_snippet(Lang::Fr, "https://n.example.com", "nuage_abc");
         assert!(snippet.contains("\"https://n.example.com\"") && snippet.contains("\"nuage_abc\""), "{snippet}");
+        // Its `await` stands outside a function: only a module script allows that.
+        assert!(snippet.starts_with("<script type=\"module\">\n") && snippet.ends_with("</script>"), "{snippet}");
+        assert!(snippet.contains("// articles : le nom d'une de vos tables"), "{snippet}");
     }
 }

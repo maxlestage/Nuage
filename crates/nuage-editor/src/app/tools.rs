@@ -36,7 +36,7 @@ pub(super) fn generator(ui: &mut egui::Ui, generated: &mut Option<Generated>, cl
         None => again = ui.button(t(l, "Generate a token")).clicked(),
         Some(g) => {
             let shown = if g.shown { g.token.expose().to_owned() } else { super::dialogs::MASK.repeat(4) };
-            super::apps::code(ui, &Zeroizing::new(shown));
+            super::apps::secret_code(ui, &Zeroizing::new(shown));
             ui.horizontal_wrapped(|ui| {
                 let show = if g.shown { t(l, "Hide the token") } else { t(l, "Show the token") };
                 if ui.button(show).clicked() {
@@ -75,7 +75,7 @@ pub(super) fn generator(ui: &mut egui::Ui, generated: &mut Option<Generated>, cl
 
 impl Editor {
     /// The answers of the tools' jobs, and of a start of this computer's server.
-    pub(super) fn poll_tools(&mut self, l: Lang) {
+    pub(super) fn poll_tools(&mut self, ctx: &egui::Context, l: Lang) {
         if let Some(answer) = take(&mut self.token_test.job) {
             self.token_test.answer = Some(answer);
         }
@@ -94,8 +94,9 @@ impl Editor {
                 Ok(Err(e)) => Notice::bad(format!("{} {}", super::local_error(l, e), tf(l, "Its log: {}.", &[&log]))),
                 Err(e) => Notice::bad(e.explain(l)),
             });
-            // What answers now.
+            // What answers now, whatever page is open (the start's card, the sections).
             self.here = None;
+            self.look_here(ctx);
         }
     }
 
@@ -119,6 +120,23 @@ impl Editor {
             help(ui, t(l, "What a website or a program does: it opens Nuage DB with an application's token."));
             let label = ui.strong(t(l, "Server address"));
             ui.add(egui::TextEdit::singleline(&mut self.token_test.address).desired_width(380.0)).labelled_by(label.id);
+            // As for the management token: plain http to the Internet waits for a consent, each time.
+            let cleartext = crate::address::normalize(&self.token_test.address)
+                .ok()
+                .filter(|a| a.is_cleartext_public())
+                .map(|a| a.base());
+            if let Some(base) = &cleartext {
+                theme::status(
+                    ui,
+                    Mark::Bad,
+                    t(l, "Not encrypted: the token would cross the Internet in clear. Use the server's https:// address."),
+                );
+                let mut anyway = self.token_test.cleartext_ok.as_deref() == Some(base.as_str());
+                if ui.checkbox(&mut anyway, t(l, "Connect anyway")).changed() {
+                    self.token_test.cleartext_ok = anyway.then(|| base.clone());
+                }
+            }
+            let consented = cleartext.is_none() || self.token_test.cleartext_ok == cleartext;
             let label = ui.strong(t(l, "Application token"));
             let field = ui
                 .add(
@@ -133,11 +151,12 @@ impl Editor {
             }
             let running = self.token_test.job.is_some();
             ui.horizontal(|ui| {
-                test |= ui.add_enabled(!running, theme::primary(t(l, "Test"), ui)).clicked();
+                test |= ui.add_enabled(!running && consented, theme::primary(t(l, "Test"), ui)).clicked();
                 if running {
                     ui.spinner();
                 }
             });
+            test &= consented && !running;
             if let Some(answer) = &self.token_test.answer {
                 let (m, text) = match answer {
                     Ok(ping) => (
@@ -173,11 +192,16 @@ impl Editor {
             let address = self.token_test.address.clone();
             let (lang, transport) = (l, self.transport.clone());
             self.token_test.answer = None;
+            self.token_test.cleartext_ok = None;
             self.token_test.job = Some(Job::start(&ctx, &self.calls, move || {
                 if token.is_empty() {
                     return Err(ApiError::TokenRefused);
                 }
-                Server::new(&address, token, lang, &transport)?.ping()
+                // The health first, without the token: a wrong address, a website or a captive
+                // portal never gets it.
+                let server = Server::new(&address, token, lang, &transport)?;
+                server.health()?;
+                server.ping()
             }));
         }
         ui.add_space(10.0);
@@ -209,7 +233,7 @@ impl Editor {
             ui.set_width(ui.available_width());
             theme::subheading(ui, t(l, "Preferences"));
             ui.horizontal_wrapped(|ui| {
-                self.lang_combo(ui, l);
+                self.lang_combo(ui, l, false);
                 self.theme_combo(ui, l);
             });
             ui.horizontal_wrapped(|ui| {

@@ -285,15 +285,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "{} réglage(s) enregistré(s) plus tôt sont ignorés tant que l'environnement fait foi.",
         "{} ajuste(s) guardado(s) antes se ignoran mientras manda el entorno.",
     ),
-    ("Variable", "Variable", "Variable"),
-    ("Value", "Valeur", "Valor"),
     ("set (a secret: not shown)", "réglé (un secret : non affiché)", "definido (un secreto: no se muestra)"),
     ("Overview", "Vue d'ensemble", "Resumen"),
     ("Limits and visibility", "Limites et visibilité", "Límites y visibilidad"),
     ("Started with", "Réglés au démarrage", "Definidos al arrancar"),
     ("Application", "Application", "Aplicación"),
-    ("Its cache holds", "Son cache contient", "Su caché contiene"),
-    ("may hold", "peut contenir", "puede contener"),
     ("Page cache", "Cache de pages", "Caché de páginas"),
     ("Key-value store", "Stockage clé-valeur", "Almacén clave-valor"),
     ("({} dropped)", "({} retiré)", "(sin {})"),
@@ -458,9 +454,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Este servidor toma sus ajustes solo de su entorno (NUAGE_SETTINGS=environment): nada se cambia desde aquí.",
     ),
     (
-        "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Set it in its settings file or its host's variables (`nuage genkey` makes one), then restart the server.",
-        "L'API de gestion de ce serveur est désactivée : NUAGE_ADMIN_TOKEN n'y est pas réglé. Réglez-le dans son fichier de réglages ou dans les variables de son hébergeur (`nuage genkey` en crée un), puis redémarrez le serveur.",
-        "La API de gestión de este servidor está desactivada: NUAGE_ADMIN_TOKEN no está definido en él. Defínelo en su archivo de ajustes o en las variables de su alojamiento (`nuage genkey` crea uno) y reinicia el servidor.",
+        "This server's management API is off: NUAGE_ADMIN_TOKEN is not set on it. Tools, Generate a token makes one. Then set it: on Heroku in Settings, Config Vars (Heroku restarts the server by itself); with Docker in the .env file, then restart the container; for a server installed with the installer, in its settings file, then restart its service.",
+        "L'API de gestion de ce serveur est désactivée : NUAGE_ADMIN_TOKEN n'y est pas réglé. Outils, Générer un jeton en crée un. Réglez-le ensuite : sur Heroku dans Settings, Config Vars (Heroku redémarre le serveur tout seul) ; avec Docker dans le fichier .env, puis redémarrez le conteneur ; pour un serveur installé avec l'installeur, dans son fichier de réglages, puis redémarrez son service.",
+        "La API de gestión de este servidor está desactivada: NUAGE_ADMIN_TOKEN no está definido en él. Herramientas, Generar un token crea uno. Defínelo después: en Heroku en Settings, Config Vars (Heroku reinicia el servidor solo); con Docker en el archivo .env, y reinicia el contenedor; para un servidor instalado con el instalador, en su archivo de ajustes, y reinicia su servicio.",
     ),
     (
         "This server's version cannot do this yet: update the server to do it here.",
@@ -629,11 +625,7 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("{} tokens", "{} jetons", "{} tokens"),
     ("{}, {} read-only", "{}, dont {} en lecture seule", "{}, {} de solo lectura"),
     ("Waiting for a first connection", "En attente d'une première connexion", "Esperando una primera conexión"),
-    (
-        "Tested from the editor {} — your site has not connected yet",
-        "Testée depuis l'éditeur {} — votre site ne s'est pas encore connecté",
-        "Probada desde el editor {}: tu sitio aún no se ha conectado",
-    ),
+    ("Tested from the editor {}", "Testée depuis l'éditeur {}", "Probada desde el editor {}"),
     ("Connected {} ({})", "Connectée {} ({})", "Conectada {} ({})"),
     (
         "There is no application {} any more (deleted from the console?).",
@@ -766,9 +758,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Go to Websites allowed", "Aller aux sites web autorisés", "Ir a Sitios web autorizados"),
     ("Websites allowed: {}.", "Sites autorisés : {}.", "Sitios permitidos: {}."),
     (
-        "Paste this in the page's script:",
-        "Collez ceci dans le script de la page :",
-        "Pega esto en el script de la página:",
+        "Paste this in the page's HTML, where the page reads its data:",
+        "Collez ceci dans le HTML de la page, là où elle lit ses données :",
+        "Pega esto en el HTML de la página, donde lee sus datos:",
     ),
     ("Copy for the web page", "Copier pour la page web", "Copiar para la página web"),
     (
@@ -833,9 +825,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Todo lo que el editor guardaba en este equipo está olvidado.",
     ),
     (
-        "The token of {} could not be removed from {}. Remove the entry io.github.maxlestage.nuage-editor yourself in Keychain Access, Credential Manager or your keyring.",
-        "Le jeton de {} n'a pas pu être retiré de {}. Retirez vous-même l'entrée io.github.maxlestage.nuage-editor dans Trousseaux d'accès, le Gestionnaire d'identification ou votre trousseau.",
-        "No se pudo quitar el token de {} de {}. Quita tú la entrada io.github.maxlestage.nuage-editor en Acceso a Llaveros, el Administrador de credenciales o tu llavero.",
+        "The token of {} could not be removed: it is still in {}. Remove the entry io.github.maxlestage.nuage-editor yourself in Keychain Access, Credential Manager or your keyring.",
+        "Le jeton de {} n'a pas pu être retiré : il est toujours dans {}. Retirez vous-même l'entrée io.github.maxlestage.nuage-editor dans Trousseaux d'accès, le Gestionnaire d'identification ou votre trousseau.",
+        "No se pudo quitar el token de {}: sigue en {}. Quita tú la entrada io.github.maxlestage.nuage-editor en Acceso a Llaveros, el Administrador de credenciales o tu llavero.",
     ),
     (
         "This one looks like an application's token.",
@@ -1205,16 +1197,16 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("read from this computer", "lu sur cet ordinateur", "leído en este equipo"),
     ("Forget this server?", "Oublier ce serveur ?", "¿Olvidar este servidor?"),
     (
-        "Forget {}? Its kept token is deleted from {}.",
-        "Oublier {} ? Son jeton gardé est supprimé de {}.",
-        "¿Olvidar {}? Su token guardado se borra de {}.",
+        "Forget {}? Its token kept in {} is deleted.",
+        "Oublier {} ? Son jeton gardé dans {} est supprimé.",
+        "¿Olvidar {}? Su token guardado en {} se borra.",
     ),
     ("Forget {}?", "Oublier {} ?", "¿Olvidar {}?"),
     ("Forget everything on this computer?", "Tout oublier sur cet ordinateur ?", "¿Olvidarlo todo en este equipo?"),
     (
-        "The servers you used and the language and theme chosen are forgotten, and every token the editor kept is deleted from {}. Your servers are not changed.",
-        "Les serveurs utilisés, la langue et le thème choisis sont oubliés, et chaque jeton gardé par l'éditeur est supprimé de {}. Vos serveurs ne sont pas modifiés.",
-        "Se olvidan los servidores usados, el idioma y el tema elegidos, y cada token guardado por el editor se borra de {}. Tus servidores no se modifican.",
+        "The servers you used and the language and theme chosen are forgotten, and every token the editor kept in {} is deleted. Your servers are not changed.",
+        "Les serveurs utilisés, la langue et le thème choisis sont oubliés, et chaque jeton gardé par l'éditeur dans {} est supprimé. Vos serveurs ne sont pas modifiés.",
+        "Se olvidan los servidores usados, el idioma y el tema elegidos, y se borra cada token guardado por el editor en {}. Tus servidores no se modifican.",
     ),
     ("Forget everything", "Tout oublier", "Olvidarlo todo"),
     (
@@ -1387,6 +1379,61 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Its log is in the system journal, unit nuage (GNOME Logs shows it).",
         "Son journal est dans le journal du système, unité nuage (Journaux de GNOME le montre).",
         "Su registro está en el diario del sistema, unidad nuage (Registros de GNOME lo muestra).",
+    ),
+    (
+        "A management token has {} characters at least: is part of it missing, or is this the console password (NUAGE_ADMIN_PASSWORD)? The editor needs NUAGE_ADMIN_TOKEN, 64 characters when the installer or Heroku made it.",
+        "Un jeton de gestion a au moins {} caractères : en manque-t-il une partie, ou est-ce le mot de passe de la console (NUAGE_ADMIN_PASSWORD) ? L'éditeur a besoin de NUAGE_ADMIN_TOKEN, 64 caractères quand l'installeur ou Heroku l'a créé.",
+        "Un token de gestión tiene al menos {} caracteres: ¿falta una parte, o es la contraseña de la consola (NUAGE_ADMIN_PASSWORD)? El editor necesita NUAGE_ADMIN_TOKEN, 64 caracteres cuando lo creó el instalador o Heroku.",
+    ),
+    (
+        "The application may have been created anyway: the list is read again.",
+        "L'application a peut-être été créée quand même : la liste est relue.",
+        "Puede que la aplicación se haya creado de todos modos: la lista se vuelve a leer.",
+    ),
+    (
+        "The change may or may not have been made: the page is read again to show what is in force.",
+        "Le changement a peut-être été fait, ou peut-être pas : la page est relue pour montrer ce qui est en vigueur.",
+        "Puede que el cambio se haya hecho o no: la página se vuelve a leer para mostrar lo que está en vigor.",
+    ),
+    (
+        "The server no longer accepts this token: it was changed in its settings file. Open it again from On this computer: the editor reads the new token from the file.",
+        "Le serveur n'accepte plus ce jeton : il a été changé dans son fichier de réglages. Rouvrez-le depuis Sur cet ordinateur : l'éditeur lit le nouveau jeton dans le fichier.",
+        "El servidor ya no acepta este token: se cambió en su archivo de ajustes. Vuelve a abrirlo desde En este equipo: el editor lee el nuevo token del archivo.",
+    ),
+    ("Connect to {}", "Se connecter à {}", "Conectar a {}"),
+    ("Forget {}", "Oublier {}", "Olvidar {}"),
+    ("Revoke nuage_{}…", "Révoquer nuage_{}…", "Revocar nuage_{}…"),
+    ("Remove {}", "Retirer {}", "Quitar {}"),
+    (
+        "A token was made, but it never reached the editor: nobody has it. Revoke the one marked never shown; make a new one if you need it.",
+        "Un jeton a été créé, mais il n'est jamais arrivé jusqu'à l'éditeur : personne ne l'a. Révoquez celui marqué jamais montré ; créez-en un autre si vous en avez besoin.",
+        "Se creó un token, pero nunca llegó al editor: nadie lo tiene. Revoca el marcado nunca mostrado; crea otro si lo necesitas.",
+    ),
+    (
+        "No new token was made: make it again if you need it.",
+        "Aucun nouveau jeton n'a été créé : refaites-le si vous en avez besoin.",
+        "No se creó ningún token nuevo: vuelve a pedirlo si lo necesitas.",
+    ),
+    ("never shown", "jamais montré", "nunca mostrado"),
+    (
+        "The answer to the creation did not reach the editor: the application may have been created anyway.",
+        "La réponse à la création n'est pas arrivée jusqu'à l'éditeur : l'application a peut-être été créée quand même.",
+        "La respuesta a la creación no llegó al editor: puede que la aplicación se haya creado de todos modos.",
+    ),
+    (
+        "articles: the name of one of your tables",
+        "articles : le nom d'une de vos tables",
+        "articles: el nombre de una de tus tablas",
+    ),
+    (
+        "Its version, its memory and its backups could not be read this time: Refresh asks again.",
+        "Sa version, sa mémoire et ses sauvegardes n'ont pas pu être lues cette fois : Actualiser les redemande.",
+        "Su versión, su memoria y sus copias de seguridad no se pudieron leer esta vez: Actualizar las vuelve a pedir.",
+    ),
+    (
+        "Not read this time: Refresh asks again.",
+        "Pas lu cette fois : Actualiser le redemande.",
+        "No se leyó esta vez: Actualizar lo vuelve a pedir.",
     ),
 ];
 

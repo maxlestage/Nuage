@@ -4,8 +4,8 @@
 
 use eframe::egui::{self, RichText};
 
-use super::{Confirm, Doing, OLDER_WEBSITES, Outcome, Session, help, lan_for};
-use crate::api::{self, Application, DbStatus};
+use super::{Confirm, Doing, OLDER_WEBSITES, Outcome, Session, TokenAsked, help, lan_for};
+use crate::api::{self, Application, DbStatus, LastConnection};
 use crate::format;
 use crate::i18n::{Lang, t, tf};
 use crate::theme::{self, Mark};
@@ -53,7 +53,7 @@ pub(super) fn list_page(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
             }
             help(ui, tokens(l, app));
             if let Some(db) = db {
-                let (m, line) = connection(l, db, now);
+                let (m, line) = connection(l, db, session.sites.get(&app.name), now);
                 theme::status(ui, m, line);
                 help(
                     ui,
@@ -139,7 +139,7 @@ fn new_application(ui: &mut egui::Ui, session: &mut Session, l: Lang) {
     });
 }
 
-/// A creation that timed out: was it made? Read the list again to know.
+/// A creation whose answer was lost: was it made? Read the list again to know.
 fn unsure(ui: &mut egui::Ui, session: &mut Session, name: &str, l: Lang) {
     let made = session.app(name).cloned();
     let mut check = false;
@@ -164,7 +164,10 @@ fn unsure(ui: &mut egui::Ui, session: &mut Session, name: &str, l: Lang) {
                 theme::status(
                     ui,
                     Mark::Warn,
-                    t(l, "The server did not answer in time. The application may have been created anyway."),
+                    t(
+                        l,
+                        "The answer to the creation did not reach the editor: the application may have been created anyway.",
+                    ),
                 );
                 check = ui.add_enabled(!session.loading(), egui::Button::new(t(l, "Check"))).clicked();
             }
@@ -176,6 +179,8 @@ fn unsure(ui: &mut egui::Ui, session: &mut Session, name: &str, l: Lang) {
     if open {
         session.open_app = Some(name.to_owned());
         session.unsure = None;
+        // Its first token never reached the editor: its page marks it.
+        session.token_asked = Some(TokenAsked { app: name.to_owned(), known: Vec::new(), lost: true });
     }
 }
 
@@ -192,23 +197,28 @@ fn tokens(l: Lang, app: &Application) -> String {
 }
 
 /// Whether its site connected: "Connected 2 min ago (https://monsite.fr)".
-fn connection(l: Lang, db: &DbStatus, now: i64) -> (Mark, String) {
-    let Some(c) = &db.last_connection else {
-        return (Mark::Off, t(l, "Waiting for a first connection").to_owned());
+/// The server keeps the last client only, so a test from the editor hides
+/// the connection before it: `earlier` is the last one the editor saw that
+/// was not its own.
+fn connection(l: Lang, db: &DbStatus, earlier: Option<&LastConnection>, now: i64) -> (Mark, String) {
+    let ago = |c: &LastConnection| format::parse_time(&c.at).map(|at| format::ago(l, at, now)).unwrap_or_default();
+    let site = match &db.last_connection {
+        None => return (Mark::Off, t(l, "Waiting for a first connection").to_owned()),
+        Some(c) if c.by_the_editor() => match earlier {
+            Some(earlier) => earlier,
+            // Nothing is known of the site: the test may have hidden its connection.
+            None => return (Mark::Ok, tf(l, "Tested from the editor {}", &[&ago(c)])),
+        },
+        Some(c) => c,
     };
-    let ago = format::parse_time(&c.at).map(|at| format::ago(l, at, now)).unwrap_or_default();
-    if c.by_the_editor() {
-        (Mark::Ok, tf(l, "Tested from the editor {} — your site has not connected yet", &[&ago]))
-    } else {
-        let who = if c.client.is_empty() { c.via.clone() } else { c.client.clone() };
-        (Mark::On, tf(l, "Connected {} ({})", &[&ago, &who]))
-    }
+    let who = if site.client.is_empty() { site.via.clone() } else { site.client.clone() };
+    (Mark::On, tf(l, "Connected {} ({})", &[&ago(site), &who]))
 }
 
 /// One application: its connection, its tokens, its websites, its memory.
 pub(super) fn app_page(ui: &mut egui::Ui, session: &mut Session, name: &str, l: Lang) {
     let ctx = ui.ctx().clone();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.link(t(l, "Applications")).clicked() {
             session.open_app = None;
         }
@@ -241,7 +251,7 @@ pub(super) fn app_page(ui: &mut egui::Ui, session: &mut Session, name: &str, l: 
         ui.set_width(ui.available_width());
         theme::subheading(ui, t(l, "Connection"));
         if let Some(db) = &db {
-            let (m, line) = connection(l, db, format::now_ms());
+            let (m, line) = connection(l, db, session.sites.get(name), format::now_ms());
             theme::status(ui, m, line);
         }
         let lines = format!(
@@ -312,13 +322,38 @@ fn tokens_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
         if app.tokens.is_empty() && !app.env_token {
             help(ui, t(l, "No token: no program can connect yet."));
         }
+        // A new token whose answer was lost: once the list is read again, the one made is marked.
+        let lost = session.token_asked.as_ref().filter(|a| a.lost && a.app == app.name).map(|a| a.known.clone());
+        if let Some(known) = &lost
+            && !session.loading()
+        {
+            if app.tokens.iter().any(|t| !known.contains(&t.id)) {
+                theme::status(
+                    ui,
+                    Mark::Warn,
+                    t(
+                        l,
+                        "A token was made, but it never reached the editor: nobody has it. Revoke the one marked never shown; make a new one if you need it.",
+                    ),
+                );
+            } else {
+                theme::status(ui, Mark::Off, t(l, "No new token was made: make it again if you need it."));
+            }
+        }
         for token in &app.tokens {
             ui.horizontal_wrapped(|ui| {
                 ui.monospace(format!("nuage_{}…", token.id));
                 let kind = if token.read_only { t(l, "read only") } else { t(l, "read and write") };
                 ui.label(tf(l, "{} · made {}", &[&kind, &format::date(l, token.created_at)]));
+                if lost.as_ref().is_some_and(|known| !known.contains(&token.id)) {
+                    ui.label(RichText::new(t(l, "never shown")).color(Mark::Warn.color(theme::of(ui))));
+                }
+                // Each says which token it revokes (a screen reader reads its name alone).
                 let revoke = egui::Button::new(t(l, "Revoke")).small();
-                if ui.add_enabled(!session.busy(), revoke).clicked() {
+                let revoke = ui
+                    .add_enabled(!session.busy(), revoke)
+                    .accessible_name(tf(l, "Revoke nuage_{}…", &[&token.id]));
+                if revoke.clicked() {
                     session.confirm = Some(Confirm { app: app.name.clone(), id: token.id.clone(), focused: false });
                 }
             });
@@ -330,6 +365,8 @@ fn tokens_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
             {
                 if ui.add_enabled(!session.busy(), egui::Button::new(label)).clicked() {
                     let name = app.name.clone();
+                    let known = app.tokens.iter().map(|t| t.id.clone()).collect();
+                    session.token_asked = Some(TokenAsked { app: name.clone(), known, lost: false });
                     session.act(&ctx, Doing::Token, move |server| {
                         let connection = server.new_token(&name, read_only)?;
                         let lan = lan_for(&connection);
@@ -374,7 +411,13 @@ fn websites_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l:
                     ui.monospace(origin);
                 }
                 let remove = egui::Button::new(t(l, "Remove")).small();
-                if can && ui.add_enabled(!session.busy(), remove).on_hover_text(origin).clicked() {
+                if can
+                    && ui
+                        .add_enabled(!session.busy(), remove)
+                        .accessible_name(tf(l, "Remove {}", &[origin]))
+                        .on_hover_text(origin)
+                        .clicked()
+                {
                     send = Some(app.origins.iter().filter(|o| *o != origin).cloned().collect());
                 }
             });
@@ -392,7 +435,7 @@ fn websites_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l:
         if can {
             let label = ui.strong(t(l, "Website to allow"));
             let mut add = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let field = ui
                     .add(
                         egui::TextEdit::singleline(&mut session.origin_field)
@@ -496,12 +539,23 @@ fn memory_card(ui: &mut egui::Ui, session: &mut Session, app: &Application, l: L
 
 /// Lines to copy by hand, in monospace (selectable, never an editable field).
 pub(super) fn code(ui: &mut egui::Ui, text: &str) {
+    code_block(ui, text, true);
+}
+
+/// Lines that hold a secret: not selectable, so a selection and Ctrl+C
+/// never copy it the ordinary way (the clipboard history would keep it);
+/// its Copy buttons ask the history to skip it.
+pub(super) fn secret_code(ui: &mut egui::Ui, text: &str) {
+    code_block(ui, text, false);
+}
+
+fn code_block(ui: &mut egui::Ui, text: &str, selectable: bool) {
     let p = theme::of(ui);
     egui::Frame::new().fill(p.code).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(8).inner_margin(10).show(
         ui,
         |ui| {
             ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+            ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(selectable));
         },
     );
 }
@@ -509,7 +563,7 @@ pub(super) fn code(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{LastConnection, Token};
+    use crate::api::Token;
 
     #[test]
     fn rows_say_it_in_words() {
@@ -521,21 +575,27 @@ mod tests {
         app.env_token = false;
         assert_eq!(tokens(Lang::Es, &app), "1 token, 1 de solo lectura");
         let mut db = DbStatus { name: "shop".into(), ..DbStatus::default() };
-        assert_eq!(connection(Lang::Fr, &db, now), (Mark::Off, "En attente d'une première connexion".to_owned()));
+        assert_eq!(connection(Lang::Fr, &db, None, now), (Mark::Off, "En attente d'une première connexion".to_owned()));
+        let site = LastConnection {
+            at: "2026-11-15T21:02:05Z".into(),
+            client: "https://monsite.fr".into(),
+            ..LastConnection::default()
+        };
+        db.last_connection = Some(site.clone());
+        assert_eq!(
+            connection(Lang::En, &db, None, now),
+            (Mark::On, "Connected 2 min ago (https://monsite.fr)".to_owned())
+        );
+        // The editor's test takes the site's place on the server: it never says the site did not connect.
         db.last_connection = Some(LastConnection {
             at: "2026-11-15T21:04:00Z".into(),
             client: "nuage-editor/0.4.7".into(),
             ..LastConnection::default()
         });
+        assert_eq!(connection(Lang::Fr, &db, None, now), (Mark::Ok, "Testée depuis l'éditeur il y a 5 s".to_owned()));
         assert_eq!(
-            connection(Lang::Fr, &db, now).1,
-            "Testée depuis l'éditeur il y a 5 s — votre site ne s'est pas encore connecté"
+            connection(Lang::En, &db, Some(&site), now),
+            (Mark::On, "Connected 2 min ago (https://monsite.fr)".to_owned())
         );
-        db.last_connection = Some(LastConnection {
-            at: "2026-11-15T21:02:05Z".into(),
-            client: "https://monsite.fr".into(),
-            ..LastConnection::default()
-        });
-        assert_eq!(connection(Lang::En, &db, now), (Mark::On, "Connected 2 min ago (https://monsite.fr)".to_owned()));
     }
 }

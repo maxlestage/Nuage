@@ -26,8 +26,8 @@ pub struct Failure {
 }
 
 impl Failure {
-    /// What the person can copy and send with a report (no secret is ever in a panic message:
-    /// secrets print as `***`).
+    /// What the person can copy and send with a report. The editor's secrets print as
+    /// `***`, and the message is [`redact`]ed (a panic of a dependency prints raw text).
     pub fn details(&self) -> String {
         let place = self.place.as_deref().unwrap_or("?");
         format!(
@@ -38,6 +38,36 @@ impl Failure {
             self.message
         )
     }
+}
+
+/// The shortest run of letters, digits, `-` and `_` taken for a secret.
+const SECRET_RUN: usize = 24;
+
+/// `text` with what may be a secret hidden: each run of at least
+/// [`SECRET_RUN`] letters, digits, `-` or `_` (a token, a key) becomes `***`.
+/// A panic raised in a dependency prints its text as it is: egui's text
+/// editing, for one, quotes the string it failed on, which may be a token.
+pub fn redact(text: &str) -> String {
+    fn flush(run: &mut String, out: &mut String) {
+        if run.chars().count() >= SECRET_RUN {
+            out.push_str("***");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// The last panic the hook saw on a thread: its message and place.
@@ -70,7 +100,12 @@ fn record(info: &PanicHookInfo<'_>) {
     let message = message_of(info.payload());
     let place = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
     // Not eprintln!: it panics when standard error is gone, and a panic in the hook aborts.
-    let _ = writeln!(std::io::stderr(), "nuage-editor: a bug: {message} (at {})", place.as_deref().unwrap_or("?"));
+    let _ = writeln!(
+        std::io::stderr(),
+        "nuage-editor: a bug: {} (at {})",
+        redact(&message),
+        place.as_deref().unwrap_or("?")
+    );
     // Never panic in a panic hook: a thread being torn down only loses the place.
     let _ = LAST.try_with(|last| {
         if let Ok(mut last) = last.try_borrow_mut() {
@@ -91,7 +126,8 @@ pub fn failure_of(payload: &(dyn Any + Send)) -> Failure {
     let message = message_of(payload);
     let seen = LAST.try_with(|last| last.try_borrow_mut().ok().and_then(|mut last| last.take())).ok().flatten();
     let place = seen.filter(|seen| seen.message == message).and_then(|seen| seen.place);
-    Failure { message, place }
+    // What the window shows, and the details a person may paste in a public report.
+    Failure { message: redact(&message), place }
 }
 
 #[cfg(test)]
@@ -106,6 +142,13 @@ mod tests {
         let failure = catch(|| std::panic::panic_any(3_u8)).unwrap_err();
         assert_eq!(failure.message, "a panic without a message");
         assert!(failure.details().contains(env!("CARGO_PKG_VERSION")), "{}", failure.details());
+        // A dependency's panic quoting a token: the token is not in what is shown or copied.
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let failure = catch(|| -> u8 { panic!("byte index 3 is not a char boundary; it is inside 'é' of `{token}`") })
+            .unwrap_err();
+        assert!(!failure.details().contains(token) && failure.message.contains("of `***`"), "{failure:?}");
+        assert_eq!(redact("nuage_abcdefghijklmnopqrstuvwxyz0123 at src/app/mod.rs:12"), "*** at src/app/mod.rs:12");
+        assert_eq!(redact("made-up bug 42"), "made-up bug 42");
     }
 
     #[test]

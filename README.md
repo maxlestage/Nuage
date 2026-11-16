@@ -692,8 +692,8 @@ changes nothing by itself: every change is a button you press, and it says what 
 - **Make an application** for a website or a program: say what it is for, its name follows. Its
   two lines (`NUAGE_URL`, `NUAGE_TOKEN`) are shown once, masked until you show them, and copied
   with the clipboard history asked to skip them. **Test the token** calls the server with it from
-  this computer; the application's page then says it was tested from the editor, and that your
-  site has not connected yet.
+  this computer; the application's page then says it was tested from the editor, and when your
+  site last connected as the editor saw it (the server keeps only the last connection).
 - **Connect a web page**: a read-only token, the website to allow (`https://monsite.fr`), and the
   script to paste in the page. A token is revoked after a question.
 - **Memory and limits**: in force at once, with no restart; a refusal comes in your language, with
@@ -715,7 +715,8 @@ the websites), the editor says that updating the server would show it.
    password. Windows: double-click the `.exe` (nothing to install); Edge may say it is not
    commonly downloaded: **Keep**; SmartScreen says it protected your PC: **More info**, then
    **Run anyway**. Linux: unpack, then right-click `nuage-editor`, **Run as a Program** (GNOME
-   Files does not start a program on a double-click); `README.txt` puts it in the menu.
+   Files does not start a program on a double-click); in the editor, **About**, then **Add the
+   editor to the applications menu** puts it in the menu (`README.txt` has the same in commands).
 3. **Connect.** A server installed on this computer by the installer is found by itself:
    **Open**, with one window of the system's at most. The editor never runs as administrator;
    the system's own tools read four lines of the settings file for it (`PORT`,

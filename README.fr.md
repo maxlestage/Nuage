@@ -727,8 +727,9 @@ bouton que vous pressez, et il dit ce qu'il a fait.
   suit. Ses deux lignes (`NUAGE_URL`, `NUAGE_TOKEN`) sont montrées une fois, masquées tant que
   vous ne les affichez pas, et copiées en priant l'historique du presse-papiers de les ignorer.
   **Tester le jeton** appelle le serveur avec lui depuis cet ordinateur ; la page de
-  l'application dit ensuite qu'il a été testé depuis l'éditeur, et que votre site ne s'est pas
-  encore connecté.
+  l'application dit ensuite qu'il a été testé depuis l'éditeur, et quand votre site s'est
+  connecté pour la dernière fois tel que l'éditeur l'a vu (le serveur ne garde que la dernière
+  connexion).
 - **Brancher une page web** : un jeton en lecture seule, le site à autoriser
   (`https://monsite.fr`), et le script à coller dans la page. Un jeton se révoque après une
   question.
@@ -755,7 +756,8 @@ réglages, l'état, les sites web), l'éditeur dit qu'une mise à jour du serveu
    téléchargé : **Conserver** ; SmartScreen dit « Windows a protégé votre ordinateur » :
    **Informations complémentaires**, puis **Exécuter quand même**. Linux : décompressez, puis
    clic droit sur `nuage-editor`, **Exécuter comme un programme** (GNOME Fichiers ne lance pas
-   un programme d'un double-clic) ; `README.txt` le met dans le menu.
+   un programme d'un double-clic) ; dans l'éditeur, **À propos**, puis **Ajouter l'éditeur au
+   menu des applications** le met dans le menu (`README.txt` donne la même chose en commandes).
 3. **Connectez-vous.** Un serveur installé sur cet ordinateur par l'installeur est trouvé
    tout seul : **Ouvrir**, avec une fenêtre du système au plus. L'éditeur ne tourne jamais en
    administrateur ; les outils du système lisent pour lui quatre lignes du fichier de
