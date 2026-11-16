@@ -628,7 +628,7 @@ before it serves. The installer asks where they go; or say it in the command:
   holds nothing is not served either: the server starts without it, and the console lists it
   as one that cannot be opened (complete its backup and restart, or delete it there). Set it
   once the server holds data: a first start has nothing to restore.
-- **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` and the other
+- **Two places at once** (experimental): `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` and the other
   `NUAGE_BACKUP2_S3_*`, add a second destination kept in step with the first. Each one gets
   the snapshots and the log with its own progress: one that does not answer never holds the
   other back (each has its own thread), and gets a whole snapshot when it answers again. An
@@ -636,13 +636,13 @@ before it serves. The installer asks where they go; or say it in the command:
   server does not start when either does not answer, since it may be the one that reaches
   furthest (take it out of the settings to start from the other alone; a second that has not
   answered 5 seconds after the first counts as not answering), or when the two hold different
-  databases. Without the first, `NUAGE_BACKUP2_*` is the only destination: adding the second,
-  waiting until it has everything, swapping the two, then removing the old one moves the
-  backups without a stop (see Heroku below). The console's *Storage* page shows each
+  databases. Without the first, `NUAGE_BACKUP2_*` is the only destination. It is still
+  experimental: it is not yet a safe way to move the backups to another place (move them with
+  a stop, as shown under Heroku), and its known limits are listed in the CHANGELOG. The console's *Storage* page shows each
   destination's last backup, and `/api/status` each one in `backup.destinations`: a
   destination shows no time until it has received a whole snapshot since the start, and the
   last backup shows none until both have. A round to a destination that has not ended after
-  10 minutes (one that does not answer, or so slow it never keeps up) shows as its error, and
+  an hour (one that does not answer, or so slow it never keeps up) shows as its error, and
   in the event log, until it ends. The stop sends to both at the same time: the first gets as
   long as it takes, the second 20 seconds at most.
 - **Deleting an application** in the console empties its backup (`apps/<name>/`) in each
@@ -721,22 +721,10 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
   creates and writes nothing. Heroku shows it as crashed, `heroku logs --tail` says what to
   check, and putting the settings back starts it from its backup. Not on a first deployment,
   which has nothing to restore: `app.json` leaves it unset.
-- **Move the backups without a stop.** To move them to another bucket:
-  (1) add the new one as the second destination, in one command (`heroku config:set
-  NUAGE_BACKUP2_S3_BUCKET=new-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
-  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`, and `NUAGE_BACKUP2_S3_ENDPOINT=…` for storage other
-  than AWS: the second never takes the first's endpoint): the dyno restarts from the old one
-  and sends a whole snapshot of every application to the new one; (2) wait until the
-  console's *Storage* page, or `/app`, shows the last backup of every application with no
-  error (it shows none until the new bucket has a whole snapshot of each), or until
-  `backup.destinations[1].last_at` of `/api/status` has a time; (3) swap them, in one command:
-  the new bucket's settings as `NUAGE_BACKUP_S3_*` and the old one's as `NUAGE_BACKUP2_S3_*`
-  (bucket, region, keys, prefix and endpoint of each): the stopping dyno sends its last
-  seconds to both, and the next one restores from the one that reaches furthest; (4) remove
-  the old one, now the second, in one command (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET
-  NUAGE_BACKUP2_S3_REGION …`): the stopping dyno sends its last seconds to the new bucket,
-  now the first, as long as that takes (the second only gets 20 seconds), and the next one
-  restores from it, the only destination.
+- **Move the backups with a stop.** Changing the backup variables restarts the dyno on the new
+  place: stop it first, copy the backup there with the storage's own tools, then change the
+  settings and start it again (the commands are below). The second destination
+  (`NUAGE_BACKUP2_*`) is still experimental and is not a safe way to move them yet.
 
 By hand:
 
@@ -753,8 +741,7 @@ For storage other than AWS, set `NUAGE_BACKUP_S3_ENDPOINT` too. Then open
 `https://my-nuage.herokuapp.com/admin`: its *Storage* page (or `backup.last_ok` in
 `/api/status`) should show the first backup with no error.
 
-To move the backups **with a stop** instead, when the storage's own tools copy a large backup
-faster than the dyno sends it:
+To move the backups to another bucket:
 
 ```bash
 heroku config:set NUAGE_RESTORE_REQUIRED=true        # once: from now on an empty start is refused

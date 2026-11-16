@@ -132,7 +132,7 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   restore.
 - **Documentation**: the READMEs, in English, French and Spanish, say where the key-value
   store lives and how to choose, how to change the backup destination on a disk that is not
-  erased and on Heroku (with or without a stop), and what `NUAGE_RESTORE_REQUIRED` does.
+  erased and on Heroku (moving them with a stop), and what `NUAGE_RESTORE_REQUIRED` does.
   `nuage.env.example` names every setting the server reads, and `app.json` offers the two new
   ones, empty. A test (`tests/docs.rs`) keeps the settings tables of `config.rs` and of the
   three READMEs, the example file and `app.json` in agreement, and the three READMEs with the
@@ -141,11 +141,31 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   `Engine::restore_required`, `EngineOptions::kv_in_database`, `BackupStatus::started_empty`,
   `S3Store::with_timeout`; `Config::restore_required`. For an application that embeds the
   engine: `EngineOptions` and `BackupStatus` have new public fields (build them with
-  `..Default::default()`), a snapshot now refuses a destination that holds another
-  database's backup, and `S3Store::get` answers an error for a bucket that does not exist.
-  `Engine::open` is unchanged.
+  `..Default::default()`), and so has `BackupOptions` (`stuck_after`: build it with
+  `BackupOptions { ..., ..BackupOptions::new(store) }`); a snapshot now refuses a destination
+  that holds another database's backup; `S3Store::get` answers an error for a bucket that does
+  not exist; `Engine::close` ends the backup rounds and refuses later ones. `Engine::open` is
+  unchanged, and `Engine::backup_now` still waits for a round already running
+  (`Engine::backup_now_within` gives up after a time, as the console's Back up now does).
 
-### A second backup destination, kept in step
+### A second backup destination, kept in step (experimental)
+
+This part is experimental: it works and is tested, but a third review found limits that are not
+fixed yet, so it is not yet a safe way to move the backups to another place (move them with a
+stop, as the README shows). Known limits:
+
+- When the first destination cannot be read at a start and is taken out of the settings to start
+  from the second, then put back later, the next start may restore the older history it holds
+  and drop what was written meanwhile: empty it before putting it back.
+- After the two are swapped, the new first destination gets no log until its whole snapshot is
+  done; a stop in that time sends the last seconds to the other one only.
+- Both destinations upload the same snapshot at the same time, each holding it whole in memory:
+  the memory peak doubles at every start and every hour.
+- A second destination slower than a checkpoint interval can miss log segments between two
+  rounds and fall back to whole snapshots, with no error.
+- An application that could not be opened is left out of `/api/status`, so the status can show
+  both destinations complete while that application's backup is only in one.
+
 
 - **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` with
   `_REGION`, `_ENDPOINT`, `_PREFIX`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` (else
@@ -160,7 +180,8 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   never one after a hole. A round in which both are due copies the page store once; each
   copy has a name of its own, and a copy left by a process that stopped is removed at the next
   start. Every application backs up under `apps/<name>/` of both.
-- **A round that does not end is a failure**: past `BackupOptions::stuck_after` (10 minutes),
+- **A round that does not end is a failure**: past `BackupOptions::stuck_after` (an hour, the
+  default interval between two snapshots, so that a large snapshot on a slow line is not one),
   the status gives its destination the error `… a backup round has been running for N
   minutes and has not ended: the destination does not answer, or is very slow`, and an
   `error` event says it once, until the round ends. The console's Back up now waits 10
@@ -205,9 +226,7 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   second backup destination did not get everything within 20 seconds: …`), so that neither
   takes the other's last seconds. A request still waiting on a destination that does not
   answer no longer keeps the process from ending.
-- **Settings**: set alone, `NUAGE_BACKUP2_*` is the only destination, so adding the second,
-  waiting until it has everything, swapping the two, then removing the old one moves the
-  backups without a stop (the steps for Heroku are in the README). A `NUAGE_BACKUP2_S3_*`
+- **Settings**: set alone, `NUAGE_BACKUP2_*` is the only destination. A `NUAGE_BACKUP2_S3_*`
   setting without `NUAGE_BACKUP2_S3_BUCKET` (or `NUAGE_BACKUP2_DIR`) stops the start, so that
   a bucket name mistyped is never a destination left out in silence. `NUAGE_BACKUP2_DIR` with
   `NUAGE_BACKUP2_S3_BUCKET`, or the two destinations naming the same place, stop the start.

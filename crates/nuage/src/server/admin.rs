@@ -1760,7 +1760,9 @@ fn post_now(state: &State, path: &str, form: &HashMap<String, String>, cx: &Cx, 
         p if p.starts_with("/storage/") => {
             let msg = match &p["/storage/".len()..] {
                 "checkpoint" => engine.checkpoint().map(|lsn| note(true, &cx.tf("Checkpoint at {}.", &[&lsn]))),
-                "backup" => engine.backup_now(true).map(|()| note(true, cx.t("Backup done."))),
+                "backup" => engine
+                    .backup_now_within(true, Some(crate::engine::BUSY_WAIT))
+                    .map(|()| note(true, cx.t("Backup done."))),
                 "integrity" => engine.check_integrity().map(|ok| {
                     note(
                         ok,

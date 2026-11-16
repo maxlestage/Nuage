@@ -664,7 +664,7 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   plus : le serveur démarre sans elle, et la console la range parmi celles qui ne s'ouvrent
   pas (complétez sa sauvegarde et redémarrez, ou supprimez-la là). Activez-le une fois que le
   serveur contient des données : un premier démarrage n'a rien à restaurer.
-- **Deux endroits à la fois** : `NUAGE_BACKUP2_DIR`, ou `NUAGE_BACKUP2_S3_BUCKET` et les autres
+- **Deux endroits à la fois** (expérimental) : `NUAGE_BACKUP2_DIR`, ou `NUAGE_BACKUP2_S3_BUCKET` et les autres
   `NUAGE_BACKUP2_S3_*`, ajoutent une seconde destination tenue à jour avec la première.
   Chacune reçoit les instantanés et le journal à son propre rythme : celle qui ne répond pas
   ne retient jamais l'autre (chacune a son propre fil), et reçoit un instantané complet quand
@@ -673,13 +673,13 @@ L'installateur demande où elles vont ; ou dites-le dans la commande :
   pas, puisque ce peut être celle qui va le plus loin (retirez-la des réglages pour démarrer
   depuis l'autre seule ; une seconde qui n'a pas répondu 5 secondes après la première compte
   comme ne répondant pas), ni quand les deux tiennent des bases différentes. Sans la première,
-  `NUAGE_BACKUP2_*` est l'unique destination : ajouter la seconde, attendre qu'elle ait tout,
-  échanger les deux, puis retirer l'ancienne déplace les sauvegardes sans arrêt (voir Heroku
-  plus bas). La page *Stockage* de la console montre la dernière sauvegarde de chaque
+  `NUAGE_BACKUP2_*` est l'unique destination. C'est encore expérimental : ce n'est pas encore
+  une façon sûre de déplacer les sauvegardes ailleurs (déplacez-les avec un arrêt, comme
+  indiqué pour Heroku), et ses limites connues sont listées dans le CHANGELOG. La page *Stockage* de la console montre la dernière sauvegarde de chaque
   destination, et `/api/status` chacune dans `backup.destinations` : une destination
   n'affiche pas d'heure tant qu'elle n'a pas reçu un instantané complet depuis le démarrage,
   et la dernière sauvegarde n'en affiche pas tant que les deux n'en ont pas reçu. Un tour vers
-  une destination qui n'est pas fini au bout de 10 minutes (elle ne répond pas, ou si
+  une destination qui n'est pas fini au bout d'une heure (elle ne répond pas, ou si
   lentement qu'elle ne suit jamais) s'affiche comme son erreur, et dans le journal des
   événements, jusqu'à ce qu'il finisse. L'arrêt envoie aux deux en même temps : la première a
   le temps qu'il faut, la seconde 20 secondes au plus. Sur Linux, le service de l'installateur ne peut écrire que dans le dossier des
@@ -764,24 +764,11 @@ La racine de ce dépôt se déploie telle quelle : `Procfile`, `RustConfig` et
   démarre pas, et ne crée ni n'écrit rien. Heroku le montre planté, `heroku logs --tail` dit
   quoi vérifier, et remettre les réglages le redémarre depuis sa sauvegarde. Pas lors d'un
   premier déploiement, qui n'a rien à restaurer : `app.json` ne le définit pas.
-- **Déplacer les sauvegardes sans arrêt.** Pour passer à un autre bucket : (1) ajoutez le
-  nouveau comme seconde destination, en une seule commande
-  (`heroku config:set NUAGE_BACKUP2_S3_BUCKET=nouveau-bucket NUAGE_BACKUP2_S3_REGION=…
-  NUAGE_BACKUP2_S3_ACCESS_KEY_ID=… NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`, et
-  `NUAGE_BACKUP2_S3_ENDPOINT=…` pour un stockage autre qu'AWS : la seconde ne prend jamais le
-  point d'accès de la première) : le dyno redémarre depuis l'ancien et envoie un instantané
-  complet de chaque application au nouveau ; (2) attendez que la page *Stockage* de la
-  console, ou `/app`, montre la dernière sauvegarde de chaque application sans erreur (elle
-  n'en montre pas tant que le nouveau bucket n'a pas un instantané complet de chacune), ou que
-  `backup.destinations[1].last_at` de `/api/status` ait une heure ; (3) échangez-les, en une
-  seule commande : les réglages du nouveau bucket en `NUAGE_BACKUP_S3_*` et ceux de l'ancien
-  en `NUAGE_BACKUP2_S3_*` (bucket, région, clés, préfixe et point d'accès de chacun) : le dyno
-  qui s'arrête envoie ses dernières secondes aux deux, et le suivant restaure depuis celui qui
-  va le plus loin ; (4) retirez l'ancien, désormais le second, en une seule commande
-  (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET NUAGE_BACKUP2_S3_REGION …`) : le dyno qui
-  s'arrête envoie ses dernières secondes au nouveau bucket, désormais le premier, en prenant
-  le temps qu'il faut (le second n'a que 20 secondes), et le suivant restaure depuis lui,
-  l'unique destination.
+- **Déplacer les sauvegardes avec un arrêt.** Changer les variables de sauvegarde redémarre
+  le dyno sur le nouvel endroit : arrêtez-le d'abord, copiez-y la sauvegarde avec les outils
+  du stockage, puis changez les réglages et redémarrez-le (les commandes sont plus bas). La
+  seconde destination (`NUAGE_BACKUP2_*`) est encore expérimentale, et pas encore une façon
+  sûre de les déplacer.
 
 À la main :
 
@@ -798,8 +785,7 @@ Pour un stockage autre qu'AWS, définissez aussi `NUAGE_BACKUP_S3_ENDPOINT`. Ouv
 `https://mon-nuage.herokuapp.com/admin` : sa page *Stockage* (ou `backup.last_ok` dans
 `/api/status`) doit montrer la première sauvegarde, sans erreur.
 
-Pour déplacer les sauvegardes **avec un arrêt**, quand les outils du stockage copient une
-grosse sauvegarde plus vite que le dyno ne l'envoie :
+Pour déplacer les sauvegardes vers un autre bucket :
 
 ```bash
 heroku config:set NUAGE_RESTORE_REQUIRED=true        # une fois : désormais un démarrage à vide est refusé

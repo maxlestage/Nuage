@@ -914,8 +914,11 @@ impl DatabaseKv {
         let pass = move || {
             loop {
                 match kv.sweep_now() {
-                    Ok((_, true)) => continue,
-                    Ok((_, false)) => break,
+                    // More due, and this pass removed some: on. A pass that removed
+                    // nothing (the commit it works from has already dropped what
+                    // the visible one still shows) waits for the next tick.
+                    Ok((removed, true)) if removed > 0 => continue,
+                    Ok(_) => break,
                     Err(e) => {
                         kv.engine.event("error", format!("key-value store: expired keys could not be removed: {e}"));
                         break;

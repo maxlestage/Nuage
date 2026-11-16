@@ -654,7 +654,7 @@ el comando:
   consola la muestra entre las que no se pueden abrir (complete su copia y reinicie, o
   bórrela allí). Actívelo cuando el servidor ya tenga datos: un primer arranque no tiene nada
   que restaurar.
-- **Dos lugares a la vez**: `NUAGE_BACKUP2_DIR`, o `NUAGE_BACKUP2_S3_BUCKET` y los demás
+- **Dos lugares a la vez** (experimental): `NUAGE_BACKUP2_DIR`, o `NUAGE_BACKUP2_S3_BUCKET` y los demás
   `NUAGE_BACKUP2_S3_*`, añaden un segundo destino que se mantiene al día con el primero. Cada
   uno recibe las instantáneas y el registro a su propio ritmo: el que no responde nunca
   retiene al otro (cada uno tiene su propio hilo), y recibe una instantánea completa cuando
@@ -663,12 +663,13 @@ el comando:
   ya que puede ser el que llega más lejos (quítelo de los ajustes para arrancar desde el otro
   solo; un segundo que no ha respondido 5 segundos después del primero cuenta como que no
   responde), ni cuando los dos guardan bases distintas. Sin el primero, `NUAGE_BACKUP2_*` es
-  el único destino: añadir el segundo, esperar a que lo tenga todo, intercambiar los dos y
-  luego quitar el antiguo mueve las copias sin detener nada (vea Heroku más abajo). La página
+  el único destino. Todavía es experimental: aún no es una forma segura de mover las copias a
+  otro lugar (muévalas deteniendo el servidor, como se indica para Heroku), y sus límites
+  conocidos están en el CHANGELOG. La página
   *Almacenamiento* de la consola muestra la última copia de cada destino, y `/api/status` cada
   uno en `backup.destinations`: un destino no muestra hora hasta que ha recibido una
   instantánea completa desde el arranque, y la última copia no la muestra hasta que la han
-  recibido los dos. Una ronda hacia un destino que no ha terminado al cabo de 10 minutos (no
+  recibido los dos. Una ronda hacia un destino que no ha terminado al cabo de una hora (no
   responde, o tan despacio que nunca se pone al día) se muestra como su error, y en el
   registro de eventos, hasta que termina. La parada envía a los dos a la vez: el primero tiene
   el tiempo que haga falta, el segundo 20 segundos como mucho. En Linux, el servicio del
@@ -752,23 +753,11 @@ La raíz de este repositorio se despliega tal cual: `Procfile`, `RustConfig` y
   arranca, y no crea ni escribe nada. Heroku lo muestra caído, `heroku logs --tail` dice qué
   comprobar, y volver a poner los ajustes lo arranca desde su copia. No en un primer
   despliegue, que no tiene nada que restaurar: `app.json` no lo define.
-- **Mover las copias sin detener nada.** Para pasar a otro bucket: (1) añada el nuevo como
-  segundo destino, en un solo comando (`heroku config:set
-  NUAGE_BACKUP2_S3_BUCKET=nuevo-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
-  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`, y `NUAGE_BACKUP2_S3_ENDPOINT=…` para un almacenamiento
-  que no sea AWS: el segundo nunca toma el endpoint del primero): el dyno se reinicia desde el
-  antiguo y envía una instantánea completa de cada aplicación al nuevo; (2) espere a que la
-  página *Almacenamiento* de la consola, o `/app`, muestre la última copia de cada aplicación
-  sin errores (no la muestra hasta que el nuevo bucket tiene una instantánea completa de
-  cada una), o a que `backup.destinations[1].last_at` de `/api/status` tenga una hora; (3)
-  intercámbielos, en un solo comando: los ajustes del nuevo bucket como `NUAGE_BACKUP_S3_*` y
-  los del antiguo como `NUAGE_BACKUP2_S3_*` (bucket, región, claves, prefijo y endpoint de
-  cada uno): el dyno que se detiene envía sus últimos segundos a los dos, y el siguiente
-  restaura desde el que llega más lejos; (4) quite el antiguo, ahora el segundo, en un solo
-  comando (`heroku config:unset NUAGE_BACKUP2_S3_BUCKET NUAGE_BACKUP2_S3_REGION …`): el dyno
-  que se detiene envía sus últimos segundos al nuevo bucket, ahora el primero, con el tiempo
-  que haga falta (el segundo solo tiene 20 segundos), y el siguiente restaura desde él, el
-  único destino.
+- **Mover las copias deteniendo el servidor.** Cambiar las variables de copia reinicia el
+  dyno sobre el nuevo lugar: deténgalo primero, copie allí la copia con las herramientas del
+  almacenamiento, y luego cambie los ajustes y arránquelo de nuevo (los comandos están más
+  abajo). El segundo destino (`NUAGE_BACKUP2_*`) todavía es experimental, y aún no es una
+  forma segura de moverlas.
 
 A mano:
 
@@ -785,8 +774,7 @@ Para un almacenamiento distinto de AWS, defina también `NUAGE_BACKUP_S3_ENDPOIN
 abra `https://mi-nuage.herokuapp.com/admin`: su página *Almacenamiento* (o `backup.last_ok` en
 `/api/status`) debe mostrar la primera copia, sin errores.
 
-Para mover las copias **deteniendo el servidor**, cuando las herramientas del almacenamiento
-trasladan una copia grande más rápido de lo que el dyno la envía:
+Para mover las copias a otro bucket:
 
 ```bash
 heroku config:set NUAGE_RESTORE_REQUIRED=true        # una vez: desde ahora un arranque en vacío se rechaza

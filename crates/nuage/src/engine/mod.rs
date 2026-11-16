@@ -80,7 +80,9 @@ pub struct BackupOptions {
     /// A round to a destination that has not ended after this long is
     /// reported as failed, in the status and by an `error` event, until it
     /// ends: a destination that does not answer (a network folder that hangs)
-    /// or one so slow that it never keeps up. Default: 10 minutes.
+    /// or one so slow that it never keeps up. Default: an hour, the default
+    /// interval between two snapshots (a working round of a large snapshot on
+    /// a slow line is not a failure).
     pub stuck_after: Duration,
 }
 
@@ -101,7 +103,7 @@ impl BackupOptions {
             snapshot_every: Duration::from_secs(3600),
             keep_snapshots: 2,
             restore_when_empty: true,
-            stuck_after: Duration::from_secs(600),
+            stuck_after: Duration::from_secs(3600),
         }
     }
 }
@@ -320,7 +322,8 @@ impl Drop for Running<'_> {
 /// How long the console's Back up now waits for a round to a destination
 /// that is already running before it says so, instead of waiting for ever
 /// behind a destination that does not answer.
-const BUSY_WAIT: Duration = Duration::from_secs(10);
+#[cfg(feature = "server")]
+pub(crate) const BUSY_WAIT: Duration = Duration::from_secs(10);
 
 /// `lock`, once it is free, or `None` after `limit`.
 fn lock_within<T>(lock: &Mutex<T>, limit: Duration) -> Option<MutexGuard<'_, T>> {
@@ -740,7 +743,19 @@ impl Engine {
     /// error, if any. The upkeep thread does not call this: it sends to each
     /// destination on a thread of its own, so that one that is slow, or does
     /// not answer, never holds the other's rounds or the checkpoints.
+    ///
+    /// It waits for a round already running to a destination, then runs its
+    /// own: when it returns `Ok`, everything committed before the call is in
+    /// every destination.
     pub fn backup_now(&self, force_snapshot: bool) -> Result<()> {
+        self.backup_now_within(force_snapshot, None)
+    }
+
+    /// [`backup_now`](Self::backup_now) that waits at most `limit` for a
+    /// round already running to a destination, and says it is busy past it:
+    /// what the console's Back up now calls, so that a destination that does
+    /// not answer never holds the page.
+    pub fn backup_now_within(&self, force_snapshot: bool, limit: Option<Duration>) -> Result<()> {
         let Some(b) = &self.options.backup else {
             return Err(Error::Unsupported("no backup location is configured".into()));
         };
@@ -749,7 +764,11 @@ impl Engine {
         let mut taken = None;
         let mut failed = None;
         for i in 0..self.places.len() {
-            let round = match lock_within(&self.progress[i], BUSY_WAIT) {
+            let progress = match limit {
+                Some(limit) => lock_within(&self.progress[i], limit),
+                None => Some(self.progress[i].lock().unwrap_or_else(|e| e.into_inner())),
+            };
+            let round = match progress {
                 Some(progress) => self.round_with(b, i, progress, force_snapshot, &mut taken),
                 None => Err(self.busy(i)),
             };

@@ -2032,7 +2032,7 @@ async fn a_round_that_does_not_end_is_a_failure() {
     let snapshots = engine.events().0.iter().filter(|e| e.message == to_one).count();
     let now = engine.clone();
     let started = std::time::Instant::now();
-    let e = within(Duration::from_secs(30), move || now.backup_now(true))
+    let e = within(Duration::from_secs(30), move || now.backup_now_within(true, Some(Duration::from_secs(10))))
         .expect("Back up now waits behind the second's round")
         .unwrap_err()
         .to_string();
