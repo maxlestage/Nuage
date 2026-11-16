@@ -27,15 +27,19 @@
 //! database's.
 //!
 //! A backup can go to two places at once ([`MirrorStore`]). The engine ships
-//! to each one in turn, each with its own progress: one that does not answer
-//! never holds the other back, and one that missed log segments the data
-//! directory no longer has gets a whole snapshot before anything else
-//! ([`can_continue`]). An empty data directory is restored from ONE of them,
-//! whole, never a mix: the one that reaches furthest ([`restore_best`]).
+//! to each one with its own progress and its own lock, the second on a
+//! thread of its own: one that does not answer never holds the other back,
+//! and one that missed log segments the data directory no longer has gets a
+//! whole snapshot before anything else ([`can_continue`]). An empty data
+//! directory is restored from ONE of them, whole, never a mix: the one that
+//! reaches furthest; when either cannot be read, nothing is restored
+//! ([`restore_best`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use memoire_orm::{Error, Result};
 use serde_json::{Value as Json, json};
@@ -111,7 +115,8 @@ pub trait BackupStore: Send + Sync {
 /// to both. It is only the pair: the engine ships to each place
 /// ([`parts`](BackupStore::parts)) with its own progress, so a place that does
 /// not answer never holds the other back, and an empty data directory is
-/// restored from one place, whole (the one that reaches furthest).
+/// restored from one place, whole (the one that reaches furthest; a place
+/// that cannot be read stops the opening, see [`restore_best`]).
 ///
 /// Used as a store by itself, it writes and deletes in both places (trying
 /// both, and returning the first error), lists what either holds, and reads
@@ -396,7 +401,16 @@ pub(crate) fn delete_all(backup: &dyn BackupStore) -> Result<()> {
     Ok(())
 }
 
-const MANIFEST: &str = "manifest.json";
+pub(crate) const MANIFEST: &str = "manifest.json";
+
+/// The places of `store`, in order: the two of a [`MirrorStore`] (and of a
+/// [`PrefixedStore`] of one), or the store itself.
+pub(crate) fn places(store: &Arc<dyn BackupStore>) -> Vec<Arc<dyn BackupStore>> {
+    match store.parts() {
+        Some((first, second)) => vec![first, second],
+        None => vec![store.clone()],
+    }
+}
 
 /// Where the last backup of a version up to 0.4 is kept once this version
 /// writes its own (see [`keep_aside`]).
@@ -532,7 +546,8 @@ pub(crate) fn prepare(store: &Store, backup: &dyn BackupStore) -> Result<bool> {
 }
 
 /// A copy of the page store for a snapshot ([`take`]), removed from the disk
-/// when it is dropped.
+/// when it is dropped. Each copy has a name of its own: the two destinations
+/// may each be sending one.
 pub(crate) struct Taken {
     /// The LSN the copy holds everything up to.
     pub(crate) lsn: u64,
@@ -548,7 +563,8 @@ impl Drop for Taken {
 /// The second step of a snapshot: a checkpoint, then a copy of the page
 /// store beside it, with no commit in between.
 pub(crate) fn take(store: &Store) -> Result<Taken> {
-    let path = store.dir.join("snapshot.partial");
+    static COPIES: AtomicU64 = AtomicU64::new(0);
+    let path = store.dir.join(format!("{COPY}{}.partial", COPIES.fetch_add(1, Ordering::Relaxed)));
     // No commit may land while the file is copied.
     let mut w = store.writer();
     let lsn = store.checkpoint_locked(&mut w, Some(0))?;
@@ -557,6 +573,22 @@ pub(crate) fn take(store: &Store) -> Result<Taken> {
     // Through the store's own handle: Windows lets no other handle read the locked file.
     store.pages.copy_file_to(&taken.path)?;
     Ok(taken)
+}
+
+/// The start of the names of the copies [`take`] makes in the data directory.
+const COPY: &str = "snapshot-";
+
+/// Removes the copies of the page store left in `dir` by a process that
+/// stopped while it sent one (they were never named by a manifest).
+pub(crate) fn remove_copies(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `snapshot.partial`: the name a copy had up to 0.4.6.
+        if (name.starts_with(COPY) && name.ends_with(".partial")) || name == "snapshot.partial" {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The last step of a snapshot: the copy is uploaded, then the header and the
@@ -709,46 +741,56 @@ pub fn inspect(backup: &dyn BackupStore) -> Result<Option<BackupInfo>> {
     }))
 }
 
-/// What [`restore_best`] did.
-pub(crate) struct Best {
-    /// The place the data was restored from; `None`: neither holds a backup.
-    pub(crate) from: Option<String>,
-    /// The second place could not be read, and the data was restored from
-    /// the first: what it said.
-    pub(crate) skipped: Option<String>,
-}
+/// How long, after the first destination has been read, a restore waits for
+/// the second one ([`restore_best`]): a second that hangs stops the start
+/// within seconds, not after its own time limit for each database.
+const SECOND_WAIT: Duration = Duration::from_secs(5);
 
 /// Restores an empty `dir` from one of the two places of a backup, whole,
 /// never a mix of both: the one that reaches furthest ([`BackupInfo::reach`]),
-/// the first on a tie; the other one when only one holds a backup. The first
-/// place that cannot be read is an error: an older copy is never restored in
-/// silence while a newer one may exist (to start from the second alone, the
-/// first is taken out of the settings). The second that cannot be read is
-/// skipped and said ([`Best::skipped`]), unless the first holds nothing: then
-/// the second may hold the only copy, and it is an error too. Two places
-/// that hold different databases are an error, and nothing is restored.
-pub(crate) fn restore_best(dir: &Path, first: &dyn BackupStore, second: &dyn BackupStore) -> Result<Best> {
+/// the first on a tie; the other one when only one holds a backup. Returns
+/// the place restored from, `None` when neither holds a backup.
+///
+/// Both places are read at the same time. A place that cannot be read is an
+/// error, and so is a second that has not answered [`SECOND_WAIT`] after the
+/// first: either may be the one that reaches furthest, and an older copy is
+/// never restored in silence while a newer one may exist (to start from one
+/// alone, the other is taken out of the settings). Two places that hold
+/// different databases are an error too. On an error, nothing is restored.
+pub(crate) fn restore_best(
+    dir: &Path,
+    first: &Arc<dyn BackupStore>,
+    second: &Arc<dyn BackupStore>,
+) -> Result<Option<String>> {
     let (one, two) = (first.describe(), second.describe());
-    let a = inspect(first).map_err(|e| {
+    let (sent, looked) = std::sync::mpsc::channel();
+    let looking = second.clone();
+    // Left to end on its own when it does not answer in time.
+    std::thread::Builder::new()
+        .name("nuage-restore-2".into())
+        .spawn(move || {
+            let _ = sent.send(inspect(looking.as_ref()));
+        })
+        .map_err(|e| storage_err(format!("cannot read the second backup destination: {e}")))?;
+    let a = inspect(first.as_ref()).map_err(|e| {
         storage_err(format!(
             "the first backup destination does not answer ({one}: {}): nothing was restored. To start from the \
              second alone ({two}), take the first out of the settings",
             super::reason(&e)
         ))
     })?;
-    let (b, skipped) = match inspect(second) {
-        Ok(b) => (b, None),
-        Err(e) if a.is_some() => (None, Some(super::reason(&e))),
-        Err(e) => {
-            return Err(storage_err(format!(
-                "{one} holds no backup and the second backup destination does not answer ({two}: {}): nothing \
-                 was restored, and no empty database is started while it may hold the data",
-                super::reason(&e)
-            )));
-        }
+    let unread = |why: String| {
+        storage_err(format!(
+            "the second backup destination does not answer ({two}: {why}): nothing was restored, since it may hold \
+             more than the first. To start from the first alone ({one}), take the second out of the settings"
+        ))
+    };
+    let b = match looked.recv_timeout(SECOND_WAIT) {
+        Ok(read) => read.map_err(|e| unread(super::reason(&e)))?,
+        Err(_) => return Err(unread(format!("no answer {} seconds after the first's", SECOND_WAIT.as_secs()))),
     };
     let chosen = match (&a, &b) {
-        (None, None) => return Ok(Best { from: None, skipped }),
+        (None, None) => return Ok(None),
         (Some(_), None) => first,
         (None, Some(_)) => second,
         (Some(a), Some(b)) => {
@@ -768,10 +810,10 @@ pub(crate) fn restore_best(dir: &Path, first: &dyn BackupStore, second: &dyn Bac
         }
     };
     let from = chosen.describe();
-    if !restore(dir, chosen)? {
+    if !restore(dir, chosen.as_ref())? {
         return Err(storage_err(format!("{from} held a backup a moment ago and holds none now: nothing was restored")));
     }
-    Ok(Best { from: Some(from), skipped })
+    Ok(Some(from))
 }
 
 #[cfg(test)]

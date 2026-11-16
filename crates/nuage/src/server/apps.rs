@@ -476,6 +476,27 @@ impl Apps {
                 dir.display()
             )));
         }
+        // A new application starts empty: a backup left under its name (a deletion that
+        // could not empty a destination) would otherwise be restored into it.
+        for place in self.backup_places(name) {
+            match place.get(backup::MANIFEST) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(Error::Validation(format!(
+                        "{} still holds the backup of an application named `{name}`, deleted earlier: delete it \
+                         there, or pick another name",
+                        place.describe()
+                    )));
+                }
+                Err(e) => {
+                    return Err(crate::engine::storage_err(format!(
+                        "cannot check that {} holds no backup of an application named `{name}`: {}",
+                        place.describe(),
+                        crate::engine::reason(&e)
+                    )));
+                }
+            }
+        }
         let engine = self.open_engine(name, true)?;
         let app = Arc::new(App::new(
             name.to_owned(),
@@ -527,8 +548,10 @@ impl Apps {
     }
 
     /// Deletes an application: its tokens, its data and its backups. The
-    /// first application cannot be deleted.
-    pub(crate) fn delete(&self, name: &str) -> Result<bool> {
+    /// first application cannot be deleted. Returns `None` when there is no
+    /// such application, else the destinations that still hold its backup
+    /// (they could not be emptied, and say why): none when it is all gone.
+    pub(crate) fn delete(&self, name: &str) -> Result<Option<Vec<String>>> {
         let _guard = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         if name == self.first.name {
             return Err(Error::Unsupported("the first application cannot be deleted".into()));
@@ -541,7 +564,7 @@ impl Apps {
             before != failed.len()
         };
         if app.is_none() && !was_failed {
-            return Ok(false);
+            return Ok(None);
         }
         let mut key = REGISTRY_PREFIX.to_vec();
         key.extend_from_slice(name.as_bytes());
@@ -549,13 +572,43 @@ impl Apps {
         if let Some(app) = app {
             let _ = app.engine.close();
         }
-        if let Some(b) = &self.first.engine.options().backup {
-            let _ = backup::delete_all(&PrefixedStore::new(b.store.clone(), format!("apps/{name}/")));
-        }
+        // Each destination on its own: one that cannot be emptied is said, by name.
+        let kept: Vec<String> = self
+            .backup_places(name)
+            .iter()
+            .filter_map(|place| {
+                let e = backup::delete_all(place.as_ref()).err()?;
+                Some(format!("{} ({})", place.describe(), crate::engine::reason(&e)))
+            })
+            .collect();
         let _ = std::fs::remove_dir_all(dir_of(&self.first.engine, name));
         self.share_cache();
-        self.first.engine.event("warn", format!("application `{name}` deleted, with its data and backups"));
-        Ok(true)
+        if kept.is_empty() {
+            self.first.engine.event("warn", format!("application `{name}` deleted, with its data and backups"));
+        } else {
+            self.first.engine.event(
+                "error",
+                format!(
+                    "application `{name}` deleted, with its data, but its backup is still in {}: delete it there. \
+                     Until then, no application named `{name}` can be created",
+                    kept.join(" and ")
+                ),
+            );
+        }
+        Ok(Some(kept))
+    }
+
+    /// Where the backup of application `name` is: each destination's
+    /// `apps/<name>/`, none without a backup.
+    fn backup_places(&self, name: &str) -> Vec<Arc<dyn crate::engine::BackupStore>> {
+        match &self.first.engine.options().backup {
+            Some(b) => {
+                let whole: Arc<dyn crate::engine::BackupStore> =
+                    Arc::new(PrefixedStore::new(b.store.clone(), format!("apps/{name}/")));
+                backup::places(&whole)
+            }
+            None => Vec::new(),
+        }
     }
 }
 

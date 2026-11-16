@@ -10,7 +10,9 @@
 //! changed is written as one log record, a transaction included. The
 //! commands that look at the whole store (`KEYS`, `SCAN`, `DBSIZE`, `INFO`,
 //! `FLUSHDB`, `FLUSHALL`) are answered here, from the tree and what the call
-//! changed so far.
+//! changed so far: `SCAN` page by page, with a cursor the store remembers,
+//! and `KEYS` up to a limit, so that no call builds the list of every key of
+//! a store bounded only by the disk.
 //!
 //! The tree `kv`:
 //!
@@ -25,7 +27,8 @@
 //! holds the writer lock of the application's database, reads its last
 //! commit, and is answered once its record is on disk. An expired key is
 //! never returned nor counted; it leaves the tree when a write touches it,
-//! or in a batch removed at most every 30 seconds.
+//! or in the batches of a pass that runs at most every 30 seconds, and again
+//! at once while more keys are due than one pass removes.
 //!
 //! Nothing is evicted: a value is 64 MiB at most, and the store is bounded
 //! by the disk, like the tables.
@@ -55,12 +58,26 @@ pub(crate) const MAX_VALUE: usize = 64 << 20;
 const SWEEP_EVERY_MS: i64 = 30_000;
 /// Expired keys removed by one log record.
 const SWEEP_BATCH: usize = 1000;
-/// Records one pass writes at most; what is left waits for the next pass.
+/// Records one pass writes at most; what is left goes in the next pass, at
+/// once.
 const SWEEP_ROUNDS: usize = 20;
 /// The most one call may write, in bytes: what one log record carries.
 const MAX_WRITE: usize = 1 << 30;
 /// The key of the two counters.
 const COUNTS: &[u8] = b"n";
+/// The most keys `KEYS` answers: past it, it answers an error and `SCAN`
+/// gives them page by page.
+const KEYS_MAX: usize = 100_000;
+/// ... and the most bytes of keys.
+const KEYS_MAX_BYTES: usize = 16 << 20;
+/// Entries of the tree one page of `SCAN` goes through when it is not given
+/// a `COUNT` (as many as Redis's own).
+const SCAN_COUNT: usize = 10;
+/// The `SCAN` cursors the store remembers: the oldest goes past it.
+const CURSORS: usize = 1024;
+/// A `SCAN` cursor the store does not remember.
+const UNKNOWN_CURSOR: &str = "invalid cursor: this server does not know it (it was given long ago, or before a \
+                              restart): start again with SCAN 0";
 
 /// The clock of the expiries: Unix time in milliseconds.
 fn now_ms() -> u64 {
@@ -193,6 +210,59 @@ fn keys_of<'a>(name: &str, args: &'a [Vec<u8>]) -> Touch<'a> {
         Some(Place::EveryOther) => Touch::Keys(args.iter().step_by(2).map(Vec::as_slice).collect()),
         Some(Place::Nothing) | None => Touch::Keys(Vec::new()),
     }
+}
+
+/// The `COUNT` of `SCAN`'s options: [`SCAN_COUNT`] without one. The other
+/// options are checked by `scan_pattern`.
+fn scan_count(options: &[Vec<u8>]) -> Result<usize, Reply> {
+    let mut count = SCAN_COUNT;
+    for pair in options.chunks(2) {
+        if let [name, value] = pair
+            && upper(name) == "COUNT"
+        {
+            count = match number::<i64>(value) {
+                Some(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+                Some(_) => return Err(Reply::err("syntax error")),
+                None => return Err(Reply::err("value is not an integer or out of range")),
+            };
+        }
+    }
+    Ok(count)
+}
+
+/// The cursors `SCAN` gave out: each number stands for the last key of its
+/// page. The [`CURSORS`] latest are kept, so a client that asks a page again
+/// gets it again.
+#[derive(Default)]
+struct Cursors {
+    last: u64,
+    given: std::collections::VecDeque<(u64, Vec<u8>)>,
+}
+
+impl Cursors {
+    /// A new cursor for the page after `key`.
+    fn give(&mut self, key: Vec<u8>) -> u64 {
+        // 0 means "from the start": never given.
+        self.last = self.last.checked_add(1).unwrap_or(1);
+        if self.given.len() == CURSORS {
+            self.given.pop_front();
+        }
+        self.given.push_back((self.last, key));
+        self.last
+    }
+
+    /// The key the cursor `n` stands for.
+    fn find(&self, n: u64) -> Option<Vec<u8>> {
+        self.given.iter().find(|(c, _)| *c == n).map(|(_, key)| key.clone())
+    }
+}
+
+/// How far [`Run::walk`] went.
+struct Walked {
+    /// It reached the end of the tree.
+    complete: bool,
+    /// The last entry it went through.
+    last: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,11 +407,16 @@ impl<'a> Run<'a> {
         }
         let list = |keys: Vec<Vec<u8>>| Reply::Array(keys.into_iter().map(Reply::Bulk).collect());
         Ok(match (name, rest) {
-            ("KEYS", [pattern]) => list(self.matching(pattern)?),
-            ("SCAN", [_cursor, options @ ..]) => match scan_pattern(options) {
-                // The whole answer in one page: the cursor that comes back is 0.
-                Ok(pattern) => Reply::Array(vec![Reply::Bulk(b"0".to_vec()), list(self.matching(pattern)?)]),
-                Err(refused) => refused,
+            ("KEYS", [pattern]) => match self.matching(pattern)? {
+                Some(keys) => list(keys),
+                None => Reply::err(format!(
+                    "too many keys for KEYS (more than {KEYS_MAX} or {} MiB): use SCAN, which answers page by page",
+                    KEYS_MAX_BYTES >> 20
+                )),
+            },
+            ("SCAN", [cursor, options @ ..]) => match (scan_pattern(options), scan_count(options)) {
+                (Ok(pattern), Ok(count)) => self.scan(cursor, pattern, count)?,
+                (Err(refused), _) | (_, Err(refused)) => refused,
             },
             ("DBSIZE", []) => Reply::Int(self.stats()?.keys as i64),
             ("INFO", _) => info(&self.stats()?),
@@ -364,40 +439,119 @@ impl<'a> Run<'a> {
     }
 
     /// The keys alive that match `pattern`, sorted: those of the tree the call
-    /// does not name, and those it names as the scratch holds them.
-    fn matching(&self, pattern: &[u8]) -> Result<Vec<Vec<u8>>> {
+    /// does not name, and those it names as the scratch holds them. `None`
+    /// past [`KEYS_MAX`] keys or [`KEYS_MAX_BYTES`] of them: the list is not
+    /// made, whatever the size of the store.
+    fn matching(&self, pattern: &[u8]) -> Result<Option<Vec<Vec<u8>>>> {
         let mut keys = Vec::new();
-        if let Some(tree) = self.tree() {
-            let mut bad = false;
-            self.pages.walk(tree, b"k", b"l", &mut |k, stored| {
-                let key = &k[1..];
-                match split(stored) {
-                    Some((at, _)) => {
-                        if alive(at, self.now) && !self.declared.contains(key) && glob(pattern, key) {
-                            keys.push(key.to_vec());
-                        }
-                        true
-                    }
-                    None => {
-                        bad = true;
-                        false
-                    }
-                }
-            })?;
-            if bad {
-                return Err(damaged("a key"));
-            }
+        let mut bytes = 0;
+        let mut keep = |keys: &mut Vec<Vec<u8>>, key: &[u8]| {
+            bytes += key.len();
+            keys.push(key.to_vec());
+            keys.len() <= KEYS_MAX && bytes <= KEYS_MAX_BYTES
+        };
+        let walked = self.walk(&[], usize::MAX, &mut |key| !glob(pattern, key) || keep(&mut keys, key))?;
+        if !walked.complete {
+            return Ok(None);
         }
-        for key in &self.declared {
-            if let Some(e) = self.scratch.map.get(key.as_slice())
-                && e.expires.is_none_or(|at| at > self.now)
-                && glob(pattern, key)
-            {
-                keys.push(key.clone());
+        for key in self.alive_declared(pattern, &[], None) {
+            if !keep(&mut keys, &key) {
+                return Ok(None);
             }
         }
         keys.sort();
-        Ok(keys)
+        Ok(Some(keys))
+    }
+
+    /// Up to `limit` entries of the tree after the key `after` (from the
+    /// first when empty), in order, each alive key the call does not name
+    /// given to `f`, until it returns `false`. Expired keys count towards
+    /// `limit` too: it bounds the work.
+    fn walk(&self, after: &[u8], limit: usize, f: &mut dyn FnMut(&[u8]) -> bool) -> Result<Walked> {
+        let mut walked = Walked { complete: true, last: None };
+        let Some(tree) = self.tree() else { return Ok(walked) };
+        let mut start = entry_key(after);
+        if !after.is_empty() {
+            // The key right after it.
+            start.push(0);
+        }
+        let (mut seen, mut bad) = (0usize, false);
+        self.pages.walk(tree, &start, b"l", &mut |k, stored| {
+            if seen == limit {
+                walked.complete = false;
+                return false;
+            }
+            seen += 1;
+            let key = &k[1..];
+            walked.last = Some(key.to_vec());
+            match split(stored) {
+                Some((at, _)) => {
+                    if alive(at, self.now) && !self.declared.contains(key) && !f(key) {
+                        walked.complete = false;
+                        return false;
+                    }
+                    true
+                }
+                None => {
+                    bad = true;
+                    false
+                }
+            }
+        })?;
+        if bad {
+            return Err(damaged("a key"));
+        }
+        Ok(walked)
+    }
+
+    /// The keys the call names that are alive in the scratch and match
+    /// `pattern`, after `after` and up to `upto` (to the end when `None`).
+    fn alive_declared(&self, pattern: &[u8], after: &[u8], upto: Option<&[u8]>) -> Vec<Vec<u8>> {
+        self.declared
+            .iter()
+            .filter(|key| key.as_slice() > after && upto.is_none_or(|upto| key.as_slice() <= upto))
+            .filter(|key| {
+                self.scratch.map.get(key.as_slice()).is_some_and(|e| e.expires.is_none_or(|at| at > self.now))
+                    && glob(pattern, key)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// One page of `SCAN`: the keys alive that match `pattern` among the
+    /// next `count` entries of the tree after where `cursor` stopped, and
+    /// the cursor of the next page (`0`: this was the last one). A cursor is
+    /// a number the store gives out and remembers the last key of its page
+    /// by ([`Cursors`]): every key alive from the first page to the last is
+    /// returned, whatever is written meanwhile.
+    fn scan(&self, cursor: &[u8], pattern: &[u8], count: usize) -> Result<Reply> {
+        let after = match number::<u64>(cursor) {
+            Some(0) => Vec::new(),
+            Some(n) => match self.kv.cursors.lock().unwrap_or_else(|e| e.into_inner()).find(n) {
+                Some(key) => key,
+                None => return Ok(Reply::err(UNKNOWN_CURSOR)),
+            },
+            None => return Ok(Reply::err("invalid cursor")),
+        };
+        let mut keys = Vec::new();
+        // A large COUNT is a large page, not the whole store at once.
+        let walked = self.walk(&after, count.min(KEYS_MAX), &mut |key| {
+            if glob(pattern, key) {
+                keys.push(key.to_vec());
+            }
+            true
+        })?;
+        let upto = if walked.complete { None } else { walked.last.as_deref() };
+        keys.extend(self.alive_declared(pattern, &after, upto));
+        keys.sort();
+        let next = match (walked.complete, walked.last) {
+            (false, Some(last)) => self.kv.cursors.lock().unwrap_or_else(|e| e.into_inner()).give(last),
+            _ => 0,
+        };
+        Ok(Reply::Array(vec![
+            Reply::Bulk(next.to_string().into_bytes()),
+            Reply::Array(keys.into_iter().map(Reply::Bulk).collect()),
+        ]))
     }
 
     /// The counters of the tree the call found.
@@ -561,6 +715,8 @@ pub(crate) struct DatabaseKv {
     next_sweep: AtomicI64,
     /// A pass is running.
     sweeping: AtomicBool,
+    /// The cursors `SCAN` gave out.
+    cursors: std::sync::Mutex<Cursors>,
 }
 
 impl DatabaseKv {
@@ -573,6 +729,7 @@ impl DatabaseKv {
             expired: AtomicU64::new(0),
             next_sweep: AtomicI64::new(0),
             sweeping: AtomicBool::new(false),
+            cursors: std::sync::Mutex::new(Cursors::default()),
         }
     }
 
@@ -713,7 +870,9 @@ impl DatabaseKv {
 
     /// Removes expired keys from the tree soon, on the blocking threads (or
     /// here, outside a runtime): at most every 30 seconds, never two passes
-    /// at once. Meanwhile no read returns an expired key and the figures
+    /// at once, and at the next call after a pass that stopped at its limit
+    /// with more keys due, so that the removals keep up with any number of
+    /// expiries. Meanwhile no read returns an expired key and the figures
     /// leave them out.
     pub(crate) fn sweep_soon(self: &Arc<Self>) {
         if now_millis() < self.next_sweep.load(Ordering::Relaxed) || self.sweeping.swap(true, Ordering::AcqRel) {
@@ -721,10 +880,15 @@ impl DatabaseKv {
         }
         let kv = self.clone();
         let pass = move || {
-            if let Err(e) = kv.sweep_now() {
-                kv.engine.event("error", format!("key-value store: expired keys could not be removed: {e}"));
-            }
-            kv.next_sweep.store(now_millis() + SWEEP_EVERY_MS, Ordering::Relaxed);
+            let more = match kv.sweep_now() {
+                Ok((_, more)) => more,
+                Err(e) => {
+                    kv.engine.event("error", format!("key-value store: expired keys could not be removed: {e}"));
+                    false
+                }
+            };
+            let wait = if more { 0 } else { SWEEP_EVERY_MS };
+            kv.next_sweep.store(now_millis() + wait, Ordering::Relaxed);
             kv.sweeping.store(false, Ordering::Release);
         };
         match tokio::runtime::Handle::try_current() {
@@ -734,9 +898,11 @@ impl DatabaseKv {
     }
 
     /// Removes the keys whose time has come, a batch per record, and
-    /// returns how many. Each one is read again first: a key written since
-    /// with another expiry stays, and only its old index entry goes.
-    fn sweep_now(&self) -> Result<usize> {
+    /// returns how many, and whether more were due when it stopped at its
+    /// limit ([`SWEEP_ROUNDS`] batches). Each one is read again first: a key
+    /// written since with another expiry stays, and only its old index entry
+    /// goes.
+    fn sweep_now(&self) -> Result<(usize, bool)> {
         let store = &self.engine.store;
         let pages = &store.pages;
         let mut removed = 0;
@@ -782,10 +948,21 @@ impl DatabaseKv {
             self.expired.fetch_add(gone, Ordering::Relaxed);
             removed += gone as usize;
             if due.len() < SWEEP_BATCH {
-                break;
+                return Ok((removed, false));
             }
         }
-        Ok(removed)
+        // Stopped at the limit, or found nothing to do: is more due?
+        Ok((removed, self.due_now()?))
+    }
+
+    /// Some key on disk is due to leave the tree.
+    fn due_now(&self) -> Result<bool> {
+        let pages = &self.engine.store.pages;
+        let visible = pages.visible();
+        Ok(match visible.root(TREE) {
+            Some(tree) => !due_entries(pages, &tree, now_ms(), 1)?.is_empty(),
+            None => false,
+        })
     }
 }
 
@@ -1507,7 +1684,7 @@ mod tests {
         assert_eq!((stats.keys, stats.expiring, stats.expired), (1, 1, 0));
         assert_eq!(lsn(&engine), before);
         assert!(tree_of(&engine).unwrap().0.iter().any(|(k, _)| k == b"short"), "not swept yet");
-        assert_eq!(kv.sweep_now().unwrap(), 1);
+        assert_eq!(kv.sweep_now().unwrap(), (1, false));
         assert_eq!(lsn(&engine), before + 1);
         let (keys, index, counts) = tree_of(&engine).unwrap();
         assert_eq!(keys.iter().map(|(k, _)| k.as_slice()).collect::<Vec<_>>(), [&b"later"[..]]);
@@ -1516,7 +1693,7 @@ mod tests {
         let stats = kv.stats().unwrap();
         assert_eq!((stats.keys, stats.expiring, stats.expired), (1, 1, 1));
         // Nothing due: a pass writes nothing.
-        assert_eq!(kv.sweep_now().unwrap(), 0);
+        assert_eq!(kv.sweep_now().unwrap(), (0, false));
         kv.sweep_soon();
         assert_eq!(lsn(&engine), before + 1);
 
@@ -1537,7 +1714,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(60));
         let before = lsn(&engine);
-        assert_eq!(kv.sweep_now().unwrap(), 0);
+        assert_eq!(kv.sweep_now().unwrap(), (0, false));
         assert_eq!(lsn(&engine), before + 1);
         let (keys, index, counts) = tree_of(&engine).unwrap();
         assert_eq!(keys.len(), 2);
@@ -1649,6 +1826,172 @@ mod tests {
         seen.sort();
         assert_eq!(seen, (1..=400).collect::<Vec<_>>());
         assert_eq!(kv.command(&args(&["GET", "n"]), false).unwrap(), bulk("400"));
+        drop((kv, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The keys of a `SCAN` answer, and its cursor.
+    fn scanned(reply: Reply) -> (String, Vec<String>) {
+        let text = |r: &Reply| match r {
+            Reply::Bulk(b) => String::from_utf8(b.clone()).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        match reply {
+            Reply::Array(parts) => match &parts[..] {
+                [cursor, Reply::Array(keys)] => (text(cursor), keys.iter().map(text).collect()),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `MSET` of `keys`, each with the value `v`.
+    fn mset(kv: &DatabaseKv, keys: impl Iterator<Item = String>) {
+        let mut command = vec![b"MSET".to_vec()];
+        for key in keys {
+            command.push(key.into_bytes());
+            command.push(b"v".to_vec());
+        }
+        kv.command(&command, false).unwrap();
+    }
+
+    /// `SCAN` answers page by page: `COUNT` entries of the tree at most (10
+    /// without one), and the cursor of the next page, `0` after the last. A
+    /// whole scan returns every key once, even when they are deleted as it
+    /// goes; a page asked again comes again; a cursor the store does not
+    /// know is an error. In a transaction, the keys it wrote are in the
+    /// page they fall in.
+    #[test]
+    fn scan_answers_page_by_page() {
+        let dir = temp("scan");
+        let engine = open(&dir, false);
+        let kv = DatabaseKv::new(engine.clone());
+        mset(&kv, (0..25).map(|n| format!("key:{n:02}")).chain(["other".to_owned()]));
+        let page = |cursor: &str, options: &[&str]| {
+            scanned(kv.command(&args(&[&["SCAN", cursor], options].concat()), false).unwrap())
+        };
+        let (cursor, keys) = page("0", &[]);
+        assert_eq!(keys, (0..10).map(|n| format!("key:{n:02}")).collect::<Vec<_>>());
+        assert_ne!(cursor, "0");
+        assert_eq!(page(&cursor, &[]).1, page(&cursor, &[]).1, "the same page again");
+        let whole = |options: &[&str], delete: bool| {
+            let (mut cursor, mut all, mut pages) = ("0".to_owned(), Vec::new(), 0);
+            loop {
+                let (next, keys) = page(&cursor, options);
+                pages += 1;
+                if delete {
+                    for key in &keys {
+                        assert_eq!(kv.command(&args(&["DEL", key]), false).unwrap(), Reply::Int(1));
+                    }
+                }
+                all.extend(keys);
+                if next == "0" {
+                    return (all, pages);
+                }
+                cursor = next;
+            }
+        };
+        let expected: Vec<String> = (0..25).map(|n| format!("key:{n:02}")).collect();
+        assert_eq!(whole(&["MATCH", "key:*", "COUNT", "7"], false), (expected.clone(), 4));
+        assert_eq!(whole(&["COUNT", "100"], false).1, 1);
+        // `for key in scan_iter("key:*"): delete(key)`: every key goes.
+        assert_eq!(whole(&["MATCH", "key:*"], true).0, expected);
+        assert_eq!(kv.command(&args(&["KEYS", "*"]), false).unwrap(), Reply::Array(vec![bulk("other")]));
+        let replies =
+            kv.transaction(&[args(&["SET", "key:new", "v"]), args(&["SCAN", "0", "COUNT", "100"])], false).unwrap();
+        assert_eq!(scanned(replies[1].clone()), ("0".to_owned(), vec!["key:new".to_owned(), "other".to_owned()]));
+        // Refused.
+        let refused = |command: &[&str]| kv.command(&args(command), false).unwrap();
+        assert_eq!(refused(&["SCAN", "123456"]), Reply::err(UNKNOWN_CURSOR));
+        assert_eq!(refused(&["SCAN", "x"]), Reply::err("invalid cursor"));
+        assert_eq!(refused(&["SCAN", "0", "COUNT", "0"]), Reply::err("syntax error"));
+        assert_eq!(refused(&["SCAN", "0", "COUNT", "x"]), Reply::err("value is not an integer or out of range"));
+        drop((kv, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `KEYS` does not build a list of more than [`KEYS_MAX`] keys: past it,
+    /// it says to use `SCAN`, and a `SCAN` with a larger `COUNT` gives a page
+    /// of that size at most.
+    #[test]
+    fn keys_does_not_list_a_whole_large_store() {
+        let dir = temp("keys-max");
+        let engine = open(&dir, false);
+        let kv = DatabaseKv::new(engine.clone());
+        mset(&kv, (0..=KEYS_MAX).map(|n| format!("key:{n:06}")));
+        match kv.command(&args(&["KEYS", "*"]), false).unwrap() {
+            Reply::Error(e) => assert!(e.contains("too many keys for KEYS") && e.contains("use SCAN"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        match kv.command(&args(&["KEYS", "key:00001?"]), false).unwrap() {
+            Reply::Array(keys) => assert_eq!(keys.len(), 10),
+            other => panic!("{other:?}"),
+        }
+        let (cursor, keys) = scanned(kv.command(&args(&["SCAN", "0", "COUNT", "1000000000"]), false).unwrap());
+        assert_eq!((cursor == "0", keys.len()), (false, KEYS_MAX));
+        drop((kv, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// More keys expire than one pass removes: the next pass comes at the
+    /// next call, not 30 seconds later, so the removals keep up.
+    #[test]
+    fn the_sweep_keeps_up_with_many_expiries() {
+        let dir = temp("sweep-more");
+        let engine = open(&dir, false);
+        let kv = Arc::new(DatabaseKv::new(engine.clone()));
+        let n = SWEEP_ROUNDS * SWEEP_BATCH + 5000;
+        {
+            // Expired a second ago.
+            let at = now_ms() - 1000;
+            let mut ops =
+                vec![Op::Put { table: TREE.into(), key: COUNTS.to_vec(), value: counts_value(n as u64, n as u64) }];
+            for i in 0..n {
+                let key = format!("k{i:06}").into_bytes();
+                ops.push(Op::Put { table: TREE.into(), key: entry_key(&key), value: entry_value(at, b"v") });
+                ops.push(Op::Put { table: TREE.into(), key: index_key(at, &key), value: Vec::new() });
+            }
+            let mut w = engine.store.writer();
+            let lsn = engine.store.log_and_apply(&mut w, ops).unwrap();
+            drop(w);
+            engine.store.wait_durable(lsn).unwrap();
+        }
+        assert_eq!(kv.stats().unwrap().keys, 0, "expired: not counted");
+        kv.sweep_soon();
+        assert_eq!(tree_of(&engine).unwrap().0.len(), 5000, "one pass: its limit");
+        kv.sweep_soon();
+        let (keys, index, counts) = tree_of(&engine).unwrap();
+        assert_eq!((keys.len(), index.len(), counts), (0, 0, (0, 0)), "the next one, at once");
+        assert_eq!(kv.stats().unwrap().expired, n as u64);
+        // Nothing more due: the next pass waits its 30 seconds.
+        let before = lsn(&engine);
+        kv.command(&args(&["SET", "short", "v", "PX", "1"]), false).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        kv.sweep_soon();
+        kv.sweep_soon();
+        assert_eq!(lsn(&engine), before + 1, "only the SET was written");
+        drop((kv, engine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once the database stops taking commits (a server that stops), a write
+    /// is the storage error and changes nothing; reads go on.
+    #[test]
+    fn a_write_after_the_stop_is_refused() {
+        let dir = temp("stopped");
+        let engine = open(&dir, false);
+        let kv = AppKv::open(&engine, 0);
+        kv.command(&args(&["SET", "kept", "v"]), false).unwrap();
+        engine.stop_writes();
+        for e in [
+            kv.command(&args(&["SET", "lost", "v"]), false).unwrap_err(),
+            kv.incr_by(b"n", 1, None).unwrap_err(),
+            kv.set(b"lost", b"v".to_vec(), &SetOptions::default()).unwrap_err(),
+        ] {
+            assert!(e.to_string().contains("the database is stopping: nothing was written"), "{e}");
+        }
+        assert_eq!(kv.command(&args(&["GET", "lost"]), false).unwrap(), Reply::Nil);
+        assert_eq!(kv.command(&args(&["GET", "kept"]), false).unwrap(), bulk("v"));
         drop((kv, engine));
         let _ = std::fs::remove_dir_all(&dir);
     }

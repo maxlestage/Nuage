@@ -131,6 +131,14 @@ fn app_json(state: &State, app: &App, env_token: bool) -> Json {
             "read_only": c.read_only,
         })),
         "requests": requests_json(&app.metrics),
+        // Each backup destination: `last_at` stays null until it has received a whole
+        // snapshot since the start (a destination just added may hold nothing yet).
+        "backup_destinations": backup.destinations.iter().map(|d| json!({
+            "target": d.target,
+            "last_at": d.last_snapshot_at.and(d.last_at).and_then(rfc3339_ms),
+            "last_ok": d.error.is_none(),
+            "last_error": d.error,
+        })).collect::<Vec<_>>(),
         "kv": kv,
         // What it keeps in the bucket (`/v1/files`), as last counted: null
         // without a bucket, or until the first count is back.
@@ -173,6 +181,29 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
         ),
         (Some(_), Some(error)) => ("degraded", error.clone()),
     };
+    // Each destination, over every application: the one furthest behind, the first error.
+    let destinations: Vec<Json> = backup
+        .destinations
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let last_at = every
+                .iter()
+                .map(|(_, b)| b.destinations.get(i).and_then(|d| d.last_snapshot_at.and(d.last_at)))
+                .min()
+                .flatten();
+            let error = all
+                .iter()
+                .zip(&every)
+                .find_map(|(a, (_, b))| b.destinations.get(i)?.error.as_ref().map(|e| format!("{}: {e}", a.name)));
+            json!({
+                "target": d.target,
+                "last_at": last_at.and_then(rfc3339_ms),
+                "last_ok": error.is_none(),
+                "last_error": error,
+            })
+        })
+        .collect();
     let oldest_checkpoint = every.iter().map(|(s, _)| s.last_checkpoint).min().flatten();
     let wal_detail = oldest_checkpoint.map_or("no checkpoint yet".to_owned(), |t| format!("checkpoint {}", ago(t)));
     let compaction = match all.iter().filter_map(|a| a.engine.last_compaction()).filter(|(_, done)| *done).max() {
@@ -243,6 +274,7 @@ pub(crate) fn status(state: &State, view: &View) -> Json {
             "last_at": oldest_backup.and_then(rfc3339_ms),
             "last_ok": failing.is_empty(),
             "last_error": failing.first(),
+            "destinations": destinations,
         },
         "encryption": {
             "enabled": encrypted,

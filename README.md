@@ -383,10 +383,15 @@ the backups. The requests, the commands and the port stay the same. With `databa
   the disk refuses is an error (`500` over HTTP, `-ERR storage: …` on the port), never half
   written;
 - **an expiry is a date**: a key set to live an hour expires an hour later, whether the server
-  restarted in between or not. An expired key is never returned or counted, and a background
-  pass removes it from the disk;
+  restarted in between or not. An expired key is never returned or counted, and background
+  passes remove it from the disk, as fast as keys expire;
+- **`SCAN` answers page by page**: `COUNT` keys of the store at most per page (10 without it),
+  and a cursor for the next page, `0` after the last, as Redis does: `scan_iter` and the like
+  go through any number of keys, even when they delete them on the way. `KEYS` answers at most
+  100,000 keys (16 MiB of them): past that, it says to use `SCAN`;
 - **on a disk erased at each restart** (Heroku), a clean restart keeps every key: on `SIGTERM`
-  the server ships its last log segment. After a crash, the keys come back as they were at the
+  the server stops taking writes, then ships its last log segment, so every write it answered
+  is in it (one that comes after gets the storage error). After a crash, the keys come back as they were at the
   last segment shipped, like the rows (30 seconds by default): a lock released in that window is
   held again, a counter raised in it is back to its earlier value;
 - the figures (`GET /v1/kv`, `/api/status`) say `"storage": "database"`, with `max_bytes` 0;
@@ -623,16 +628,25 @@ before it serves. The installer asks where they go; or say it in the command:
 - **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` and the other
   `NUAGE_BACKUP2_S3_*`, add a second destination kept in step with the first. Each one gets
   the snapshots and the log with its own progress: one that does not answer never holds the
-  other back, and gets a whole snapshot when it answers again. An empty data folder is
-  restored from one of them, whole: the one that reaches furthest. The server does not start
-  when the first does not answer (take it out of the settings to start from the second
-  alone), or when the two hold different databases. Without the first, `NUAGE_BACKUP2_*` is
-  the only destination: adding the second, waiting until it has everything, then removing
-  the first moves the backups without a stop. On Linux, the installer's service may write
+  other back (each has its own thread), and gets a whole snapshot when it answers again. An
+  empty data folder is restored from one of them, whole: the one that reaches furthest. The
+  server does not start when either does not answer, since it may be the one that reaches
+  furthest (take it out of the settings to start from the other alone; a second that has not
+  answered 5 seconds after the first counts as not answering), or when the two hold different
+  databases. Without the first, `NUAGE_BACKUP2_*` is the only destination: adding the second,
+  waiting until it has everything, then removing the first moves the backups without a stop.
+  The console's *Storage* page shows each destination's last backup, and `/api/status` each
+  one in `backup.destinations`: a destination shows no time until it has received a whole
+  snapshot since the start, and the last backup shows none until both have. The stop sends to
+  the first, then gives the second 20 seconds at most.
+- **Deleting an application** in the console empties its backup (`apps/<name>/`) in each
+  destination. One that cannot be emptied is named in the answer and the event log; until its
+  backup there is deleted by hand, no application of that name can be created, so that a new
+  one never starts with the deleted one's rows. On Linux, the installer's service may write
   only to the data folder and `NUAGE_BACKUP_DIR`: there, make the second one a bucket.
 - **Check**: the console's *Storage* page, and `/app`, show the last backup and its errors. A
-  bucket that stops answering fails the round after 60 seconds, and the next round tries
-  again.
+  bucket that stops answering fails the round after 60 seconds with nothing moving, and the
+  next round tries again; an upload that keeps moving is never cut, however slow the line.
 - **Restore** on a new computer: install, put the old settings file's
   `NUAGE_ENCRYPTION_KEY` and the same backup settings in the new one, empty the data folder
   and restart the service: it restores the last snapshot and replays the log after it.
@@ -683,7 +697,8 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
   (`NUAGE_BACKUP_DIR`).
 - **Loss window.** Commits since the last shipped log segment (30 seconds by default) are
   lost only if the dyno stops without the `SIGTERM` Heroku sends first: on `SIGTERM` the
-  server checkpoints and ships the last segment. The keys of the key-value stores follow the
+  server stops taking writes (one that comes after gets an error, never an answer the backup
+  lacks), checkpoints and ships the last segment. The keys of the key-value stores follow the
   same rule with `NUAGE_KV_STORAGE=database`; in memory, a restart empties them.
 - **A change of settings restarts the dyno.** Each `heroku config:set` or `config:unset`
   restarts it: its disk is erased and the database is restored from the backup that the new
@@ -699,9 +714,12 @@ The root of this repository deploys as is: `Procfile`, `RustConfig` and `heroku-
 - **Move the backups without a stop.** To move them to another bucket:
   (1) add the new one as the second destination, in one command (`heroku config:set
   NUAGE_BACKUP2_S3_BUCKET=new-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
-  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`): the dyno restarts from the old one and sends a
-  whole snapshot of every application to the new one; (2) wait until the console's *Storage*
-  page, or `/app`, shows the last backup of every application with no error; (3) remove the
+  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`, and `NUAGE_BACKUP2_S3_ENDPOINT=…` for storage other
+  than AWS: the second never takes the first's endpoint): the dyno restarts from the old one
+  and sends a whole snapshot of every application to the new one; (2) wait until the
+  console's *Storage* page, or `/app`, shows the last backup of every application with no
+  error (it shows none until the new bucket has a whole snapshot of each), or until
+  `backup.destinations[1].last_at` of `/api/status` has a time; (3) remove the
   old one, in one command (`heroku config:unset NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION
   …`): the stopping dyno sends its last seconds to both, and the next one restores from the
   new bucket, now the only destination.
@@ -762,7 +780,7 @@ heroku ps:scale web=1                                # it restores from the new 
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutes between two snapshots (of each destination) | `60` |
 | `NUAGE_BACKUP2_DIR` | a second backup destination kept in step with the first: this folder (see the backups above); alone, it is the only destination | |
 | `NUAGE_BACKUP2_S3_BUCKET` | the second destination in this bucket (with `NUAGE_BACKUP2_DIR` too, or the same place as the first, the server does not start) | |
-| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | its endpoint, region and prefix | as for the first |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | its endpoint, region and prefix, set for it: never the first's | `https://s3.<region>.amazonaws.com`, `us-east-1`, `nuage/` |
 | `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | its credentials (else `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_RESTORE_REQUIRED` | `true`: an empty data directory must be restored from the backup; with nothing to restore, or no backup set, the server does not start, and creates and writes nothing (nor does it serve a registered application whose backup holds nothing). For a disk erased at each restart, once the server holds data (see [Deploy on Heroku](#deploy-on-heroku)) | `false`: an empty start is allowed, and said in the log |
 | `NUAGE_KV_PORT` | also serve the key-value store on a port of its own (`6379`), over the wire Redis clients speak: one connects to an application's store, a token as the password | off |

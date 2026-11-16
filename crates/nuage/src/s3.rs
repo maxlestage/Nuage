@@ -4,19 +4,26 @@
 //!
 //! Every request has a time limit, so a bucket that takes the connection and
 //! then says nothing cannot hold a backup round, a restore, the shutdown or
-//! `/v1/files` for ever. The connection, the TLS handshake, sending the
-//! request and receiving the head of the answer must be done within the
-//! store's timeout (60 seconds) plus one second per 64 KiB of body sent; the
-//! body of the answer is then read piece by piece, and a wait of more than
-//! the timeout for the next piece is an error too. A large snapshot sent at
-//! 64 KiB/s or more, or received at any speed while bytes keep coming, is
-//! never cut.
+//! `/v1/files` for ever. The limit counts from the last thing that moved,
+//! never from the start: the connection, the TLS handshake and the head of
+//! the request must be done within the store's timeout (60 seconds); a body
+//! is sent in pieces of 64 KiB, and the connection must take the next one
+//! within the timeout; after the last one, the head of the answer must come
+//! within the timeout, plus a second for each 64 KiB of the body that may
+//! still be in the connection's buffers on its way (4 seconds at most); the
+//! body of the answer is then read piece by piece,
+//! and a wait of more than the timeout for the next piece is an error too. A
+//! large snapshot sent or received at any speed, on the slowest line, is
+//! never cut while its bytes keep moving.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::BodyExt;
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -59,9 +66,102 @@ impl std::fmt::Debug for S3Options {
 /// [`S3Store::with_timeout`].
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The time a request may take on top of the timeout for each 64 KiB of the
-/// body it sends: the upload of a large snapshot needs it on a slow line.
-const BYTES_PER_EXTRA_SECOND: u64 = 64 * 1024;
+/// The pieces a body is sent in: each one the connection takes is progress.
+const PIECE: usize = 64 * 1024;
+
+/// What the buffers of a connection may still hold of a body once its last
+/// piece is taken: the answer may take one more second per 64 KiB of it.
+const IN_FLIGHT: usize = 256 * 1024;
+
+/// How far a request has got: when something last moved, and the bytes of
+/// its body the connection has taken.
+struct Progress {
+    last: Mutex<Instant>,
+    sent: AtomicU64,
+}
+
+impl Progress {
+    fn new() -> Arc<Progress> {
+        Arc::new(Progress { last: Mutex::new(Instant::now()), sent: AtomicU64::new(0) })
+    }
+
+    fn moved(&self, bytes: usize) {
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The body of a request, given to the connection [`PIECE`] by [`PIECE`]:
+/// each piece taken is said to its [`Progress`].
+struct Upload {
+    data: Bytes,
+    progress: Arc<Progress>,
+}
+
+impl hyper::body::Body for Upload {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.data.is_empty() {
+            return Poll::Ready(None);
+        }
+        let piece = this.data.split_to(this.data.len().min(PIECE));
+        this.progress.moved(piece.len());
+        Poll::Ready(Some(Ok(Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
+/// Runs `work` until it ends, or until `progress` has not moved for
+/// `timeout`: the error then says how far the body got (`len` bytes in
+/// all).
+async fn while_moving<T>(
+    work: impl std::future::Future<Output = Result<T>>,
+    progress: &Progress,
+    timeout: Duration,
+    len: usize,
+    late: impl Fn(String) -> Error,
+) -> Result<T> {
+    let mut work = std::pin::pin!(work);
+    // Once the whole body is taken, its last bytes may still be on their way.
+    let drain = Duration::from_millis(len.min(IN_FLIGHT) as u64 * 1000 / PIECE as u64);
+    let limit = || match progress.sent.load(Ordering::Relaxed) as usize {
+        sent if sent < len => timeout,
+        _ => timeout + drain,
+    };
+    loop {
+        let deadline = tokio::time::Instant::from_std(progress.last() + limit());
+        match tokio::time::timeout_at(deadline, &mut work).await {
+            Ok(out) => return out,
+            // Something moved meanwhile: a new limit, from then.
+            Err(_) if progress.last() + limit() > Instant::now() => {}
+            Err(_) => {
+                let sent = progress.sent.load(Ordering::Relaxed) as usize;
+                return Err(late(if sent < len {
+                    format!(
+                        "stopped taking the upload for {} seconds ({sent} of {len} bytes taken)",
+                        timeout.as_secs_f64()
+                    )
+                } else {
+                    format!("did not answer within {} seconds", limit().as_secs_f64())
+                }));
+            }
+        }
+    }
+}
 
 /// A [`BackupStore`] in an S3 bucket (path-style requests:
 /// `<endpoint>/<bucket>/<key>`, which every S3-compatible service accepts).
@@ -285,10 +385,9 @@ impl S3Store {
         })
     }
 
-    /// The same store with another time limit (60 seconds by default): how
-    /// long the bucket may take to answer a request with no body, and the
-    /// longest wait for the next piece of an answer. A request that sends a
-    /// body has one more second per 64 KiB of it to be answered.
+    /// The same store with another time limit (60 seconds by default): the
+    /// longest wait for anything to move, whatever the size of the request
+    /// (see the module's text: an answer to a body has a few seconds more).
     pub fn with_timeout(self, timeout: Duration) -> S3Store {
         S3Store { timeout, ..self }
     }
@@ -374,21 +473,16 @@ impl S3Store {
     /// when the bucket does not answer in time (see the module's text).
     async fn send(&self, method: Method, key: &str, query: &[(&str, &str)], body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
         let what = if key.is_empty() { "LIST".to_owned() } else { format!("{method} {key}") };
-        let late = |how: &str, after: Duration| {
-            s3_err(format!("{what}: {} {how} {} seconds", self.describe(), after.as_secs_f64()))
-        };
-        let limit = self.timeout + Duration::from_millis(body.len() as u64 * 1000 / BYTES_PER_EXTRA_SECOND);
-        let request = self.request(method, key, query, body)?;
-        let response = tokio::time::timeout(limit, self.open(request))
-            .await
-            .map_err(|_| late("did not answer within", limit))??;
+        let late = |how: String| s3_err(format!("{what}: {} {how}", self.describe()));
+        let (len, progress) = (body.len(), Progress::new());
+        let request = self.request(method, key, query, body, progress.clone())?;
+        let response = while_moving(self.open(request), &progress, self.timeout, len, late).await?;
         let status = response.status().as_u16();
         let mut answer = response.into_body();
         let mut body = Vec::new();
-        while let Some(frame) = tokio::time::timeout(self.timeout, answer.frame())
-            .await
-            .map_err(|_| late("stopped answering for", self.timeout))?
-        {
+        while let Some(frame) = tokio::time::timeout(self.timeout, answer.frame()).await.map_err(|_| {
+            s3_err(format!("{what}: {} stopped answering for {} seconds", self.describe(), self.timeout.as_secs_f64()))
+        })? {
             if let Ok(data) = frame.map_err(s3_err)?.into_data() {
                 body.extend_from_slice(&data);
             }
@@ -403,7 +497,8 @@ impl S3Store {
         key: &str,
         query: &[(&str, &str)],
         body: Vec<u8>,
-    ) -> Result<Request<Full<Bytes>>> {
+        progress: Arc<Progress>,
+    ) -> Result<Request<Upload>> {
         let path = if key.is_empty() {
             format!("/{}", self.options.bucket)
         } else {
@@ -440,7 +535,7 @@ impl S3Store {
             .header("x-amz-date", &amz_date)
             .header("authorization", auth)
             .header("content-length", body.len())
-            .body(Full::new(Bytes::from(body)))
+            .body(Upload { data: Bytes::from(body), progress })
             .map_err(s3_err)
     }
 
@@ -448,7 +543,7 @@ impl S3Store {
     /// answer; its body comes after. A request given up (its future or its
     /// body dropped) closes the connection: hyper's connection task stops
     /// when nobody waits for the answer any more.
-    async fn open(&self, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
+    async fn open(&self, request: Request<Upload>) -> Result<Response<Incoming>> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port)).await.map_err(s3_err)?;
         if self.https {
             let name = rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(s3_err)?;
@@ -642,6 +737,96 @@ mod tests {
             let hung_up = tokio::time::timeout(Duration::from_secs(1), closed.recv()).await;
             assert_eq!(hung_up, Ok(Some(())), "the connection of a request that timed out is closed");
         }
+    }
+
+    /// A store at `endpoint` with a time limit of `timeout`.
+    fn store_at(endpoint: String, timeout: Duration) -> S3Store {
+        S3Store::new(S3Options {
+            endpoint,
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            prefix: "nuage/".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap()
+        .with_timeout(timeout)
+    }
+
+    /// The limit counts from the last thing that moved, never from the start:
+    /// work that keeps moving goes on for as long as it takes, whatever the
+    /// limit; work that stops moving is cut one limit after its last move,
+    /// with how far its upload got.
+    #[tokio::test]
+    async fn the_limit_counts_from_the_last_move() {
+        let late = |how: String| s3_err(how);
+        let limit = Duration::from_millis(300);
+        let work = |moves: usize, then_stop: bool| {
+            let progress = Progress::new();
+            let moving = progress.clone();
+            let work = async move {
+                for _ in 0..moves {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    moving.moved(PIECE);
+                }
+                if then_stop {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            };
+            (progress, work)
+        };
+        // Four times the limit, moving all along.
+        let (progress, moving) = work(12, false);
+        let started = Instant::now();
+        while_moving(moving, &progress, limit, 12 * PIECE, late).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1200), "{:?}", started.elapsed());
+        // Three moves, then nothing.
+        let (progress, stalled) = work(3, true);
+        let started = Instant::now();
+        let e = while_moving(stalled, &progress, limit, 12 * PIECE, late).await.unwrap_err().to_string();
+        assert!(e.contains("stopped taking the upload for 0.3 seconds (196608 of 786432 bytes taken)"), "{e}");
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(600) && took < Duration::from_millis(1500), "{took:?}");
+        // Nothing moves at all.
+        let (progress, silent) = work(0, true);
+        let e = while_moving(silent, &progress, limit, 0, late).await.unwrap_err().to_string();
+        assert!(e.contains("did not answer within 0.3 seconds"), "{e}");
+        // The whole body went and no answer comes: its last 128 KiB may still be on their way.
+        let (progress, silent) = work(2, true);
+        let started = Instant::now();
+        let e = while_moving(silent, &progress, limit, 2 * PIECE, late).await.unwrap_err().to_string();
+        assert!(e.contains("did not answer within 2.3 seconds"), "{e}");
+        assert!(started.elapsed() >= Duration::from_millis(2500), "{:?}", started.elapsed());
+    }
+
+    /// A body goes to the connection in pieces of 64 KiB at most, each one
+    /// counted, its whole length said beforehand.
+    #[tokio::test]
+    async fn a_body_goes_in_pieces() {
+        let progress = Progress::new();
+        let mut body = Upload { data: Bytes::from(vec![7u8; 200 * 1024]), progress: progress.clone() };
+        assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(200 * 1024));
+        let mut pieces = Vec::new();
+        while let Some(frame) = body.frame().await {
+            pieces.push(frame.unwrap().into_data().unwrap().len());
+        }
+        assert_eq!(pieces, [PIECE, PIECE, PIECE, 200 * 1024 - 3 * PIECE]);
+        assert_eq!(progress.sent.load(Ordering::Relaxed), 200 * 1024);
+        assert!(hyper::body::Body::is_end_stream(&body));
+    }
+
+    /// A bucket that takes a large upload and never answers: the request
+    /// fails one limit (and the 4 seconds its last bytes may take) after the
+    /// last byte went, not after a time that grows with the size of the body.
+    #[test]
+    fn a_bucket_that_takes_an_upload_and_never_answers_fails_in_time() {
+        let (endpoint, _closed) = stalled_bucket();
+        let store = store_at(endpoint, Duration::from_millis(300));
+        let started = Instant::now();
+        let e = store.put("snapshots/big.db", &vec![0u8; 8 << 20]).unwrap_err().to_string();
+        assert!(e.contains("PUT nuage/snapshots/big.db: s3://bucket/nuage/ did not answer within 4.3 seconds"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[test]

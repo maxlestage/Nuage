@@ -399,9 +399,16 @@ siendo los mismos. Con `database`:
   nunca a medio escribir;
 - **una caducidad es una fecha**: una clave hecha para vivir una hora caduca una hora después,
   se haya reiniciado el servidor entretanto o no. Una clave caducada nunca se devuelve ni se
-  cuenta, y una pasada en segundo plano la borra del disco;
+  cuenta, y unas pasadas en segundo plano la borran del disco, tan rápido como caducan las
+  claves;
+- **`SCAN` responde página a página**: `COUNT` claves del almacén como mucho por página (10
+  sin él), y un cursor para la página siguiente, `0` tras la última, como Redis: `scan_iter` y
+  sus semejantes recorren cualquier número de claves, aunque las borren por el camino. `KEYS`
+  responde 100 000 claves como mucho (16 MiB de claves): más allá, dice que se use `SCAN`;
 - **en un disco que se borra en cada reinicio** (Heroku), un reinicio limpio conserva todas las
-  claves: con `SIGTERM`, el servidor envía su último segmento del registro. Tras un fallo, las
+  claves: con `SIGTERM`, el servidor deja de aceptar escrituras y luego envía su último
+  segmento del registro, que contiene así cada escritura a la que respondió (una que llega
+  después recibe el error de almacenamiento). Tras un fallo, las
   claves vuelven tal como estaban en el último segmento enviado, como las filas (30 segundos
   por defecto): un cerrojo liberado en ese intervalo vuelve a estar tomado, un contador
   aumentado vuelve a su valor anterior;
@@ -647,17 +654,28 @@ el comando:
 - **Dos lugares a la vez**: `NUAGE_BACKUP2_DIR`, o `NUAGE_BACKUP2_S3_BUCKET` y los demás
   `NUAGE_BACKUP2_S3_*`, añaden un segundo destino que se mantiene al día con el primero. Cada
   uno recibe las instantáneas y el registro a su propio ritmo: el que no responde nunca
-  retiene al otro, y recibe una instantánea completa cuando vuelve a responder. Una carpeta
-  de datos vacía se restaura desde uno solo de los dos, entero: el que llega más lejos. El
-  servidor no arranca cuando el primero no responde (quítelo de los ajustes para arrancar
-  desde el segundo solo), ni cuando los dos guardan bases distintas. Sin el primero,
-  `NUAGE_BACKUP2_*` es el único destino: añadir el segundo, esperar a que lo tenga todo y
-  luego quitar el primero mueve las copias sin detener nada. En Linux, el servicio del
+  retiene al otro (cada uno tiene su propio hilo), y recibe una instantánea completa cuando
+  vuelve a responder. Una carpeta de datos vacía se restaura desde uno solo de los dos,
+  entero: el que llega más lejos. El servidor no arranca cuando uno de los dos no responde,
+  ya que puede ser el que llega más lejos (quítelo de los ajustes para arrancar desde el otro
+  solo; un segundo que no ha respondido 5 segundos después del primero cuenta como que no
+  responde), ni cuando los dos guardan bases distintas. Sin el primero, `NUAGE_BACKUP2_*` es
+  el único destino: añadir el segundo, esperar a que lo tenga todo y luego quitar el primero
+  mueve las copias sin detener nada. La página *Almacenamiento* de la consola muestra la
+  última copia de cada destino, y `/api/status` cada uno en `backup.destinations`: un destino
+  no muestra hora hasta que ha recibido una instantánea completa desde el arranque, y la
+  última copia no la muestra hasta que la han recibido los dos. La parada envía al primero, y
+  luego deja 20 segundos como mucho al segundo. En Linux, el servicio del
   instalador solo puede escribir en la carpeta de datos y en `NUAGE_BACKUP_DIR`: allí, use
   un bucket para el segundo.
+- **Borrar una aplicación** en la consola vacía su copia (`apps/<nombre>/`) en cada destino.
+  El que no puede vaciarse se nombra en la respuesta y en el registro de eventos; mientras su
+  copia no se borre allí a mano, no se puede crear ninguna aplicación con ese nombre, para que
+  una nueva nunca arranque con las filas de la borrada.
 - **Comprobar**: la página *Almacenamiento* de la consola, y `/app`, muestran la última copia
-  y sus errores. Un bucket que deja de responder hace fallar la ronda a los 60 segundos, y la
-  ronda siguiente lo vuelve a intentar.
+  y sus errores. Un bucket que deja de responder hace fallar la ronda a los 60 segundos sin
+  que nada avance, y la ronda siguiente lo vuelve a intentar; un envío que avanza nunca se
+  corta, por lenta que sea la línea.
 - **Restaurar** en un ordenador nuevo: instale, ponga en el nuevo fichero de ajustes la
   `NUAGE_ENCRYPTION_KEY` del antiguo y los mismos ajustes de copia, vacíe la carpeta de datos y
   reinicie el servicio: restaura la última instantánea y reproduce el registro posterior.
@@ -708,7 +726,9 @@ La raíz de este repositorio se despliega tal cual: `Procfile`, `RustConfig` y
   con disco persistente, basta con una carpeta (`NUAGE_BACKUP_DIR`).
 - **Ventana de pérdida.** Los commits hechos desde el último segmento del registro enviado
   (30 segundos por defecto) solo se pierden si el dyno se detiene sin el `SIGTERM` que Heroku
-  envía antes: con `SIGTERM`, el servidor hace un checkpoint y envía el último segmento. Las
+  envía antes: con `SIGTERM`, el servidor deja de aceptar escrituras (una que llega después
+  recibe un error, nunca una respuesta que la copia no tenga), hace un checkpoint y envía el
+  último segmento. Las
   claves de los almacenes clave-valor siguen la misma regla con `NUAGE_KV_STORAGE=database`;
   en memoria, un reinicio las vacía.
 - **Cambiar un ajuste reinicia el dyno.** Cada `heroku config:set` o `config:unset` lo
@@ -725,10 +745,12 @@ La raíz de este repositorio se despliega tal cual: `Procfile`, `RustConfig` y
 - **Mover las copias sin detener nada.** Para pasar a otro bucket: (1) añada el nuevo como
   segundo destino, en un solo comando (`heroku config:set
   NUAGE_BACKUP2_S3_BUCKET=nuevo-bucket NUAGE_BACKUP2_S3_REGION=… NUAGE_BACKUP2_S3_ACCESS_KEY_ID=…
-  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`): el dyno se reinicia desde el antiguo y envía una
-  instantánea completa de cada aplicación al nuevo; (2) espere a que la página
-  *Almacenamiento* de la consola, o `/app`, muestre la última copia de cada aplicación sin
-  errores; (3) quite el antiguo, en un solo comando (`heroku config:unset
+  NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY=…`, y `NUAGE_BACKUP2_S3_ENDPOINT=…` para un almacenamiento
+  que no sea AWS: el segundo nunca toma el endpoint del primero): el dyno se reinicia desde el
+  antiguo y envía una instantánea completa de cada aplicación al nuevo; (2) espere a que la
+  página *Almacenamiento* de la consola, o `/app`, muestre la última copia de cada aplicación
+  sin errores (no la muestra hasta que el nuevo bucket tiene una instantánea completa de
+  cada una), o a que `backup.destinations[1].last_at` de `/api/status` tenga una hora; (3) quite el antiguo, en un solo comando (`heroku config:unset
   NUAGE_BACKUP_S3_BUCKET NUAGE_BACKUP_S3_REGION …`): el dyno que se detiene envía sus últimos
   segundos a los dos, y el siguiente restaura desde el nuevo bucket, ahora el único destino.
 
@@ -788,7 +810,7 @@ heroku ps:scale web=1                                # restaura desde el bucket 
 | `NUAGE_BACKUP_SNAPSHOT_MINUTES` | minutos entre dos instantáneas (de cada destino) | `60` |
 | `NUAGE_BACKUP2_DIR` | un segundo destino de copia, al día con el primero: esta carpeta (vea las copias más arriba); solo, es el único destino | |
 | `NUAGE_BACKUP2_S3_BUCKET` | el segundo destino en este bucket (con `NUAGE_BACKUP2_DIR` también, o en el mismo lugar que el primero, el servidor no arranca) | |
-| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | su endpoint, su región y su prefijo | como para el primero |
+| `NUAGE_BACKUP2_S3_ENDPOINT`, `NUAGE_BACKUP2_S3_REGION`, `NUAGE_BACKUP2_S3_PREFIX` | su endpoint, su región y su prefijo, propios: nunca los del primero | `https://s3.<region>.amazonaws.com`, `us-east-1`, `nuage/` |
 | `NUAGE_BACKUP2_S3_ACCESS_KEY_ID`, `NUAGE_BACKUP2_S3_SECRET_ACCESS_KEY` | sus credenciales (si no, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) | |
 | `NUAGE_RESTORE_REQUIRED` | `true`: un directorio de datos vacío debe restaurarse desde la copia de seguridad; sin nada que restaurar, o sin copia, el servidor no arranca, y no crea ni escribe nada (tampoco sirve una aplicación registrada cuya copia no contiene nada). Para un disco que se borra en cada reinicio, cuando el servidor ya tenga datos (vea [Desplegar en Heroku](#desplegar-en-heroku)) | `false`: un arranque en vacío se permite, y se dice en el registro |
 | `NUAGE_KV_PORT` | sirve también el almacén clave-valor en un puerto propio (`6379`), por el protocolo que hablan los clientes Redis: uno se conecta al almacén de una aplicación, un token como contraseña | desactivado |

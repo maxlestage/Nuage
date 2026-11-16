@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
@@ -283,6 +283,8 @@ pub(crate) struct Store {
     applied_lsn: AtomicU64,
     /// Catalog entries already parsed (see [`Store::parsed`]).
     catalog: Mutex<Catalog>,
+    /// No commit is accepted any more ([`Store::stop_writes`]).
+    writes_stopped: AtomicBool,
     /// Bytes of changed nodes the page store may keep in memory before they
     /// are written out, whatever the checkpoint interval.
     /// Commits the log read at opening does not hold, between two it does:
@@ -430,6 +432,7 @@ impl Store {
             saved_generation: AtomicU64::new(generation),
             applied_lsn: AtomicU64::new(last),
             catalog: Mutex::new(Catalog::default()),
+            writes_stopped: AtomicBool::new(false),
             log_gap,
         };
         store.load_branches()?;
@@ -735,6 +738,9 @@ impl Store {
     /// let go of it, waits for [`wait_durable`](Self::wait_durable) of that
     /// number before telling anyone the commit is made.
     pub(crate) fn log_and_apply(&self, writer: &mut Writer, ops: Vec<Op>) -> Result<u64> {
+        if self.writes_stopped.load(Ordering::SeqCst) {
+            return Err(storage_err("the database is stopping: nothing was written"));
+        }
         self.log_is_sound()?;
         if writer.wal.spent() {
             // A record was cut from this segment: its number is not sealed
@@ -774,6 +780,13 @@ impl Store {
         self.durable.lsn.fetch_max(lsn, Ordering::SeqCst);
         w.checkpoint_lsn = lsn;
         Ok(lsn)
+    }
+
+    /// Refuses every commit from now on: each one is an error, before
+    /// anything is logged. A commit holding the writer lock now ends first.
+    pub(crate) fn stop_writes(&self) {
+        let _w = self.writer();
+        self.writes_stopped.store(true, Ordering::SeqCst);
     }
 
     /// Takes the writer lock.

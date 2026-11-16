@@ -76,8 +76,8 @@ use memoire_orm::{NuageDb, NuageTransaction};
 pub use crypto::Encryption;
 pub use embedded::{Embedded, EmbeddedTransaction, TableInfo};
 pub use engine::{
-    BackupInfo, BackupOptions, BackupStatus, BackupStore, DirectoryStore, Engine, EngineOptions, Event, MirrorStore,
-    PrefixedStore, StorageStats,
+    BackupInfo, BackupOptions, BackupStatus, BackupStore, DestinationStatus, DirectoryStore, Engine, EngineOptions,
+    Event, MirrorStore, PrefixedStore, StorageStats,
 };
 pub use memoire_orm::nuage::Branch;
 #[cfg(feature = "server")]

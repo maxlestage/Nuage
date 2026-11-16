@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1099,12 +1099,16 @@ async fn a_limit_does_not_cut_what_an_aggregate_counts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A backup folder for the tests that stops answering (`down`), or refuses
-/// to write (`read_only`), on demand.
+/// A backup folder for the tests that stops answering (`down`), refuses to
+/// write (`read_only`), or holds every call until it is let go (`hang`: a
+/// network folder that hangs, a bucket that says nothing), on demand.
 struct TestPlace {
     folder: DirectoryStore,
     down: AtomicBool,
     read_only: AtomicBool,
+    hang: AtomicBool,
+    /// Calls held now.
+    held: AtomicUsize,
 }
 
 impl TestPlace {
@@ -1113,7 +1117,32 @@ impl TestPlace {
             folder: DirectoryStore::new(root),
             down: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
+            hang: AtomicBool::new(false),
+            held: AtomicUsize::new(0),
         })
+    }
+
+    /// `root`, read and never written to, holding every call until let go.
+    fn hanging(root: &std::path::Path) -> Arc<TestPlace> {
+        let place = TestPlace::reading(root);
+        place.hang.store(true, Ordering::SeqCst);
+        place
+    }
+
+    /// Holds the calls from now (`true`), or lets them go.
+    fn set_hang(&self, hang: bool) {
+        self.hang.store(hang, Ordering::SeqCst);
+    }
+
+    /// Waits until a call is held.
+    fn wait_held(&self) {
+        for _ in 0..2000 {
+            if self.held.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no call reached {}", self.describe());
     }
 
     /// `root`, read and never written to: what the tests restore from, so
@@ -1136,6 +1165,13 @@ impl TestPlace {
     }
 
     fn answer(&self, write: bool) -> memoire_orm::Result<()> {
+        if self.hang.load(Ordering::SeqCst) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            while self.hang.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.held.fetch_sub(1, Ordering::SeqCst);
+        }
         let why = if self.down.load(Ordering::SeqCst) {
             "does not answer"
         } else if write && self.read_only.load(Ordering::SeqCst) {
@@ -1528,10 +1564,9 @@ async fn a_second_that_was_away_comes_back_with_a_snapshot() {
 
 /// An empty directory is restored from one destination, whole: the one that
 /// reaches furthest, the first on a tie, the second when the first holds
-/// nothing. Two databases, a first that does not answer, or a second that
-/// does not answer while the first holds nothing: nothing is restored, and
-/// nothing is created. A second that does not answer otherwise is said, and
-/// the first is used.
+/// nothing. Two databases, or a destination that does not answer, whichever
+/// it is: nothing is restored, and nothing is created. A second that hangs
+/// stops the start within seconds of the first's answer.
 #[tokio::test]
 async fn an_empty_directory_is_restored_from_the_one_that_reaches_furthest() {
     let (dir, other) = (temp_dir("furthest-data"), temp_dir("furthest-other"));
@@ -1604,15 +1639,22 @@ async fn an_empty_directory_is_restored_from_the_one_that_reaches_furthest() {
     let expected =
         format!("the first backup destination does not answer ({}: {} does not answer)", a.display(), a.display());
     assert!(e.contains(&expected) && e.contains("To start from the second alone"), "{e}");
-    let e = refused(both(reading(&empty), TestPlace::away(&b)));
-    assert!(e.contains("holds no backup and the second backup destination does not answer"), "{e}");
-
-    // The second does not answer: the first, and it is said.
-    let (status, events, rows, _) = restored_from(both(reading(&a), TestPlace::away(&b)), "furthest-second-away").await;
-    assert_eq!((status.restored_from, rows), (Some(a.display().to_string()), 10));
+    // The second does not answer: it may be the one that reaches furthest, so
+    // the first is not restored in its place, whether or not it holds a backup.
     let said =
-        format!("the second backup destination did not answer ({}: {} does not answer)", b.display(), b.display());
-    assert!(events.iter().any(|e| e.level == "warn" && e.message.starts_with(&said)), "{events:?}");
+        format!("the second backup destination does not answer ({}: {} does not answer)", b.display(), b.display());
+    for first in [&a, &empty] {
+        let e = refused(both(reading(first), TestPlace::away(&b)));
+        assert!(e.contains(&said) && e.contains("nothing was restored"), "{e}");
+        assert!(e.contains(&format!("To start from the first alone ({}), take the second out", first.display())));
+    }
+    // A second that hangs: the same, a few seconds after the first has answered.
+    let hanging = TestPlace::hanging(&b);
+    let started = std::time::Instant::now();
+    let e = refused(both(reading(&a), hanging.clone()));
+    assert!(e.contains("no answer 5 seconds after the first's") && e.contains("nothing was restored"), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(9), "{:?}", started.elapsed());
+    hanging.set_hang(false);
     for d in [dir, other, a, b, c, empty] {
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1677,6 +1719,160 @@ async fn adding_then_removing_a_destination_loses_nothing() {
     drop(db);
     closed(gone);
     for d in disks.into_iter().chain([old, new]) {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Waits until `done` holds (10 seconds at most).
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..2000 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("{what}: not after 10 seconds");
+}
+
+/// `f` on a thread of its own: its result, or `None` when it has not ended
+/// after `limit` (the thread is left to end on its own).
+fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (sent, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sent.send(f());
+    });
+    done.recv_timeout(limit).ok()
+}
+
+/// A second destination that hangs (a network folder that never answers, a
+/// bucket that says nothing) never holds the first back. While the upkeep's
+/// round to it is stuck, the upkeep keeps checkpointing and shipping to the
+/// first by itself, a round to the first ends at once, and so does the stop
+/// (no commit accepted any more, a checkpoint, the first): the first alone
+/// then restores every commit acknowledged. Meanwhile the status gives no
+/// time of a complete backup, since the second has nothing of this run.
+/// Once it answers again, its round goes on with the log segments the
+/// checkpoints kept for it, and it restores every commit too.
+#[tokio::test]
+async fn a_second_that_hangs_never_holds_the_first_nor_the_stop() {
+    let dir = temp_dir("hang-data");
+    let (a, b) = (temp_dir("hang-one"), temp_dir("hang-two"));
+    let two = TestPlace::new(&b);
+    let places = || mirror(TestPlace::new(&a), two.clone());
+    let options = |store| EngineOptions { checkpoint_every: Duration::from_millis(50), ..backed_up_to(store, 1) };
+    // Both destinations hold the database's backup.
+    let gone = {
+        let db = Embedded::open_with(&dir, options(places())).unwrap();
+        first_round(db.engine(), 2);
+        db.create_table::<Item>().await.unwrap();
+        db.engine().backup_now(false).unwrap();
+        db.engine().close().unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+
+    // The next start: the round to the second hangs.
+    two.set_hang(true);
+    let db = Embedded::open_with(&dir, options(places())).unwrap();
+    let engine = db.engine().clone();
+    first_round(&engine, 1);
+    two.wait_held();
+    let status = engine.backup_status();
+    assert!(status.last_ok && status.last_at.is_none(), "the second has nothing of this run yet: {status:?}");
+    let [first, second] = &status.destinations[..] else { panic!("{status:?}") };
+    assert!(first.last_snapshot_at.is_some() && first.last_at.is_some(), "{status:?}");
+    assert!(second.last_snapshot_at.is_none() && second.last_at.is_none() && second.error.is_none(), "{status:?}");
+    // The upkeep ships to the first by itself, and a round to it ends at once.
+    for n in 0..20 {
+        item(n).insert(&db).await.unwrap();
+    }
+    let lsn = engine.stats().lsn;
+    eventually("the upkeep ships to the first", || engine.backup_status().shipped_lsn >= lsn);
+    let first_only = engine.clone();
+    let shipped = within(Duration::from_secs(5), move || first_only.backup_to(0, true));
+    assert!(shipped.expect("a round to the first waits for the second").is_ok());
+
+    // It answers again: its round ends, and the status has a time.
+    two.set_hang(false);
+    eventually("the second gets its snapshot", || engine.backup_status().last_at.is_some());
+    assert!(engine.backup_status().destinations[1].last_snapshot_at.is_some());
+
+    // It hangs while it is sent log segments: the checkpoints that follow keep
+    // what it has yet to send, and it goes on with them once it answers.
+    two.set_hang(true);
+    for n in 20..30 {
+        item(n).insert(&db).await.unwrap();
+    }
+    two.wait_held();
+    for n in 30..40 {
+        item(n).insert(&db).await.unwrap();
+    }
+    let lsn = engine.stats().lsn;
+    eventually("the first gets everything", || engine.backup_status().shipped_lsn >= lsn);
+    let failed_before = engine.events().0.iter().filter(|e| e.message.starts_with("backup failed")).count();
+    two.set_hang(false);
+    // After the round that was stuck, one more: nothing was missing for either.
+    engine.backup_to(1, false).unwrap();
+    assert!(engine.backup_status().destinations[1].shipped_lsn >= lsn, "{:?}", engine.backup_status());
+    let failed = engine.events().0.iter().filter(|e| e.message.starts_with("backup failed")).count();
+    assert_eq!(failed, failed_before, "{:?}", engine.events().0);
+
+    // The stop while the second hangs again.
+    two.set_hang(true);
+    for n in 40..45 {
+        item(n).insert(&db).await.unwrap();
+    }
+    two.wait_held();
+    let stopping = engine.clone();
+    let stopped = within(Duration::from_secs(5), move || {
+        stopping.stop_writes();
+        stopping.checkpoint()?;
+        stopping.backup_to(0, false)
+    });
+    assert!(stopped.expect("the stop waits for the second").is_ok());
+    // A commit that comes after is refused, and nothing is written.
+    let e = item(45).insert(&db).await.unwrap_err().to_string();
+    assert!(e.contains("the database is stopping: nothing was written"), "{e}");
+    assert_eq!(Item::count(&db).await.unwrap(), 45, "reads go on");
+    let (_, _, rows, _) = restored_from(TestPlace::reading(&a), "hang-from-one").await;
+    assert_eq!(rows, 45, "the first has every commit acknowledged");
+    two.set_hang(false);
+    engine.backup_to(1, false).unwrap();
+    let gone = Arc::downgrade(&engine);
+    drop((db, engine));
+    closed(gone);
+    let (_, events, rows, _) = restored_from(TestPlace::reading(&b), "hang-from-two").await;
+    assert_eq!(rows, 45);
+    assert!(!events.iter().any(|e| e.message.contains("the log holds commit")), "{events:?}");
+    for d in [dir, a, b] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The copies of the page store a process left when it stopped during a
+/// snapshot are removed at the next opening; the data stays.
+#[tokio::test]
+async fn copies_left_by_a_stop_are_removed() {
+    let (dir, folder) = (temp_dir("copies-data"), temp_dir("copies-backup"));
+    let gone = {
+        let db = Embedded::open_with(&dir, backed_up(&folder, 1)).unwrap();
+        db.create_table::<Item>().await.unwrap();
+        item(1).insert(&db).await.unwrap();
+        Arc::downgrade(db.engine())
+    };
+    closed(gone);
+    for name in ["snapshot-7.partial", "snapshot.partial"] {
+        std::fs::write(dir.join(name), b"half a copy").unwrap();
+    }
+    let db = Embedded::open_with(&dir, backed_up(&folder, 1)).unwrap();
+    for name in ["snapshot-7.partial", "snapshot.partial"] {
+        assert!(!dir.join(name).exists(), "{name}");
+    }
+    assert_eq!(Item::count(&db).await.unwrap(), 1);
+    let gone = Arc::downgrade(db.engine());
+    drop(db);
+    closed(gone);
+    for d in [dir, folder] {
         let _ = std::fs::remove_dir_all(&d);
     }
 }

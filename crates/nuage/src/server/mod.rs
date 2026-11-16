@@ -458,7 +458,7 @@ impl Server {
     /// Deletes the application `name`, its data and its backups (not the
     /// first one).
     pub fn delete_app(&self, name: &str) -> Result<bool> {
-        self.state.apps.delete(name)
+        Ok(self.state.apps.delete(name)?.is_some())
     }
 
     /// The live status, as `/api/status` answers it to an authenticated

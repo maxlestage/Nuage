@@ -63,8 +63,18 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   with `KEYS`, `DBSIZE` or `FLUSHDB` inside it. A write is answered once it is on disk; a read
   takes no lock. Nothing is evicted (`NUAGE_KV_MB` is not used; a value is 64 MiB at most).
   Expiries are dates, so a TTL means the same after a restart, and expired keys leave the
-  tree in batches in the background. A write the disk refuses is the server's storage error
-  (`500` over HTTP, `-ERR storage: …` on the port), never "no such key". Going back to
+  tree in batches in the background: a pass that stops at its limit (20,000 keys) is followed
+  by the next one a second later, not thirty, so the removals keep up with any rate of
+  expiries. A write the disk refuses is the server's storage error (`500` over HTTP, `-ERR
+  storage: …` on the port), never "no such key".
+- **`SCAN` answers page by page in the database**: `COUNT` entries at most (10 by default, as
+  Redis), and a cursor for the next page, `0` after the last; a cursor stands for the last key
+  of its page, so a whole scan returns every key that was there from start to end, even when
+  the client deletes them as it goes (`ERR invalid cursor: this server does not know it …`
+  for one it no longer knows: the last 1,024 are kept). `KEYS` answers at most 100,000 keys
+  (16 MiB of them), else `ERR too many keys for KEYS (…): use SCAN, which answers page by
+  page`: the store is bounded only by the disk, and no call builds the list of all its keys.
+  In memory, both answer as before. Going back to
   `memory` leaves the keys in the database, found again when `database` comes back: nothing
   is dropped at start. Branches, SQL and the console's tables do not see the keys.
 - **The figures say where the keys are**: `storage` (`memory` or `database`) in the `stats`
@@ -86,16 +96,26 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - **A bucket that does not exist is an error** (``GET …: the bucket `x` does not exist (HTTP
   404 NoSuchBucket)``), at startup and in every round, where it read as an empty backup. A
   missing object is still read as missing.
-- **S3 requests have time limits**: a request that gets no answer within 60 seconds (an
-  upload has one more second for each 64 KiB it sends), or an answer that stops for 60
-  seconds, fails with `… did not answer within 60 seconds` or `… stopped answering for 60
-  seconds`. A bucket that hangs fails the round, which is tried again, instead of holding the
-  backups, the stop or `/v1/files` without end. A restore is never cut while its bytes keep
-  coming, whatever its speed.
+- **S3 requests have time limits**, counted from the last thing that moved: a request that
+  gets no answer within 60 seconds of its last byte (an upload has one more second for each
+  64 KiB that may still be on its way, 4 at most), an upload the connection takes no more of
+  for 60 seconds, or an answer that stops for 60 seconds fails with `… did not answer within
+  60 seconds`, `… stopped taking the upload for 60 seconds (N of M bytes taken)` or `…
+  stopped answering for 60 seconds`. A bucket that hangs fails the round, which is tried
+  again, instead of holding the backups, the stop or `/v1/files` without end. A snapshot sent
+  or a restore received is never cut while its bytes keep moving, whatever the speed of the
+  line (a body goes in pieces of 64 KiB).
 - **An empty start is said.** When the data directory is empty and the backup holds nothing to
-  restore, the server's log and a `warn` event say `the data directory was empty and <place>
-  holds no backup: this is a NEW, EMPTY database`, with what to check. A registered
+  restore, a `warn` event says `the data directory was empty and <place> holds no backup: this
+  is a new, empty database`, and the server's log `… this is a NEW, EMPTY database. If this
+  server had data, stop it now and check …`, naming the settings it read the destination from
+  (`NUAGE_BACKUP_DIR`, `NUAGE_BACKUP2_S3_BUCKET and NUAGE_BACKUP2_S3_PREFIX`…). A registered
   application whose backup holds nothing gets a line of its own.
+- **Nothing is acknowledged that the last backup lacks.** On `SIGTERM`, before its last
+  checkpoint and backup, the server refuses every commit (`the database is stopping: nothing
+  was written`: `500` over HTTP, `-ERR storage` on the key-value port) while the connections
+  already open are still served: a write answered is in the last log segment sent, never
+  after it on a disk about to be erased.
 - **`NUAGE_RESTORE_REQUIRED=true` refuses it.** With nothing to restore, or no backup set, the
   server stops with exit status 1 and says what to check, before it creates a folder, a header
   or a page file and before anything is sent to a backup. A registered application whose
@@ -125,22 +145,42 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
 - **Two places at once**: `NUAGE_BACKUP2_DIR`, or `NUAGE_BACKUP2_S3_BUCKET` with
   `_REGION`, `_ENDPOINT`, `_PREFIX`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` (else
   `AWS_*`), add a second destination. Each one gets the snapshots and the log segments with
-  its own progress: one that does not answer never holds the other back, the log is kept on
-  the disk for the first only (a second that is away never fills it), and a second that
-  missed segments no longer on the disk gets a whole snapshot before any further segment,
-  never one after a hole. A round in which both are due copies the page store once. Every
-  application backs up under `apps/<name>/` of both; deleting one empties both.
+  its own progress and its own lock, and the upkeep sends to the second on a thread of its own:
+  one that is slow or hangs (a network folder that never answers, a bucket that says nothing)
+  never holds the first's rounds, the checkpoints or the stop. The log is kept on the disk for
+  the first, and for a round to the second only while it runs (an hour at most: a second that
+  is away never fills the disk); a second that missed segments no longer on the disk gets a
+  whole snapshot before any further segment, never one after a hole. A round in which both
+  are due copies the page store once; each copy has a name of its own, and a copy left by a
+  process that stopped is removed at the next start. Every application backs up under
+  `apps/<name>/` of both; deleting one empties both.
+- **A deletion that cannot empty a destination is said**: the console's answer and an `error`
+  event name the destination that still holds the application's backup, and creating an
+  application of that name is refused (`<place> still holds the backup of an application named
+  `<name>`, deleted earlier: delete it there, or pick another name`) until it is gone there, so
+  that a new application never starts with the deleted one's rows.
 - **An empty data directory is restored from one destination, whole**: the one that reaches
-  furthest in the log, the first on a tie, the second when the first holds nothing. A first
-  that does not answer, two destinations that hold different databases, or a second that
-  does not answer while the first holds nothing stop the start, and nothing is created; a
-  second that does not answer otherwise is said, and the first is used.
+  furthest in the log, the first on a tie, the second when the first holds nothing. Both are
+  read at the same time. A destination that does not answer, whichever it is, stops the start,
+  since it may be the one that reaches furthest: restoring the other would serve an older
+  database and later mix the two histories. A second that has not answered 5 seconds after the
+  first counts as not answering, so a second that hangs stops the start within seconds, not
+  after a minute for each database. Two destinations that hold different databases stop it
+  too. Nothing is created; the binary names the settings to remove to start from the other
+  alone.
 - **The status tells both**: `target` reads `A and B`, `last_ok` is true only while the last
   attempt of each succeeded, `last_error` names the second (`second destination (<place>):
-  …`), and the last backup's time moves only then: the console and `/app` show it as they
-  are. The startup line says where the backups go and how an empty disk is restored.
-- **The stop** sends to the first destination of every application before any second one:
-  a slow second cannot take the first's last seconds.
+  …`), and the last backup's time moves only once every destination has received a whole
+  snapshot since the start, and then only while each one's last attempt succeeded: a
+  destination just added shows no backup until it has one. Each destination's own figures are
+  in `BackupStatus::destinations`, in `/api/status` (`backup.destinations`, and each
+  database's `backup_destinations`: `target`, `last_at`, `last_ok`, `last_error`) and on the
+  console's *Storage* page (`Last backup to <place>`). The startup line says where the backups
+  go and how an empty disk is restored.
+- **The stop** sends to the first destination of every application before any second one,
+  and gives the seconds 20 seconds at most (`the second backup destination did not get
+  everything within 20 seconds: …`): a slow second cannot take the first's last seconds, nor
+  keep the process from ending.
 - **Settings**: set alone, `NUAGE_BACKUP2_*` is the only destination, so adding the second,
   waiting until it has everything, then removing the first moves the backups without a stop
   (the steps for Heroku are in the README). `NUAGE_BACKUP2_DIR` with
@@ -148,6 +188,7 @@ All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://s
   Without them, nothing changes: the backup store gets the same calls, in the same order.
 - **Rust API**: `MirrorStore` (a pair of stores, `BackupStore::parts`, which
   `PrefixedStore` forwards), `Engine::backup_to` (one destination's round),
+  `Engine::stop_writes`, `BackupStatus::destinations` and `DestinationStatus`,
   `engine::backup::inspect` and `BackupInfo` (what a location holds, and how far it
   reaches), `BackupStatus::restored_from`; `Config::backups`.
 
