@@ -2191,3 +2191,44 @@ async fn a_second_that_hangs_does_not_fill_the_disk() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// The model of `ranged` with a text key: Memoire's protocol can write a text
+/// key into a table that declared integers.
+#[derive(Model, Debug, Clone, PartialEq)]
+#[memoire(table = "ranged")]
+struct RangedText {
+    #[memoire(primary_key)]
+    id: String,
+    v: i32,
+}
+
+/// Bounds of the primary key read the bounded keys alone only when every key is
+/// of their type: with a text among integer keys, `id <= 30` still fails, with
+/// the same error as a read of the whole table, and `id > 'a'` still finds it.
+#[test]
+fn primary_key_bounds_with_keys_of_another_type() {
+    let dir = temp_dir("ranged");
+    let db = Embedded::open(&dir).unwrap();
+    db.sql("CREATE TABLE ranged (id BIGINT PRIMARY KEY, v INT)", &[]).unwrap();
+    for i in 0..50 {
+        db.sql("INSERT INTO ranged (id, v) VALUES (?, ?)", &[serde_json::json!(i), serde_json::json!(i)]).unwrap();
+    }
+    let rows = |sql: &str| db.sql(sql, &[]).map(|mut r| r.pop().unwrap().rows).map_err(|e| e.to_string());
+    assert_eq!(rows("SELECT count(*) FROM ranged WHERE id <= 30").unwrap(), vec![vec![Value::I64(31)]]);
+    let values = vec![Value::Text("x".into()), Value::I32(0)];
+    db.batch(&[(false, Query::InsertRow { table: RangedText::SCHEMA, values: &values })]).unwrap();
+    for tail in ["", "LIMIT 3", "ORDER BY id LIMIT 3"] {
+        for (fast, whole) in [
+            ("id <= 30", "(id <= 30 OR id IS NULL)"),
+            ("id BETWEEN 5 AND 9", "(id BETWEEN 5 AND 9 OR id IS NULL)"),
+            ("id > 'a'", "(id > 'a' OR id IS NULL)"),
+        ] {
+            let a = rows(&format!("SELECT id FROM ranged WHERE {fast} {tail}"));
+            let b = rows(&format!("SELECT id FROM ranged WHERE {whole} {tail}"));
+            assert_eq!(a.is_err(), !fast.contains('\''), "{fast} {tail}: {a:?}");
+            assert_eq!(a, b, "{fast} {tail}");
+        }
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

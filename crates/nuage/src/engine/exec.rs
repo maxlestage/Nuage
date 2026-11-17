@@ -390,20 +390,20 @@ impl Ctx<'_> {
         Ok(n)
     }
 
-    /// Calls `f` with each chunk of rows of the table, in primary-key order,
-    /// until it returns `false`.
+    /// Calls `f` with each chunk of rows of the table whose keys are in
+    /// `[start, end)`, in primary-key order, until it returns `false`.
     fn scan_rows(
         &self,
-        meta: &TableMeta,
+        start: &[u8],
+        end: &[u8],
         map: &[Option<usize>],
         want: Option<&[bool]>,
         mut f: impl FnMut(Vec<Vec<Value>>) -> Result<bool>,
     ) -> Result<()> {
-        let (start, end) = keys::rows_range(meta.generation);
         let mut rows = Vec::new();
         let mut stopped = false;
         // Rows are decoded where they are read, a chunk at a time.
-        self.snap.each(Some(self.overlay), &start, &end, |_, v| {
+        self.snap.each(Some(self.overlay), start, end, |_, v| {
             rows.push(self.decode(want, map, v)?);
             if rows.len() == CHUNK && !f(std::mem::take(&mut rows))? {
                 stopped = true;
@@ -414,6 +414,16 @@ impl Ctx<'_> {
             f(rows)?;
         }
         Ok(())
+    }
+
+    /// Whether the table has a row in the key range `[start, end)`.
+    fn any_row(&self, start: &[u8], end: &[u8]) -> Result<bool> {
+        let mut found = false;
+        self.snap.each(Some(self.overlay), start, end, |_, _| {
+            found = true;
+            Ok(false)
+        })?;
+        Ok(found)
     }
 }
 
@@ -927,6 +937,90 @@ fn pushdown<'e>(
     }
 }
 
+/// The keys a filter that only bounds the primary key (`id <= 1000`, `id > ?
+/// AND id < ?`, `id BETWEEN ? AND ?`) can keep, when every bound is a value of
+/// one type whose key order is Memoire's order: an integer no further from zero
+/// than 2^53 (where every number compares exactly with it) or a text (the keys of
+/// texts sort as their bytes, as Memoire compares them).
+///
+/// `(outside, inside)`: the key ranges of the rows whose primary key holds a value
+/// of another type (comparing them with the bounds fails, so the range is only
+/// read when there are none), and the range of the bounded keys of the bounds'
+/// type. A row of that type never fails such a filter, it only matches or not.
+#[allow(clippy::type_complexity)]
+fn pk_range(
+    meta: &TableMeta,
+    schema: &TableSchema,
+    parts: &[&Expr],
+) -> Option<([(Vec<u8>, Vec<u8>); 2], (Vec<u8>, Vec<u8>))> {
+    const EXACT: i64 = 1 << 53;
+    let pk = meta.columns.get(meta.pk)?;
+    let is_pk = |e: &Expr| {
+        matches!(e, Expr::Column(c) if c.table == schema.name
+            && schema.columns.get(c.index).is_some_and(|col| col.name == pk.as_str()))
+    };
+    // The key type of a bound: 2 for integers, 4 for texts (see `keys::push_value`).
+    let tag = |v: &Value| match v {
+        Value::I32(_) => Some(2u8),
+        Value::I64(i) if (-EXACT..=EXACT).contains(i) => Some(2),
+        Value::Text(_) => Some(4),
+        _ => None,
+    };
+    // Each bound: (value, is a lower bound, is inclusive).
+    let mut bounds: Vec<(&Value, bool, bool)> = Vec::new();
+    for part in parts {
+        match part {
+            Expr::Binary { op, left, right } => {
+                let (v, lower, inclusive) = match (&**left, &**right, op) {
+                    (l, Expr::Value(v), BinOp::Lt) if is_pk(l) => (v, false, false),
+                    (l, Expr::Value(v), BinOp::Le) if is_pk(l) => (v, false, true),
+                    (l, Expr::Value(v), BinOp::Gt) if is_pk(l) => (v, true, false),
+                    (l, Expr::Value(v), BinOp::Ge) if is_pk(l) => (v, true, true),
+                    (Expr::Value(v), r, BinOp::Lt) if is_pk(r) => (v, true, false),
+                    (Expr::Value(v), r, BinOp::Le) if is_pk(r) => (v, true, true),
+                    (Expr::Value(v), r, BinOp::Gt) if is_pk(r) => (v, false, false),
+                    (Expr::Value(v), r, BinOp::Ge) if is_pk(r) => (v, false, true),
+                    _ => return None,
+                };
+                bounds.push((v, lower, inclusive));
+            }
+            Expr::Between { expr, low, high, negated: false } if is_pk(expr) => match (&**low, &**high) {
+                (Expr::Value(l), Expr::Value(h)) => bounds.extend([(l, true, true), (h, false, true)]),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    let t = tag(bounds.first()?.0)?;
+    if bounds.iter().any(|(v, _, _)| tag(v) != Some(t)) {
+        return None;
+    }
+    let base = keys::data_prefix(meta.generation, keys::ROW);
+    let at = |extra: &[u8]| {
+        let mut k = base.clone();
+        k.extend_from_slice(extra);
+        k
+    };
+    let (rows_start, rows_end) = keys::rows_range(meta.generation);
+    let (region_start, region_end) = (at(&[t]), at(&[t + 1]));
+    let (mut lo, mut hi) = (region_start.clone(), region_end.clone());
+    for (v, lower, inclusive) in bounds {
+        let mut key = base.clone();
+        keys::push_value(&mut key, v);
+        // The first key after `key` is `key` followed by the smallest byte (no row
+        // key of this type has another one as its prefix).
+        if lower != inclusive {
+            key.push(0);
+        }
+        if lower {
+            lo = lo.max(key);
+        } else {
+            hi = hi.min(key);
+        }
+    }
+    Some(([(rows_start, region_start), (region_end, rows_end)], (lo, hi)))
+}
+
 /// `Some(descending)` when `order` is the primary key of `schema` alone.
 fn pk_order(order: &[memoire_orm::Order], schema: &TableSchema) -> Option<bool> {
     match order {
@@ -1051,7 +1145,20 @@ fn matching_rows(
     let mut out: Vec<Vec<Value>> = Vec::new();
     // What the read held before this table.
     let base = watch.held;
-    ctx.scan_rows(&meta, &map, want, |chunk| {
+    let mut range = keys::rows_range(meta.generation);
+    // A filter that only bounds the primary key, every key of the bounds' type: the
+    // rows outside the bounds cannot match, and no row read can fail the filter.
+    // Only the bounded keys are read, in the same order, and with `ORDER BY` the
+    // primary key the reading stops at the `n`th match, as for `LIMIT` alone.
+    let mut by_pk = false;
+    if let Some((outside, inside)) = pk_range(&meta, schema, parts)
+        && !ctx.any_row(&outside[0].0, &outside[0].1)?
+        && !ctx.any_row(&outside[1].0, &outside[1].1)?
+    {
+        range = inside;
+        by_pk = matches!(&stop, Stop::Best(order, _) if pk_order(order, schema) == Some(false));
+    }
+    ctx.scan_rows(&range.0, &range.1, &map, want, |chunk| {
         watch.time()?;
         let matched = columns.keep(if filter.is_some() { keep(chunk, &select)? } else { chunk });
         watch.more(&matched)?;
@@ -1059,6 +1166,7 @@ fn matching_rows(
         Ok(match &stop {
             Stop::Never => true,
             Stop::First(n) => out.len() < *n,
+            Stop::Best(_, n) if by_pk => out.len() < *n,
             Stop::Best(order, n) => {
                 if out.len() > *n {
                     let mut best = SelectAst::new(schema);

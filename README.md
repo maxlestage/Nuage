@@ -320,7 +320,7 @@ every PostgreSQL driver connects too: see below.
 
 **Does my connection work?** `GET /v1/ping` answers which application the token opens:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` gives
-`Connected to Nuage DB 0.4.8: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.9: application blog, read and write, branch main, 3 table(s).`,
 and without a token, or with one that opens nothing, it says what is wrong. From any machine:
 `nuage check <url> <token>`. A PostgreSQL connection gets the same line as a notice (psql
 prints it), and each application's page in the console shows its last connection (when, how,
@@ -555,7 +555,7 @@ administrators only, with a firewall rule for the local network.
   but warns that the password travels in clear.
 - **Upgrade**: run the command again; data, key, settings and backups stay.
 - **Options**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: off), `NUAGE_SWAP_MB` (`0`: no swap),
-  `NUAGE_VERSION=v0.4.8`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
+  `NUAGE_VERSION=v0.4.9`, `NUAGE_BINARY=/path/to/nuage`, `NUAGE_FROM_SOURCE=1` (build with
   cargo). On Windows, set them first: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Remove**: `... | sudo bash -s uninstall` keeps the data, the settings and the backups;
   `... | sudo bash -s purge` removes the data and the settings, never the backups. On Windows:
@@ -587,7 +587,7 @@ The `nuage` binary lands in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Window
 website and the live dashboard. A lighter server, without them (`/` is then a small home page;
 the console, the API and everything else stay):
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-A release: `--tag v0.4.8`. Upgrade: the same command, with `--force`.
+A release: `--tag v0.4.9`. Upgrade: the same command, with `--force`.
 
 `cargo install` only puts the binary there: no service, no settings, no backups. Hand it to
 the installer, which does the rest (settings, backups, service started with the computer):
