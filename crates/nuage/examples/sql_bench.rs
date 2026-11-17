@@ -67,6 +67,24 @@ fn main() {
     run("index (1/3), id+date", 50, "SELECT id, joue_le FROM main WHERE espace = ?", &[json!(1)]);
     run("parcours, id+date", 50, "SELECT id, joue_le FROM main", &[]);
     run("parcours, filtre non indexé", 50, "SELECT id FROM main WHERE resume = 'non'", &[]);
+    run(
+        "plage de clés (1/5), id+date",
+        50,
+        "SELECT id, joue_le FROM main WHERE id <= ?",
+        &[json!(format!("m{:06}", n / 5 - 1))],
+    );
+    run(
+        "plage de clés (20 lignes)",
+        500,
+        "SELECT id, resume FROM main WHERE id BETWEEN ? AND ?",
+        &[json!(format!("m{:06}", n / 2)), json!(format!("m{:06}", n / 2 + 19))],
+    );
+    run(
+        "count(*) plage de clés (1/2)",
+        50,
+        "SELECT count(*) FROM main WHERE id >= ?",
+        &[json!(format!("m{:06}", n / 2))],
+    );
     run("tri paginé (LIMIT 20)", 50, "SELECT id FROM main ORDER BY joue_le DESC NULLS LAST, id LIMIT 20", &[]);
     run(
         "IN (sous-requête, 1/50)",

@@ -665,3 +665,108 @@ fn an_index_that_repeats_a_column_does_not_stand_for_the_filter() {
     assert_eq!(db.rows("DELETE FROM t WHERE a = 'x' AND b = 'y!' RETURNING id", &[]), json!([[1]]));
     assert_eq!(db.rows("SELECT id FROM t ORDER BY id", &[]), json!([[2], [3]]));
 }
+
+/// A filter that only bounds the primary key reads the bounded keys alone: the
+/// rows, their order and the errors are the ones a read of the whole table gives
+/// (the same bounds written so that they are not seen as bounds).
+#[test]
+fn primary_key_bounds_answer_as_a_whole_read() {
+    let db = Db::open("pk-range");
+    db.run(
+        "CREATE TABLE n (id BIGINT PRIMARY KEY, v INT);
+         CREATE TABLE s (id TEXT PRIMARY KEY, v INT)",
+        &[],
+    );
+    let tx = db.0.begin_now().unwrap();
+    for i in (-300..=300).step_by(3) {
+        tx.sql("INSERT INTO n (id, v) VALUES (?, ?)", &[json!(i), json!(i % 7)]).unwrap();
+    }
+    let texts = ["", "a", "a\u{0}", "a\u{0}b", "a\u{1}", "ab", "abc", "b", "ba", "z", "é", "\u{7f}", "m001", "m0010"];
+    for (i, t) in texts.iter().enumerate() {
+        tx.sql("INSERT INTO s (id, v) VALUES (?, ?)", &[json!(t), json!(i)]).unwrap();
+    }
+    tx.commit_now().unwrap();
+    // `id IS NULL` is never true: `(c OR id IS NULL)` keeps what `c` keeps, read whole.
+    let same = |table: &str, cond: &str, params: &[Json], tail: &str| {
+        let plain = cond.replace("{t}", table);
+        let whole = if plain.contains("BETWEEN") {
+            format!("({plain} OR id IS NULL)")
+        } else {
+            plain.split(" AND ").map(|c| format!("({c} OR id IS NULL)")).collect::<Vec<_>>().join(" AND ")
+        };
+        for select in ["SELECT id, v FROM {t}", "SELECT * FROM {t}", "SELECT count(*), sum(v) FROM {t}"] {
+            let select = select.replace("{t}", table);
+            let tail = if select.contains("count") { "" } else { tail };
+            let fast = db.0.sql(&format!("{select} WHERE {plain} {tail}"), params);
+            let slow = db.0.sql(&format!("{select} WHERE {whole} {tail}"), params);
+            match (fast, slow) {
+                (Ok(a), Ok(b)) => assert_eq!(a[0].rows, b[0].rows, "{select} WHERE {plain} {tail}"),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{select} WHERE {plain} {tail}"),
+                (a, b) => panic!("{select} WHERE {plain} {tail}: {a:?} / {b:?}"),
+            }
+        }
+    };
+    let tails = [
+        "",
+        "LIMIT 5",
+        "LIMIT 5 OFFSET 3",
+        "ORDER BY id LIMIT 4",
+        "ORDER BY id DESC LIMIT 4",
+        "ORDER BY v, id LIMIT 6",
+    ];
+    for tail in tails {
+        for cond in [
+            "id <= 30",
+            "id < 30",
+            "id > -31",
+            "id >= -30",
+            "30 >= id",
+            "-30 < id",
+            "id BETWEEN -10 AND 40",
+            "id BETWEEN 40 AND -10",
+            "id > 0 AND id < 100 AND id <= 50",
+            "id >= 300",
+            "id > 300",
+            "id < -300",
+            "id <= 9007199254740993",
+            "id > -9007199254740993",
+            "id <= 30.5",
+            "id < 2.0",
+        ] {
+            same("n", cond, &[], tail);
+        }
+        same("n", "id >= ? AND id < ?", &[json!(-7), json!(8)], tail);
+        same("n", "id BETWEEN ? AND ?", &[json!(1), json!(1)], tail);
+        for cond in
+            ["id <= 'ab'", "id < 'ab'", "id > 'a'", "id >= 'a'", "id BETWEEN 'a' AND 'b'", "id > 'z'", "id >= ''"]
+        {
+            same("s", cond, &[], tail);
+        }
+        same("s", "id > ? AND id <= ?", &[json!("a\u{0}"), json!("m001")], tail);
+        // Bounds of another type than the keys: an error, as before.
+        same("s", "id <= 5", &[], tail);
+        same("n", "id >= 'a'", &[], tail);
+    }
+    assert_eq!(
+        db.rows("SELECT id FROM n WHERE id BETWEEN -3 AND 6 ORDER BY id DESC", &[]),
+        json!([[6], [3], [0], [-3]])
+    );
+    assert_eq!(
+        db.rows("SELECT id FROM s WHERE id > 'a' AND id < 'ab'", &[]),
+        json!([["a\u{0}"], ["a\u{0}b"], ["a\u{1}"]])
+    );
+
+    // In a transaction, its own writes are read with the others.
+    let tx = db.0.begin_now().unwrap();
+    tx.sql("INSERT INTO n (id, v) VALUES (1, 1); DELETE FROM n WHERE id = 3", &[]).unwrap();
+    let rows = tx.sql("SELECT id FROM n WHERE id >= 0 AND id <= 6", &[]).unwrap().pop().unwrap().rows;
+    assert_eq!(rows, vec![vec![Value::I64(0)], vec![Value::I64(1)], vec![Value::I64(6)]]);
+    drop(tx);
+
+    // Writes by bounds of the key.
+    assert_eq!(db.one("UPDATE n SET v = 100 WHERE id BETWEEN 0 AND 9", &[]).rows_affected, 4);
+    assert_eq!(db.rows("SELECT id FROM n WHERE v = 100", &[]), json!([[0], [3], [6], [9]]));
+    assert_eq!(db.one("DELETE FROM n WHERE id > 290", &[]).rows_affected, 4);
+    assert_eq!(db.rows("SELECT max(id) FROM n", &[]), json!([[288]]));
+    assert_eq!(db.rows("DELETE FROM s WHERE id >= 'z' RETURNING id", &[]), json!([["z"], ["\u{7f}"], ["é"]]));
+}

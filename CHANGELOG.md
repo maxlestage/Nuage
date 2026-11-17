@@ -2,6 +2,32 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.4.9 (2026-11-17)
+
+### Faster
+
+Measured with `cargo run --release -p nuage --no-default-features --example sql_bench` (three
+new lines, 5,000 rows) and `cargo run --release -p nuage --example bench` (20,000 encrypted
+rows), before (0.4.8) and after, run in turn on the same machine (4 cores, busy with other
+builds; medians of three runs):
+
+| | 0.4.8 | 0.4.9 |
+|---|---|---|
+| `WHERE id <= ?`, a fifth of the table (1,000 rows) | 1.37 ms | **0.36 ms** (−74 %) |
+| `WHERE id BETWEEN ? AND ?`, 20 rows | 1.70 ms | **0.016 ms** (−99 %) |
+| `count(*) ... WHERE id >= ?`, half of the table | 1.47 ms | **1.04 ms** (−29 %) |
+| 1,000 rows of `db.raw("... WHERE id <= 1000")` (`/v1/fetch`) | 10.90 ms | **1.35 ms** (−88 %) |
+
+- **A filter that only bounds the primary key reads the bounded rows alone** (`id <= 1000`,
+  `id > ? AND id < ?`, `id BETWEEN ? AND ?`, through SQL, the PostgreSQL port, `db.raw` and
+  Memoire's queries alike; reads, counts, `UPDATE` and `DELETE`), instead of the whole table.
+  The bounds are integers or texts, whose key order is the order they compare in, and every
+  key of the table is of their type (checked with two lookups): the rows, their order and the
+  errors are the ones a read of the whole table gives, tested against it, with the
+  transaction's own writes. With `LIMIT` alone, or `ORDER BY` the key with `LIMIT`, the read
+  stops at the last row asked. Any other filter is read as before.
+- The bench measures the bounds of the key.
+
 ## 0.4.8 (2026-11-16)
 
 ### Against quantum computers
