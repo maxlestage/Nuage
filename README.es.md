@@ -330,7 +330,7 @@ cada driver PostgreSQL se conecta también: ver abajo.
 
 **¿Funciona mi conexión?** `GET /v1/ping` responde qué aplicación abre el token:
 `curl https://db.example.com/v1/ping -H "Authorization: Bearer <token>"` da
-`Connected to Nuage DB 0.4.9: application blog, read and write, branch main, 3 table(s).`,
+`Connected to Nuage DB 0.4.10: application blog, read and write, branch main, 3 table(s).`,
 y sin token, o con uno que no abre nada, dice qué falla. Desde cualquier máquina:
 `nuage check <url> <token>`. Una conexión PostgreSQL recibe la misma frase como aviso (psql
 la muestra), y la página de cada aplicación en la consola muestra su última conexión (cuándo,
@@ -579,7 +579,7 @@ legible solo por los administradores, con una regla de cortafuegos para la red l
   funciona, pero avisa de que la contraseña viaja en claro.
 - **Actualizar**: vuelva a ejecutar el comando; datos, clave, ajustes y copias se conservan.
 - **Opciones**: `NUAGE_PORT`, `NUAGE_PG_PORT` (`0`: desactivado), `NUAGE_SWAP_MB` (`0`: sin
-  swap), `NUAGE_VERSION=v0.4.9`, `NUAGE_BINARY=/ruta/a/nuage`, `NUAGE_FROM_SOURCE=1`
+  swap), `NUAGE_VERSION=v0.4.10`, `NUAGE_BINARY=/ruta/a/nuage`, `NUAGE_FROM_SOURCE=1`
   (compilar con cargo). En Windows, defínalas antes: `$env:NUAGE_PORT = '9090'; irm ... | iex`.
 - **Desinstalar**: `... | sudo bash -s uninstall` conserva los datos, los ajustes y las
   copias; `... | sudo bash -s purge` borra los datos y los ajustes, nunca las copias. En
@@ -612,7 +612,7 @@ El binario `nuage` queda en `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` en Window
 sitio y el panel en directo. Un servidor más ligero, sin ellos (`/` es entonces una pequeña
 página de inicio; la consola, la API y todo lo demás se mantienen):
 `cargo install --locked --git https://github.com/maxlestage/Nuage nuage --no-default-features --features server`.
-Una versión concreta: `--tag v0.4.9`. Actualizar: el mismo comando, con `--force`.
+Una versión concreta: `--tag v0.4.10`. Actualizar: el mismo comando, con `--force`.
 
 `cargo install` solo coloca el binario: ni servicio, ni ajustes, ni copias. Páselo al
 instalador, que hace el resto (ajustes, copias, servicio que arranca con el ordenador):

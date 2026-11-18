@@ -332,6 +332,29 @@ impl<'c> Out<'c> {
         let at = self.buf.len();
         self.buf.extend_from_slice(&[0; 4]);
         body(&mut self.buf);
+        self.sealed(at);
+    }
+
+    /// [`msg`](Self::msg) with a body that may fail: then nothing of the
+    /// message is kept, and its error is returned (as if the body ran before
+    /// the message began, even once the client is gone).
+    fn try_msg(&mut self, kind: u8, body: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        let start = self.buf.len();
+        self.buf.push(kind);
+        let at = self.buf.len();
+        self.buf.extend_from_slice(&[0; 4]);
+        let done = body(&mut self.buf);
+        if done.is_err() || self.failed.is_some() {
+            self.buf.truncate(start);
+            return done;
+        }
+        self.sealed(at);
+        Ok(())
+    }
+
+    /// Writes the length of the message whose length is at `at`, and sends what
+    /// piled up once it is enough.
+    fn sealed(&mut self, at: usize) {
         let len = (self.buf.len() - at) as u32;
         self.buf[at..at + 4].copy_from_slice(&len.to_be_bytes());
         if self.buf.len() >= SEND_AT
@@ -2041,24 +2064,23 @@ fn row_description(out: &mut Out<'_>, cols: &[(String, i32)], formats: &[i16]) {
 }
 
 fn data_row(out: &mut Out<'_>, row: &[Value], types: &[i32], formats: &[i16]) -> Result<()> {
-    let mut cells = Vec::with_capacity(row.len());
-    for (i, v) in row.iter().enumerate() {
-        let oid = types.get(i).copied().unwrap_or(25);
-        cells.push(if v.is_null() { None } else { Some(encode(v, oid, format_of(formats, i))?) });
-    }
-    out.msg(b'D', |b| {
-        b.extend_from_slice(&(cells.len() as i16).to_be_bytes());
-        for c in &cells {
-            match c {
-                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
-                Some(bytes) => {
-                    b.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-                    b.extend_from_slice(bytes);
-                }
+    // Each value written where it is sent, its length in front of it once known.
+    out.try_msg(b'D', |b| {
+        b.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        for (i, v) in row.iter().enumerate() {
+            if v.is_null() {
+                b.extend_from_slice(&(-1i32).to_be_bytes());
+                continue;
             }
+            let oid = types.get(i).copied().unwrap_or(25);
+            let at = b.len();
+            b.extend_from_slice(&[0; 4]);
+            encode_into(b, v, oid, format_of(formats, i))?;
+            let len = (b.len() - at - 4) as i32;
+            b[at..at + 4].copy_from_slice(&len.to_be_bytes());
         }
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,9 +2185,37 @@ fn text_of(v: &Value) -> String {
 }
 
 /// A value as a column of type `oid` sends it, in text (0) or binary (1).
+#[cfg(test)]
 fn encode(v: &Value, oid: i32, format: i16) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_into(&mut out, v, oid, format)?;
+    Ok(out)
+}
+
+/// [`text_of`], written at the end of `out`: the usual types without a string of their own.
+fn push_text(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Bool(b) => out.push(if *b { b't' } else { b'f' }),
+        // `Display`, as `to_string` writes them.
+        Value::I32(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::I64(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::F64(f) if f.is_finite() => {
+            let _ = write!(out, "{f}");
+        }
+        Value::Text(s) => out.extend_from_slice(s.as_bytes()),
+        other => out.extend_from_slice(text_of(other).as_bytes()),
+    }
+}
+
+/// [`encode`], written at the end of `out` (which holds part of it when it fails).
+fn encode_into(out: &mut Vec<u8>, v: &Value, oid: i32, format: i16) -> Result<()> {
     if format == 0 {
-        return Ok(text_of(v).into_bytes());
+        push_text(out, v);
+        return Ok(());
     }
     let int = || match v {
         Value::I32(n) => Some(*n as i64),
@@ -2183,20 +2233,20 @@ fn encode(v: &Value, oid: i32, format: i16) -> Result<Vec<u8>> {
         _ => None,
     };
     let mismatch = || Error::Conversion(format!("cannot send {} as PostgreSQL type {oid}", v.type_name()));
-    Ok(match oid {
-        BOOL => vec![matches!(v, Value::Bool(true)) as u8],
-        INT2 => (int().ok_or_else(mismatch)? as i16).to_be_bytes().to_vec(),
-        INT4 => (int().ok_or_else(mismatch)? as i32).to_be_bytes().to_vec(),
-        INT8 | OID => int().ok_or_else(mismatch)?.to_be_bytes().to_vec(),
-        FLOAT4 => (float().ok_or_else(mismatch)? as f32).to_be_bytes().to_vec(),
-        FLOAT8 => float().ok_or_else(mismatch)?.to_be_bytes().to_vec(),
+    match oid {
+        BOOL => out.push(matches!(v, Value::Bool(true)) as u8),
+        INT2 => out.extend_from_slice(&(int().ok_or_else(mismatch)? as i16).to_be_bytes()),
+        INT4 => out.extend_from_slice(&(int().ok_or_else(mismatch)? as i32).to_be_bytes()),
+        INT8 | OID => out.extend_from_slice(&int().ok_or_else(mismatch)?.to_be_bytes()),
+        FLOAT4 => out.extend_from_slice(&(float().ok_or_else(mismatch)? as f32).to_be_bytes()),
+        FLOAT8 => out.extend_from_slice(&float().ok_or_else(mismatch)?.to_be_bytes()),
         BYTEA => match v {
-            Value::Bytes(b) => b.clone(),
-            other => text_of(other).into_bytes(),
+            Value::Bytes(b) => out.extend_from_slice(b),
+            other => push_text(out, other),
         },
         UUID => match v {
-            Value::Uuid(u) => u.as_bytes().to_vec(),
-            Value::Text(s) => uuid::Uuid::parse_str(s).map_err(|_| mismatch())?.as_bytes().to_vec(),
+            Value::Uuid(u) => out.extend_from_slice(u.as_bytes()),
+            Value::Text(s) => out.extend_from_slice(uuid::Uuid::parse_str(s).map_err(|_| mismatch())?.as_bytes()),
             _ => return Err(mismatch()),
         },
         TIMESTAMP | TIMESTAMPTZ => {
@@ -2207,7 +2257,7 @@ fn encode(v: &Value, oid: i32, format: i16) -> Result<Vec<u8>> {
                 _ => return Err(mismatch()),
             };
             let micros = (t - epoch()).num_microseconds().ok_or_else(mismatch)?;
-            micros.to_be_bytes().to_vec()
+            out.extend_from_slice(&micros.to_be_bytes());
         }
         DATE => {
             let d = match v {
@@ -2216,22 +2266,22 @@ fn encode(v: &Value, oid: i32, format: i16) -> Result<Vec<u8>> {
                 Value::TimestampTz(t) => t.date_naive(),
                 _ => return Err(mismatch()),
             };
-            ((d - epoch().date()).num_days() as i32).to_be_bytes().to_vec()
+            out.extend_from_slice(&((d - epoch().date()).num_days() as i32).to_be_bytes());
         }
         TIME => match v {
             Value::Time(t) => {
                 let micros = t.num_seconds_from_midnight() as i64 * 1_000_000 + (t.nanosecond() / 1000) as i64;
-                micros.to_be_bytes().to_vec()
+                out.extend_from_slice(&micros.to_be_bytes());
             }
             _ => return Err(mismatch()),
         },
         JSONB => {
-            let mut b = vec![1u8];
-            b.extend_from_slice(text_of(v).as_bytes());
-            b
+            out.push(1);
+            push_text(out, v);
         }
-        _ => text_of(v).into_bytes(),
-    })
+        _ => push_text(out, v),
+    }
+    Ok(())
 }
 
 /// Bytes written as hexadecimal digits, two each (`None`: not that).
@@ -2310,6 +2360,67 @@ fn decode_param(raw: &[u8], oid: i32, format: i16) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values written where they are sent: the text `text_of` gives, and a
+    /// row that cannot be sent leaves nothing of itself behind.
+    #[test]
+    fn rows_are_written_in_place() {
+        let t = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap().and_hms_micro_opt(10, 30, 0, 250).unwrap();
+        let values = [
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::I32(i32::MIN),
+            Value::I32(0),
+            Value::I64(i64::MAX),
+            Value::I64(-42),
+            Value::F64(0.1),
+            Value::F64(-0.0),
+            Value::F64(1e300),
+            Value::F64(5e-324),
+            Value::F64(44.833_800_000_000_004),
+            Value::F64(f64::NAN),
+            Value::F64(f64::NEG_INFINITY),
+            Value::Text("héllo".into()),
+            Value::Text(String::new()),
+            Value::Bytes(vec![0, 255]),
+            Value::Timestamp(t),
+            Value::Uuid(uuid::Uuid::from_u128(7)),
+            Value::Json(serde_json::json!({"a": [1, "b"]})),
+        ];
+        for v in &values {
+            let mut out = b"before".to_vec();
+            push_text(&mut out, v);
+            assert_eq!(&out[6..], text_of(v).as_bytes(), "{v:?}");
+        }
+        let row: Vec<Value> = values.iter().cloned().chain([Value::Null]).collect();
+        let types: Vec<i32> = row.iter().map(oid_of).collect();
+        for formats in [&[][..], &[1][..]] {
+            let mut out = Out::default();
+            data_row(&mut out, &row, &types, formats).unwrap();
+            // The message as the cells, encoded one by one, make it.
+            let mut body = (row.len() as i16).to_be_bytes().to_vec();
+            for (i, v) in row.iter().enumerate() {
+                if v.is_null() {
+                    body.extend_from_slice(&(-1i32).to_be_bytes());
+                } else {
+                    let cell = encode(v, types[i], format_of(formats, i)).unwrap();
+                    body.extend_from_slice(&(cell.len() as i32).to_be_bytes());
+                    body.extend_from_slice(&cell);
+                }
+            }
+            let mut expected = vec![b'D'];
+            expected.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+            expected.extend_from_slice(&body);
+            assert_eq!(out.buf, expected, "formats {formats:?}");
+        }
+        // A value its column's type cannot send: an error, and nothing written.
+        let mut out = Out::default();
+        data_row(&mut out, &[Value::I64(1)], &[INT8], &[]).unwrap();
+        let sent = out.buf.clone();
+        let err = data_row(&mut out, &[Value::I64(2), Value::Text("x".into())], &[INT8, UUID], &[1]).unwrap_err();
+        assert!(err.to_string().contains("cannot send"), "{err}");
+        assert_eq!(out.buf, sent);
+    }
 
     #[test]
     fn types_round_trip() {

@@ -124,6 +124,36 @@ impl Snapshot {
         Ok(None)
     }
 
+    /// Where [`with_near`](Self::with_near) starts: no leaf yet, for each tree.
+    pub(crate) fn near(&self) -> Vec<Option<Arc<Node>>> {
+        vec![None; self.layers.len()]
+    }
+
+    /// [`with`](Self::with) for keys looked up one after the other: `near`
+    /// (from [`near`](Self::near)) holds the leaf of each tree the last key
+    /// ended in, where the next one is looked for first
+    /// ([`Pages::find_near`]). The same value as [`with`](Self::with).
+    pub(crate) fn with_near<R>(
+        &self,
+        near: &mut [Option<Arc<Node>>],
+        key: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>> {
+        let mut f = Some(f);
+        for (layer, near) in self.layers.iter().zip(near.iter_mut()) {
+            let Some(layer) = layer else { continue };
+            let found = self.pages.find_near(layer, near, key, |v| match (v.split_first(), f.take()) {
+                (Some((1, value)), Some(f)) => Some(f(value)),
+                _ => None,
+            })?;
+            // Found in this layer, as a value or as a deletion: the ones behind are hidden.
+            if let Some(value) = found {
+                return Ok(value);
+            }
+        }
+        Ok(None)
+    }
+
     /// Calls `f` with each live entry of `start..end`, in key order, until it
     /// returns `Ok(false)`. The key and the value are lent where they are.
     pub(crate) fn each(

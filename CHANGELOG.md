@@ -2,6 +2,49 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.4.10 (2026-11-18)
+
+### Faster
+
+Measured with `cargo run --release -p nuage --no-default-features --example sql_bench` (5,000
+rows), before (0.4.9) and after, run in turn on the same machine (4 cores, busy with other
+builds; medians of nine runs). The PostgreSQL port: the CPU time of one process holding a
+server and a tokio-postgres client, for a `SELECT` of a 5,000-row table of six columns
+(medians of ten runs of 60 reads; the client's own work included).
+
+| | 0.4.9 | 0.4.10 |
+|---|---|---|
+| `WHERE espace = ?`, an index naming a third of the table (1,667 rows) | 0.92 ms | **0.74 ms** (−20 %) |
+| `id IN (SELECT ...)`, every row (5,000) | 8.01 ms | **6.23 ms** (−22 %) |
+| `id IN (...)`, 20 keys | 22.3 µs | **18.9 µs** (−16 %) |
+| `count(*) ... WHERE id >= ?`, half of the table | 1.04 ms | **0.75 ms** (−28 %) |
+| `ORDER BY joue_le DESC NULLS LAST, id LIMIT 20` | 1.29 ms | **1.00 ms** (−23 %) |
+| `WHERE id <= ?`, a fifth of the table (1,000 rows) | 0.377 ms | **0.312 ms** (−17 %) |
+| A filter on a column with no index, no row matching | 1.60 ms | **1.36 ms** (−15 %) |
+| PostgreSQL port, 5,000 rows in text / in binary | 4.38 / 4.12 ms | **4.01 / 3.75 ms** (−8 / −9 %) |
+
+- **Rows read by their keys are looked for first in the leaf of the row before**: an `IN`
+  list of the primary key (and the `IN (SELECT ...)` that becomes one), the rows an index
+  names, a page of rows by their keys. The keys come in key order, so most of them are in
+  the leaf of the page store where the one before was found, and are found there without
+  going down the tree again (nor through the page cache once the pages are on disk). A key
+  outside that leaf goes down from the root as before. The same rows, in the same order,
+  with a transaction's own writes and on a branch over its parent's pages: tested against a
+  read of the whole table, in memory and after a checkpoint, and the store against its
+  plain lookup on random trees through checkpoints, restarts and compactions.
+- **Memoire 0.2.7** (it was 0.2.4): the rows Nuage DB hands to Memoire's evaluator, a chunk
+  of 2,048 at a time, are indexed only for what the statement uses, and each typed copy of a
+  numeric column is made when a scan or a sort first reads it. Filters, counts and sorts of
+  scanned rows are faster (the count, the sort, the bounds and the filter above). Same answers.
+- **The PostgreSQL port writes each value where it is sent**: the values of a row were each
+  written into a buffer of their own (a number into a string), then copied into the
+  message; they are now written straight into it, their length in front once known. The
+  same bytes (tested against the values encoded one by one, in text and in binary), and a
+  row that cannot be sent leaves nothing of itself behind, as before.
+- A statement's filter is copied once instead of twice (an `IN` list of thousands of
+  values), and the keys an index lookup stands for are checked with one buffer instead of
+  one per row.
+
 ## 0.4.9 (2026-11-17)
 
 ### Faster

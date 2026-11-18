@@ -347,10 +347,24 @@ impl Ctx<'_> {
         // One key buffer for all of them, and each row decoded where it is stored.
         let mut key = keys::data_prefix(meta.generation, keys::ROW);
         let prefix = key.len();
+        if let [pk] = pks {
+            key.extend_from_slice(pk);
+            if let Some(row) = self.with_value(&key, |b| self.decode(want, map, b))? {
+                out.push(row?);
+            }
+            return Ok(out);
+        }
+        // The keys mostly come in key order: each is looked for first in the leaf
+        // where the one before it was found (`Snapshot::with_near`).
+        let mut near = self.snap.near();
         for pk in pks {
             key.truncate(prefix);
             key.extend_from_slice(pk);
-            if let Some(row) = self.with_value(&key, |b| self.decode(want, map, b))? {
+            let row = match self.overlay.get(&key) {
+                Some(pending) => pending.as_deref().map(|b| self.decode(want, map, b)),
+                None => self.snap.with_near(&mut near, &key, |b| self.decode(want, map, b))?,
+            };
+            if let Some(row) = row {
                 out.push(row?);
             }
         }
@@ -742,8 +756,8 @@ impl<'a> Pin<'a> {
         Pin { column, allowed, by_key: std::cell::OnceCell::new() }
     }
 
-    /// `held` is exactly one of the allowed values.
-    fn holds(&self, held: &Value) -> bool {
+    /// `held` is exactly one of the allowed values (`buf`: room for its key form).
+    fn holds(&self, held: &Value, buf: &mut Vec<u8>) -> bool {
         // NULL equals nothing and a float may be NaN: those go to the evaluator.
         if matches!(held, Value::Null | Value::F64(_)) {
             return false;
@@ -752,7 +766,9 @@ impl<'a> Pin<'a> {
             return self.allowed.contains(&held);
         }
         let by_key = self.by_key.get_or_init(|| self.allowed.iter().map(|v| (pk_enc(v), *v)).collect());
-        by_key.get(&pk_enc(held)).is_some_and(|v| *v == held)
+        buf.clear();
+        push_value(buf, held);
+        by_key.get(buf.as_slice()).is_some_and(|v| *v == held)
     }
 }
 
@@ -769,8 +785,10 @@ struct Pushed<'a> {
 impl Pushed<'_> {
     /// Every row holds exactly the values it was looked up by, and the lookup was the whole filter.
     fn settles(&self, rows: &[Vec<Value>]) -> bool {
+        let mut buf = Vec::new();
         self.whole.as_ref().is_some_and(|pins| {
-            rows.iter().all(|row| pins.iter().all(|pin| row.get(pin.column).is_some_and(|held| pin.holds(held))))
+            rows.iter()
+                .all(|row| pins.iter().all(|pin| row.get(pin.column).is_some_and(|held| pin.holds(held, &mut buf))))
         })
     }
 }
@@ -1087,7 +1105,6 @@ fn matching_rows(
     let want = wanted(needed, &meta, &map);
     let want = want.as_deref();
     let seq = ctx.counter(&keys::seq_key(meta.generation))?;
-    let filter = and_all(parts);
     // Keeps the rows of `chunk` that match, evaluated by Memoire.
     let keep = |chunk: Vec<Vec<Value>>, ast: &SelectAst| -> Result<Vec<Vec<Value>>> {
         let mut t = side.clone();
@@ -1095,7 +1112,8 @@ fn matching_rows(
         evaluator::fetch(&t, Query::Select(ast))
     };
     let mut select = SelectAst::new(schema);
-    select.filter = filter.clone();
+    select.filter = and_all(parts);
+    let filtered = select.filter.is_some();
     let _ = side_schemas;
     if let Some(mut pushed) = pushdown(ctx, &meta, schema, parts)? {
         let mut pks = std::mem::take(&mut pushed.keys);
@@ -1117,7 +1135,7 @@ fn matching_rows(
             for chunk in pks.chunks(n.clamp(16, CHUNK)) {
                 watch.time()?;
                 let rows = ctx.rows_by_pk(&meta, &map, want, chunk)?;
-                let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
+                let rows = if filtered && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
                 let rows = columns.keep(rows);
                 watch.more(&rows)?;
                 out.extend(rows);
@@ -1135,7 +1153,7 @@ fn matching_rows(
                 watch.time()?;
             }
             let rows = ctx.rows_by_pk(&meta, &map, want, chunk)?;
-            let rows = if filter.is_some() && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
+            let rows = if filtered && !pushed.settles(&rows) { keep(rows, &select)? } else { rows };
             let rows = columns.keep(rows);
             watch.more(&rows)?;
             out.extend(rows);
@@ -1160,7 +1178,7 @@ fn matching_rows(
     }
     ctx.scan_rows(&range.0, &range.1, &map, want, |chunk| {
         watch.time()?;
-        let matched = columns.keep(if filter.is_some() { keep(chunk, &select)? } else { chunk });
+        let matched = columns.keep(if filtered { keep(chunk, &select)? } else { chunk });
         watch.more(&matched)?;
         out.extend(matched);
         Ok(match &stop {
