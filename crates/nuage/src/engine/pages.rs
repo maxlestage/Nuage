@@ -1399,6 +1399,45 @@ impl Pages {
         }
     }
 
+    /// [`find`](Self::find) for keys looked up one after the other, `near` the
+    /// leaf the last one ended in (`None` at first). A key between the first and
+    /// the last key of that leaf can only be there (the leaves of a tree hold
+    /// ranges of keys that do not overlap): it is looked up in that leaf alone,
+    /// without going down from `root` again. Any other key goes down from `root`,
+    /// and `near` becomes its leaf. Keys that follow each other in key order (the
+    /// rows a filter or an index names) mostly fall in the same leaf.
+    pub(crate) fn find_near<R>(
+        &self,
+        root: &Arc<Node>,
+        near: &mut Option<Arc<Node>>,
+        key: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>> {
+        if let Some(Node::Leaf(c)) = near.as_deref()
+            && c.len() > 0
+            && c.key(0) <= key
+            && key <= c.key(c.len() - 1)
+        {
+            return Ok(c.search(key).ok().map(|i| f(c.val(i))));
+        }
+        let leaf = self.leaf_of(root, key)?;
+        let Node::Leaf(c) = &*leaf else { unreachable!("leaf_of ends at a leaf") };
+        let found = c.search(key).ok().map(|i| f(c.val(i)));
+        *near = Some(leaf);
+        Ok(found)
+    }
+
+    /// The leaf under `node` where `key` is, or would be.
+    fn leaf_of(&self, node: &Arc<Node>, key: &[u8]) -> Result<Arc<Node>> {
+        match &**node {
+            Node::Leaf(_) => Ok(node.clone()),
+            Node::Branch(b) => match &b.children[b.child_index(key)].ptr {
+                Ptr::Mem(n) => self.leaf_of(n, key),
+                Ptr::Disk(e) => self.leaf_of(&self.load(*e)?, key),
+            },
+        }
+    }
+
     /// Calls `f` with each entry of `start..end` under `node`, in key order,
     /// until it returns `false`. Returns `false` when the walk is over (`f`
     /// stopped it, or the range ended).
@@ -2318,6 +2357,40 @@ mod tests {
         }
     }
 
+    /// Keys looked up one after the other, each first in the leaf of the one
+    /// before (`find_near`): in key order, in reverse and at random, present or
+    /// not, between two keys of a leaf or of two leaves, the values `find` gives.
+    fn near_lookups_match_find(pages: &Pages, model: &BTreeMap<Vec<u8>, Vec<u8>>, round: usize) {
+        let root = pages.version().root(T).unwrap_or_else(|| Arc::new(Node::Leaf(Cells::default())));
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D ^ round as u64);
+        let step = 1 + model.len() / 300;
+        let mut asked: Vec<Vec<u8>> = Vec::new();
+        for (i, k) in model.keys().enumerate() {
+            if i % step == 0 || rng.below(8) == 0 {
+                asked.push(k.clone());
+            }
+            if rng.below(6) == 0 {
+                // Just after a key: absent, before the next one.
+                let mut after = k.clone();
+                after.push(0);
+                asked.push(after);
+            }
+        }
+        asked.extend([Vec::new(), b"k".to_vec(), b"k99999".to_vec(), vec![0xFF; 3]]);
+        asked.sort();
+        let mut order = asked.clone();
+        order.extend(asked.iter().rev().cloned());
+        for _ in 0..asked.len() {
+            order.push(asked[rng.below(asked.len() as u64) as usize].clone());
+        }
+        let mut near = None;
+        for k in &order {
+            let got = pages.find_near(&root, &mut near, k, |v| v.to_vec()).unwrap();
+            assert_eq!(got, pages.find(&root, k, |v| v.to_vec()).unwrap(), "round {round}: key {k:?}");
+            assert_eq!(got.as_ref(), model.get(k), "round {round}: key {k:?}");
+        }
+    }
+
     /// Random commits against a `BTreeMap`: the same content at every step,
     /// through checkpoints, restarts and compactions, with or without a key.
     fn random_commits(name: &str, xts: Option<Arc<Xts>>, keys: u64, rounds: usize, batch: u64) {
@@ -2401,6 +2474,9 @@ mod tests {
             for (k, v) in model.iter().take(20) {
                 let root = pages.version().root(T).unwrap();
                 assert_eq!(pages.find(&root, k, |v| v.to_vec()).unwrap().as_ref(), Some(v));
+            }
+            if whole {
+                near_lookups_match_find(&pages, &model, round);
             }
             assert_eq!(pages.version().bytes(T), model.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum::<u64>());
             match round % 23 {

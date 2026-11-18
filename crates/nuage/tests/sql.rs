@@ -770,3 +770,71 @@ fn primary_key_bounds_answer_as_a_whole_read() {
     assert_eq!(db.rows("SELECT max(id) FROM n", &[]), json!([[288]]));
     assert_eq!(db.rows("DELETE FROM s WHERE id >= 'z' RETURNING id", &[]), json!([["z"], ["\u{7f}"], ["é"]]));
 }
+
+/// Rows read by their keys one after the other (an `IN` list of the key, an
+/// index), each looked for first in the leaf of the one before: the rows of a
+/// whole read, in order, present or not, with a transaction's own writes, on a
+/// branch over its parent's pages, and once the pages are on disk.
+#[test]
+fn rows_read_by_their_keys_match_a_whole_read() {
+    let db = Db::open("keys-in-a-row");
+    db.run("CREATE TABLE n (id BIGINT PRIMARY KEY, v INT, t TEXT); CREATE INDEX n_v ON n (v)", &[]);
+    let tx = db.0.begin_now().unwrap();
+    for i in (0..6000).step_by(2) {
+        tx.sql(
+            "INSERT INTO n (id, v, t) VALUES (?, ?, ?)",
+            &[json!(i), json!(i % 7), json!("x".repeat(i as usize % 90))],
+        )
+        .unwrap();
+    }
+    tx.commit_now().unwrap();
+    // Keys present and absent, out of order, twice over, across many leaves.
+    let mut keys: Vec<i64> = (0..6100).step_by(3).collect();
+    keys.extend([5999, 1, 0, 4, 4, -1, 7000, 2]);
+    keys.extend((0..400).rev().map(|i| i * 13));
+    let list = keys.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ");
+    let same = |on: &Embedded, what: &str| {
+        for (fast, slow) in [
+            (format!("id IN ({list})"), format!("(id IN ({list}) OR id IS NULL)")),
+            ("v = 3".to_string(), "(v = 3 OR v IS NULL)".to_string()),
+            ("v IN (1, 5)".to_string(), "(v IN (1, 5) OR v IS NULL)".to_string()),
+        ] {
+            for tail in ["", "ORDER BY id DESC LIMIT 7", "LIMIT 9"] {
+                let a = on.sql(&format!("SELECT id, v, t FROM n WHERE {fast} {tail}"), &[]).unwrap().pop().unwrap();
+                let b = on.sql(&format!("SELECT id, v, t FROM n WHERE {slow} {tail}"), &[]).unwrap().pop().unwrap();
+                assert!(!a.rows.is_empty(), "{what}: {fast} {tail}");
+                assert_eq!(a.rows, b.rows, "{what}: {fast} {tail}");
+            }
+        }
+    };
+    same(&db.0, "in memory");
+    // A transaction's own writes among the rows read.
+    let tx = db.0.begin_now().unwrap();
+    tx.sql(
+        "INSERT INTO n (id, v, t) VALUES (3, 3, 'new'), (6001, 3, 'end'); DELETE FROM n WHERE id IN (6, 600, 3000)",
+        &[],
+    )
+    .unwrap();
+    tx.sql("UPDATE n SET v = 3, t = 'moved' WHERE id IN (2, 8, 5998)", &[]).unwrap();
+    let rows = tx.sql(&format!("SELECT id, v, t FROM n WHERE id IN ({list}) ORDER BY id"), &[]).unwrap().pop().unwrap();
+    let whole =
+        tx.sql(&format!("SELECT id, v, t FROM n WHERE (id IN ({list}) OR id IS NULL) ORDER BY id"), &[]).unwrap().pop();
+    assert_eq!(rows.rows, whole.unwrap().rows);
+    assert!(rows.rows.iter().any(|r| r[0] == Value::I64(3)) && !rows.rows.iter().any(|r| r[0] == Value::I64(6)));
+    let by_v = tx.sql("SELECT id FROM n WHERE v = 3", &[]).unwrap().pop().unwrap().rows;
+    let by_v_whole = tx.sql("SELECT id FROM n WHERE (v = 3 OR v IS NULL)", &[]).unwrap().pop().unwrap().rows;
+    assert_eq!(by_v, by_v_whole);
+    assert!(by_v.contains(&vec![Value::I64(8)]) && by_v.contains(&vec![Value::I64(6001)]));
+    drop(tx);
+    // A branch: its own changes over its parent's rows.
+    db.0.engine().create_branch("side", None).unwrap();
+    let side = db.0.on_branch("side").unwrap();
+    side.sql("DELETE FROM n WHERE id IN (0, 12, 2400); UPDATE n SET v = 3 WHERE id IN (4, 1000); INSERT INTO n (id, v) VALUES (9, 3)", &[])
+        .unwrap();
+    same(&side, "on a branch");
+    same(&db.0, "its parent");
+    // The pages on disk, read back through the cache.
+    db.0.engine().checkpoint().unwrap();
+    same(&side, "on a branch, after a checkpoint");
+    same(&db.0, "after a checkpoint");
+}
