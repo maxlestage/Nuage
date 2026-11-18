@@ -1557,6 +1557,21 @@ async fn closed(server: Server) {
     tokio::task::spawn_blocking(move || all_closed(&engines)).await.unwrap();
 }
 
+/// Opens the existing database in `dir` again once the previous server has let
+/// go of it: `closed` waits for the engines to be dropped, but the file itself
+/// is released a moment later by the engine's upkeep thread (as `open_when_free`
+/// in the engine tests). Any other error fails the test as before.
+fn open_existing_when_free(dir: &std::path::Path, options: EngineOptions) -> Arc<Engine> {
+    for _ in 0..200 {
+        match Engine::open_existing(dir, options.clone()) {
+            Ok(engine) => return engine,
+            Err(e) if e.to_string().contains("already open") => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("{} stays open", dir.display())
+}
+
 /// The options of the engines of the applications' tests below: encrypted,
 /// backed up to the folder `backups`.
 fn backed_up_to(backups: &std::path::Path) -> EngineOptions {
@@ -1713,7 +1728,7 @@ async fn creating_an_application_works_when_a_restore_is_required() {
     closed(server).await;
 
     // The same disk.
-    let server = Server::new(Engine::open_existing(&restored, backed_up_to(&backups)).unwrap(), options());
+    let server = Server::new(open_existing_when_free(&restored, backed_up_to(&backups)), options());
     assert!(server.failed_apps().is_empty(), "{:?}", server.failed_apps());
     let db = nuage::Embedded::from_engine(server.app_engine("shop").unwrap());
     assert_eq!(User::count(&db).await.unwrap(), 1);
