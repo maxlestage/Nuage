@@ -18,7 +18,7 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$repo=/nuage --remap-path-prefix=$cargo_home=/cargo" \
   cargo build -p nuage-site --lib --locked --target wasm32-unknown-unknown --profile wasm-release
 version=$(grep -A1 '^name = "wasm-bindgen"$' "$root/Cargo.lock" | sed -n 's/^version = "\(.*\)"$/\1/p')
-if ! wasm-bindgen --version | grep -q "$version"; then
+if ! case "$(wasm-bindgen --version 2>/dev/null)" in *"$version"*) true ;; *) false ;; esac; then
   echo "wasm-bindgen $version is needed: cargo install wasm-bindgen-cli --version $version" >&2
   exit 1
 fi

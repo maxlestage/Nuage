@@ -83,6 +83,9 @@ else
 	echo "ok   isolation"
 fi
 # The description of the API, for code generators.
-if curl -fs "$NUAGE_URL/v1/openapi.json" | grep -q '"openapi"'; then echo "ok   openapi.json"; else echo "FAIL openapi.json"; failed=1; fi
+# Read whole, then searched: `grep -q` stops at the first match, and with pipefail curl cut
+# off mid-transfer would fail the check.
+openapi=$(curl -fs "$NUAGE_URL/v1/openapi.json" || true)
+if case "$openapi" in *'"openapi"'*) true ;; *) false ;; esac; then echo "ok   openapi.json"; else echo "FAIL openapi.json"; failed=1; fi
 
 [ $failed = 0 ] || { echo "server log:"; cat "$dir/server.log"; exit 1; }

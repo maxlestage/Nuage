@@ -48,7 +48,8 @@ printf '%s\n' "$settings" | grep -q '^memory.cache_mb' || fail "no settings: $se
 curl -fsS -H "Authorization: Bearer $admin" "http://127.0.0.1:$port/api/settings" | grep -Eq '"detected_bytes":[0-9]{8,}' ||
 	fail "the server does not know the memory of this computer"
 ! curl -fsS "http://127.0.0.1:$port/api/status" >/dev/null 2>&1 || fail "the status is public before it is said so"
-NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings set status.public true | grep -q 'saved' ||
+saved=$(NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings set status.public true)
+printf '%s\n' "$saved" | grep -q 'saved' ||
 	fail "the setting was not saved"
 curl -fsS "http://127.0.0.1:$port/api/status" >/dev/null || fail "the saved setting is not in force"
 
@@ -61,8 +62,10 @@ step "run again without options: the backup setting stays, the service restarts"
 sudo env CI=1 NUAGE_BINARY="$binary" NUAGE_SWAP_MB=0 bash install.sh | tee "$RUNNER_TEMP/again.txt"
 grep -q "Backups: kept as they are" "$RUNNER_TEMP/again.txt" || fail "the backup setting was not kept"
 health || fail "the service does not answer after the upgrade"
-NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" apps list | grep -q '^essai' || fail "the application is gone"
-NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings | grep -Eq '^status\.public[[:space:]]+true[[:space:]]+saved' ||
+apps=$(NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" apps list)
+printf '%s\n' "$apps" | grep -q '^essai' || fail "the application is gone"
+settings=$(NUAGE_URL=http://127.0.0.1:$port NUAGE_ADMIN_TOKEN=$admin "$binary" settings)
+printf '%s\n' "$settings" | grep -Eq '^status\.public[[:space:]]+true[[:space:]]+saved' ||
 	fail "the saved setting is gone (the file says NUAGE_PUBLIC_STATUS=false: what was saved wins)"
 
 step "uninstall: the service stops, the backups and the settings stay"
