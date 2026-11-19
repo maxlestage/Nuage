@@ -296,7 +296,10 @@ chmod 755 "$TMP/nuage"
 [ "$OS" = Darwin ] && { xattr -d com.apple.quarantine "$TMP/nuage" 2>/dev/null || true; }
 "$TMP/nuage" --version >/dev/null || die "this binary does not run here"
 # The settings file must be readable by this version (`--env-file`, 0.4.2 and later).
-"$TMP/nuage" --help 2>/dev/null | grep -q -- --env-file || [ "$OS" = Linux ] ||
+# Read whole before the search: `grep -q` stops at the first match, and with pipefail the
+# help cut off mid-write (Broken pipe) would fail the test.
+help=$("$TMP/nuage" --help 2>/dev/null || true)
+case "$help" in *--env-file*) ;; *) false ;; esac || [ "$OS" = Linux ] ||
 	die "this binary is older than 0.4.2: on macOS the service needs \`nuage --env-file\` (NUAGE_VERSION=latest, or NUAGE_FROM_SOURCE=1)"
 mkdir -p "$(dirname "$BIN")"
 # Replaced in one step: the running server keeps its file until it restarts.
