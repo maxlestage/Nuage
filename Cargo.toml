@@ -6,7 +6,7 @@ members = ["crates/nuage", "crates/nuage-site", "crates/nuage-editor"]
 default-members = ["crates/nuage", "crates/nuage-site"]
 
 [workspace.package]
-version = "0.4.10"
+version = "0.4.11"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -17,8 +17,8 @@ authors = ["Maxime Nathan Lestage"]
 # Pinned to a commit of Memoire: its `nuage-wire` feature has the protocol alone (no HTTP
 # client), all the engine needs, and its client sends a table's schema once, then a reference
 # (`schemaRefs` in `/v1/info`). The `server` feature adds Memoire's client (`nuage`).
-# TODO: switch to memoire-orm 0.2.7 from crates.io once published
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "f73d96f", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
+# TODO: switch to memoire-orm 0.2.9 from crates.io once published
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "2fff592", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
 nuage-site = { version = "0.1.0", path = "crates/nuage-site" }
 
 # The server (`nuage`, Dockerfile, heroku-build.sh) and the examples: one code generation unit,
