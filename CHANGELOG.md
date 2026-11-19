@@ -2,6 +2,32 @@
 
 All notable changes to Nuage DB. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.4.11 (2026-11-19)
+
+### Faster
+
+Measured with `cargo run --release -p nuage --no-default-features --example sql_bench` (5,000
+rows; medians of fifteen runs) and `cargo run --release -p nuage --example bench` (20,000
+rows; medians of seven runs), before (0.4.10) and after, run in turn on the same machine (4
+cores, busy with other builds). The Memoire statements: `Embedded::fetch_rows` of whole rows
+on a 5,000-row table (medians of nine runs).
+
+| | 0.4.10 | 0.4.11 |
+|---|---|---|
+| `WHERE id <= ?`, a fifth of the table (1,000 rows) | 318 µs | **197 µs** (−38 %) |
+| `WHERE id BETWEEN ? AND ?`, 20 rows | 14.5 µs | **11.4 µs** (−21 %) |
+| `count(*) ... WHERE id >= ?`, half of the table | 806 µs | **503 µs** (−38 %) |
+| Server, `/v1/fetch` of 1,000 rows (`raw 1000`) | 1.41 ms | **1.16 ms** (−18 %) |
+| Memoire select, a filter every row passes (5,000 rows) | 2.40 ms | **1.53 ms** (−37 %) |
+| Memoire select, a range of 2,000 primary keys | 930 µs | **568 µs** (−39 %) |
+
+- **The rows that pass a filter are moved, not copied** (Memoire 0.2.9, it was 0.2.8): the
+  rows Nuage DB reads a chunk at a time are handed to Memoire's evaluator, which answered a
+  copy of each row passing the filter, then dropped the chunk. Its new `fetch_owned` takes
+  the chunk and moves the rows that pass out of it. The more rows pass, the more it saves.
+  The same rows, in the same order, with the same errors. The re-sort of `ORDER BY ... LIMIT`
+  still copies its few best rows, which is as fast.
+
 ## 0.4.10 (2026-11-18)
 
 ### Faster

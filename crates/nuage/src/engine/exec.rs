@@ -1105,11 +1105,16 @@ fn matching_rows(
     let want = wanted(needed, &meta, &map);
     let want = want.as_deref();
     let seq = ctx.counter(&keys::seq_key(meta.generation))?;
-    // Keeps the rows of `chunk` that match, evaluated by Memoire.
-    let keep = |chunk: Vec<Vec<Value>>, ast: &SelectAst| -> Result<Vec<Vec<Value>>> {
+    // The tables a statement on the rows of `chunk` runs on.
+    let tables = |chunk: Vec<Vec<Value>>| {
         let mut t = side.clone();
         t.insert(schema, chunk, seq);
-        evaluator::fetch(&t, Query::Select(ast))
+        t
+    };
+    // Keeps the rows of `chunk` that match, evaluated by Memoire: the rows kept
+    // are moved out of the chunk, not copied.
+    let keep = |chunk: Vec<Vec<Value>>, ast: &SelectAst| -> Result<Vec<Vec<Value>>> {
+        evaluator::fetch_owned(tables(chunk), Query::Select(ast))
     };
     let mut select = SelectAst::new(schema);
     select.filter = and_all(parts);
@@ -1190,7 +1195,8 @@ fn matching_rows(
                     let mut best = SelectAst::new(schema);
                     best.order = order.clone();
                     best.limit = Some(*n as u64);
-                    out = keep(std::mem::take(&mut out), &best)?;
+                    // Copying the few best rows is faster here than moving them.
+                    out = evaluator::fetch(&tables(std::mem::take(&mut out)), Query::Select(&best))?;
                     // Only the best rows are still held.
                     watch.now(base, &out)?;
                 }

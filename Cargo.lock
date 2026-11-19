@@ -2350,8 +2350,8 @@ dependencies = [
 
 [[package]]
 name = "memoire-orm"
-version = "0.2.8"
-source = "git+https://github.com/maxlestage/Memoire?rev=f73d96f#f73d96f595d59a09ebbd97fb58d7a45de7b3e78c"
+version = "0.2.9"
+source = "git+https://github.com/maxlestage/Memoire?rev=2fff592#2fff5921092db15bf6d7015dfb04bae529b647d4"
 dependencies = [
  "chrono",
  "foldhash 0.2.0",
@@ -2378,8 +2378,8 @@ dependencies = [
 
 [[package]]
 name = "memoire-orm-derive"
-version = "0.2.8"
-source = "git+https://github.com/maxlestage/Memoire?rev=f73d96f#f73d96f595d59a09ebbd97fb58d7a45de7b3e78c"
+version = "0.2.9"
+source = "git+https://github.com/maxlestage/Memoire?rev=2fff592#2fff5921092db15bf6d7015dfb04bae529b647d4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "nuage"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "nuage-editor"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "arboard",
  "chrono",
