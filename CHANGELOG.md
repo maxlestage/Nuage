@@ -28,6 +28,13 @@ on a 5,000-row table (medians of nine runs).
   The same rows, in the same order, with the same errors. The re-sort of `ORDER BY ... LIMIT`
   still copies its few best rows, which is as fast.
 
+### Fixed
+
+- **The installer no longer fails at random on macOS** with "this binary is older than
+  0.4.2". It checked the binary's `--help` for `--env-file` through `grep -q`, which stops
+  reading at the first match: the binary, cut off mid-write (Broken pipe), then failed, and
+  with `pipefail` the check failed too. The help is now read whole, then searched.
+
 ## 0.4.10 (2026-11-18)
 
 ### Faster
