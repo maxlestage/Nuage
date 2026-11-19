@@ -34,6 +34,10 @@ on a 5,000-row table (medians of nine runs).
   0.4.2". It checked the binary's `--help` for `--env-file` through `grep -q`, which stops
   reading at the first match: the binary, cut off mid-write (Broken pipe), then failed, and
   with `pipefail` the check failed too. The help is now read whole, then searched.
+- **The same race, out of the test scripts:** the check of `/v1/openapi.json` in
+  `clients/test.sh` (curl cut off mid-transfer), the checks of `nuage settings` and
+  `nuage apps list` in the installer test, and the wasm-bindgen version check of
+  `build-wasm.sh` now read the output whole, then search it.
 
 ## 0.4.10 (2026-11-18)
 
