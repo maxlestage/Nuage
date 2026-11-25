@@ -18,7 +18,7 @@ authors = ["Maxime Nathan Lestage"]
 # client), all the engine needs, and its client sends a table's schema once, then a reference
 # (`schemaRefs` in `/v1/info`). The `server` feature adds Memoire's client (`nuage`).
 # TODO: switch to memoire-orm 0.2.9 from crates.io once published
-memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "2fff592", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
+memoire-orm = { git = "https://github.com/maxlestage/Memoire", rev = "d084b91", default-features = false, features = ["memory", "nuage-wire", "chrono", "uuid", "json"] }
 nuage-site = { version = "0.1.0", path = "crates/nuage-site" }
 
 # The server (`nuage`, Dockerfile, heroku-build.sh) and the examples: one code generation unit,

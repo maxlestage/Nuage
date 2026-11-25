@@ -2351,7 +2351,7 @@ dependencies = [
 [[package]]
 name = "memoire-orm"
 version = "0.2.9"
-source = "git+https://github.com/maxlestage/Memoire?rev=2fff592#2fff5921092db15bf6d7015dfb04bae529b647d4"
+source = "git+https://github.com/maxlestage/Memoire?rev=d084b91#d084b914e6367bfa78d9bf95b432480a89fa5eaf"
 dependencies = [
  "chrono",
  "foldhash 0.2.0",
@@ -2379,7 +2379,7 @@ dependencies = [
 [[package]]
 name = "memoire-orm-derive"
 version = "0.2.9"
-source = "git+https://github.com/maxlestage/Memoire?rev=2fff592#2fff5921092db15bf6d7015dfb04bae529b647d4"
+source = "git+https://github.com/maxlestage/Memoire?rev=d084b91#d084b914e6367bfa78d9bf95b432480a89fa5eaf"
 dependencies = [
  "proc-macro2",
  "quote",
